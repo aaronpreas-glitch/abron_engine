@@ -33,28 +33,38 @@ jobs:
           VITE_API_BASE: ''
         run: npm run build
 
-      # ── Deploy via rsync-deployments action ────────────────────────────────
+      # ── Setup SSH key ───────────────────────────────────────────────────────
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s' "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      # ── Sync files via rsync over SSH ──────────────────────────────────────
       - name: Sync Python backend + engine
-        uses: burnett01/rsync-deployments@7.0.1
-        with:
-          switches: -avz --delete --exclude='.git' --exclude='__pycache__' --exclude='*.pyc' --exclude='.env' --exclude='*.db' --exclude='data_storage/' --exclude='logs/' --exclude='engine_state.json' --exclude='dashboard/frontend/node_modules/' --exclude='dashboard/frontend/dist/' --exclude='dashboard/frontend/src/'
-          path: ./
-          remote_path: /root/memecoin_engine/
-          remote_host: ${{ secrets.VPS_HOST }}
-          remote_port: 22
-          remote_user: root
-          remote_key: ${{ secrets.VPS_SSH_KEY }}
+        run: |
+          rsync -az --delete \
+            --exclude='.git' \
+            --exclude='__pycache__' \
+            --exclude='*.pyc' \
+            --exclude='.env' \
+            --exclude='*.db' \
+            --exclude='data_storage/' \
+            --exclude='logs/' \
+            --exclude='engine_state.json' \
+            --exclude='dashboard/frontend/node_modules/' \
+            --exclude='dashboard/frontend/dist/' \
+            --exclude='dashboard/frontend/src/' \
+            -e "ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no -o IdentitiesOnly=yes" \
+            ./ root@${{ secrets.VPS_HOST }}:/root/memecoin_engine/
 
       - name: Sync built frontend
-        uses: burnett01/rsync-deployments@7.0.1
-        with:
-          switches: -avz --delete
-          path: dashboard/frontend/dist/
-          remote_path: /root/memecoin_engine/dashboard/frontend/dist/
-          remote_host: ${{ secrets.VPS_HOST }}
-          remote_port: 22
-          remote_user: root
-          remote_key: ${{ secrets.VPS_SSH_KEY }}
+        run: |
+          rsync -az --delete \
+            -e "ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no -o IdentitiesOnly=yes" \
+            dashboard/frontend/dist/ \
+            root@${{ secrets.VPS_HOST }}:/root/memecoin_engine/dashboard/frontend/dist/
 
       # ── Restart services ───────────────────────────────────────────────────
       - name: Install deps & restart services
@@ -70,7 +80,7 @@ jobs:
             pip3 install -q -r dashboard/backend/requirements.txt 2>/dev/null || true
             systemctl restart memecoin-engine   || true
             systemctl restart memecoin-dashboard || true
-            sleep 3
+            sleep 2
             systemctl is-active memecoin-engine   && echo "engine: active"   || echo "engine: failed"
             systemctl is-active memecoin-dashboard && echo "dashboard: active" || echo "dashboard: failed"
             echo "Deploy complete"
