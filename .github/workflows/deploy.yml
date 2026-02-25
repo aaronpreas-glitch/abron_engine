@@ -1,0 +1,97 @@
+name: Deploy to VPS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:   # Allow manual trigger from GitHub UI
+
+jobs:
+  deploy:
+    name: Deploy to DigitalOcean VPS
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── Build frontend ──────────────────────────────────────────────────────
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: dashboard/frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: dashboard/frontend
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: dashboard/frontend
+        env:
+          VITE_API_BASE: ''
+        run: npm run build
+
+      # ── Deploy to VPS ────────────────────────────────────────────────────────
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Sync Python backend + engine
+        run: |
+          rsync -avz --delete \
+            --exclude='.git' \
+            --exclude='__pycache__' \
+            --exclude='*.pyc' \
+            --exclude='.env' \
+            --exclude='*.db' \
+            --exclude='data_storage/' \
+            --exclude='logs/' \
+            --exclude='engine_state.json' \
+            --exclude='dashboard/frontend/node_modules/' \
+            --exclude='dashboard/frontend/dist/' \
+            --exclude='dashboard/frontend/src/' \
+            -e "ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no" \
+            ./ root@${{ secrets.VPS_HOST }}:/root/memecoin_engine/
+
+      - name: Sync built frontend
+        run: |
+          rsync -avz --delete \
+            -e "ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no" \
+            dashboard/frontend/dist/ \
+            root@${{ secrets.VPS_HOST }}:/root/memecoin_engine/dashboard/frontend/dist/
+
+      - name: Install Python deps & restart services
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            root@${{ secrets.VPS_HOST }} << 'REMOTE'
+          set -e
+          cd /root/memecoin_engine
+
+          echo "=== Installing Python dependencies ==="
+          pip3 install -q -r requirements.txt
+
+          echo "=== Installing dashboard backend dependencies ==="
+          pip3 install -q -r dashboard/backend/requirements.txt 2>/dev/null || true
+
+          echo "=== Restarting services ==="
+          systemctl restart memecoin-engine   || true
+          systemctl restart memecoin-dashboard || true
+          sleep 3
+
+          echo "=== Service status ==="
+          systemctl is-active memecoin-engine   && echo "✅ engine: active"   || echo "❌ engine: failed"
+          systemctl is-active memecoin-dashboard && echo "✅ dashboard: active" || echo "❌ dashboard: failed"
+
+          echo "=== Deploy complete ==="
+          REMOTE
+
+      - name: Verify deployment
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            root@${{ secrets.VPS_HOST }} \
+            "systemctl status memecoin-engine --no-pager -l | tail -5"

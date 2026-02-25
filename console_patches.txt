@@ -1,0 +1,605 @@
+################################################################################
+# MEMECOIN ENGINE — VPS CONSOLE PATCHES
+# Server root: /root/memecoin_engine/
+# Run each block independently in the VPS console.
+# Each patch is idempotent (checks before inserting).
+################################################################################
+
+
+################################################################################
+# PATCH 1: utils/db.py — Add helius_grade migration block
+# Target: /root/memecoin_engine/utils/db.py
+# Inserts the ALTER TABLE helius_grade block after the cycle_phase migration.
+# Safe to run multiple times (SQLite ignores duplicate column errors).
+################################################################################
+
+python3 << 'PYEOF'
+path = '/root/memecoin_engine/utils/db.py'
+old = '''        for _tbl in ("regime_snapshots", "alert_outcomes", "signals"):
+            try:
+                cur.execute(f"ALTER TABLE {_tbl} ADD COLUMN cycle_phase TEXT")
+            except Exception:
+                pass  # column already exists — fine
+
+
+def log_signal'''
+new = '''        for _tbl in ("regime_snapshots", "alert_outcomes", "signals"):
+            try:
+                cur.execute(f"ALTER TABLE {_tbl} ADD COLUMN cycle_phase TEXT")
+            except Exception:
+                pass  # column already exists — fine
+
+        # Add helius_grade to signals table
+        try:
+            cur.execute("ALTER TABLE signals ADD COLUMN helius_grade TEXT")
+        except Exception:
+            pass
+
+
+def log_signal'''
+with open(path) as f: src = f.read()
+if 'helius_grade' in src:
+    print('SKIP: helius_grade already present in db.py')
+elif old not in src:
+    print('ERROR: anchor string not found — check file manually')
+else:
+    with open(path, 'w') as f: f.write(src.replace(old, new, 1))
+    print('OK: helius_grade migration added to db.py')
+PYEOF
+
+
+################################################################################
+# PATCH 2: dashboard/backend/main.py — Add /api/sniper/second-leg endpoint
+# Target: /root/memecoin_engine/dashboard/backend/main.py
+# Inserts the endpoint before the SPA catch-all comment block.
+# Safe to run multiple times.
+################################################################################
+
+python3 << 'PYEOF'
+path = '/root/memecoin_engine/dashboard/backend/main.py'
+anchor = '''# ---------------------------------------------------------------------------
+# SPA catch-all — serve index.html for all non-API paths (React Router)
+# Must be defined LAST so it doesn't shadow any /api/ or /ws/ routes.
+# ---------------------------------------------------------------------------'''
+insert = '''@app.get("/api/sniper/second-leg")
+async def get_second_leg_candidates_api():
+    """Return tokens currently in second-leg territory from ATH tracker."""
+    try:
+        import sys, os
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+        from utils.ath_tracker import get_second_leg_candidates
+        from utils.db import get_conn
+
+        # Prime candidates (75%+ drawdown)
+        candidates = get_second_leg_candidates(min_drawdown_pct=75.0, limit=20)
+
+        # Approaching zone (60-74%)
+        approaching = []
+        try:
+            with get_conn() as conn:
+                rows = conn.execute(
+                    """SELECT mint, symbol, ath_price, last_price, pct_from_ath, leg, ath_ts_utc, last_seen_utc
+                       FROM token_ath
+                       WHERE pct_from_ath >= 0.60 AND pct_from_ath < 0.75
+                       ORDER BY pct_from_ath DESC LIMIT 10"""
+                ).fetchall()
+                approaching = [
+                    {
+                        "mint": r[0], "symbol": r[1], "ath_price": r[2],
+                        "last_price": r[3], "drawdown_pct": round(r[4] * 100, 1),
+                        "leg": r[5], "ath_ts_utc": r[6], "last_seen_utc": r[7],
+                    }
+                    for r in rows
+                ]
+        except Exception:
+            pass
+
+        # Total ATH tracking count
+        total_tracked = 0
+        try:
+            with get_conn() as conn:
+                total_tracked = conn.execute("SELECT COUNT(*) FROM token_ath").fetchone()[0]
+        except Exception:
+            pass
+
+        return {
+            "prime_candidates": candidates,
+            "approaching": approaching,
+            "total_tracked": total_tracked,
+            "updated_at": datetime.utcnow().isoformat(),
+        }
+    except Exception as e:
+        return {"prime_candidates": [], "approaching": [], "total_tracked": 0, "error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# SPA catch-all — serve index.html for all non-API paths (React Router)
+# Must be defined LAST so it doesn't shadow any /api/ or /ws/ routes.
+# ---------------------------------------------------------------------------'''
+with open(path) as f: src = f.read()
+if '/api/sniper/second-leg' in src:
+    print('SKIP: /api/sniper/second-leg already present in main.py')
+elif anchor not in src:
+    print('ERROR: SPA catch-all anchor not found — check file manually')
+else:
+    with open(path, 'w') as f: f.write(src.replace(anchor, insert, 1))
+    print('OK: /api/sniper/second-leg endpoint added to dashboard/backend/main.py')
+PYEOF
+
+
+################################################################################
+# PATCH 3: main.py (root) — Add cmd_sniper handler registration
+# Target: /root/memecoin_engine/main.py
+# The cmd_sniper function body should already exist. This patch ensures the
+# CommandHandler registration line is present alongside the other lev handlers.
+# Safe to run multiple times.
+################################################################################
+
+python3 << 'PYEOF'
+path = '/root/memecoin_engine/main.py'
+anchor = '        app.add_handler(CommandHandler("pricezones", cmd_price_zones))\n'
+insert = '        app.add_handler(CommandHandler("pricezones", cmd_price_zones))\n        app.add_handler(CommandHandler("sniper", cmd_sniper))\n'
+with open(path) as f: src = f.read()
+if 'CommandHandler("sniper", cmd_sniper)' in src:
+    print('SKIP: sniper handler already registered in main.py')
+elif anchor not in src:
+    print('ERROR: pricezones anchor not found — check file manually')
+else:
+    with open(path, 'w') as f: f.write(src.replace(anchor, insert, 1))
+    print('OK: sniper CommandHandler registered in main.py')
+PYEOF
+
+
+################################################################################
+# PATCH 4: NEW FILE — dashboard/frontend/src/components/sniper/SniperPanel.tsx
+# Target: /root/memecoin_engine/dashboard/frontend/src/components/sniper/SniperPanel.tsx
+# Creates the directory and writes the full component file.
+################################################################################
+
+python3 << 'PYEOF'
+import os
+path = '/root/memecoin_engine/dashboard/frontend/src/components/sniper/SniperPanel.tsx'
+os.makedirs(os.path.dirname(path), exist_ok=True)
+if os.path.exists(path):
+    print('SKIP: SniperPanel.tsx already exists')
+else:
+    content = r"""import { useState, useEffect } from 'react'
+
+interface SniperCandidate {
+  mint: string
+  symbol: string
+  ath_price: number
+  last_price: number
+  drawdown_pct: number
+  leg: string
+  ath_ts_utc: string
+  last_seen_utc?: string
+}
+
+interface SniperData {
+  prime_candidates: SniperCandidate[]
+  approaching: SniperCandidate[]
+  total_tracked: number
+  updated_at: string
+  error?: string
+}
+
+function depthColor(dd: number): string {
+  if (dd >= 90) return '#ef4444'
+  if (dd >= 85) return '#f97316'
+  if (dd >= 75) return '#f59e0b'
+  return '#eab308'
+}
+
+function depthEmoji(dd: number): string {
+  if (dd >= 90) return '🔥🔥'
+  if (dd >= 85) return '🔥'
+  return '📍'
+}
+
+function fmtPrice(p: number): string {
+  if (!p) return '—'
+  if (p < 0.000001) return '$' + p.toExponential(2)
+  if (p < 0.01) return '$' + p.toFixed(6)
+  if (p < 1) return '$' + p.toFixed(4)
+  return '$' + p.toFixed(3)
+}
+
+function fmtAge(ts: string): string {
+  if (!ts) return '—'
+  const diff = Date.now() - new Date(ts).getTime()
+  const h = Math.floor(diff / 3600000)
+  const m = Math.floor((diff % 3600000) / 60000)
+  if (h > 48) return `${Math.floor(h/24)}d ago`
+  if (h > 0) return `${h}h ago`
+  return `${m}m ago`
+}
+
+const BASE = import.meta.env.VITE_API_BASE ?? ''
+
+export default function SniperPanel() {
+  const [data, setData] = useState<SniperData | null>(null)
+  const [loading, setLoading] = useState(true)
+
+  const load = async () => {
+    try {
+      const r = await fetch(`${BASE}/api/sniper/second-leg`)
+      const j = await r.json()
+      setData(j)
+    } catch {
+      // silent
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    load()
+    const t = setInterval(load, 5 * 60 * 1000)
+    return () => clearInterval(t)
+  }, [])
+
+  const cardStyle: React.CSSProperties = {
+    background: '#0f1117',
+    border: '1px solid #1e2130',
+    borderRadius: 8,
+    padding: '16px 20px',
+    fontFamily: 'monospace',
+  }
+
+  const headerStyle: React.CSSProperties = {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 12,
+  }
+
+  const sectionLabel: React.CSSProperties = {
+    fontSize: 11,
+    fontWeight: 700,
+    letterSpacing: '0.08em',
+    textTransform: 'uppercase' as const,
+    marginBottom: 6,
+    marginTop: 12,
+  }
+
+  const rowStyle: React.CSSProperties = {
+    display: 'grid',
+    gridTemplateColumns: '80px 60px 1fr 1fr 60px',
+    gap: 8,
+    padding: '5px 0',
+    borderBottom: '1px solid #1e2130',
+    fontSize: 12,
+    alignItems: 'center',
+  }
+
+  if (loading) {
+    return (
+      <div style={cardStyle}>
+        <div style={{ color: '#6b7280', fontSize: 13 }}>Loading sniper data…</div>
+      </div>
+    )
+  }
+
+  const prime = data?.prime_candidates ?? []
+  const approaching = data?.approaching ?? []
+  const tracked = data?.total_tracked ?? 0
+
+  return (
+    <div style={cardStyle}>
+      <div style={headerStyle}>
+        <span style={{ color: '#f1f5f9', fontWeight: 700, fontSize: 14 }}>
+          🎯 Second Leg Sniper
+        </span>
+        <span style={{ color: '#6b7280', fontSize: 11 }}>
+          {tracked} tokens tracked
+        </span>
+      </div>
+
+      {prime.length === 0 && approaching.length === 0 ? (
+        <div style={{ color: '#6b7280', fontSize: 12, lineHeight: 1.6 }}>
+          <div>No second-leg candidates yet.</div>
+          <div style={{ marginTop: 4 }}>
+            Engine is building ATH history — check back in 24-48h.
+          </div>
+        </div>
+      ) : (
+        <>
+          {prime.length > 0 && (
+            <>
+              <div style={{ ...sectionLabel, color: '#ef4444' }}>
+                🔴 Prime Zone — 75-95% below ATH ({prime.length})
+              </div>
+              {/* Column headers */}
+              <div style={{ ...rowStyle, color: '#6b7280', fontSize: 10, borderBottom: '1px solid #2d3148' }}>
+                <span>SYMBOL</span>
+                <span>DOWN</span>
+                <span>ATH</span>
+                <span>NOW</span>
+                <span>SEEN</span>
+              </div>
+              {prime.slice(0, 10).map((c, i) => (
+                <div key={i} style={rowStyle}>
+                  <span style={{ color: '#f1f5f9', fontWeight: 700 }}>
+                    {depthEmoji(c.drawdown_pct)} {c.symbol}
+                  </span>
+                  <span style={{ color: depthColor(c.drawdown_pct), fontWeight: 700 }}>
+                    ↓{c.drawdown_pct.toFixed(0)}%
+                  </span>
+                  <span style={{ color: '#9ca3af' }}>{fmtPrice(c.ath_price)}</span>
+                  <span style={{ color: '#f1f5f9' }}>{fmtPrice(c.last_price)}</span>
+                  <span style={{ color: '#6b7280', fontSize: 10 }}>{fmtAge(c.last_seen_utc ?? c.ath_ts_utc)}</span>
+                </div>
+              ))}
+            </>
+          )}
+
+          {approaching.length > 0 && (
+            <>
+              <div style={{ ...sectionLabel, color: '#f59e0b' }}>
+                🟡 Approaching — 60-74% below ATH ({approaching.length})
+              </div>
+              {approaching.slice(0, 5).map((c, i) => (
+                <div key={i} style={{ ...rowStyle, opacity: 0.8 }}>
+                  <span style={{ color: '#d1d5db', fontWeight: 600 }}>
+                    📊 {c.symbol}
+                  </span>
+                  <span style={{ color: '#f59e0b', fontWeight: 600 }}>
+                    ↓{c.drawdown_pct.toFixed(0)}%
+                  </span>
+                  <span style={{ color: '#6b7280' }}>{fmtPrice(c.ath_price)}</span>
+                  <span style={{ color: '#9ca3af' }}>{fmtPrice(c.last_price)}</span>
+                  <span style={{ color: '#6b7280', fontSize: 10 }}>{fmtAge(c.last_seen_utc ?? c.ath_ts_utc)}</span>
+                </div>
+              ))}
+            </>
+          )}
+        </>
+      )}
+
+      <div style={{ marginTop: 12, paddingTop: 8, borderTop: '1px solid #1e2130', color: '#4b5563', fontSize: 10 }}>
+        Strategy: Entry zone = 80-90% below ATH • Wait for volume + social confirmation
+      </div>
+    </div>
+  )
+}
+"""
+    with open(path, 'w') as f: f.write(content)
+    print('OK: SniperPanel.tsx created')
+PYEOF
+
+
+################################################################################
+# PATCH 5: CommandCenter.tsx — Add SniperPanel import + usage
+# Target: /root/memecoin_engine/dashboard/frontend/src/components/home/CommandCenter.tsx
+# Adds the import at the top and the <SniperPanel /> usage block at the bottom.
+# Safe to run multiple times.
+################################################################################
+
+python3 << 'PYEOF'
+path = '/root/memecoin_engine/dashboard/frontend/src/components/home/CommandCenter.tsx'
+with open(path) as f: src = f.read()
+
+changed = False
+
+# 1. Add import after GlobalMetricsBar import
+old_import = "import { GlobalMetricsBar } from './GlobalMetricsBar'"
+new_import = "import { GlobalMetricsBar } from './GlobalMetricsBar'\nimport SniperPanel from '../sniper/SniperPanel'"
+if 'SniperPanel' not in src:
+    if old_import not in src:
+        print('ERROR: GlobalMetricsBar import anchor not found')
+    else:
+        src = src.replace(old_import, new_import, 1)
+        changed = True
+        print('OK: SniperPanel import added')
+else:
+    print('SKIP: SniperPanel import already present')
+
+# 2. Add <SniperPanel /> usage before closing right-column div
+old_block = '        </div>\n      </div>\n    </div>\n  )\n}'
+new_block = '''          {/* Second Leg Sniper */}
+          <div style={{ marginTop: 16 }}>
+            <SniperPanel />
+          </div>
+
+        </div>
+      </div>
+    </div>
+  )
+}'''
+if '<SniperPanel' not in src:
+    if old_block not in src:
+        print('ERROR: closing div anchor not found for SniperPanel usage')
+    else:
+        src = src.replace(old_block, new_block, 1)
+        changed = True
+        print('OK: SniperPanel usage block added')
+else:
+    print('SKIP: SniperPanel usage already present')
+
+if changed:
+    with open(path, 'w') as f: f.write(src)
+    print('OK: CommandCenter.tsx written')
+PYEOF
+
+
+################################################################################
+# PATCH 6: types.ts — Add helius_grade field to Signal interface
+# Target: /root/memecoin_engine/dashboard/frontend/src/types.ts
+# Safe to run multiple times.
+################################################################################
+
+python3 << 'PYEOF'
+path = '/root/memecoin_engine/dashboard/frontend/src/types.ts'
+old = '  notes: string | null\n}'
+new = '  notes: string | null\n  helius_grade: string | null\n}'
+with open(path) as f: src = f.read()
+if 'helius_grade' in src:
+    print('SKIP: helius_grade already in types.ts')
+elif old not in src:
+    print('ERROR: Signal interface closing brace anchor not found')
+else:
+    with open(path, 'w') as f: f.write(src.replace(old, new, 1))
+    print('OK: helius_grade added to Signal interface in types.ts')
+PYEOF
+
+
+################################################################################
+# PATCH 7: SignalCard.tsx — Add heliusColor/heliusEmoji helpers + badge rendering
+# Target: /root/memecoin_engine/dashboard/frontend/src/components/signals/SignalCard.tsx
+# Safe to run multiple times.
+################################################################################
+
+python3 << 'PYEOF'
+path = '/root/memecoin_engine/dashboard/frontend/src/components/signals/SignalCard.tsx'
+with open(path) as f: src = f.read()
+
+changed = False
+
+# 1. Add heliusColor + heliusEmoji helper functions before the SignalCard export
+old_helpers = 'export function SignalCard'
+new_helpers = '''function heliusColor(grade: string | null): string {
+  if (grade === 'SAFE') return '#22c55e'
+  if (grade === 'CAUTION') return '#f59e0b'
+  if (grade === 'RISKY') return '#ef4444'
+  if (grade === 'DANGER') return '#dc2626'
+  return '#6b7280'
+}
+function heliusEmoji(grade: string | null): string {
+  if (grade === 'SAFE') return '🛡'
+  if (grade === 'CAUTION') return '⚠️'
+  if (grade === 'RISKY') return '🚨'
+  if (grade === 'DANGER') return '☠️'
+  return ''
+}
+
+export function SignalCard'''
+if 'heliusColor' not in src:
+    if old_helpers not in src:
+        print('ERROR: SignalCard export anchor not found for helpers')
+    else:
+        src = src.replace(old_helpers, new_helpers, 1)
+        changed = True
+        print('OK: heliusColor/heliusEmoji helpers added')
+else:
+    print('SKIP: heliusColor already present')
+
+# 2. Add helius badge rendering after conviction grade badge block
+old_badge = '''          {sig.setup_type && sig.setup_type !== 'standard' && (
+            <span style={{ color: 'var(--muted)', fontSize: 10, fontStyle: 'italic' }}>{sig.setup_type}</span>
+          )}'''
+new_badge = """          {sig.helius_grade && sig.helius_grade !== 'UNKNOWN' && (
+            <span title={`On-chain safety: ${sig.helius_grade}`} style={{
+              padding: '1px 6px', borderRadius: 3, fontSize: 10, fontWeight: 700,
+              letterSpacing: '0.05em',
+              background: heliusColor(sig.helius_grade) + '22',
+              color: heliusColor(sig.helius_grade),
+              border: `1px solid ${heliusColor(sig.helius_grade)}44`,
+              cursor: 'default',
+            }}>
+              {heliusEmoji(sig.helius_grade)} {sig.helius_grade}
+            </span>
+          )}
+
+          {sig.setup_type && sig.setup_type !== 'standard' && (
+            <span style={{ color: 'var(--muted)', fontSize: 10, fontStyle: 'italic' }}>{sig.setup_type}</span>
+          )}"""
+if 'helius_grade' not in src:
+    if old_badge not in src:
+        print('ERROR: setup_type badge anchor not found for helius badge insertion')
+    else:
+        src = src.replace(old_badge, new_badge, 1)
+        changed = True
+        print('OK: helius_grade badge rendering added')
+else:
+    print('SKIP: helius_grade badge already present')
+
+if changed:
+    with open(path, 'w') as f: f.write(src)
+    print('OK: SignalCard.tsx written')
+PYEOF
+
+
+################################################################################
+# PATCH 8: Deploy built frontend dist/ folder
+# The React app was pre-built locally. Rsync the dist/ to the server.
+#
+# Run this from your LOCAL machine (not the VPS console):
+#
+#   rsync -avz --delete \
+#     /Users/abron/memecoin_engine/dashboard/frontend/dist/ \
+#     root@<YOUR_VPS_IP>:/root/memecoin_engine/dashboard/frontend/dist/
+#
+# The dist/ folder contains:
+#   index.html
+#   vite.svg
+#   assets/index-D44bIWYX.css
+#   assets/index-DfbXZKKk.js
+#
+# After rsync, restart the backend on the VPS:
+#   systemctl restart memecoin   (or however your service is named)
+#
+# If you want to verify the dist is intact on the VPS:
+#   ls -lh /root/memecoin_engine/dashboard/frontend/dist/assets/
+################################################################################
+
+
+################################################################################
+# PATCH 9: .env — Add/update WATCHLIST_ENTRIES and WATCHLIST_MAX_ALERTS_PER_CYCLE
+# Target: /root/memecoin_engine/.env
+# This patch ADDS the lines if missing. If they already exist with different
+# values, it replaces them. Safe to run multiple times.
+################################################################################
+
+python3 << 'PYEOF'
+import re
+path = '/root/memecoin_engine/.env'
+with open(path) as f: src = f.read()
+
+WATCHLIST_ENTRIES = 'WATCHLIST_ENTRIES=PUMP:pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn,BONK:DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263,JUP:JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN,PENGU:2zMMhcVQEXDtdE6vsFS7S7D5oUodfJHE8vd1gnBouauv,WIF:EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm,FARTCOIN:9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump,RAY:4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R,SKR:SKRbvo6Gf7GondiT3BbTfuRDPqLWei4j2Qy2NPGZhW3,MET:METvsvVRapdj9cFLzq4Tr43xK4tAjQfwX76z3n6mWQL,POPCAT:7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr,BOME:ukHH6c7mMyiWCf1b9pnWe25TSpkDDt3H5pQZgZ74J82,MYRO:HhJpBhRRn4g56VsyLuT8DL5Bv31HkXqsrahTTUCZeZg4,MEW:MEW1gQWJ3nEXg2qgERiKu7FAFj79PHvQVREQUzScPP5,GOAT:CzLSujWBLFsSjncfkh59rUFqvafWcY5tzedWJSuypump,PNUT:2qEHjDLDLbuBgRYvsxhc5Twd3yYMX3aBHnrn3MhVEDR7,MOODENG:ED5nyyWEzpPPiWimP8vYm7sD7TD3LAt3Q3gRTWHzc3ev,ZEREBRO:8x5VqbHA8D7NkD52uNuS5nnt3PwA8pLD34ymskeSo2Wn,AI16Z:HeLp6NuQkmYB4pYWo2zYs22mESHXPQYzXbB8n4V98jwC,GRIFFAIN:KENJSUYLASHUMfHyy5o4Hp2FdNqZg1AsUPhfH2kYvEP,ARC:61V8vBaqAGMpgDQi4JcAwo1dmBGHsyhzodcPqnEVpump,ORCA:orcaEKTdK7LKz57vaAYr9QeNsVEPfiu6QeMU1Adventure,PYTH:HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3,RENDER:rndrizKT3MK1iimdxRdWabcF7Zg7AR5T4nud4EkHBof,TRUMP:6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN,MELANIA:FUAfBo2jgks6gB4Z4LfZkqSZgzNucisEHqnNebaRxM1P,DRIFT:DriFtupjxFXb4rZPBRKk1PFZP4pWcyW7L7xwFNGy4cG9,TNSR:TNSRxcUxoT9xBG3de7A4QJ58E2sGMW3RYj6QK8FXBT,KMNO:KMNo3nJsBXfcpJTVhZcXLW7RmTwTt4GVFE7suUBo9sS,CLOUD:CLoUDKc4Ane7HeQcPpE3YkTs6ioR9aWXoYEr8HGfbLcm,JTO:jtojtomepa8b1D9bveQGHxPF8wNEELZjhomhJWB2YkD,PYUSD:2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo,MOBILE:mb1eu7TzEc71KxDpsmsKoucSSuuoGLv1drys1oP2jh6,HNT:hntyVP6YFm1Hg25TN9WGLqM18BB8FLCFPxrKBbqE9hu,W:85VBFQZC9TZkfaptBWjvUw7YbZjy52A6mjtPGjstQAmQ,LAYER:LayerAsDTHxMBHjPQyBRXRgjHjCVkBVNZMmUaKQhJFP,IO:BZLbGTNCSFfoth2GYDtwr7e4imWzpR5jqcUuGEwr646V,GRASS:Grass7B4RdKfBCjTKgSqnXkqjwiGvQyFbuSCUJr3XXjs'
+WATCHLIST_MAX = 'WATCHLIST_MAX_ALERTS_PER_CYCLE=6'
+
+changed = False
+
+# Replace or append WATCHLIST_ENTRIES
+if re.search(r'^WATCHLIST_ENTRIES=', src, re.MULTILINE):
+    new_src = re.sub(r'^WATCHLIST_ENTRIES=.*$', WATCHLIST_ENTRIES, src, flags=re.MULTILINE)
+    if new_src != src:
+        src = new_src; changed = True
+        print('OK: WATCHLIST_ENTRIES updated')
+    else:
+        print('SKIP: WATCHLIST_ENTRIES unchanged')
+else:
+    src += '\n' + WATCHLIST_ENTRIES + '\n'
+    changed = True
+    print('OK: WATCHLIST_ENTRIES appended')
+
+# Replace or append WATCHLIST_MAX_ALERTS_PER_CYCLE
+if re.search(r'^WATCHLIST_MAX_ALERTS_PER_CYCLE=', src, re.MULTILINE):
+    new_src = re.sub(r'^WATCHLIST_MAX_ALERTS_PER_CYCLE=.*$', WATCHLIST_MAX, src, flags=re.MULTILINE)
+    if new_src != src:
+        src = new_src; changed = True
+        print('OK: WATCHLIST_MAX_ALERTS_PER_CYCLE updated')
+    else:
+        print('SKIP: WATCHLIST_MAX_ALERTS_PER_CYCLE unchanged')
+else:
+    src += WATCHLIST_MAX + '\n'
+    changed = True
+    print('OK: WATCHLIST_MAX_ALERTS_PER_CYCLE appended')
+
+if changed:
+    with open(path, 'w') as f: f.write(src)
+    print('OK: .env written')
+PYEOF
+
+
+################################################################################
+# POST-PATCH: Restart services on the VPS
+# Run these after all patches above are applied:
+#
+#   cd /root/memecoin_engine
+#   systemctl restart memecoin        # or your service name
+#   # Verify:
+#   systemctl status memecoin
+#   journalctl -u memecoin -n 50 --no-pager
+################################################################################

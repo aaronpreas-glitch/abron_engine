@@ -1,0 +1,23 @@
+[Unit]
+Description=Memecoin Trading Dashboard (FastAPI/uvicorn)
+After=network.target memecoin-engine.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/memecoin_engine/dashboard/backend
+ExecStart=/root/memecoin_engine/dashboard/.venv/bin/uvicorn main:app \
+    --host 0.0.0.0 \
+    --port 8888 \
+    --workers 1 \
+    --log-level info \
+    --access-log
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=memecoin-dashboard
+EnvironmentFile=/root/memecoin_engine/.env
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Data / DB / Logs
+*.db
+*.sqlite
+*.sqlite3
+data_storage/*.json
+data_storage/*.jsonl
+logs/
+*.log
+engine_state.json
+
+# Keys / secrets
+*.pem
+*.key
+*.p12
+*.pfx
+id_*
+*_rsa
+*_ed25519
+*_ecdsa
+
+# Node / frontend build
+dashboard/frontend/node_modules/
+dashboard/frontend/dist/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
