@@ -37,8 +37,9 @@ jobs:
       - name: Setup SSH key
         run: |
           mkdir -p ~/.ssh
-          printf '%s' "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/deploy_key
+          echo "${{ secrets.VPS_SSH_KEY }}" | sed 's/\\n/\n/g' > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
+          ssh-keygen -l -f ~/.ssh/deploy_key || (echo "KEY DUMP:"; cat ~/.ssh/deploy_key; exit 1)
           ssh-keyscan -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts 2>/dev/null || true
 
       # ── Sync files via rsync over SSH ──────────────────────────────────────
