@@ -3,7 +3,7 @@ name: Deploy to VPS
 on:
   push:
     branches: [main]
-  workflow_dispatch:   # Allow manual trigger from GitHub UI
+  workflow_dispatch:
 
 jobs:
   deploy:
@@ -33,68 +33,44 @@ jobs:
           VITE_API_BASE: ''
         run: npm run build
 
-      # ── Deploy to VPS ────────────────────────────────────────────────────────
-      - name: Setup SSH
-        run: |
-          mkdir -p ~/.ssh
-          # Decode base64-encoded key (avoids all newline/whitespace issues)
-          echo "${{ secrets.VPS_SSH_KEY }}" | base64 -d > ~/.ssh/deploy_key
-          chmod 600 ~/.ssh/deploy_key
-          # Verify key loaded OK
-          ssh-keygen -l -f ~/.ssh/deploy_key
-          ssh-keyscan -p 2222 -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts 2>/dev/null || true
-
+      # ── Deploy via rsync-deployments action ────────────────────────────────
       - name: Sync Python backend + engine
-        run: |
-          rsync -avz --delete \
-            --exclude='.git' \
-            --exclude='__pycache__' \
-            --exclude='*.pyc' \
-            --exclude='.env' \
-            --exclude='*.db' \
-            --exclude='data_storage/' \
-            --exclude='logs/' \
-            --exclude='engine_state.json' \
-            --exclude='dashboard/frontend/node_modules/' \
-            --exclude='dashboard/frontend/dist/' \
-            --exclude='dashboard/frontend/src/' \
-            -e "ssh -i ~/.ssh/deploy_key -p 2222 -o StrictHostKeyChecking=no" \
-            ./ root@${{ secrets.VPS_HOST }}:/root/memecoin_engine/
+        uses: burnett01/rsync-deployments@7.0.1
+        with:
+          switches: -avz --delete --exclude='.git' --exclude='__pycache__' --exclude='*.pyc' --exclude='.env' --exclude='*.db' --exclude='data_storage/' --exclude='logs/' --exclude='engine_state.json' --exclude='dashboard/frontend/node_modules/' --exclude='dashboard/frontend/dist/' --exclude='dashboard/frontend/src/'
+          path: ./
+          remote_path: /root/memecoin_engine/
+          remote_host: ${{ secrets.VPS_HOST }}
+          remote_port: 2222
+          remote_user: root
+          remote_key: ${{ secrets.VPS_SSH_KEY }}
 
       - name: Sync built frontend
-        run: |
-          rsync -avz --delete \
-            -e "ssh -i ~/.ssh/deploy_key -p 2222 -o StrictHostKeyChecking=no" \
-            dashboard/frontend/dist/ \
-            root@${{ secrets.VPS_HOST }}:/root/memecoin_engine/dashboard/frontend/dist/
+        uses: burnett01/rsync-deployments@7.0.1
+        with:
+          switches: -avz --delete
+          path: dashboard/frontend/dist/
+          remote_path: /root/memecoin_engine/dashboard/frontend/dist/
+          remote_host: ${{ secrets.VPS_HOST }}
+          remote_port: 2222
+          remote_user: root
+          remote_key: ${{ secrets.VPS_SSH_KEY }}
 
-      - name: Install Python deps & restart services
-        run: |
-          ssh -i ~/.ssh/deploy_key -p 2222 -o StrictHostKeyChecking=no \
-            root@${{ secrets.VPS_HOST }} << 'REMOTE'
-          set -e
-          cd /root/memecoin_engine
-
-          echo "=== Installing Python dependencies ==="
-          pip3 install -q -r requirements.txt
-
-          echo "=== Installing dashboard backend dependencies ==="
-          pip3 install -q -r dashboard/backend/requirements.txt 2>/dev/null || true
-
-          echo "=== Restarting services ==="
-          systemctl restart memecoin-engine   || true
-          systemctl restart memecoin-dashboard || true
-          sleep 3
-
-          echo "=== Service status ==="
-          systemctl is-active memecoin-engine   && echo "✅ engine: active"   || echo "❌ engine: failed"
-          systemctl is-active memecoin-dashboard && echo "✅ dashboard: active" || echo "❌ dashboard: failed"
-
-          echo "=== Deploy complete ==="
-          REMOTE
-
-      - name: Verify deployment
-        run: |
-          ssh -i ~/.ssh/deploy_key -p 2222 -o StrictHostKeyChecking=no \
-            root@${{ secrets.VPS_HOST }} \
-            "systemctl status memecoin-engine --no-pager -l | tail -5"
+      # ── Restart services ───────────────────────────────────────────────────
+      - name: Install deps & restart services
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          port: 2222
+          username: root
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            cd /root/memecoin_engine
+            pip3 install -q -r requirements.txt
+            pip3 install -q -r dashboard/backend/requirements.txt 2>/dev/null || true
+            systemctl restart memecoin-engine   || true
+            systemctl restart memecoin-dashboard || true
+            sleep 3
+            systemctl is-active memecoin-engine   && echo "engine: active"   || echo "engine: failed"
+            systemctl is-active memecoin-dashboard && echo "dashboard: active" || echo "dashboard: failed"
+            echo "Deploy complete"
