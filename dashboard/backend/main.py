@@ -180,15 +180,16 @@ async def _scalp_monitor_loop():
             from utils.perp_executor import scalp_monitor_step  # type: ignore
             await scalp_monitor_step()
         except Exception as _e:
-            log.debug("scalp_monitor_step error: %s", _e)
+            log.warning("scalp_monitor_step error: %s", _e)
         await asyncio.sleep(5)
 
 
 async def _scalp_signal_scan_loop():
     """Background: auto-fire paper scalp perp trades every 30s on SOL/BTC/ETH.
 
-    Uses real 5-minute price movement from CoinGecko market_chart endpoint
-    rather than the 24h/6 proxy used by the swing scanner.
+    Uses real 5-minute OHLC data from Kraken (no API key, no geo-block, generous limits).
+    Kraken OHLC?interval=5 returns 5-minute candles: compare last closed candle vs
+    the one before it for an accurate 5-minute price move.
     High frequency → many trades → rapid learning data accumulation.
     """
     import sys
@@ -196,7 +197,13 @@ async def _scalp_signal_scan_loop():
     if root not in sys.path:
         sys.path.insert(0, root)
 
-    _CG_IDS = {"SOL": "solana", "BTC": "bitcoin", "ETH": "ethereum"}
+    # Kraken pair names: (query_pair, result_key)
+    # Kraken normalises result keys differently from query params (e.g. XBTUSD → XXBTZUSD)
+    _KRAKEN_PAIRS = {
+        "SOL": ("SOLUSD",  "SOLUSD"),
+        "BTC": ("XBTUSD",  "XXBTZUSD"),
+        "ETH": ("ETHUSD",  "XETHZUSD"),
+    }
 
     while True:
         await asyncio.sleep(30)
@@ -219,53 +226,59 @@ async def _scalp_signal_scan_loop():
             except Exception:
                 phase = "TRANSITION"
 
-            for symbol, cg_id in _CG_IDS.items():
+            for symbol, (kraken_pair, result_key) in _KRAKEN_PAIRS.items():
                 try:
-                    # Fetch ~60 min of minutely price data — days=0.042 ≈ 60 minutes
+                    # Fetch 5-minute OHLC candles from Kraken (no API key required)
+                    # Each candle: [time, open, high, low, close, vwap, volume, count]
                     r = _req.get(
-                        f"https://api.coingecko.com/api/v3/coins/{cg_id}/market_chart"
-                        f"?vs_currency=usd&days=0.042&interval=minutely",
+                        f"https://api.kraken.com/0/public/OHLC?pair={kraken_pair}&interval=5",
                         timeout=8,
                     )
-                    chart = r.json()
-                    prices = chart.get("prices", [])  # [[timestamp_ms, price], ...]
-
-                    if len(prices) < 6:
-                        log.debug("scalp_scan: not enough data for %s (%d points)", symbol, len(prices))
+                    data = r.json()
+                    errors = data.get("error", [])
+                    if errors:
+                        log.warning("scalp_scan Kraken error for %s: %s", symbol, errors)
                         continue
 
-                    price_now = float(prices[-1][1])
-                    price_5m  = float(prices[-6][1])   # ~5 minutes ago
-
-                    if price_5m <= 0:
+                    candles = data.get("result", {}).get(result_key, [])
+                    if len(candles) < 3:
+                        log.debug("scalp_scan: not enough candles for %s (%d)", symbol, len(candles))
                         continue
 
-                    chg_5m = (price_now - price_5m) / price_5m * 100  # signed %
+                    # Use the last two *closed* candles (index -2 and -3)
+                    # [-1] is the still-forming candle, [-2] is the last completed one
+                    prev_close = float(candles[-3][4])  # close of 2 candles ago
+                    curr_close = float(candles[-2][4])  # close of last completed candle
+                    price_now  = float(candles[-2][4])
+
+                    if prev_close <= 0:
+                        continue
+
+                    chg_5m = (curr_close - prev_close) / prev_close * 100  # signed %
+
+                    log.info(
+                        "[SCALP SCAN] %s  5m=%.3f%%  threshold=±%.2f%%  price=$%.2f",
+                        symbol, chg_5m, threshold, price_now,
+                    )
 
                     if chg_5m > threshold:
                         await execute_perp_signal({
                             "symbol": symbol, "side": "LONG",
                             "regime_label": phase or "SCALP", "source": "scalp",
                         })
-                        log.info(
-                            "[SCALP SCAN] LONG %s  5m=+%.3f%%  threshold=%.2f%%",
-                            symbol, chg_5m, threshold,
-                        )
+                        log.info("[SCALP SCAN] → LONG signal fired for %s", symbol)
                     elif chg_5m < -threshold:
                         await execute_perp_signal({
                             "symbol": symbol, "side": "SHORT",
                             "regime_label": phase or "SCALP", "source": "scalp",
                         })
-                        log.info(
-                            "[SCALP SCAN] SHORT %s  5m=%.3f%%  threshold=%.2f%%",
-                            symbol, chg_5m, threshold,
-                        )
+                        log.info("[SCALP SCAN] → SHORT signal fired for %s", symbol)
 
                 except Exception as sym_e:
-                    log.debug("scalp_scan %s error: %s", symbol, sym_e)
+                    log.warning("scalp_scan %s error: %s", symbol, sym_e)
 
         except Exception as _e:
-            log.debug("scalp_signal_scan error: %s", _e)
+            log.warning("scalp_signal_scan error: %s", _e)
 
 
 @asynccontextmanager
