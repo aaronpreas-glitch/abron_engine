@@ -7,6 +7,10 @@
  */
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import {
+  AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip,
+  ReferenceLine, ResponsiveContainer,
+} from 'recharts'
 import { api } from '../../api'
 
 // ── Types ──────────────────────────────────────────────────────────────────────
@@ -222,6 +226,256 @@ function PositionCard({
       >
         ⚡ FORCE SELL
       </button>
+    </div>
+  )
+}
+
+// ── Equity Curve ──────────────────────────────────────────────────────────────
+
+interface EquityPoint {
+  trade_n: number
+  ts: string
+  symbol: string
+  gross_ret: number
+  net_ret: number
+  equity: number
+  equity_pct: number
+  drawdown_pct: number
+  regime_label?: string
+  confidence?: string
+  score?: number
+}
+
+const LOOKBACK_OPTIONS = [
+  { label: '7D',  days: 7  },
+  { label: '30D', days: 30 },
+  { label: '90D', days: 90 },
+]
+
+// Custom tooltip for the equity chart
+function EquityTooltip({ active, payload }: { active?: boolean; payload?: { payload: EquityPoint }[] }) {
+  if (!active || !payload?.length) return null
+  const d = payload[0].payload
+  const pct = d.equity_pct
+  const color = pct >= 0 ? '#00d48a' : '#f04f4f'
+  return (
+    <div style={{
+      background: 'rgba(14,17,27,0.97)', border: '1px solid rgba(255,255,255,0.1)',
+      borderRadius: 8, padding: '10px 14px', fontSize: 11,
+      fontFamily: 'JetBrains Mono, monospace', minWidth: 160,
+      boxShadow: '0 8px 32px rgba(0,0,0,0.5)',
+    }}>
+      <div style={{ color: '#666', fontSize: 9, letterSpacing: '0.1em', marginBottom: 4 }}>
+        TRADE #{d.trade_n} · {d.symbol}
+      </div>
+      <div style={{ fontSize: 18, fontWeight: 800, color, lineHeight: 1.1, marginBottom: 6 }}>
+        {pct >= 0 ? '+' : ''}{pct.toFixed(2)}%
+      </div>
+      <div style={{ color: '#888', fontSize: 10 }}>
+        Net ret: <span style={{ color: d.net_ret >= 0 ? '#00d48a' : '#f04f4f' }}>
+          {d.net_ret >= 0 ? '+' : ''}{d.net_ret.toFixed(2)}%
+        </span>
+      </div>
+      {d.drawdown_pct < 0 && (
+        <div style={{ color: '#888', fontSize: 10, marginTop: 2 }}>
+          Drawdown: <span style={{ color: '#f04f4f' }}>{d.drawdown_pct.toFixed(2)}%</span>
+        </div>
+      )}
+      {d.regime_label && (
+        <div style={{ color: '#555', fontSize: 9, marginTop: 4 }}>
+          {d.regime_label}{d.confidence ? ` · Conf ${d.confidence}` : ''}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function EquityChart() {
+  const [lookback, setLookback] = useState(30)
+
+  const { data: points, isLoading, error } = useQuery<EquityPoint[]>({
+    queryKey: ['equity-curve', lookback],
+    queryFn: () => api.get(`/performance/equity-curve-v2?lookback_days=${lookback}&horizon_hours=4`)
+      .then(r => r.data),
+    refetchInterval: 5 * 60_000,   // refresh every 5 min
+    staleTime: 4 * 60_000,
+  })
+
+  const pts = points ?? []
+  const hasData = pts.length >= 2
+
+  // Derive stats from curve data
+  const last = pts[pts.length - 1]
+  const totalPct  = last?.equity_pct ?? 0
+  const maxDD     = hasData ? Math.min(...pts.map(p => p.drawdown_pct)) : 0
+  const wins      = pts.filter(p => p.net_ret > 0).length
+  const winRate   = pts.length > 0 ? (wins / pts.length) * 100 : 0
+  const isPos     = totalPct >= 0
+  const curveColor = isPos ? '#00d48a' : '#f04f4f'
+  const gradId = 'eq-grad'
+
+  // Format x-axis label: show date from ts
+  function fmtDate(ts: string) {
+    try {
+      const d = new Date(ts.endsWith('Z') ? ts : ts + 'Z')
+      return `${d.getMonth() + 1}/${d.getDate()}`
+    } catch { return '' }
+  }
+
+  // Thin out points for x-axis labels (avoid crowding)
+  const xTicks = hasData
+    ? pts.filter((_, i) => i === 0 || i === pts.length - 1 || i % Math.max(1, Math.floor(pts.length / 5)) === 0)
+        .map(p => p.trade_n)
+    : []
+
+  return (
+    <div style={{
+      background: 'var(--surface2)', border: '1px solid var(--border)',
+      borderRadius: 10, padding: '18px 20px', marginTop: 28,
+    }}>
+      {/* Header row */}
+      <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 16 }}>
+        <div>
+          <div style={{
+            fontSize: 9, fontWeight: 600, letterSpacing: '0.18em',
+            color: 'var(--dim)', ...MONO, textTransform: 'uppercase', marginBottom: 6,
+          }}>
+            Portfolio Equity Curve
+          </div>
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: 10 }}>
+            <span style={{ fontSize: 28, fontWeight: 800, color: curveColor, ...MONO, lineHeight: 1 }}>
+              {totalPct >= 0 ? '+' : ''}{totalPct.toFixed(2)}%
+            </span>
+            <span style={{ fontSize: 11, color: 'var(--dim)', ...MONO }}>
+              {pts.length} trades
+            </span>
+          </div>
+        </div>
+
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 10 }}>
+          {/* Lookback selector */}
+          <div style={{ display: 'flex', gap: 4 }}>
+            {LOOKBACK_OPTIONS.map(opt => (
+              <button
+                key={opt.days}
+                onClick={() => setLookback(opt.days)}
+                style={{
+                  padding: '3px 10px', borderRadius: 4, fontSize: 10, fontWeight: 700,
+                  cursor: 'pointer', ...MONO,
+                  background: lookback === opt.days ? 'rgba(255,255,255,0.1)' : 'transparent',
+                  color: lookback === opt.days ? 'var(--text)' : 'var(--dim)',
+                  border: `1px solid ${lookback === opt.days ? 'rgba(255,255,255,0.2)' : 'transparent'}`,
+                }}
+              >
+                {opt.label}
+              </button>
+            ))}
+          </div>
+
+          {/* Mini stat pills */}
+          <div style={{ display: 'flex', gap: 16 }}>
+            <div style={{ textAlign: 'right' }}>
+              <div style={{ fontSize: 8.5, color: 'var(--dim)', ...MONO, letterSpacing: '0.1em' }}>WIN RATE</div>
+              <div style={{ fontSize: 13, fontWeight: 700, ...MONO, color: winRate >= 50 ? 'var(--green)' : 'var(--red)' }}>
+                {winRate.toFixed(0)}%
+              </div>
+            </div>
+            <div style={{ textAlign: 'right' }}>
+              <div style={{ fontSize: 8.5, color: 'var(--dim)', ...MONO, letterSpacing: '0.1em' }}>MAX DD</div>
+              <div style={{ fontSize: 13, fontWeight: 700, ...MONO, color: 'var(--red)' }}>
+                {maxDD.toFixed(1)}%
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Chart */}
+      {isLoading && (
+        <div style={{ height: 180, display: 'flex', alignItems: 'center', justifyContent: 'center',
+          color: 'var(--dim)', fontSize: 11, ...MONO }}>
+          Loading equity curve…
+        </div>
+      )}
+      {error && (
+        <div style={{ height: 180, display: 'flex', alignItems: 'center', justifyContent: 'center',
+          color: 'var(--red)', fontSize: 11, ...MONO }}>
+          Failed to load curve
+        </div>
+      )}
+      {!isLoading && !error && !hasData && (
+        <div style={{ height: 180, display: 'flex', alignItems: 'center', justifyContent: 'center',
+          flexDirection: 'column', gap: 8 }}>
+          <div style={{ color: 'var(--dim)', fontSize: 12, ...MONO }}>No trade data yet</div>
+          <div style={{ color: 'var(--muted)', fontSize: 10, ...MONO }}>
+            Paper trades will appear here once the engine fires its first signal
+          </div>
+        </div>
+      )}
+      {hasData && (
+        <ResponsiveContainer width="100%" height={200}>
+          <AreaChart data={pts} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
+            <defs>
+              <linearGradient id={gradId} x1="0" y1="0" x2="0" y2="1">
+                <stop offset="5%"  stopColor={curveColor} stopOpacity={0.18} />
+                <stop offset="95%" stopColor={curveColor} stopOpacity={0.01} />
+              </linearGradient>
+            </defs>
+            <CartesianGrid
+              strokeDasharray="3 3"
+              stroke="rgba(255,255,255,0.04)"
+              vertical={false}
+            />
+            <XAxis
+              dataKey="trade_n"
+              ticks={xTicks}
+              tickFormatter={n => {
+                const pt = pts.find(p => p.trade_n === n)
+                return pt ? fmtDate(pt.ts) : String(n)
+              }}
+              tick={{ fill: '#444', fontSize: 9, fontFamily: 'JetBrains Mono, monospace' }}
+              axisLine={false}
+              tickLine={false}
+            />
+            <YAxis
+              tickFormatter={v => `${v > 0 ? '+' : ''}${Number(v).toFixed(0)}%`}
+              tick={{ fill: '#444', fontSize: 9, fontFamily: 'JetBrains Mono, monospace' }}
+              axisLine={false}
+              tickLine={false}
+              width={46}
+            />
+            <Tooltip content={<EquityTooltip />} />
+            <ReferenceLine y={0} stroke="rgba(255,255,255,0.12)" strokeDasharray="4 4" />
+            <Area
+              type="monotone"
+              dataKey="equity_pct"
+              stroke={curveColor}
+              strokeWidth={2}
+              fill={`url(#${gradId})`}
+              dot={false}
+              activeDot={{ r: 4, fill: curveColor, stroke: '#0e111b', strokeWidth: 2 }}
+              isAnimationActive={false}
+            />
+          </AreaChart>
+        </ResponsiveContainer>
+      )}
+
+      {/* Bottom meta */}
+      {hasData && (
+        <div style={{
+          display: 'flex', gap: 6, marginTop: 10, flexWrap: 'wrap',
+          borderTop: '1px solid var(--border)', paddingTop: 10,
+        }}>
+          <span style={{ fontSize: 9, color: 'var(--dim)', ...MONO }}>
+            Fee-adjusted · 0.5% round-trip · 4h horizon · paper trades only
+          </span>
+          {last && (
+            <span style={{ fontSize: 9, color: 'var(--dim)', ...MONO, marginLeft: 'auto' }}>
+              Last: {last.symbol} {last.net_ret >= 0 ? '+' : ''}{last.net_ret.toFixed(2)}%
+            </span>
+          )}
+        </div>
+      )}
     </div>
   )
 }
@@ -663,6 +917,9 @@ export function LivePositions() {
           Use the ENABLE button above or set <code style={{ ...MONO }}>EXECUTOR_ENABLED=true</code> in .env.
         </div>
       )}
+
+      {/* Equity curve chart */}
+      <EquityChart />
     </div>
   )
 }
