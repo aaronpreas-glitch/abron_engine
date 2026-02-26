@@ -271,8 +271,8 @@ export function PerpsPaperTrading() {
   }
 
   const enabled   = data?.enabled ?? false
-  const positions = data?.positions ?? []
-  const pts       = curveData ?? []
+  const positions = Array.isArray(data?.positions) ? data!.positions : []
+  const pts       = Array.isArray(curveData) ? curveData : []
   const hasChart  = pts.length >= 2
   const last      = pts[pts.length - 1]
   const totalPct  = last?.equity_pct ?? 0

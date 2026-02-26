@@ -350,12 +350,12 @@ export function CommandCenter() {
   const riskMode = risk?.mode ?? ''
   const engColor = modeColor(riskMode)
 
-  const topSignals = (recentRaw || [])
+  const topSignals = (Array.isArray(recentRaw) ? recentRaw : [])
     .filter(s => s.decision === 'ALERT' || s.decision === 'WATCHLIST')
     .sort((a, b) => (b.score_total ?? 0) - (a.score_total ?? 0))
     .slice(0, 12)
 
-  const equityData = (equity || []).map(p => ({ v: (p.equity - 1) * 100 }))
+  const equityData = (Array.isArray(equity) ? equity : []).map(p => ({ v: (p.equity - 1) * 100 }))
   const equityEnd  = equityData.length ? equityData[equityData.length - 1].v : 0
   const eqColor    = equityEnd >= 0 ? '#00d48a' : '#f04f4f'
 

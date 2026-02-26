@@ -301,7 +301,7 @@ function EquityChart() {
     staleTime: 4 * 60_000,
   })
 
-  const pts = points ?? []
+  const pts = Array.isArray(points) ? points : []
   const hasData = pts.length >= 2
 
   // Derive stats from curve data

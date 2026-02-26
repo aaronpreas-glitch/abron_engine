@@ -321,11 +321,11 @@ export function PerpsLiveTrading() {
   }
 
   // Show all positions (dry_run=0 for live)
-  const allPositions = data?.positions ?? []
+  const allPositions = Array.isArray(data?.positions) ? data!.positions : []
   const livePositions = allPositions.filter(p => p.dry_run === 0)
   const isLive = data != null && !data.dry_run
 
-  const pts       = curveData ?? []
+  const pts       = Array.isArray(curveData) ? curveData : []
   const hasChart  = pts.length >= 2
   const last      = pts[pts.length - 1]
   const totalPct  = last?.equity_pct ?? 0
