@@ -60,6 +60,17 @@ PERP_TP1_PCT        = lambda: _float("PERP_TP1_PCT", 15.0)
 PERP_TP2_PCT        = lambda: _float("PERP_TP2_PCT", 30.0)
 PERP_TP1_CLOSE_PCT  = lambda: _float("PERP_TP1_CLOSE_PCT", 0.50)
 
+# ── Scalp config (parallel paper track) ───────────────────────────────────────
+SCALP_ENABLED       = lambda: _bool("SCALP_ENABLED", False)
+SCALP_TP_PCT        = lambda: _float("SCALP_TP_PCT", 2.0)
+SCALP_STOP_PCT      = lambda: _float("SCALP_STOP_PCT", 0.8)
+SCALP_SIZE_USD      = lambda: _float("SCALP_SIZE_USD", 25.0)
+SCALP_LEVERAGE      = lambda: _float("SCALP_LEVERAGE", 3.0)
+SCALP_MAX_HOLD_MIN  = lambda: _float("SCALP_MAX_HOLD_MINUTES", 30.0)
+SCALP_COOLDOWN_MIN  = lambda: _float("SCALP_COOLDOWN_MINUTES", 2.0)
+SCALP_MAX_OPEN      = lambda: _int("SCALP_MAX_OPEN", 15)
+SCALP_5M_THRESHOLD  = lambda: _float("SCALP_5M_THRESHOLD", 0.15)
+
 DB_PATH = os.path.join(
     os.path.dirname(os.path.dirname(__file__)), "data_storage", "engine.db"
 )
@@ -220,17 +231,63 @@ def _queue_perp_outcome(symbol: str, side: str, entry_price: float, regime_label
         c.commit()
 
 
+def _get_open_scalp_positions() -> list[dict]:
+    """Return open perp positions tagged mode=SCALP."""
+    with _conn() as c:
+        cur = c.cursor()
+        cur.execute(
+            "SELECT * FROM perp_positions WHERE status='OPEN' AND notes LIKE '%mode=SCALP%' ORDER BY opened_ts_utc DESC"
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+def _get_open_swing_positions() -> list[dict]:
+    """Return open perp positions NOT tagged mode=SCALP (swing + legacy positions)."""
+    with _conn() as c:
+        cur = c.cursor()
+        cur.execute(
+            "SELECT * FROM perp_positions WHERE status='OPEN' AND (notes IS NULL OR notes NOT LIKE '%mode=SCALP%') ORDER BY opened_ts_utc DESC"
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
 def _in_cooldown(symbol: str, side: str) -> bool:
-    """Return True if a same-symbol same-side position was opened within cooldown window."""
+    """Return True if a same-symbol same-side SWING position was opened within cooldown window."""
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=PERP_COOLDOWN_H())).isoformat()
     with _conn() as c:
         cur = c.cursor()
         cur.execute("""
             SELECT COUNT(*) FROM perp_positions
             WHERE symbol=? AND side=? AND opened_ts_utc > ? AND status IN ('OPEN','CLOSED')
+              AND (notes IS NULL OR notes NOT LIKE '%mode=SCALP%')
         """, (symbol.upper(), side.upper(), cutoff))
         count = cur.fetchone()[0]
     return count > 0
+
+
+def _in_cooldown_for_mode(symbol: str, side: str, mode: str) -> bool:
+    """Mode-scoped cooldown — scalp and swing cooldowns don't interfere with each other."""
+    if mode == "SCALP":
+        hours = SCALP_COOLDOWN_MIN() / 60.0
+    else:
+        hours = PERP_COOLDOWN_H()
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    with _conn() as c:
+        cur = c.cursor()
+        if mode == "SCALP":
+            cur.execute("""
+                SELECT COUNT(*) FROM perp_positions
+                WHERE symbol=? AND side=? AND opened_ts_utc > ?
+                  AND status IN ('OPEN','CLOSED') AND notes LIKE '%mode=SCALP%'
+            """, (symbol.upper(), side.upper(), cutoff))
+        else:
+            cur.execute("""
+                SELECT COUNT(*) FROM perp_positions
+                WHERE symbol=? AND side=? AND opened_ts_utc > ?
+                  AND status IN ('OPEN','CLOSED')
+                  AND (notes IS NULL OR notes NOT LIKE '%mode=SCALP%')
+            """, (symbol.upper(), side.upper(), cutoff))
+        return cur.fetchone()[0] > 0
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -258,21 +315,31 @@ async def execute_perp_signal(signal: dict) -> bool:
         logger.warning("Unsupported perp symbol: %s", symbol)
         return False
 
-    # Guard: cooldown
-    if _in_cooldown(symbol, side):
-        logger.info("Perp cooldown active for %s %s — skipping", symbol, side)
+    # Detect scalp vs swing mode
+    is_scalp = str(signal.get("source", "")).lower() == "scalp"
+    mode_tag = "SCALP" if is_scalp else "SWING"
+
+    # Guard: mode-scoped cooldown (scalp and swing use separate counters)
+    if _in_cooldown_for_mode(symbol, side, mode_tag):
+        logger.info("%s cooldown active for %s %s — skipping", mode_tag, symbol, side)
         return False
 
-    # Guard: max open positions
-    open_positions = _get_open_perp_positions()
-    if len(open_positions) >= MAX_OPEN_PERPS():
-        logger.info("Max open perps (%d) reached — skipping", MAX_OPEN_PERPS())
+    # Guard: mode-scoped max open positions
+    if is_scalp:
+        open_mine = _get_open_scalp_positions()
+        cap = SCALP_MAX_OPEN()
+    else:
+        open_mine = _get_open_swing_positions()
+        cap = MAX_OPEN_PERPS()
+
+    if len(open_mine) >= cap:
+        logger.info("Max open %s positions (%d) reached — skipping", mode_tag, cap)
         return False
 
-    # Guard: no duplicate symbol+side already open
-    for p in open_positions:
+    # Guard: no duplicate symbol+side already open in same mode
+    for p in open_mine:
         if p["symbol"] == symbol and p["side"] == side:
-            logger.info("Already have open %s %s — skipping", symbol, side)
+            logger.info("Already have open %s %s %s — skipping", mode_tag, symbol, side)
             return False
 
     # Fetch live price
@@ -281,35 +348,54 @@ async def execute_perp_signal(signal: dict) -> bool:
         logger.warning("Could not fetch price for %s — skipping perp signal", symbol)
         return False
 
-    size_usd    = float(signal.get("size_usd", PERP_SIZE_USD()))
-    leverage    = float(signal.get("leverage", PERP_LEVERAGE()))
-    regime      = str(signal.get("regime_label", "NEUTRAL"))
-    dry_run     = PERP_DRY_RUN()
+    regime  = str(signal.get("regime_label", "NEUTRAL"))
+    dry_run = PERP_DRY_RUN()
+    paper_tag = "PAPER" if dry_run else "LIVE"
 
-    # Compute exit levels
-    stop_pct = PERP_STOP_PCT() / 100
-    tp1_pct  = PERP_TP1_PCT() / 100
-    tp2_pct  = PERP_TP2_PCT() / 100
-
-    if side == "LONG":
-        stop_price = entry_price * (1 - stop_pct)
-        tp1_price  = entry_price * (1 + tp1_pct)
-        tp2_price  = entry_price * (1 + tp2_pct)
-    else:  # SHORT
-        stop_price = entry_price * (1 + stop_pct)
-        tp1_price  = entry_price * (1 - tp1_pct)
-        tp2_price  = entry_price * (1 - tp2_pct)
-
-    mode_tag = "PAPER" if dry_run else "LIVE"
-    notes    = (
-        f"auto={signal.get('source','auto')}|regime={regime}"
-        f"|leverage={leverage}|tp1={round(tp1_price,4)}|tp2={round(tp2_price,4)}"
-    )
-
-    logger.info(
-        "[PERP %s] %s %s @ $%.4f  stop=$%.4f  TP1=$%.4f  TP2=$%.4f  size=$%.0f x%.1f",
-        mode_tag, side, symbol, entry_price, stop_price, tp1_price, tp2_price, size_usd, leverage,
-    )
+    # Compute exit levels — scalp uses tight TP/SL, swing uses wide swing targets
+    if is_scalp:
+        size_usd   = float(signal.get("size_usd", SCALP_SIZE_USD()))
+        leverage   = float(signal.get("leverage", SCALP_LEVERAGE()))
+        stop_pct   = SCALP_STOP_PCT() / 100
+        tp1_pct    = SCALP_TP_PCT() / 100
+        if side == "LONG":
+            stop_price = entry_price * (1 - stop_pct)
+            tp1_price  = entry_price * (1 + tp1_pct)
+            tp2_price  = tp1_price   # sentinel: full exit at TP1, no TP2
+        else:  # SHORT
+            stop_price = entry_price * (1 + stop_pct)
+            tp1_price  = entry_price * (1 - tp1_pct)
+            tp2_price  = tp1_price
+        notes = (
+            f"mode=SCALP|source={signal.get('source','scalp')}|regime={regime}"
+            f"|leverage={leverage}|tp1={round(tp1_price, 4)}"
+        )
+        logger.info(
+            "[SCALP %s] %s %s @ $%.4f  stop=$%.4f  TP1=$%.4f  size=$%.0f x%.1f",
+            paper_tag, side, symbol, entry_price, stop_price, tp1_price, size_usd, leverage,
+        )
+    else:
+        size_usd   = float(signal.get("size_usd", PERP_SIZE_USD()))
+        leverage   = float(signal.get("leverage", PERP_LEVERAGE()))
+        stop_pct   = PERP_STOP_PCT() / 100
+        tp1_pct    = PERP_TP1_PCT() / 100
+        tp2_pct    = PERP_TP2_PCT() / 100
+        if side == "LONG":
+            stop_price = entry_price * (1 - stop_pct)
+            tp1_price  = entry_price * (1 + tp1_pct)
+            tp2_price  = entry_price * (1 + tp2_pct)
+        else:  # SHORT
+            stop_price = entry_price * (1 + stop_pct)
+            tp1_price  = entry_price * (1 - tp1_pct)
+            tp2_price  = entry_price * (1 - tp2_pct)
+        notes = (
+            f"mode=SWING|source={signal.get('source','auto')}|regime={regime}"
+            f"|leverage={leverage}|tp1={round(tp1_price, 4)}|tp2={round(tp2_price, 4)}"
+        )
+        logger.info(
+            "[PERP %s] %s %s @ $%.4f  stop=$%.4f  TP1=$%.4f  TP2=$%.4f  size=$%.0f x%.1f",
+            paper_tag, side, symbol, entry_price, stop_price, tp1_price, tp2_price, size_usd, leverage,
+        )
 
     if dry_run:
         pos = _open_perp_position(
@@ -327,7 +413,7 @@ async def execute_perp_signal(signal: dict) -> bool:
 
     if pos:
         _queue_perp_outcome(symbol, side, entry_price, regime)
-        logger.info("[PERP %s] Position opened id=%s", mode_tag, pos.get("id"))
+        logger.info("[%s %s] Position opened id=%s", mode_tag, paper_tag, pos.get("id"))
         return True
 
     return False
@@ -445,7 +531,7 @@ async def perp_monitor_step():
     Check all open perp positions and close on stop/TP/time.
     Called every 60s from the background monitor loop in main.py.
     """
-    open_positions = _get_open_perp_positions()
+    open_positions = _get_open_swing_positions()  # scalp positions handled by scalp_monitor_step()
     if not open_positions:
         return
 
@@ -501,4 +587,65 @@ async def perp_monitor_step():
                 logger.info(
                     "[PERP %s] Closed %s %s @ $%.4f  reason=%s  pnl=%.2f%%",
                     mode, side, symbol, price, exit_reason, result.get("pnl_pct", 0),
+                )
+
+
+async def scalp_monitor_step():
+    """
+    Check open SCALP positions every 5s and close on stop/TP/time.
+    Called from _scalp_monitor_loop() in main.py.
+
+    Scalp exits differ from swing:
+    - TP1 triggers full exit (tp2=tp1 sentinel, so both conditions fire on same price)
+    - max_hold uses SCALP_MAX_HOLD_MINUTES converted to hours
+    - 5-second polling catches tiny 0.8% SL and 2% TP moves fast enough
+    """
+    open_positions = _get_open_scalp_positions()
+    if not open_positions:
+        return
+
+    max_hold_h = SCALP_MAX_HOLD_MIN() / 60.0
+
+    for pos in open_positions:
+        pos_id = pos["id"]
+        symbol = pos["symbol"]
+        side   = pos["side"].upper()
+        stop   = pos["stop_price"]
+        tp1    = pos["tp1_price"]
+        opened = pos["opened_ts_utc"]
+
+        price = _fetch_price(symbol)
+        if not price:
+            continue
+
+        try:
+            opened_dt = datetime.fromisoformat(opened.replace("Z", "+00:00"))
+            age_h = (datetime.now(timezone.utc) - opened_dt).total_seconds() / 3600
+        except Exception:
+            age_h = 0
+
+        exit_reason = None
+
+        if side == "LONG":
+            if price <= stop:
+                exit_reason = "STOP_LOSS"
+            elif tp1 and price >= tp1:
+                exit_reason = "TP1"
+            elif age_h >= max_hold_h:
+                exit_reason = "TIME_LIMIT"
+        else:  # SHORT
+            if price >= stop:
+                exit_reason = "STOP_LOSS"
+            elif tp1 and price <= tp1:
+                exit_reason = "TP1"
+            elif age_h >= max_hold_h:
+                exit_reason = "TIME_LIMIT"
+
+        if exit_reason:
+            result = _close_perp_position(pos_id, price, exit_reason)
+            paper_label = "PAPER" if pos["dry_run"] else "LIVE"
+            if result:
+                logger.info(
+                    "[SCALP %s] Closed %s %s @ $%.4f  reason=%s  pnl=%.2f%%",
+                    paper_label, side, symbol, price, exit_reason, result.get("pnl_pct", 0),
                 )

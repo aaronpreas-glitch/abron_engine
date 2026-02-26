@@ -36,6 +36,15 @@ DEFAULT_TRAILING_PCT    = 0.12      # 12% trail after TP1
 DEFAULT_MAX_HOLD_HOURS  = float(os.getenv("MAX_HOLD_HOURS", "24"))
 MIN_SAMPLES_TO_LEARN    = 5         # need at least 5 outcomes before adapting
 
+# ── Scalp override — hard-coded tight parameters, bypass all learning ──────────
+_SCALP_STOP_PCT     = -0.008   # -0.8% stop loss
+_SCALP_TP1_PCT      =  0.015   # +1.5% take profit
+_SCALP_TP1_SELL_PCT =  1.0     # 100% exit at TP1 (no partial)
+_SCALP_TP2_PCT      =  0.015   # same as TP1 (signals no second level)
+_SCALP_TP2_SELL_PCT =  0.0
+_SCALP_TRAILING_PCT =  0.008   # 0.8% tight trail
+_SCALP_MAX_HOLD_H   =  0.33    # 20 minutes max hold
+
 
 # ── DB helper ─────────────────────────────────────────────────────────────────
 
@@ -115,6 +124,25 @@ def build_exit_plan(signal: dict) -> dict:
 
     Falls back to conservative defaults if fewer than MIN_SAMPLES_TO_LEARN
     historical outcomes are found.
+
+    Special case: if signal contains scalp_mode=True, returns hard-coded scalp
+    parameters (tight TP/SL, short hold) bypassing the learning system entirely.
+    """
+    # ── Scalp mode: hard-coded tight parameters, no learning ──────────────────
+    if signal.get("scalp_mode") is True:
+        return {
+            "stop_loss_pct":     _SCALP_STOP_PCT,
+            "tp1_pct":           _SCALP_TP1_PCT,
+            "tp1_sell_pct":      _SCALP_TP1_SELL_PCT,
+            "tp2_pct":           _SCALP_TP2_PCT,
+            "tp2_sell_pct":      _SCALP_TP2_SELL_PCT,
+            "trailing_stop_pct": _SCALP_TRAILING_PCT,
+            "max_hold_hours":    _SCALP_MAX_HOLD_H,
+            "learned_from":      0,
+            "best_horizon_h":    0,
+            "profile_key":       "SCALP|fixed",
+            "cycle_phase":       "SCALP",
+        }
 
     Returns:
     {

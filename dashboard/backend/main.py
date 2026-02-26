@@ -169,17 +169,120 @@ async def _perp_signal_scan_loop():
             log.debug("perp_signal_scan error: %s", _e)
 
 
+async def _scalp_monitor_loop():
+    """Background: check open SCALP positions every 5s for fast exit on tiny TP/SL."""
+    import sys
+    root = _engine_root()
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    while True:
+        try:
+            from utils.perp_executor import scalp_monitor_step  # type: ignore
+            await scalp_monitor_step()
+        except Exception as _e:
+            log.debug("scalp_monitor_step error: %s", _e)
+        await asyncio.sleep(5)
+
+
+async def _scalp_signal_scan_loop():
+    """Background: auto-fire paper scalp perp trades every 30s on SOL/BTC/ETH.
+
+    Uses real 5-minute price movement from CoinGecko market_chart endpoint
+    rather than the 24h/6 proxy used by the swing scanner.
+    High frequency → many trades → rapid learning data accumulation.
+    """
+    import sys
+    root = _engine_root()
+    if root not in sys.path:
+        sys.path.insert(0, root)
+
+    _CG_IDS = {"SOL": "solana", "BTC": "bitcoin", "ETH": "ethereum"}
+
+    while True:
+        await asyncio.sleep(30)
+        try:
+            scalp_enabled = os.getenv("SCALP_ENABLED", "false").lower() == "true"
+            if not scalp_enabled:
+                continue
+
+            try:
+                threshold = float(os.getenv("SCALP_5M_THRESHOLD", "0.15"))
+            except Exception:
+                threshold = 0.15
+
+            import requests as _req
+            from utils.perp_executor import execute_perp_signal  # type: ignore
+
+            try:
+                from utils.market_cycle import get_cycle_phase  # type: ignore
+                phase = get_cycle_phase()
+            except Exception:
+                phase = "TRANSITION"
+
+            for symbol, cg_id in _CG_IDS.items():
+                try:
+                    # Fetch ~60 min of minutely price data — days=0.042 ≈ 60 minutes
+                    r = _req.get(
+                        f"https://api.coingecko.com/api/v3/coins/{cg_id}/market_chart"
+                        f"?vs_currency=usd&days=0.042&interval=minutely",
+                        timeout=8,
+                    )
+                    chart = r.json()
+                    prices = chart.get("prices", [])  # [[timestamp_ms, price], ...]
+
+                    if len(prices) < 6:
+                        log.debug("scalp_scan: not enough data for %s (%d points)", symbol, len(prices))
+                        continue
+
+                    price_now = float(prices[-1][1])
+                    price_5m  = float(prices[-6][1])   # ~5 minutes ago
+
+                    if price_5m <= 0:
+                        continue
+
+                    chg_5m = (price_now - price_5m) / price_5m * 100  # signed %
+
+                    if chg_5m > threshold:
+                        await execute_perp_signal({
+                            "symbol": symbol, "side": "LONG",
+                            "regime_label": phase or "SCALP", "source": "scalp",
+                        })
+                        log.info(
+                            "[SCALP SCAN] LONG %s  5m=+%.3f%%  threshold=%.2f%%",
+                            symbol, chg_5m, threshold,
+                        )
+                    elif chg_5m < -threshold:
+                        await execute_perp_signal({
+                            "symbol": symbol, "side": "SHORT",
+                            "regime_label": phase or "SCALP", "source": "scalp",
+                        })
+                        log.info(
+                            "[SCALP SCAN] SHORT %s  5m=%.3f%%  threshold=%.2f%%",
+                            symbol, chg_5m, threshold,
+                        )
+
+                except Exception as sym_e:
+                    log.debug("scalp_scan %s error: %s", symbol, sym_e)
+
+        except Exception as _e:
+            log.debug("scalp_signal_scan error: %s", _e)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     task_poller      = asyncio.create_task(signal_poller())
     task_tracker     = asyncio.create_task(outcome_tracker_loop())
     task_perp_mon    = asyncio.create_task(_perp_monitor_loop())
     task_perp_scan   = asyncio.create_task(_perp_signal_scan_loop())
-    log.info("Dashboard started — signal poller + outcome tracker + perp monitor running.")
+    task_scalp_mon   = asyncio.create_task(_scalp_monitor_loop())
+    task_scalp_scan  = asyncio.create_task(_scalp_signal_scan_loop())
+    log.info("Dashboard started — swing perp monitor + scalp monitor + signal poller running.")
     yield
-    for t in (task_poller, task_tracker, task_perp_mon, task_perp_scan):
+    all_tasks = (task_poller, task_tracker, task_perp_mon, task_perp_scan,
+                 task_scalp_mon, task_scalp_scan)
+    for t in all_tasks:
         t.cancel()
-    for t in (task_poller, task_tracker, task_perp_mon, task_perp_scan):
+    for t in all_tasks:
         try:
             await t
         except asyncio.CancelledError:
