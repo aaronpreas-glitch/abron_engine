@@ -82,31 +82,44 @@ async def _perp_monitor_loop():
 
 
 async def _perp_signal_scan_loop():
-    """Background: auto-fire paper perp trades every 5 min based on regime + SOL price action."""
+    """Background: auto-fire paper perp trades every 2 min on SOL/BTC/ETH.
+
+    Paper mode is intentionally aggressive — low threshold, many assets, short cooldown.
+    Goal: maximum learning data. Tighten thresholds when switching to live.
+    """
     import sys
     root = _engine_root()
     if root not in sys.path:
         sys.path.insert(0, root)
+
+    # CoinGecko IDs for each symbol
+    _CG_IDS = {"SOL": "solana", "BTC": "bitcoin", "ETH": "ethereum"}
+
     while True:
-        await asyncio.sleep(300)  # 5 min
+        await asyncio.sleep(120)  # 2 min — more data, faster learning
         try:
             perp_enabled = os.getenv("PERP_EXECUTOR_ENABLED", "false").lower() == "true"
-            perp_dry     = os.getenv("PERP_DRY_RUN", "true").lower() == "true"
             if not perp_enabled:
                 continue
 
-            # Fetch SOL price and 1h change
+            # Configurable 1h change threshold (default 0.3% for paper — very sensitive)
+            try:
+                threshold = float(os.getenv("PERP_1H_THRESHOLD", "0.3"))
+            except Exception:
+                threshold = 0.3
+
+            # Fetch BTC + ETH + SOL prices + 24h change in one request
             import requests as _req
             try:
+                ids = ",".join(_CG_IDS.values())
                 r = _req.get(
-                    "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd&include_24hr_change=true",
-                    timeout=6,
+                    f"https://api.coingecko.com/api/v3/simple/price"
+                    f"?ids={ids}&vs_currencies=usd&include_24hr_change=true",
+                    timeout=8,
                 )
-                sol_data     = r.json().get("solana", {})
-                sol_price    = float(sol_data.get("usd", 0))
-                sol_24h_chg  = float(sol_data.get("usd_24h_change", 0))
-                sol_1h_chg   = sol_24h_chg / 6.0  # rough 1h proxy
-            except Exception:
+                price_data = r.json()
+            except Exception as fe:
+                log.debug("perp_scan price fetch error: %s", fe)
                 continue
 
             # Get current regime
@@ -118,18 +131,39 @@ async def _perp_signal_scan_loop():
 
             from utils.perp_executor import execute_perp_signal  # type: ignore
 
-            if phase == "BULL" and sol_1h_chg > 1.5:
-                await execute_perp_signal({
-                    "symbol": "SOL", "side": "LONG",
-                    "regime_label": "BULL", "source": "auto_scan",
-                })
-                log.info("[PERP SCAN] Fired LONG on SOL  phase=%s  sol_1h=+%.2f%%", phase, sol_1h_chg)
-            elif phase == "BEAR" and sol_1h_chg < -1.5:
-                await execute_perp_signal({
-                    "symbol": "SOL", "side": "SHORT",
-                    "regime_label": "BEAR", "source": "auto_scan",
-                })
-                log.info("[PERP SCAN] Fired SHORT on SOL  phase=%s  sol_1h=%.2f%%", phase, sol_1h_chg)
+            # Scan all three assets
+            for symbol, cg_id in _CG_IDS.items():
+                try:
+                    asset = price_data.get(cg_id, {})
+                    chg_24h = float(asset.get("usd_24h_change", 0))
+                    chg_1h  = chg_24h / 6.0  # rough 1h proxy from 24h
+
+                    # LONG signal: price moving up + regime not BEAR
+                    if chg_1h > threshold and phase != "BEAR":
+                        regime_label = phase if phase else "BULL"
+                        await execute_perp_signal({
+                            "symbol": symbol, "side": "LONG",
+                            "regime_label": regime_label, "source": "auto_scan",
+                        })
+                        log.info(
+                            "[PERP SCAN] LONG %s  phase=%s  1h=+%.2f%%  threshold=%.1f%%",
+                            symbol, phase, chg_1h, threshold,
+                        )
+
+                    # SHORT signal: price moving down + regime not BULL
+                    elif chg_1h < -threshold and phase != "BULL":
+                        regime_label = phase if phase else "BEAR"
+                        await execute_perp_signal({
+                            "symbol": symbol, "side": "SHORT",
+                            "regime_label": regime_label, "source": "auto_scan",
+                        })
+                        log.info(
+                            "[PERP SCAN] SHORT %s  phase=%s  1h=%.2f%%  threshold=%.1f%%",
+                            symbol, phase, chg_1h, threshold,
+                        )
+
+                except Exception as sym_e:
+                    log.debug("perp_scan %s error: %s", symbol, sym_e)
 
         except Exception as _e:
             log.debug("perp_signal_scan error: %s", _e)

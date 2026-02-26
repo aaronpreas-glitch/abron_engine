@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Outlet } from 'react-router-dom'
+import { Outlet, useNavigate } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import { RiskBanner } from './RiskBanner'
 import { Sidebar } from './Sidebar'
@@ -11,13 +11,23 @@ import { api } from '../../api'
 
 interface SnapshotData {
   regime: { regime_label: string; regime_score: number } | null
-  open_positions: { symbol: string }[]
 }
 
-interface ExecStatus { open_positions: number; enabled: boolean; dry_run: boolean }
-interface PerpStatus { open_positions: number; enabled: boolean; dry_run: boolean }
+interface ExecStatus {
+  open_positions: number
+  enabled: boolean
+  dry_run: boolean
+  total_closed?: number
+}
 
-// ── Top Status Bar ─────────────────────────────────────────────────────────────
+interface PerpStatus {
+  open_positions: number
+  enabled: boolean
+  dry_run: boolean
+  total_closed?: number
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 const MONO: React.CSSProperties = { fontFamily: 'JetBrains Mono, monospace' }
 
@@ -28,7 +38,106 @@ function regimeColor(label: string) {
   return '#f0a500'
 }
 
+// Derive bot status: GREEN = running+enabled, YELLOW = loaded but disabled, RED = offline
+type BotState = 'running' | 'idle' | 'offline'
+
+function botState(status: ExecStatus | PerpStatus | undefined): BotState {
+  if (!status || typeof status !== 'object' || !('enabled' in status)) return 'offline'
+  if (status.enabled) return 'running'
+  return 'idle'
+}
+
+function botColor(state: BotState) {
+  if (state === 'running') return '#00d48a'
+  if (state === 'idle')    return '#f0a500'
+  return '#f84951'
+}
+
+function botGlow(state: BotState) {
+  if (state === 'running') return '0 0 8px #00d48a, 0 0 16px rgba(0,212,138,0.3)'
+  if (state === 'idle')    return '0 0 6px #f0a500'
+  return '0 0 6px #f84951'
+}
+
+function botLabel(state: BotState, dry_run: boolean) {
+  if (state === 'running') return dry_run ? 'PAPER' : 'LIVE'
+  if (state === 'idle')    return 'IDLE'
+  return 'OFF'
+}
+
+// ── Bot Status Pill ────────────────────────────────────────────────────────────
+
+function BotPill({
+  label,
+  state,
+  dry_run,
+  open,
+  closed,
+  onClick,
+}: {
+  label: string
+  state: BotState
+  dry_run: boolean
+  open: number
+  closed?: number
+  onClick?: () => void
+}) {
+  const color = botColor(state)
+  const glow  = botGlow(state)
+  const tag   = botLabel(state, dry_run)
+  const isRunning = state === 'running'
+
+  return (
+    <div
+      onClick={onClick}
+      style={{
+        display: 'flex', alignItems: 'center', gap: 6,
+        padding: '0 12px', height: '100%',
+        borderRight: '1px solid rgba(255,255,255,0.06)',
+        cursor: onClick ? 'pointer' : undefined,
+        transition: 'background 0.15s',
+      }}
+      onMouseEnter={e => onClick && (e.currentTarget.style.background = 'rgba(255,255,255,0.04)')}
+      onMouseLeave={e => onClick && (e.currentTarget.style.background = 'transparent')}
+    >
+      {/* Pulsing dot */}
+      <span style={{
+        width: 7, height: 7, borderRadius: '50%',
+        background: color,
+        boxShadow: glow,
+        flexShrink: 0,
+        display: 'inline-block',
+        animation: isRunning ? 'pulse-glow 2s ease-in-out infinite' : undefined,
+      }} />
+
+      {/* Label + mode tag */}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 0, lineHeight: 1 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+          <span style={{ fontSize: 9, fontWeight: 700, color: 'rgba(255,255,255,0.5)', letterSpacing: '0.12em', ...MONO }}>
+            {label}
+          </span>
+          <span style={{
+            fontSize: 7, fontWeight: 800, padding: '1px 4px', borderRadius: 2, letterSpacing: '0.1em',
+            background: `${color}18`,
+            color,
+            border: `1px solid ${color}44`,
+            ...MONO,
+          }}>
+            {tag}
+          </span>
+        </div>
+        <span style={{ fontSize: 8.5, fontWeight: 700, color: isRunning ? color : 'rgba(255,255,255,0.22)', ...MONO, marginTop: 1 }}>
+          {open > 0 ? `${open} open` : closed != null ? `${closed} trades` : '—'}
+        </span>
+      </div>
+    </div>
+  )
+}
+
+// ── Top Status Bar ─────────────────────────────────────────────────────────────
+
 function TopBar() {
+  const navigate = useNavigate()
   const [utc, setUtc] = useState('')
 
   useEffect(() => {
@@ -54,110 +163,121 @@ function TopBar() {
   const { data: exec } = useQuery<ExecStatus>({
     queryKey: ['shell-exec-status'],
     queryFn: () => api.get('/executor/status').then(r => r.data),
-    refetchInterval: 30_000,
-    staleTime: 25_000,
+    refetchInterval: 20_000,
+    staleTime: 15_000,
   })
 
   const { data: perps } = useQuery<PerpStatus>({
     queryKey: ['shell-perps-status'],
     queryFn: () => api.get('/perps/status').then(r => r.data),
-    refetchInterval: 30_000,
-    staleTime: 25_000,
+    refetchInterval: 20_000,
+    staleTime: 15_000,
   })
 
-  const regime = snap?.regime
-  const rc = regime ? regimeColor(regime.regime_label) : 'rgba(255,255,255,0.35)'
-  const spotOpen = exec?.open_positions ?? 0
-  const perpsOpen = perps?.open_positions ?? 0
+  const regime    = snap?.regime
+  const rc        = regime ? regimeColor(regime.regime_label) : 'rgba(255,255,255,0.35)'
+  const spotState = botState(exec && typeof exec === 'object' && 'enabled' in exec ? exec : undefined)
+  const perpState = botState(perps && typeof perps === 'object' && 'enabled' in perps ? perps : undefined)
+
+  // Both bots running = full green banner tint
+  const bothRunning = spotState === 'running' && perpState === 'running'
 
   return (
     <div style={{
-      height: 30,
-      background: 'rgba(4,6,12,0.9)',
+      height: 36,
+      background: bothRunning
+        ? 'rgba(0,212,138,0.04)'
+        : 'rgba(4,6,12,0.92)',
       backdropFilter: 'blur(20px)',
-      borderBottom: '1px solid rgba(255,255,255,0.06)',
+      borderBottom: bothRunning
+        ? '1px solid rgba(0,212,138,0.12)'
+        : '1px solid rgba(255,255,255,0.06)',
       display: 'flex',
       alignItems: 'center',
-      paddingLeft: 16,
-      paddingRight: 16,
+      paddingLeft: 14,
+      paddingRight: 14,
       gap: 0,
       flexShrink: 0,
       overflow: 'hidden',
+      transition: 'background 0.5s, border-color 0.5s',
     }}>
+
       {/* Brand */}
       <span style={{
-        fontSize: 9.5, fontWeight: 800, color: 'rgba(255,255,255,0.4)',
-        letterSpacing: '0.18em', ...MONO, paddingRight: 14,
+        fontSize: 9.5, fontWeight: 800, color: 'rgba(255,255,255,0.35)',
+        letterSpacing: '0.18em', ...MONO, paddingRight: 12,
         borderRight: '1px solid rgba(255,255,255,0.07)',
+        flexShrink: 0,
       }}>
-        ABRONS ENGINE
+        ABRONS
       </span>
 
-      {/* Regime pill */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 5, padding: '0 14px', borderRight: '1px solid rgba(255,255,255,0.07)' }}>
+      {/* Regime */}
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: 5,
+        padding: '0 12px', height: '100%',
+        borderRight: '1px solid rgba(255,255,255,0.06)',
+      }}>
         <span style={{
           width: 5, height: 5, borderRadius: '50%',
-          background: rc, boxShadow: `0 0 6px ${rc}`,
-          display: 'inline-block', flexShrink: 0,
+          background: rc, boxShadow: `0 0 5px ${rc}`,
+          flexShrink: 0,
         }} />
-        <span style={{ fontSize: 9.5, fontWeight: 700, color: rc, letterSpacing: '0.06em', ...MONO }}>
+        <span style={{ fontSize: 9, fontWeight: 700, color: rc, letterSpacing: '0.06em', ...MONO }}>
           {regime?.regime_label?.replace(/_/g, ' ') || '—'}
         </span>
         {regime?.regime_score != null && (
-          <span style={{ fontSize: 8, color: 'rgba(255,255,255,0.22)', ...MONO }}>
+          <span style={{ fontSize: 7.5, color: 'rgba(255,255,255,0.2)', ...MONO }}>
             {regime.regime_score.toFixed(0)}
           </span>
         )}
       </div>
 
-      {/* Spot open */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 5, padding: '0 14px', borderRight: '1px solid rgba(255,255,255,0.07)' }}>
-        <span style={{ fontSize: 8.5, color: 'rgba(255,255,255,0.28)', letterSpacing: '0.1em', ...MONO }}>SPOT</span>
-        <span style={{
-          fontSize: 9.5, fontWeight: 700, ...MONO,
-          color: spotOpen > 0 ? '#00d48a' : 'rgba(255,255,255,0.28)',
-        }}>
-          {spotOpen} open
-        </span>
-        {exec && (
-          <span style={{
-            fontSize: 7.5, padding: '1px 5px', borderRadius: 3, fontWeight: 700, ...MONO,
-            background: exec.dry_run ? 'rgba(240,165,0,0.1)' : 'rgba(248,81,73,0.1)',
-            color: exec.dry_run ? '#f0a500' : '#f84951',
-            border: `1px solid ${exec.dry_run ? 'rgba(240,165,0,0.2)' : 'rgba(248,81,73,0.2)'}`,
-          }}>
-            {exec.dry_run ? 'PAPER' : 'LIVE'}
-          </span>
-        )}
-      </div>
+      {/* Spot bot status */}
+      <BotPill
+        label="SPOT"
+        state={spotState}
+        dry_run={exec?.dry_run ?? true}
+        open={exec?.open_positions ?? 0}
+        closed={exec?.total_closed}
+        onClick={() => navigate(exec?.dry_run !== false ? '/trading/spot-paper' : '/trading/spot-live')}
+      />
 
-      {/* Perps open */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 5, padding: '0 14px', borderRight: '1px solid rgba(255,255,255,0.07)' }}>
-        <span style={{ fontSize: 8.5, color: 'rgba(255,255,255,0.28)', letterSpacing: '0.1em', ...MONO }}>PERPS</span>
-        <span style={{
-          fontSize: 9.5, fontWeight: 700, ...MONO,
-          color: perpsOpen > 0 ? '#00d48a' : 'rgba(255,255,255,0.28)',
-        }}>
-          {perpsOpen} open
-        </span>
-        {perps && (
-          <span style={{
-            fontSize: 7.5, padding: '1px 5px', borderRadius: 3, fontWeight: 700, ...MONO,
-            background: perps.dry_run ? 'rgba(240,165,0,0.1)' : 'rgba(248,81,73,0.1)',
-            color: perps.dry_run ? '#f0a500' : '#f84951',
-            border: `1px solid ${perps.dry_run ? 'rgba(240,165,0,0.2)' : 'rgba(248,81,73,0.2)'}`,
-          }}>
-            {perps.dry_run ? 'PAPER' : 'LIVE'}
-          </span>
-        )}
-      </div>
+      {/* Perps bot status */}
+      <BotPill
+        label="PERPS"
+        state={perpState}
+        dry_run={perps?.dry_run ?? true}
+        open={perps?.open_positions ?? 0}
+        closed={perps?.total_closed}
+        onClick={() => navigate(perps?.dry_run !== false ? '/trading/perps-paper' : '/trading/perps-live')}
+      />
 
       {/* Spacer */}
       <div style={{ flex: 1 }} />
 
+      {/* Both-running status message */}
+      {bothRunning && (
+        <span style={{
+          fontSize: 8, fontWeight: 700, color: '#00d48a', letterSpacing: '0.14em', ...MONO,
+          marginRight: 12, opacity: 0.7,
+        }}>
+          ⬤ LEARNING
+        </span>
+      )}
+      {!bothRunning && (spotState === 'offline' || perpState === 'offline') && (
+        <span style={{
+          fontSize: 8, fontWeight: 700, color: '#f84951', letterSpacing: '0.14em', ...MONO,
+          marginRight: 12, opacity: 0.8,
+          animation: 'blink 2s ease-in-out infinite',
+        }}>
+          ⚠ BOT OFFLINE
+        </span>
+      )}
+
       {/* UTC Clock */}
       <span style={{
-        fontSize: 9.5, fontWeight: 600, color: 'rgba(255,255,255,0.22)',
+        fontSize: 9, fontWeight: 600, color: 'rgba(255,255,255,0.2)',
         letterSpacing: '0.08em', ...MONO,
       }}>
         {utc}
