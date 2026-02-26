@@ -501,7 +501,7 @@ export function CommandCenter() {
             value={`${(snap.perps.pnl ?? 0) >= 0 ? '+' : ''}$${(snap.perps.pnl ?? 0).toFixed(0)}`}
             sub={snap.perps.leverage != null ? `${snap.perps.leverage.toFixed(1)}× lev` : undefined}
             color={snap.perps.pnl >= 0 ? 'var(--green)' : 'var(--red)'}
-            onClick={() => navigate('/sol')}
+            onClick={() => navigate('/trading/perps-paper')}
           />
         ) : (
           /* Trailing spacer to keep strip balanced */
@@ -930,8 +930,16 @@ export function CommandCenter() {
                 <span style={{ fontSize: 9.5, color: 'var(--dim)', ...MONO, marginTop: 5, display: 'block' }}>No open positions</span>
               </>
             )}
-            <div style={{ marginTop: 10, paddingTop: 8, borderTop: '1px solid rgba(255,255,255,0.06)', fontSize: 9, color: 'var(--blue)', ...MONO }}>
-              View journal →
+            <div style={{ marginTop: 10, paddingTop: 8, borderTop: '1px solid rgba(255,255,255,0.06)', display: 'flex', gap: 12 }}>
+              <span style={{ fontSize: 9, color: 'var(--blue)', ...MONO }}>Journal →</span>
+              <span
+                onClick={e => { e.stopPropagation(); navigate('/trading/spot-paper') }}
+                style={{ fontSize: 9, color: 'var(--green)', ...MONO, cursor: 'pointer' }}
+              >Spot Paper →</span>
+              <span
+                onClick={e => { e.stopPropagation(); navigate('/trading/perps-paper') }}
+                style={{ fontSize: 9, color: '#e879f9', ...MONO, cursor: 'pointer' }}
+              >Perps →</span>
             </div>
           </div>
 

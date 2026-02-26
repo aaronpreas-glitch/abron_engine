@@ -17,9 +17,13 @@ import { SolPanel } from './components/sol/SolPanel'
 import { RiskPanel } from './components/risk/RiskPanel'
 import { SymbolPage } from './components/symbols/SymbolPage'
 import { Brain } from './components/brain/Brain'
-import { LivePositions } from './components/home/LivePositions'
 import { LaunchFeed } from './components/launches/LaunchFeed'
 import { ArbFeed } from './components/arb/ArbFeed'
+// Trading sub-pages
+import { SpotPaperTrading } from './components/trading/SpotPaperTrading'
+import { SpotLiveTrading } from './components/trading/SpotLiveTrading'
+import { PerpsPaperTrading } from './components/trading/PerpsPaperTrading'
+import { PerpsLiveTrading } from './components/trading/PerpsLiveTrading'
 
 function RequireAuth({ children }: { children: React.ReactNode }) {
   return isAuthenticated() ? <>{children}</> : <Navigate to="/login" replace />
@@ -44,10 +48,18 @@ export default function App() {
         <Route path="news"           element={<NewsPanel />} />
         <Route path="config"         element={<ConfigEditor />} />
         <Route path="brain"          element={<Brain />} />
-        <Route path="executor"       element={<LivePositions />} />
         <Route path="launches"       element={<LaunchFeed />} />
         <Route path="arb"            element={<ArbFeed />} />
         <Route path="symbol/:symbol" element={<SymbolPage />} />
+
+        {/* Trading hub — 4 sub-pages */}
+        <Route path="trading/spot-paper"  element={<SpotPaperTrading />} />
+        <Route path="trading/spot-live"   element={<SpotLiveTrading />} />
+        <Route path="trading/perps-paper" element={<PerpsPaperTrading />} />
+        <Route path="trading/perps-live"  element={<PerpsLiveTrading />} />
+
+        {/* Legacy redirects — keep old URLs working */}
+        <Route path="executor" element={<Navigate to="/trading/spot-paper" replace />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>

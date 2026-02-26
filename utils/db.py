@@ -184,6 +184,57 @@ def init_db():
         except Exception:
             pass
 
+        # ── Phase-5 perp trading tables ─────────────────────────────────────
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS perp_positions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            opened_ts_utc TEXT NOT NULL,
+            closed_ts_utc TEXT,
+            symbol TEXT NOT NULL,
+            side TEXT NOT NULL,
+            entry_price REAL NOT NULL,
+            exit_price REAL,
+            stop_price REAL NOT NULL,
+            tp1_price REAL,
+            tp2_price REAL,
+            size_usd REAL NOT NULL,
+            leverage REAL NOT NULL DEFAULT 2.0,
+            collateral_usd REAL,
+            pnl_pct REAL,
+            pnl_usd REAL,
+            regime_label TEXT,
+            exit_reason TEXT,
+            status TEXT NOT NULL DEFAULT 'OPEN',
+            dry_run INTEGER NOT NULL DEFAULT 1,
+            notes TEXT
+        );
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS perp_outcomes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_ts_utc TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            side TEXT NOT NULL,
+            entry_price REAL NOT NULL,
+            regime_label TEXT,
+            evaluated_1h_ts_utc TEXT,
+            return_1h_pct REAL,
+            evaluated_4h_ts_utc TEXT,
+            return_4h_pct REAL,
+            evaluated_24h_ts_utc TEXT,
+            return_24h_pct REAL,
+            status TEXT NOT NULL DEFAULT 'PENDING'
+        );
+        """)
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_perp_positions_symbol_status
+        ON perp_positions(symbol, status);
+        """)
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_perp_outcomes_symbol_ts
+        ON perp_outcomes(symbol, created_ts_utc);
+        """)
+
 
 def log_signal(signal_data: dict):
     """

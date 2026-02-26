@@ -482,7 +482,7 @@ function EquityChart() {
 
 // ── Main component ────────────────────────────────────────────────────────────
 
-export function LivePositions() {
+export function LivePositions({ mode = 'paper' }: { mode?: 'paper' | 'live' } = {}) {
   const qc = useQueryClient()
   const [toggling, setToggling] = useState(false)
   const [togglingDryRun, setTogglingDryRun] = useState(false)
@@ -594,8 +594,16 @@ export function LivePositions() {
       {/* Header */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginBottom: 20 }}>
         <h2 style={{ fontSize: 14, fontWeight: 700, letterSpacing: '0.06em' }}>
-          ⚡ LIVE POSITIONS
+          ⚡ {mode === 'live' ? 'SPOT — LIVE TRADING' : 'SPOT — PAPER TRADING'}
         </h2>
+        <span style={{
+          fontSize: 9, padding: '2px 8px', borderRadius: 3, fontWeight: 700, ...MONO,
+          background: mode === 'live' ? 'rgba(248,81,73,0.12)' : 'rgba(240,165,0,0.12)',
+          color: mode === 'live' ? 'var(--red)' : 'var(--amber)',
+          border: `1px solid ${mode === 'live' ? 'rgba(248,81,73,0.3)' : 'rgba(240,165,0,0.25)'}`,
+        }}>
+          {mode === 'live' ? '⬤ LIVE' : 'SIMULATION'}
+        </span>
         {data && (
           <>
             <span style={{

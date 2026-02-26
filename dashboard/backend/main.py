@@ -66,15 +66,86 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname
 # App lifecycle — start signal poller on startup
 # ---------------------------------------------------------------------------
 
+async def _perp_monitor_loop():
+    """Background: check open perp positions every 60s and close on stop/TP/time."""
+    import sys
+    root = _engine_root()
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    while True:
+        try:
+            from utils.perp_executor import perp_monitor_step  # type: ignore
+            await perp_monitor_step()
+        except Exception as _e:
+            log.debug("perp_monitor_step error: %s", _e)
+        await asyncio.sleep(60)
+
+
+async def _perp_signal_scan_loop():
+    """Background: auto-fire paper perp trades every 5 min based on regime + SOL price action."""
+    import sys
+    root = _engine_root()
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    while True:
+        await asyncio.sleep(300)  # 5 min
+        try:
+            perp_enabled = os.getenv("PERP_EXECUTOR_ENABLED", "false").lower() == "true"
+            perp_dry     = os.getenv("PERP_DRY_RUN", "true").lower() == "true"
+            if not perp_enabled:
+                continue
+
+            # Fetch SOL price and 1h change
+            import requests as _req
+            try:
+                r = _req.get(
+                    "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd&include_24hr_change=true",
+                    timeout=6,
+                )
+                sol_data     = r.json().get("solana", {})
+                sol_price    = float(sol_data.get("usd", 0))
+                sol_24h_chg  = float(sol_data.get("usd_24h_change", 0))
+                sol_1h_chg   = sol_24h_chg / 6.0  # rough 1h proxy
+            except Exception:
+                continue
+
+            # Get current regime
+            try:
+                from utils.market_cycle import get_cycle_phase  # type: ignore
+                phase = get_cycle_phase()
+            except Exception:
+                phase = "TRANSITION"
+
+            from utils.perp_executor import execute_perp_signal  # type: ignore
+
+            if phase == "BULL" and sol_1h_chg > 1.5:
+                await execute_perp_signal({
+                    "symbol": "SOL", "side": "LONG",
+                    "regime_label": "BULL", "source": "auto_scan",
+                })
+                log.info("[PERP SCAN] Fired LONG on SOL  phase=%s  sol_1h=+%.2f%%", phase, sol_1h_chg)
+            elif phase == "BEAR" and sol_1h_chg < -1.5:
+                await execute_perp_signal({
+                    "symbol": "SOL", "side": "SHORT",
+                    "regime_label": "BEAR", "source": "auto_scan",
+                })
+                log.info("[PERP SCAN] Fired SHORT on SOL  phase=%s  sol_1h=%.2f%%", phase, sol_1h_chg)
+
+        except Exception as _e:
+            log.debug("perp_signal_scan error: %s", _e)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    task_poller  = asyncio.create_task(signal_poller())
-    task_tracker = asyncio.create_task(outcome_tracker_loop())
-    log.info("Dashboard started — signal poller + outcome tracker running.")
+    task_poller      = asyncio.create_task(signal_poller())
+    task_tracker     = asyncio.create_task(outcome_tracker_loop())
+    task_perp_mon    = asyncio.create_task(_perp_monitor_loop())
+    task_perp_scan   = asyncio.create_task(_perp_signal_scan_loop())
+    log.info("Dashboard started — signal poller + outcome tracker + perp monitor running.")
     yield
-    task_poller.cancel()
-    task_tracker.cancel()
-    for t in (task_poller, task_tracker):
+    for t in (task_poller, task_tracker, task_perp_mon, task_perp_scan):
+        t.cancel()
+    for t in (task_poller, task_tracker, task_perp_mon, task_perp_scan):
         try:
             await t
         except asyncio.CancelledError:
@@ -2391,6 +2462,147 @@ async def get_second_leg_candidates_api():
         }
     except Exception as e:
         return {"prime_candidates": [], "approaching": [], "total_tracked": 0, "error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# Perpetuals Executor Endpoints — /api/perps/*
+# ---------------------------------------------------------------------------
+
+def _ensure_perp_executor():
+    """Add engine root to sys.path so perp_executor can be imported."""
+    import sys
+    root = _engine_root()
+    if root not in sys.path:
+        sys.path.insert(0, root)
+
+
+@app.get("/api/perps/status")
+async def perps_status(_: str = Depends(get_current_user)):
+    """Return perp executor state + open positions."""
+    try:
+        _ensure_perp_executor()
+        from utils.perp_executor import get_perp_status  # type: ignore
+        return get_perp_status()
+    except Exception as exc:
+        log.warning("perps_status error: %s", exc)
+        return JSONResponse(
+            {"enabled": False, "dry_run": True, "open_positions": 0, "positions": [], "error": str(exc)},
+            status_code=200,
+        )
+
+
+@app.post("/api/perps/toggle")
+async def perps_toggle(body: dict, _: str = Depends(get_current_user)):
+    """Enable or disable perp executor. body: { enabled: bool }"""
+    import re
+    enabled  = bool(body.get("enabled", False))
+    env_path = os.path.join(_engine_root(), ".env")
+    try:
+        if os.path.exists(env_path):
+            text = open(env_path).read()
+            if "PERP_EXECUTOR_ENABLED=" in text:
+                text = re.sub(
+                    r"^PERP_EXECUTOR_ENABLED=.*$",
+                    f"PERP_EXECUTOR_ENABLED={'true' if enabled else 'false'}",
+                    text, flags=re.MULTILINE,
+                )
+            else:
+                text += f"\nPERP_EXECUTOR_ENABLED={'true' if enabled else 'false'}\n"
+            open(env_path, "w").write(text)
+        os.environ["PERP_EXECUTOR_ENABLED"] = "true" if enabled else "false"
+        return {"success": True, "enabled": enabled}
+    except Exception as exc:
+        return JSONResponse({"success": False, "error": str(exc)}, status_code=500)
+
+
+@app.post("/api/perps/set-dry-run")
+async def perps_set_dry_run(body: dict, _: str = Depends(get_current_user)):
+    """Set PERP_DRY_RUN. body: { dry_run: bool }"""
+    import re
+    dry_run  = bool(body.get("dry_run", True))
+    env_path = os.path.join(_engine_root(), ".env")
+    try:
+        if os.path.exists(env_path):
+            text = open(env_path).read()
+            if "PERP_DRY_RUN=" in text:
+                text = re.sub(
+                    r"^PERP_DRY_RUN=.*$",
+                    f"PERP_DRY_RUN={'true' if dry_run else 'false'}",
+                    text, flags=re.MULTILINE,
+                )
+            else:
+                text += f"\nPERP_DRY_RUN={'true' if dry_run else 'false'}\n"
+            open(env_path, "w").write(text)
+        os.environ["PERP_DRY_RUN"] = "true" if dry_run else "false"
+        return {"success": True, "dry_run": dry_run}
+    except Exception as exc:
+        return JSONResponse({"success": False, "error": str(exc)}, status_code=500)
+
+
+@app.post("/api/perps/force-close")
+async def perps_force_close(body: dict, _: str = Depends(get_current_user)):
+    """Force-close a perp position. body: { position_id: int }"""
+    position_id = int(body.get("position_id", 0))
+    if not position_id:
+        return JSONResponse({"success": False, "error": "position_id required"}, status_code=400)
+    try:
+        _ensure_perp_executor()
+        from utils.perp_executor import force_close_perp  # type: ignore
+        return await force_close_perp(position_id)
+    except Exception as exc:
+        log.warning("perps_force_close error: %s", exc)
+        return JSONResponse({"success": False, "error": str(exc)}, status_code=500)
+
+
+class ManualPerpRequest(BaseModel):
+    symbol: str = "SOL"
+    side: str = "LONG"
+    size_usd: float | None = None
+    leverage: float = 2.0
+
+
+@app.post("/api/perps/manual-open")
+async def perps_manual_open(body: ManualPerpRequest, _: str = Depends(get_current_user)):
+    """Open a manual perp position from the dashboard."""
+    try:
+        _ensure_perp_executor()
+        from utils.perp_executor import execute_perp_signal  # type: ignore
+
+        symbol = body.symbol.strip().upper()
+        side   = body.side.strip().upper()
+        if symbol not in ("SOL", "BTC", "ETH"):
+            return JSONResponse({"success": False, "error": "symbol must be SOL, BTC, or ETH"}, status_code=400)
+        if side not in ("LONG", "SHORT"):
+            return JSONResponse({"success": False, "error": "side must be LONG or SHORT"}, status_code=400)
+
+        signal = {
+            "symbol":       symbol,
+            "side":         side,
+            "size_usd":     body.size_usd or float(os.getenv("PERP_SIZE_USD", "100")),
+            "leverage":     body.leverage,
+            "regime_label": "MANUAL",
+            "source":       "dashboard",
+        }
+        asyncio.create_task(execute_perp_signal(signal))
+        return {"success": True, "symbol": symbol, "side": side, "leverage": body.leverage}
+    except Exception as exc:
+        log.warning("perps_manual_open error: %s", exc)
+        return JSONResponse({"success": False, "error": str(exc)}, status_code=500)
+
+
+@app.get("/api/perps/equity-curve")
+async def perps_equity_curve(
+    lookback_days: int = 30,
+    _: str = Depends(get_current_user),
+):
+    """Cumulative PnL curve from closed perp positions."""
+    try:
+        _ensure_perp_executor()
+        from utils.perp_executor import get_perp_equity_curve  # type: ignore
+        return await asyncio.to_thread(get_perp_equity_curve, lookback_days)
+    except Exception as exc:
+        log.warning("perps_equity_curve error: %s", exc)
+        return JSONResponse([], status_code=200)
 
 
 # ---------------------------------------------------------------------------
