@@ -1,9 +1,9 @@
 /**
  * LivePositions — shows all open auto-executor positions with live PnL,
- * exit plan details, and a force-sell button per position.
+ * exit plan details, force-sell, and a Quick Buy form.
  *
- * Data: GET /api/executor/status
- * Actions: POST /api/executor/force-sell, POST /api/executor/toggle
+ * Data: GET /api/executor/status, GET /api/trades/live-pnl
+ * Actions: POST /api/executor/force-sell, /toggle, /manual-buy
  */
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
@@ -91,15 +91,36 @@ function StatPill({ label, value, color }: { label: string; value: string; color
   )
 }
 
+interface LivePnlEntry {
+  mark: number
+  unrealized_pct: number
+  unrealized_usd: number
+}
+
 // ── Position card ─────────────────────────────────────────────────────────────
 
-function PositionCard({ pos, onForceSell }: { pos: OpenPosition; onForceSell: (s: string) => void }) {
+function PositionCard({
+  pos, onForceSell, pnl,
+}: {
+  pos: OpenPosition
+  onForceSell: (s: string) => void
+  pnl?: LivePnlEntry
+}) {
   const notes = parseNotes(pos.notes)
-  const tp1 = notes['tp1'] || '—'
-  const tp2 = notes['tp2'] || '—'
+  // TP values are stored as absolute prices (e.g. "tp1=0.0000312")
+  const tp1Raw = notes['tp1']
+  const tp2Raw = notes['tp2']
+  const tp1 = tp1Raw ? fmtPrice(parseFloat(tp1Raw)) : '—'
+  const tp2 = tp2Raw ? fmtPrice(parseFloat(tp2Raw)) : '—'
   const score = notes['score'] || '—'
   const conf = notes['conf'] || '—'
   const regime = notes['regime'] || '—'
+  const isAuto = notes['auto'] === '1'
+
+  const pnlPct = pnl?.unrealized_pct ?? null
+  const pnlUsd = pnl?.unrealized_usd ?? null
+  const markPrice = pnl?.mark ?? null
+  const pnlColor = pnlPct == null ? 'var(--dim)' : pnlPct > 0 ? 'var(--green)' : pnlPct < 0 ? 'var(--red)' : 'var(--muted)'
 
   return (
     <div style={{
@@ -118,7 +139,7 @@ function PositionCard({ pos, onForceSell }: { pos: OpenPosition; onForceSell: (s
         }}>
           OPEN
         </span>
-        {notes['auto'] === undefined ? null : (
+        {isAuto && (
           <span style={{
             fontSize: 9, padding: '2px 6px', borderRadius: 3,
             background: 'rgba(100,100,100,0.15)', color: 'var(--muted)',
@@ -131,6 +152,35 @@ function PositionCard({ pos, onForceSell }: { pos: OpenPosition; onForceSell: (s
           {timeAgo(pos.opened_ts)}
         </span>
       </div>
+
+      {/* Live PnL banner */}
+      {pnlPct != null && (
+        <div style={{
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+          marginBottom: 10, padding: '6px 10px', borderRadius: 6,
+          background: pnlPct > 0 ? 'rgba(0,212,138,0.07)' : pnlPct < 0 ? 'rgba(240,79,79,0.07)' : 'rgba(255,255,255,0.04)',
+          border: `1px solid ${pnlPct > 0 ? 'rgba(0,212,138,0.2)' : pnlPct < 0 ? 'rgba(240,79,79,0.2)' : 'var(--border)'}`,
+        }}>
+          <div>
+            <div style={{ fontSize: 8.5, color: 'var(--dim)', ...MONO, letterSpacing: '0.12em' }}>UNREALIZED</div>
+            <div style={{ fontSize: 16, fontWeight: 800, color: pnlColor, ...MONO, lineHeight: 1.1 }}>
+              {pnlPct > 0 ? '+' : ''}{pnlPct.toFixed(2)}%
+            </div>
+          </div>
+          <div style={{ textAlign: 'right' }}>
+            {markPrice != null && (
+              <div style={{ fontSize: 9.5, color: 'var(--muted)', ...MONO }}>
+                Mark: {fmtPrice(markPrice)}
+              </div>
+            )}
+            {pnlUsd != null && (
+              <div style={{ fontSize: 11, fontWeight: 700, color: pnlColor, ...MONO }}>
+                {pnlUsd > 0 ? '+' : ''}${Math.abs(pnlUsd).toFixed(2)}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Prices */}
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '4px 12px', fontSize: 11, marginBottom: 10 }}>
@@ -186,11 +236,27 @@ export function LivePositions() {
   const [savingPortfolio, setSavingPortfolio] = useState(false)
   const [portfolioSaved, setPortfolioSaved] = useState(false)
 
+  // Quick Buy form state
+  const [buySymbol, setBuySymbol] = useState('')
+  const [buyMint, setBuyMint] = useState('')
+  const [buyAmount, setBuyAmount] = useState('')
+  const [buyLoading, setBuyLoading] = useState(false)
+  const [buyResult, setBuyResult] = useState<{ ok: boolean; msg: string } | null>(null)
+
   const { data, isLoading, error } = useQuery<ExecutorStatus>({
     queryKey: ['executor-status'],
     queryFn: () => api.get('/executor/status').then(r => r.data),
     refetchInterval: 30_000,
     staleTime: 15_000,
+  })
+
+  // Live PnL — poll every 15s when positions are open
+  const { data: livePnl } = useQuery<Record<string, LivePnlEntry>>({
+    queryKey: ['executor-live-pnl'],
+    queryFn: () => api.get('/trades/live-pnl').then(r => r.data),
+    refetchInterval: 15_000,
+    staleTime: 10_000,
+    enabled: (data?.open_positions ?? 0) > 0,
   })
 
   const forceSellMut = useMutation({
@@ -230,6 +296,38 @@ export function LivePositions() {
       setTimeout(() => setPortfolioSaved(false), 2000)
     } finally {
       setSavingPortfolio(false)
+    }
+  }
+
+  async function quickBuy() {
+    const sym = buySymbol.trim().toUpperCase()
+    const mint = buyMint.trim()
+    if (!sym || !mint) {
+      setBuyResult({ ok: false, msg: 'Symbol and mint address are required' })
+      return
+    }
+    setBuyLoading(true)
+    setBuyResult(null)
+    try {
+      const body: Record<string, unknown> = { symbol: sym, mint }
+      const amt = parseFloat(buyAmount)
+      if (amt > 0) body.position_usd = amt
+      const res = await api.post('/executor/manual-buy', body).then(r => r.data)
+      if (res.success) {
+        setBuyResult({ ok: true, msg: `✅ Order sent — ${sym} $${res.position_usd}` })
+        setBuySymbol('')
+        setBuyMint('')
+        setBuyAmount('')
+        qc.invalidateQueries({ queryKey: ['executor-status'] })
+      } else {
+        setBuyResult({ ok: false, msg: res.error ?? 'Unknown error' })
+      }
+    } catch (e: unknown) {
+      const msg = (e as { response?: { data?: { error?: string } } })?.response?.data?.error ?? 'Request failed'
+      setBuyResult({ ok: false, msg })
+    } finally {
+      setBuyLoading(false)
+      setTimeout(() => setBuyResult(null), 5000)
     }
   }
 
@@ -346,6 +444,91 @@ export function LivePositions() {
         </div>
       )}
 
+      {/* ── Quick Buy form — shown when executor is enabled ─────────────────── */}
+      {data && enabled && (
+        <div style={{
+          marginBottom: 20, padding: '14px 16px',
+          background: 'var(--surface2)', border: '1px solid var(--border)', borderRadius: 8,
+        }}>
+          <div style={{
+            fontSize: 9, fontWeight: 600, letterSpacing: '0.18em',
+            color: 'var(--dim)', ...MONO, textTransform: 'uppercase', marginBottom: 10,
+          }}>
+            ⚡ Quick Buy {dry_run ? '(Paper)' : '(LIVE)'}
+          </div>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'flex-end' }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+              <label style={{ fontSize: 9, color: 'var(--dim)', ...MONO, letterSpacing: '0.1em' }}>SYMBOL</label>
+              <input
+                type="text"
+                placeholder="BONK"
+                value={buySymbol}
+                onChange={e => setBuySymbol(e.target.value.toUpperCase())}
+                onKeyDown={e => e.key === 'Enter' && quickBuy()}
+                style={{
+                  width: 90, padding: '5px 8px', borderRadius: 4, fontSize: 12,
+                  background: 'var(--surface)', border: '1px solid var(--border)',
+                  color: 'var(--text)', ...MONO, outline: 'none', textTransform: 'uppercase',
+                }}
+              />
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 4, flex: 1, minWidth: 200 }}>
+              <label style={{ fontSize: 9, color: 'var(--dim)', ...MONO, letterSpacing: '0.1em' }}>MINT ADDRESS</label>
+              <input
+                type="text"
+                placeholder="So11111...111"
+                value={buyMint}
+                onChange={e => setBuyMint(e.target.value)}
+                onKeyDown={e => e.key === 'Enter' && quickBuy()}
+                style={{
+                  width: '100%', padding: '5px 8px', borderRadius: 4, fontSize: 11,
+                  background: 'var(--surface)', border: '1px solid var(--border)',
+                  color: 'var(--text)', ...MONO, outline: 'none',
+                }}
+              />
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+              <label style={{ fontSize: 9, color: 'var(--dim)', ...MONO, letterSpacing: '0.1em' }}>USD (optional)</label>
+              <input
+                type="number"
+                placeholder="auto"
+                value={buyAmount}
+                onChange={e => setBuyAmount(e.target.value)}
+                onKeyDown={e => e.key === 'Enter' && quickBuy()}
+                style={{
+                  width: 80, padding: '5px 8px', borderRadius: 4, fontSize: 12,
+                  background: 'var(--surface)', border: '1px solid var(--border)',
+                  color: 'var(--text)', ...MONO, outline: 'none',
+                }}
+              />
+            </div>
+            <button
+              disabled={buyLoading || !buySymbol || !buyMint}
+              onClick={quickBuy}
+              style={{
+                padding: '5px 18px', borderRadius: 4, fontSize: 12, fontWeight: 700,
+                cursor: buyLoading || !buySymbol || !buyMint ? 'default' : 'pointer',
+                ...MONO,
+                background: !dry_run ? 'rgba(248,81,73,0.18)' : 'rgba(0,212,138,0.15)',
+                color: !dry_run ? 'var(--red)' : 'var(--green)',
+                border: `1px solid ${!dry_run ? 'rgba(248,81,73,0.35)' : 'rgba(0,212,138,0.3)'}`,
+                opacity: buyLoading || !buySymbol || !buyMint ? 0.5 : 1,
+              }}
+            >
+              {buyLoading ? '…' : '⚡ BUY'}
+            </button>
+          </div>
+          {buyResult && (
+            <div style={{
+              marginTop: 8, fontSize: 11, ...MONO, fontWeight: 600,
+              color: buyResult.ok ? 'var(--green)' : 'var(--red)',
+            }}>
+              {buyResult.msg}
+            </div>
+          )}
+        </div>
+      )}
+
       {isLoading && (
         <div style={{ color: 'var(--dim)', fontSize: 11, ...MONO }}>Loading executor status…</div>
       )}
@@ -429,6 +612,7 @@ export function LivePositions() {
               key={pos.id}
               pos={pos}
               onForceSell={sym => forceSellMut.mutate(sym)}
+              pnl={livePnl?.[pos.symbol]}
             />
           ))}
         </div>

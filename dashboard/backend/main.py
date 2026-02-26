@@ -2092,6 +2092,56 @@ async def executor_set_portfolio(body: dict, _: str = Depends(get_current_user))
         return JSONResponse({"success": False, "error": str(exc)}, status_code=500)
 
 
+class ManualBuyRequest(BaseModel):
+    symbol: str
+    mint: str
+    position_usd: float | None = None   # None = auto-size via Kelly
+
+
+@app.post("/api/executor/manual-buy")
+async def executor_manual_buy(body: ManualBuyRequest, _: str = Depends(get_current_user)):
+    """
+    Trigger a buy directly from the dashboard (paper or live depending on DRY_RUN).
+    The executor handles price fetching, position sizing, DB recording, and monitoring.
+    """
+    try:
+        _ensure_engine_path()
+        from utils.executor import execute_signal  # type: ignore
+
+        symbol = body.symbol.strip().upper()
+        mint   = body.mint.strip()
+        if not symbol or not mint:
+            return JSONResponse({"success": False, "error": "symbol and mint required"}, status_code=400)
+
+        portfolio_usd = float(os.getenv("PORTFOLIO_USD", "1000"))
+        pos_usd = body.position_usd
+        if not pos_usd or pos_usd <= 0:
+            try:
+                from utils.position_sizing import calculate_position_size  # type: ignore
+                pos = calculate_position_size({"symbol": symbol}, portfolio_usd)
+                pos_usd = pos.get("position_usd", portfolio_usd * 0.03)
+            except Exception:
+                pos_usd = portfolio_usd * 0.03   # fallback: 3% of portfolio
+
+        signal = {
+            "symbol":       symbol,
+            "mint":         mint,
+            "entry_price":  0.0,        # executor fetches live price from Jupiter
+            "score":        75,
+            "confidence":   "B",
+            "regime_label": "MANUAL",
+            "position_usd": float(pos_usd),
+            "lane":         "manual_dashboard",
+            "source":       "dashboard",
+            "cycle_phase":  "TRANSITION",
+        }
+        asyncio.create_task(execute_signal(signal))
+        return {"success": True, "symbol": symbol, "position_usd": round(float(pos_usd), 2)}
+    except Exception as exc:
+        log.warning("manual_buy error: %s", exc)
+        return JSONResponse({"success": False, "error": str(exc)}, status_code=500)
+
+
 @app.get("/api/executor/exit-learnings")
 async def executor_exit_learnings(_: str = Depends(get_current_user)):
     """Return exit strategy learnings summary."""

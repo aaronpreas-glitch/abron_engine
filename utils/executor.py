@@ -268,9 +268,13 @@ async def execute_signal(signal: dict) -> bool:
 
     # ── Open position in DB ────────────────────────────────────────────────────
 
+    # Compute actual TP/stop price levels so PositionCard can display them
+    tp1_price  = round(entry_price * (1 + exit_plan["tp1_pct"]), 12)
+    tp2_price  = round(entry_price * (1 + exit_plan["tp2_pct"]), 12)
+
     notes = (
-        f"auto|score={score:.0f}|conf={confidence}|regime={regime}"
-        f"|tp1=+{exit_plan['tp1_pct']*100:.0f}%|tp2=+{exit_plan['tp2_pct']*100:.0f}%"
+        f"auto=1|score={score:.0f}|conf={confidence}|regime={regime}"
+        f"|tp1={tp1_price}|tp2={tp2_price}"
         f"|stop={exit_plan['stop_loss_pct']*100:.0f}%|tx={tx_sig[:12]}"
     )
 
@@ -279,6 +283,23 @@ async def execute_signal(signal: dict) -> bool:
         return False
 
     trade_id = trade.get("id")
+
+    # ── Queue outcome tracking so auto_tune sees executor trades ───────────────
+    try:
+        from utils.db import queue_alert_outcome  # type: ignore
+        queue_alert_outcome({
+            "symbol":       symbol,
+            "mint":         mint,
+            "entry_price":  entry_price,
+            "score":        score,
+            "regime_label": regime,
+            "confidence":   confidence,
+            "lane":         signal.get("lane", "executor"),
+            "source":       signal.get("source", "executor"),
+            "cycle_phase":  signal.get("cycle_phase", "TRANSITION"),
+        })
+    except Exception as _qao_err:
+        logger.debug("queue_alert_outcome error: %s", _qao_err)
 
     # Store state for monitor loop
     if trade_id:
