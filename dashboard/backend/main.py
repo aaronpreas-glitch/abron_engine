@@ -2209,7 +2209,7 @@ async def executor_status(_: str = Depends(get_current_user)):
         return get_executor_status()
     except Exception as exc:
         return JSONResponse(
-            {"enabled": False, "error": str(exc), "open_positions": 0, "positions": []},
+            {"enabled": False, "error": str(exc), "open_positions": 0, "positions": [], "exit_summary": {}},
             status_code=200,
         )
 

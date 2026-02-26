@@ -881,7 +881,7 @@ export function LivePositions({ mode = 'paper' }: { mode?: 'paper' | 'live' } = 
       )}
 
       {/* Exit reason breakdown */}
-      {data && Object.keys(data.exit_summary).length > 0 && (
+      {data && Object.keys(data.exit_summary ?? {}).length > 0 && (
         <div style={{ marginTop: 28 }}>
           <div style={{
             fontSize: 9, fontWeight: 600, letterSpacing: '0.18em',
@@ -890,7 +890,7 @@ export function LivePositions({ mode = 'paper' }: { mode?: 'paper' | 'live' } = 
             Exit Reason Breakdown
           </div>
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))', gap: 8 }}>
-            {Object.entries(data.exit_summary).map(([reason, stats]) => (
+            {Object.entries(data.exit_summary ?? {}).map(([reason, stats]) => (
               <div key={reason} style={{
                 background: 'var(--surface2)', border: '1px solid var(--border)',
                 borderRadius: 6, padding: '10px 12px',

@@ -192,7 +192,7 @@ export function ReadinessScore() {
 
       {/* Component bar mini-chart */}
       <div style={{ marginTop: 12, display: 'flex', gap: 3, alignItems: 'flex-end', height: 20 }}>
-        {Object.entries(data.components).map(([key, val]) => {
+        {Object.entries(data.components ?? {}).map(([key, val]) => {
           const maxVal = 20
           const pct = Math.max(2, (val / maxVal) * 100)
           return (
