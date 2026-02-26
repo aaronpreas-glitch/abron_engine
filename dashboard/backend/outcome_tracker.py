@@ -193,6 +193,30 @@ async def _jupiter_price(client: httpx.AsyncClient, mint: str) -> Optional[float
         return None
 
 
+# Kraken ticker map for major coins — no API key, no geo-blocks
+_KRAKEN_PAIR = {"SOL": "SOLUSD", "BTC": "XBTUSD", "ETH": "ETHUSD"}
+_KRAKEN_KEY  = {"SOL": "SOLUSD", "BTC": "XXBTZUSD", "ETH": "XETHZUSD"}
+
+async def _kraken_price(client: httpx.AsyncClient, symbol: str) -> Optional[float]:
+    """Fetch USD price from Kraken public ticker — no key, no rate limit issues."""
+    pair = _KRAKEN_PAIR.get(symbol.upper())
+    key  = _KRAKEN_KEY.get(symbol.upper())
+    if not pair or not key:
+        return None
+    try:
+        r = await client.get(
+            f"https://api.kraken.com/0/public/Ticker?pair={pair}",
+            timeout=REQUEST_TIMEOUT,
+        )
+        result = r.json().get("result", {})
+        price_arr = result.get(key, {}).get("c", [None])
+        price = price_arr[0] if price_arr else None
+        return float(price) if price else None
+    except Exception as e:
+        log.debug("Kraken price(%s) failed: %s", symbol, e)
+        return None
+
+
 async def fetch_current_price(
     client: httpx.AsyncClient,
     symbol: str,
@@ -200,27 +224,34 @@ async def fetch_current_price(
 ) -> Optional[float]:
     """
     Try price sources in priority order:
-      1. CoinGecko by known ID (fast, reliable for major coins)
-      2. Jupiter by mint (best for Solana memecoins)
-      3. CoinGecko by contract (slowest, most complete)
+      1. Kraken ticker (SOL/BTC/ETH — no API key, reliable from VPS)
+      2. CoinGecko by known ID (major coins)
+      3. Jupiter by mint (best for Solana memecoins)
+      4. CoinGecko by contract (slowest, most complete)
     """
     sym = symbol.upper().strip()
 
-    # Source 1: known CoinGecko ID
+    # Source 1: Kraken (most reliable from VPS — no geo-block or rate limit)
+    if sym in _KRAKEN_PAIR:
+        price = await _kraken_price(client, sym)
+        if price and price > 0:
+            return price
+
+    # Source 2: known CoinGecko ID
     cg_id = _SYMBOL_TO_CG_ID.get(sym)
     if cg_id:
         price = await _cg_price_by_id(client, cg_id)
         if price and price > 0:
             return price
 
-    # Source 2: Jupiter (mint address — best for long-tail Solana tokens)
+    # Source 3: Jupiter (mint address — best for long-tail Solana tokens)
     if mint:
         price = await _jupiter_price(client, mint)
         if price and price > 0:
             return price
         await asyncio.sleep(0.5)
 
-        # Source 3: CoinGecko contract (rate-limited, use as last resort)
+        # Source 4: CoinGecko contract (rate-limited, use as last resort)
         price = await _cg_price_by_contract(client, mint)
         if price and price > 0:
             return price

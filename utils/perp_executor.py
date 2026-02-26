@@ -97,17 +97,16 @@ def _now_iso() -> str:
 
 
 def _fetch_price(symbol: str) -> float | None:
-    """Fetch live price for SOL/BTC/ETH from Jupiter price API."""
+    """Fetch live price for SOL/BTC/ETH — tries Jupiter, CoinGecko, then Kraken."""
     try:
         url = PRICE_APIS.get(symbol)
-        if not url:
-            return None
-        r = requests.get(url, timeout=5)
-        data = r.json()
-        return float(data["data"][symbol]["price"])
+        if url:
+            r = requests.get(url, timeout=5)
+            data = r.json()
+            return float(data["data"][symbol]["price"])
     except Exception as e:
         logger.debug("Price fetch failed for %s: %s", symbol, e)
-    # Fallback: CoinGecko
+    # Fallback 1: CoinGecko
     try:
         cg_id = CG_IDS.get(symbol, symbol.lower())
         r = requests.get(
@@ -115,9 +114,30 @@ def _fetch_price(symbol: str) -> float | None:
             timeout=5,
         )
         data = r.json()
-        return float(data[cg_id]["usd"])
+        price = data.get(cg_id, {}).get("usd")
+        if price:
+            return float(price)
     except Exception as e:
         logger.debug("CoinGecko fallback failed for %s: %s", symbol, e)
+    # Fallback 2: Kraken public ticker (no API key, no geo-block)
+    _KRAKEN_TICKER = {"SOL": "SOLUSD", "BTC": "XBTUSD", "ETH": "ETHUSD"}
+    _KRAKEN_KEY    = {"SOL": "SOLUSD", "BTC": "XXBTZUSD", "ETH": "XETHZUSD"}
+    try:
+        pair = _KRAKEN_TICKER.get(symbol)
+        if pair:
+            r = requests.get(
+                f"https://api.kraken.com/0/public/Ticker?pair={pair}",
+                timeout=5,
+            )
+            result = r.json().get("result", {})
+            key    = _KRAKEN_KEY.get(symbol, pair)
+            price  = result.get(key, {}).get("c", [None])[0]
+            if price:
+                logger.debug("Kraken price for %s: %s", symbol, price)
+                return float(price)
+    except Exception as e:
+        logger.debug("Kraken fallback failed for %s: %s", symbol, e)
+    logger.warning("Could not fetch price for %s — skipping perp signal", symbol)
     return None
 
 
@@ -203,17 +223,39 @@ def _close_perp_position(
         """, (ts, exit_price, round(leveraged_pct, 4), round(pnl_usd, 4), exit_reason, position_id))
         c.commit()
 
-    # Update perp_outcomes if exists
+    # Write completed outcome to perp_outcomes for the learning loop
     try:
+        # Determine mode from notes (SCALP or SWING)
+        notes_str = pos.get("notes") or ""
+        mode = "SCALP" if "mode=SCALP" in notes_str else "SWING"
+        opened_ts = pos.get("opened_ts_utc", ts)
+        regime    = pos.get("regime_label", "UNKNOWN")
+        # Ensure columns exist (migrations may have added them)
         with _conn() as c:
             cur = c.cursor()
-            cur.execute(
-                "UPDATE perp_outcomes SET status='COMPLETE' WHERE symbol=? AND side=? AND status='PENDING'",
-                (pos["symbol"], side),
-            )
+            cur.execute("""
+                INSERT INTO perp_outcomes
+                  (created_ts_utc, symbol, side, entry_price, regime_label,
+                   return_1h_pct, return_4h_pct, return_24h_pct,
+                   evaluated_1h_ts_utc, evaluated_4h_ts_utc, evaluated_24h_ts_utc,
+                   status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'COMPLETE')
+            """, (
+                opened_ts,
+                pos["symbol"].upper(), side, pos["entry_price"], regime,
+                round(leveraged_pct, 4),   # use actual PnL for all horizons
+                round(leveraged_pct, 4),   # perp outcome known at close
+                round(leveraged_pct, 4),
+                ts, ts, ts,
+            ))
             c.commit()
-    except Exception:
-        pass
+        logger.info(
+            "[PERP OUTCOME] Recorded %s %s %s  pnl=%.2f%%  reason=%s  mode=%s",
+            side, pos["symbol"], "WIN" if leveraged_pct > 0 else "LOSS",
+            leveraged_pct, exit_reason, mode,
+        )
+    except Exception as _oe:
+        logger.warning("perp_outcomes insert failed: %s", _oe)
 
     pos.update({"exit_price": exit_price, "pnl_pct": leveraged_pct, "pnl_usd": pnl_usd, "exit_reason": exit_reason})
     return pos
