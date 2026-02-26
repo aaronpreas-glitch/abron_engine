@@ -85,6 +85,36 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
+async def broadcast_trade_event(
+    event: str,           # "trade_open" | "trade_close"
+    mode: str,            # "SCALP" | "SWING" | "SPOT"
+    symbol: str,
+    side: str,            # "LONG" | "SHORT"
+    entry_price: float,
+    exit_price: float | None = None,
+    pnl_pct: float | None = None,
+    exit_reason: str | None = None,
+    size_usd: float | None = None,
+    leverage: float | None = None,
+) -> None:
+    """Broadcast a trade open/close event to all connected WS clients."""
+    await manager.broadcast({
+        "type": event,
+        "data": {
+            "mode":        mode,
+            "symbol":      symbol,
+            "side":        side,
+            "entry_price": entry_price,
+            "exit_price":  exit_price,
+            "pnl_pct":     round(pnl_pct, 2) if pnl_pct is not None else None,
+            "exit_reason": exit_reason,
+            "size_usd":    size_usd,
+            "leverage":    leverage,
+            "ts":          __import__("datetime").datetime.utcnow().isoformat() + "Z",
+        },
+    })
+
+
 async def signal_poller() -> None:
     """Background task — polls DB for new signals, broadcasts to WS clients."""
     last_id = _get_max_id()

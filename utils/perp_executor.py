@@ -258,6 +258,22 @@ def _close_perp_position(
         logger.warning("perp_outcomes insert failed: %s", _oe)
 
     pos.update({"exit_price": exit_price, "pnl_pct": leveraged_pct, "pnl_usd": pnl_usd, "exit_reason": exit_reason})
+
+    # Broadcast trade close event to dashboard WebSocket clients
+    try:
+        import asyncio as _asyncio
+        notes_str = pos.get("notes") or ""
+        _mode = "SCALP" if "mode=SCALP" in notes_str else "SWING"
+        from dashboard.backend.ws_manager import broadcast_trade_event  # type: ignore
+        _asyncio.get_event_loop().create_task(broadcast_trade_event(
+            event="trade_close", mode=_mode, symbol=pos["symbol"], side=side,
+            entry_price=pos["entry_price"], exit_price=exit_price,
+            pnl_pct=leveraged_pct, exit_reason=exit_reason,
+            size_usd=pos.get("size_usd"), leverage=pos.get("leverage"),
+        ))
+    except Exception:
+        pass
+
     return pos
 
 
@@ -456,6 +472,16 @@ async def execute_perp_signal(signal: dict) -> bool:
     if pos:
         _queue_perp_outcome(symbol, side, entry_price, regime)
         logger.info("[%s %s] Position opened id=%s", mode_tag, paper_tag, pos.get("id"))
+        # Broadcast trade open event to dashboard WebSocket clients
+        try:
+            import asyncio as _asyncio
+            from dashboard.backend.ws_manager import broadcast_trade_event  # type: ignore
+            _asyncio.get_event_loop().create_task(broadcast_trade_event(
+                event="trade_open", mode=mode_tag, symbol=symbol, side=side,
+                entry_price=entry_price, size_usd=size_usd, leverage=leverage,
+            ))
+        except Exception:
+            pass
         return True
 
     return False

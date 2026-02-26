@@ -5,6 +5,8 @@ import { RiskBanner } from './RiskBanner'
 import { Sidebar } from './Sidebar'
 import { AiChat } from '../ai/AiChat'
 import { SignalToast } from '../signals/SignalToast'
+import { TradeToast } from '../notifications/TradeToast'
+import { NotificationBell } from '../notifications/NotificationBell'
 import { api } from '../../api'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -275,6 +277,11 @@ function TopBar() {
         </span>
       )}
 
+      {/* Notification bell */}
+      <div style={{ marginRight: 6 }}>
+        <NotificationBell />
+      </div>
+
       {/* UTC Clock */}
       <span style={{
         fontSize: 9, fontWeight: 600, color: 'rgba(255,255,255,0.2)',
@@ -308,6 +315,8 @@ export function Shell() {
       <AiChat />
       {/* Signal toasts — top-right ALERT notifications via WebSocket */}
       <SignalToast />
+      {/* Trade toasts — bottom-right open/close notifications via WebSocket */}
+      <TradeToast />
     </div>
   )
 }
