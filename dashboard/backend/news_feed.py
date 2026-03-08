@@ -177,10 +177,11 @@ def _sort_key(item: dict) -> str:
     return item.get("pub_ts") or "1970-01-01T00:00:00+00:00"
 
 
-def fetch_news(limit: int = 40, tag: Optional[str] = None) -> list[dict]:
+def fetch_news(limit: int = 40, tag: Optional[str] = None, coins: Optional[str] = None) -> list[dict]:
     """
     Return up to `limit` news items, newest first.
     Optionally filter by tag: 'SOL', 'MARKET', or 'CRYPTO'.
+    Optionally filter by coins: 'memecoins' (SOL/meme tokens) or 'majors' (BTC/ETH).
     Uses a 5-minute in-process cache.
     """
     global _cached_items, _cached_at
@@ -218,5 +219,21 @@ def fetch_news(limit: int = 40, tag: Optional[str] = None) -> list[dict]:
 
     if tag:
         items = [i for i in items if i["tag"] == tag.upper()]
+
+    if coins:
+        _ck = coins.lower()
+        if _ck == "memecoins":
+            _kw = re.compile(
+                r"\b(bonk|wif|fartcoin|pepe|doge|shib|floki|brett|mog|ponke|popcat|neiro|goat|"
+                r"meme\b|memecoin|pump\.fun|raydi|raydium|orca|jup\b|jupiter|solana|sol\b)\b",
+                re.I,
+            )
+            items = [i for i in items if _kw.search(i["title"] + " " + (i.get("summary") or ""))]
+        elif _ck in ("majors", "btc-eth"):
+            _kw = re.compile(
+                r"\b(bitcoin|btc|ethereum|eth|base\b|layer.?2|l2\b)\b",
+                re.I,
+            )
+            items = [i for i in items if _kw.search(i["title"] + " " + (i.get("summary") or ""))]
 
     return items[:limit]

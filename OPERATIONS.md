@@ -1,230 +1,196 @@
-# Memecoin Engine Operations
+# Memecoin Engine — VPS Operations Guide
 
-## 1) Create/refresh virtualenv
+> **VPS**: `root@68.183.148.183` · key: `~/.ssh/memecoin_deploy`
+> **Engine root**: `/root/memecoin_engine/`
+> **Dashboard**: `http://68.183.148.183:8000`
+> **Password**: `HArden978ab`
 
-```bash
-cd "/Users/abron/Documents/New project/memecoin_engine"
-python3.11 -m venv .venv
-source .venv/bin/activate
-python -m pip install -r requirements.txt
-```
+---
 
-## 2) Run manually
+## Quick Reference
 
 ```bash
-cd "/Users/abron/Documents/New project/memecoin_engine"
-source .venv/bin/activate
-python main.py
+# SSH in
+ssh -i ~/.ssh/memecoin_deploy root@68.183.148.183
+
+# Service
+systemctl status memecoin-dashboard
+systemctl restart memecoin-dashboard
+journalctl -u memecoin-dashboard -n 50 --no-pager
+
+# Get auth token
+TOKEN=$(curl -s -X POST http://localhost:8000/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"password":"HArden978ab"}' | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])')
+
+# System health
+curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8000/api/health/status | python3 -m json.tool
+
+# Agent status
+curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8000/api/orchestrator/status \
+  | python3 -c "import sys,json; [print(a['name'], a['health']) for a in json.load(sys.stdin)['agents']]"
+
+# Tier positions
+curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8000/api/tiers/status | python3 -m json.tool
 ```
 
-## 3) Install launchd auto-start
+---
+
+## Tier System
+
+```
+3x  SOL LONG  $50 col  Diamond hands — no TP, holds forever
+5x  BTC LONG  $20 col  TP +20% raw → closes → re-enters → profits go to buffer
+10x ETH LONG  $10 col  TP +10% raw → closes → re-enters → re-enters after liq
+```
+
+**Open tiers via dashboard buttons or API:**
+```bash
+curl -s -X POST -H "Authorization: Bearer $TOKEN" http://localhost:8000/api/tiers/open/3x
+curl -s -X POST -H "Authorization: Bearer $TOKEN" http://localhost:8000/api/tiers/open/5x
+curl -s -X POST -H "Authorization: Bearer $TOKEN" http://localhost:8000/api/tiers/open/10x
+curl -s -X POST -H "Authorization: Bearer $TOKEN" http://localhost:8000/api/tiers/open-all
+```
+
+**Profit buffer**: 5x/10x TP profits accumulate → auto-opens new 3x at $50, new 5x at $20.
+
+---
+
+## Memecoin System (Paper Mode)
+
+**Current mode**: `MEMECOIN_DRY_RUN=true` — ALL buys are paper trades (no real money ever).
+
+```
+MEMECOIN_AUTO_BUY=false       Gate — set true to enable auto-buying
+MEMECOIN_DRY_RUN=true         Paper mode hardlock — NEVER change without deliberate decision
+MEMECOIN_BUY_USD=15           USD per paper buy
+MEMECOIN_MAX_OPEN=3           Max concurrent paper positions
+MEMECOIN_BUY_SCORE_MIN=65     Score gate (tuner overrides when confident)
+```
+
+**Auto-buy gates** (ALL must pass for a buy to fire):
+1. `MEMECOIN_AUTO_BUY=true`
+2. Open positions < `MEMECOIN_MAX_OPEN`
+3. Fear & Greed > 25 (not extreme fear)
+4. Score >= threshold (from tuner or env default)
+5. rug_label == "GOOD"
+6. buy_pressure >= 55%
+7. mint_revoked == True
+
+**Learning loop**: Scanner runs every 5min → logs outcomes → 1h/4h/24h returns fill automatically → once 20+ COMPLETE rows exist, auto-tuner adjusts thresholds.
+
+---
+
+## Agent System
+
+6 agents run in a continuous loop inside `_perp_monitor_loop`:
+
+| Agent | Interval | What it does |
+|-------|----------|-------------|
+| `trading` | 60s | Main perp signal scanner (disabled: SWING_4H_THRESHOLD=99) |
+| `monitoring` | 60s | Monitors open perp positions for TP/SL/TIME_LIMIT |
+| `memecoin_monitor` | 60s | Paper buys + monitors open memecoin trades |
+| `health_watchdog` | 60s | DB/agent/scan freshness checks → kv_store['system_health'] |
+| `data_integrity` | 5min | Outcome fill rate + scan freshness + position sanity |
+| `research` | 4h | Synthesizes learning data → writes to MEMORY.md |
+
+**Telegram alerts fire on**: memecoin buy/sell, tier TP hit, buffer deploy, research synthesis, CRITICAL/DEGRADED health.
+
+---
+
+## Deploy Workflow
+
+### Backend-only change
+```bash
+# 1. Edit file locally
+# 2. SCP to VPS
+scp -i ~/.ssh/memecoin_deploy utils/some_file.py root@68.183.148.183:/root/memecoin_engine/utils/some_file.py
+
+# 3. Restart
+ssh -i ~/.ssh/memecoin_deploy root@68.183.148.183 "systemctl restart memecoin-dashboard"
+
+# 4. Verify
+ssh -i ~/.ssh/memecoin_deploy root@68.183.148.183 "systemctl is-active memecoin-dashboard"
+```
+
+### Frontend change (ALWAYS required when any .tsx changes)
+```bash
+# 1. Build
+cd /Users/abron/memecoin_engine/dashboard/frontend && npm run build
+
+# 2. Rsync (replaces dist/ entirely)
+rsync -av --delete -e "ssh -i ~/.ssh/memecoin_deploy" \
+  dist/ root@68.183.148.183:/root/memecoin_engine/dashboard/frontend/dist/
+
+# 3. Restart
+ssh -i ~/.ssh/memecoin_deploy root@68.183.148.183 "systemctl restart memecoin-dashboard"
+```
+
+> **index.html is served with `no-store`** — browser always fetches fresh. Stale JS cache is impossible.
+
+### .env changes
+```bash
+# Edit on VPS
+ssh -i ~/.ssh/memecoin_deploy root@68.183.148.183 "echo 'KEY=value' >> /root/memecoin_engine/.env"
+
+# ALWAYS restart after .env change — env vars are read at startup
+ssh -i ~/.ssh/memecoin_deploy root@68.183.148.183 "systemctl restart memecoin-dashboard"
+```
+
+---
+
+## Key .env Variables
 
 ```bash
-cd "/Users/abron/Documents/New project/memecoin_engine"
-./scripts/install_launchd.sh
+# Perps
+PERP_DRY_RUN=false            # LIVE — real money
+SWING_4H_THRESHOLD=99         # Signal scanner disabled (set 0.5 to re-enable)
+MAX_OPEN_PERPS=10
+
+# Tiers
+TIER_3X_SYMBOL=SOL  TIER_3X_LEVERAGE=3   TIER_3X_NOTIONAL=150
+TIER_5X_SYMBOL=BTC  TIER_5X_LEVERAGE=5   TIER_5X_NOTIONAL=100  TIER_5X_TP_PCT=20
+TIER_10X_SYMBOL=ETH TIER_10X_LEVERAGE=10 TIER_10X_NOTIONAL=100 TIER_10X_TP_PCT=10
+PROFIT_BUFFER_3X_THRESHOLD=50
+PROFIT_BUFFER_5X_THRESHOLD=20
+
+# Memecoins (paper mode)
+MEMECOIN_AUTO_BUY=false
+MEMECOIN_DRY_RUN=true         # NEVER flip without deliberate decision
+MEMECOIN_BUY_USD=15
+MEMECOIN_MAX_OPEN=3
+MEMECOIN_BUY_SCORE_MIN=65
+
+# Notifications
+TELEGRAM_TOKEN=...
+TELEGRAM_CHAT_ID=...
 ```
 
-Check status:
+---
+
+## Database
 
 ```bash
-launchctl list | grep com.memecoin.engine
+# Connect
+sqlite3 /root/memecoin_engine/data_storage/engine.db
+
+# Key tables
+SELECT * FROM perp_positions WHERE status='OPEN';
+SELECT * FROM memecoin_trades WHERE status='OPEN';
+SELECT * FROM memecoin_signal_outcomes ORDER BY scanned_at DESC LIMIT 20;
+SELECT key, value FROM kv_store WHERE key IN ('system_health','shared_fear_greed','tier_profit_buffer');
 ```
 
-Stop/unload:
+---
 
-```bash
-launchctl unload "$HOME/Library/LaunchAgents/com.memecoin.engine.plist"
-```
+## Troubleshooting
 
-## 4) Logs
-
-- Stdout: `logs/engine.out.log`
-- Stderr: `logs/engine.err.log`
-
-```bash
-tail -f logs/engine.out.log
-```
-
-## 5) Watchdog tuning (`.env`)
-
-- `WATCHDOG_ENABLED=true`
-- `WATCHDOG_INTERVAL_SECONDS=300`
-- `WATCHDOG_MAX_SCAN_GAP_MINUTES=90`
-- `WATCHDOG_MAX_ALERT_GAP_HOURS=12`
-
-The watchdog sends Telegram anomaly/recovery messages if scans stall or alerts stop for too long.
-
-## 6) Confidence + Regime controls (`.env`)
-
-- `ENABLE_REGIME_GATE=true`
-- `REGIME_MIN_SCORE=50`
-- `CONFIDENCE_MIN_A=85`
-- `CONFIDENCE_MIN_B=70`
-- `MIN_CONFIDENCE_TO_ALERT=B`
-
-Alerts are only sent when confidence tier meets `MIN_CONFIDENCE_TO_ALERT`, and when regime gate is enabled, only when regime score is at least `REGIME_MIN_SCORE`.
-
-## 6.1) Strategic vs Tactical profile (`.env`)
-
-- `ENGINE_PROFILE=strategic|tactical`
-
-`strategic` defaults to slower, higher-quality scanning.  
-`tactical` defaults to short-term momentum/pullback behavior.
-
-Tactical baseline knobs:
-- `SCAN_INTERVAL_SECONDS=1800`
-- `MIN_LIQUIDITY=500000`
-- `MIN_VOLUME_24H=200000`
-- `ALERT_COOLDOWN_HOURS=6`
-- `ALERT_THRESHOLD=70`
-- `TACTICAL_PULLBACK_MIN_PCT=20`
-- `TACTICAL_PULLBACK_MAX_PCT=30`
-- `TACTICAL_TREND_MIN_CHANGE_24H=5`
-- `TACTICAL_MIN_MOMENTUM_CHANGE_1H=0.3`
-- `TACTICAL_MIN_VOL_TO_LIQ_RATIO=0.12`
-- `TACTICAL_MAX_LAST_TRADE_AGE_MINUTES=45`
-- `TACTICAL_ENABLE_REAL_TECHNICALS=true`
-- `TACTICAL_REQUIRE_TECHNICAL_CONFIRMATION=false`
-- `TACTICAL_OHLCV_TYPE=15m`
-- `TACTICAL_OHLCV_LOOKBACK_HOURS=36`
-- `TACTICAL_RSI_PERIOD=14`
-- `TACTICAL_RSI_MIN=50`
-- `TACTICAL_RSI_MAX=78`
-- `TACTICAL_MACD_HIST_MIN=0`
-
-After changing profile values:
-
-```bash
-./scripts/install_launchd.sh
-```
-
-## 7) Top-N alerts + cooldown caps (`.env`)
-
-- `ALERT_TOP_N=3`
-- `MAX_ALERTS_PER_CYCLE=3`
-- `ALERT_COOLDOWN_HOURS=12`
-
-The engine ranks candidates by score, then alerts up to `ALERT_TOP_N` while enforcing `MAX_ALERTS_PER_CYCLE` and per-symbol cooldown.
-
-## 8) Risk governor circuit breakers (`.env`)
-
-- `ENABLE_RISK_GOVERNOR=true`
-- `GLOBAL_TRADING_PAUSE=false`
-- `MAX_ALERTS_PER_DAY=8`
-- `MAX_ALERTS_PER_SYMBOL_PER_DAY=2`
-- `MAX_CONSECUTIVE_4H_LOSSES=3`
-- `LOSS_STREAK_PAUSE_HOURS=6`
-
-Risk governor blocks alerts when limits are breached and can auto-pause after a losing streak.
-
-## 9) Execution-quality filters (`.env`)
-
-- `ENABLE_EXECUTION_QUALITY_FILTERS=true`
-- `MIN_VOL_TO_LIQ_RATIO=0.02`
-- `MAX_VOL_TO_LIQ_RATIO=3.0`
-- `MAX_ABS_CHANGE_24H=80`
-- `MIN_PRICE_USD=0.00000001`
-- `MIN_LIQUIDITY_PER_HOLDER=10`
-
-These filters reject low-quality or unstable setups before scoring.
-
-## 10) Outcome-driven symbol controls (`.env`)
-
-- `SYMBOL_CONTROL_ENABLED=true`
-- `SYMBOL_LOSS_STREAK_TRIGGER=3`
-- `SYMBOL_COOLDOWN_HOURS=24`
-- `SYMBOL_BLACKLIST_MIN_SAMPLES=3`
-- `SYMBOL_BLACKLIST_AVG_24H_PCT=-8`
-- `SYMBOL_BLACKLIST_HOURS=72`
-
-Symbols with repeated poor outcomes are auto-cooled or blacklisted.
-
-## 11) Weekly auto-tuning report (`.env`)
-
-- `WEEKLY_TUNING_ENABLED=true`
-- `WEEKLY_TUNING_DAY_UTC=SUN` (`MON|TUE|WED|THU|FRI|SAT|SUN`)
-- `WEEKLY_TUNING_HOUR_UTC=1`
-- `WEEKLY_TUNING_LOOKBACK_DAYS=7`
-- `WEEKLY_TUNING_MIN_OUTCOMES_4H=8`
-
-The report recommends updated `ALERT_THRESHOLD`, `REGIME_MIN_SCORE`, and `MIN_CONFIDENCE_TO_ALERT` based on recent scan outcomes, prioritizing 4h/24h realized returns.
-
-## 12) Outcome attribution (`.env`)
-
-- `OUTCOME_TRACKING_ENABLED=true`
-- `OUTCOME_EVAL_INTERVAL_SECONDS=300`
-- `OUTCOME_EVAL_BATCH_SIZE=50`
-
-Alerts are written to `alert_outcomes` and evaluated at +1h/+4h/+24h using live BirdEye price snapshots.
-
-## 13) One-click apply of weekly tuning
-
-Preview only:
-
-```bash
-./scripts/apply_weekly_tuning.sh --dry-run
-```
-
-Apply + reload launchd:
-
-```bash
-./scripts/apply_weekly_tuning.sh --reload
-```
-
-Notes:
-- Writes backup before any change: `.env.bak.YYYYMMDD_HHMMSS`
-- Applies bounded values only:
-  - `ALERT_THRESHOLD` in `[55, 95]`
-  - `REGIME_MIN_SCORE` in `[35, 70]`
-  - `MIN_CONFIDENCE_TO_ALERT` in `{A,B,C}`
-
-## 14) Singleton protection
-
-- `PROCESS_LOCK_FILE=engine.lock`
-
-Only one engine process can run at a time. Extra starts exit immediately with a lock warning.
-
-## 15) Structured JSON logs + rotation
-
-- `LOG_JSON_ENABLED=true`
-- `LOG_JSON_PATH=logs/engine.jsonl`
-- `LOG_MAX_BYTES=5242880`
-- `LOG_BACKUP_COUNT=5`
-
-JSON logs are emitted to `LOG_JSON_PATH` with automatic rotation.
-
-## 16) Health snapshot command
-
-```bash
-./scripts/health_snapshot.sh
-```
-
-Returns service status, last scan/alert timestamps, 24h metrics, portfolio simulation metrics, risk-pause state, symbol-control counts, and outcome queue depth.
-
-## 17) Telegram controls
-
-Bot commands (authorized chat only):
-- `/status`
-- `/mode strategic`
-- `/mode tactical`
-- `/risk`
-- `/pause 6`
-- `/resume`
-- `/performance`
-- `/digest`
-- `/help`
-
-Alert actions:
-- `DexScreener` button
-- `BirdEye` button
-- `Mute 24h` button
-- `Acknowledge` button
-
-Digest settings (`.env`):
-- `SIGNAL_DIGEST_ENABLED=true`
-- `SIGNAL_DIGEST_INTERVAL_SECONDS=10800`
-- `SIGNAL_DIGEST_LOOKBACK_HOURS=6`
-- `SIGNAL_DIGEST_MAX_ITEMS=5`
-
-Button toggle (`.env`):
-- `TELEGRAM_ACTION_BUTTONS_ENABLED=true`
+| Problem | Fix |
+|---------|-----|
+| Dashboard not loading | `systemctl restart memecoin-dashboard` |
+| Stale JS in browser | Hard refresh (`Cmd+Shift+R`) — but this is now impossible (no-store header) |
+| Agent shows stalled | Check `journalctl -u memecoin-dashboard -n 100` for Python errors |
+| Tier open fails | Check Jupiter API status; verify wallet has SOL for fees |
+| Liq detection false positive | Check if position is < 10 min old (grace period) |
+| Standalone script fails | `set -a && source .env && set +a && python3 script.py` |
+| Circuit breaker stale | `cat /root/memecoin_engine/cb_state.txt` — delete if stale |

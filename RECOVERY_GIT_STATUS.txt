@@ -1,0 +1,99 @@
+On branch main
+Your branch is up to date with 'origin/main'.
+
+Changes not staged for commit:
+  (use "git add/rm <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   OPERATIONS.md
+	modified:   dashboard/backend/main.py
+	modified:   dashboard/backend/news_feed.py
+	modified:   dashboard/frontend/package-lock.json
+	modified:   dashboard/frontend/package.json
+	modified:   dashboard/frontend/src/App.tsx
+	deleted:    dashboard/frontend/src/components/ai/AiChat.tsx
+	deleted:    dashboard/frontend/src/components/arb/ArbFeed.tsx
+	deleted:    dashboard/frontend/src/components/brain/Brain.tsx
+	deleted:    dashboard/frontend/src/components/brain/EquityCurve.tsx
+	deleted:    dashboard/frontend/src/components/brain/ExitLearnings.tsx
+	deleted:    dashboard/frontend/src/components/brain/SellSignalPanel.tsx
+	deleted:    dashboard/frontend/src/components/brain/ThresholdSimulator.tsx
+	deleted:    dashboard/frontend/src/components/brain/TuningHistory.tsx
+	deleted:    dashboard/frontend/src/components/config/ConfigEditor.tsx
+	deleted:    dashboard/frontend/src/components/home/CommandCenter.tsx
+	deleted:    dashboard/frontend/src/components/home/GlobalMetricsBar.tsx
+	deleted:    dashboard/frontend/src/components/home/LivePositions.tsx
+	deleted:    dashboard/frontend/src/components/home/ReadinessScore.tsx
+	deleted:    dashboard/frontend/src/components/launches/LaunchFeed.tsx
+	deleted:    dashboard/frontend/src/components/layout/LoginPage.tsx
+	deleted:    dashboard/frontend/src/components/layout/RiskBanner.tsx
+	deleted:    dashboard/frontend/src/components/layout/Shell.tsx
+	deleted:    dashboard/frontend/src/components/layout/Sidebar.tsx
+	deleted:    dashboard/frontend/src/components/leaderboard/Leaderboard.tsx
+	deleted:    dashboard/frontend/src/components/news/NewsPanel.tsx
+	deleted:    dashboard/frontend/src/components/notifications/NotificationBell.tsx
+	deleted:    dashboard/frontend/src/components/notifications/TradeToast.tsx
+	deleted:    dashboard/frontend/src/components/performance/PerformancePanel.tsx
+	deleted:    dashboard/frontend/src/components/positions/PositionsPanel.tsx
+	deleted:    dashboard/frontend/src/components/regime/RegimeHeatmap.tsx
+	deleted:    dashboard/frontend/src/components/regime/RegimeTimeline.tsx
+	deleted:    dashboard/frontend/src/components/risk/RiskPanel.tsx
+	deleted:    dashboard/frontend/src/components/shared/Badge.tsx
+	deleted:    dashboard/frontend/src/components/shared/EmptyState.tsx
+	deleted:    dashboard/frontend/src/components/shared/LoadingSpinner.tsx
+	deleted:    dashboard/frontend/src/components/shared/PctChange.tsx
+	deleted:    dashboard/frontend/src/components/signals/OutcomeGatedFeed.tsx
+	deleted:    dashboard/frontend/src/components/signals/SignalCard.tsx
+	deleted:    dashboard/frontend/src/components/signals/SignalFeed.tsx
+	deleted:    dashboard/frontend/src/components/signals/SignalModal.tsx
+	deleted:    dashboard/frontend/src/components/signals/SignalToast.tsx
+	deleted:    dashboard/frontend/src/components/signals/SnapshotBar.tsx
+	deleted:    dashboard/frontend/src/components/sniper/SniperPanel.tsx
+	deleted:    dashboard/frontend/src/components/sol/SolPanel.tsx
+	deleted:    dashboard/frontend/src/components/symbols/SymbolPage.tsx
+	deleted:    dashboard/frontend/src/components/trading/PerpsLiveTrading.tsx
+	deleted:    dashboard/frontend/src/components/trading/PerpsPaperTrading.tsx
+	deleted:    dashboard/frontend/src/components/trading/SpotLiveTrading.tsx
+	deleted:    dashboard/frontend/src/components/trading/SpotPaperTrading.tsx
+	deleted:    dashboard/frontend/src/components/watchlist/WatchCard.tsx
+	deleted:    dashboard/frontend/src/components/watchlist/WatchlistPanel.tsx
+	modified:   dashboard/frontend/src/index.css
+	modified:   dashboard/frontend/src/main.tsx
+	modified:   utils/db.py
+	modified:   utils/executor.py
+	modified:   utils/exit_strategy.py
+	modified:   utils/perp_executor.py
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	.claude/launch.json
+	=
+	RECOVERY_GIT_STATUS.txt
+	_patches/
+	dashboard/backend/routers/
+	dashboard/frontend/src/LoginPage.tsx
+	dashboard/frontend/src/Terminal.tsx
+	dashboard/frontend/src/sections/
+	data_storage/
+	electron_app/
+	headless_engine.py
+	orchestrator_config.json
+	tasks/
+	tests/
+	utils/agent_coordinator.py
+	utils/confluence_engine.py
+	utils/funding_monitor.py
+	utils/health_monitor.py
+	utils/jupiter_perps_trade.py
+	utils/memecoin_manager.py
+	utils/memecoin_scanner.py
+	utils/narrative_momentum.py
+	utils/orchestrator.py
+	utils/smart_wallet_tracker.py
+	utils/spot_accumulator.py
+	utils/spot_signal_engine.py
+	utils/telegram_alerts.py
+	utils/tier_manager.py
+	utils/whale_watch.py
+	utils/whale_watch_setup.py
+
+no changes added to commit (use "git add" and/or "git commit -a")

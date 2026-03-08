@@ -9,13 +9,44 @@ DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data_storage
 
 @contextmanager
 def get_conn():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=10)  # Patch 163: timeout for WAL readers
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")       # Patch 163: WAL for concurrent readers
+    conn.execute("PRAGMA busy_timeout=5000")      # Patch 163: wait up to 5s on lock
     try:
         yield conn
         conn.commit()
     finally:
         conn.close()
+
+
+def persistent_rate_limit_check(alert_type: str, limit_s: int) -> bool:
+    """
+    Persistent rate limiting backed by kv_store. Survives service restarts. Patch 164.
+
+    Returns True  (suppress) if the alert was fired within the last `limit_s` seconds.
+    Returns False (allow)    and records the current timestamp otherwise.
+
+    Fails open on any DB error — a DB failure never silently suppresses an alert.
+    """
+    import time as _time
+    key = f"alert_ts:{alert_type}"
+    now = _time.time()
+    try:
+        with get_conn() as conn:
+            row = conn.execute(
+                "SELECT value FROM kv_store WHERE key=?", (key,)
+            ).fetchone()
+            last_ts = float(row[0]) if row else 0.0
+            if now - last_ts < limit_s:
+                return True   # within window — suppress
+            conn.execute(
+                "INSERT OR REPLACE INTO kv_store (key, value) VALUES (?, ?)",
+                (key, str(now)),
+            )
+            return False      # outside window — allow and record
+    except Exception:
+        return False          # fail open: never suppress due to DB error
 
 
 def init_db():
@@ -206,9 +237,22 @@ def init_db():
             exit_reason TEXT,
             status TEXT NOT NULL DEFAULT 'OPEN',
             dry_run INTEGER NOT NULL DEFAULT 1,
-            notes TEXT
+            notes TEXT,
+            jupiter_position_key TEXT,
+            tx_sig_open TEXT,
+            tx_sig_close TEXT
         );
         """)
+        # Patch 108/162: idempotent — add columns to existing DBs that predate Patch 108
+        for _col_def in (
+            "jupiter_position_key TEXT",
+            "tx_sig_open TEXT",
+            "tx_sig_close TEXT",
+        ):
+            try:
+                cur.execute(f"ALTER TABLE perp_positions ADD COLUMN {_col_def}")
+            except Exception:
+                pass  # column already exists — ignore
         cur.execute("""
         CREATE TABLE IF NOT EXISTS perp_outcomes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -233,6 +277,132 @@ def init_db():
         cur.execute("""
         CREATE INDEX IF NOT EXISTS idx_perp_outcomes_symbol_ts
         ON perp_outcomes(symbol, created_ts_utc);
+        """)
+
+        # ── Patch 161: tier execution intent tracking ────────────────────────
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS tier_execution_intents (
+            id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_ts              TEXT    NOT NULL,
+            resolved_ts             TEXT,
+            tier_label              TEXT    NOT NULL,
+            symbol                  TEXT    NOT NULL,
+            side                    TEXT    NOT NULL,
+            collateral_usd          REAL    NOT NULL,
+            leverage                REAL    NOT NULL,
+            status                  TEXT    NOT NULL DEFAULT 'PENDING',
+            presigned_tx_sig        TEXT,
+            position_pubkey         TEXT,
+            tx_sig_confirmed        TEXT,
+            perp_position_id        INTEGER,
+            error_detail            TEXT,
+            build_response_excerpt  TEXT
+        );
+        """)
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_tei_status
+        ON tier_execution_intents(status);
+        """)
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_tei_tier_created
+        ON tier_execution_intents(tier_label, created_ts);
+        """)
+
+        # ── Patch 115: memecoin spot trades ─────────────────────────────────
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS memecoin_trades (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            opened_ts_utc   TEXT NOT NULL,
+            symbol          TEXT NOT NULL,
+            mint            TEXT NOT NULL,
+            entry_price     REAL,
+            amount_usd      REAL,
+            token_amount    REAL,
+            status          TEXT DEFAULT 'OPEN',
+            exit_price      REAL,
+            exit_reason     TEXT,
+            pnl_pct         REAL,
+            pnl_usd         REAL,
+            closed_ts_utc   TEXT,
+            tx_sig_open     TEXT,
+            tx_sig_close    TEXT
+        );
+        """)
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_memecoin_trades_status
+        ON memecoin_trades(status);
+        """)
+
+        # ── Patch 116+117: memecoin signal outcome tracking ──────────────────
+        # Records every DexScreener signal shown to user.
+        # Patch 117 adds safety/mcap/age enrichment columns.
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS memecoin_signal_outcomes (
+            id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+            scanned_at           TEXT NOT NULL,
+            symbol               TEXT NOT NULL,
+            mint                 TEXT NOT NULL,
+            score                REAL,
+            price_at_scan        REAL,
+            change_1h_at_scan    REAL,
+            volume_24h           REAL,
+            liquidity_usd        REAL,
+            -- Patch 117 enrichment columns
+            rug_label            TEXT DEFAULT 'UNKNOWN',
+            top_holder_pct       REAL,
+            lp_locked_pct        REAL,
+            mcap_at_scan         REAL,
+            token_age_days       REAL,
+            vol_acceleration     REAL,
+            mint_revoked         INTEGER DEFAULT 0,
+            freeze_revoked       INTEGER DEFAULT 0,
+            -- Outcome columns (filled by outcome step)
+            return_1h_pct        REAL,
+            evaluated_1h_ts_utc  TEXT,
+            return_4h_pct        REAL,
+            evaluated_4h_ts_utc  TEXT,
+            return_24h_pct       REAL,
+            evaluated_24h_ts_utc TEXT,
+            status               TEXT DEFAULT 'PENDING',
+            bought               INTEGER DEFAULT 0
+        );
+        """)
+        cur.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_memecoin_outcomes_mint_scan
+        ON memecoin_signal_outcomes(mint, scanned_at);
+        """)
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_memecoin_outcomes_status
+        ON memecoin_signal_outcomes(status);
+        """)
+
+        # ── Patch 117 migration: add enrichment columns to existing DBs ───────
+        _p117_cols = [
+            ("rug_label",        "TEXT DEFAULT 'UNKNOWN'"),
+            ("top_holder_pct",   "REAL"),
+            ("lp_locked_pct",    "REAL"),
+            ("mcap_at_scan",     "REAL"),
+            ("token_age_days",   "REAL"),
+            ("vol_acceleration", "REAL"),
+            ("mint_revoked",     "INTEGER DEFAULT 0"),
+            ("freeze_revoked",   "INTEGER DEFAULT 0"),
+        ]
+        for col, col_def in _p117_cols:
+            try:
+                cur.execute(
+                    f"ALTER TABLE memecoin_signal_outcomes ADD COLUMN {col} {col_def}"
+                )
+            except Exception:
+                pass  # column already exists
+
+        # Patch 164: ensure kv_store exists for persistent_rate_limit_check.
+        # tier_manager._get_db() also creates it, but init_db() is used by tests
+        # and fresh installs before tier_manager ever runs.
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS kv_store (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        )
         """)
 
 

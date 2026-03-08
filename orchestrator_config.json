@@ -1,0 +1,11 @@
+{
+  "agents": {
+    "monitoring":  {"enabled": true,  "telegram_on_trade": true, "telegram_on_signal": false},
+    "research":    {"enabled": true,  "interval_hours": 4, "telegram_on_complete": true},
+    "watchdog":    {"enabled": true,  "stall_multiplier": 2.5, "dd_alert_pct": 3.0},
+    "optimizer":   {"enabled": true},
+    "alert":       {"enabled": true,  "telegram": true, "slack": true}
+  },
+  "memory": {"max_lines": 5000},
+  "version": "91"
+}

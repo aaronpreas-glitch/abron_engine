@@ -226,6 +226,32 @@ async def execute_signal(signal: dict) -> bool:
     except Exception:
         pass
 
+    # Patch 168 (A): Symbol cooldown for paper (DRY_RUN) mode only.
+    # Prevents re-entering a symbol within EXECUTOR_SYMBOL_COOLDOWN_H hours of any
+    # recent alert_outcome entry for that symbol. This avoids the "enter/exit/re-enter
+    # same loser every 5min" pattern seen in paper data (ARC/GRASS, Feb 28).
+    # Never fires in live mode (DRY_RUN=false). Set cooldown to 0 to disable.
+    if DRY_RUN:
+        try:
+            cooldown_h = float(os.getenv("EXECUTOR_SYMBOL_COOLDOWN_H", "4.0"))
+            if cooldown_h > 0:
+                from utils.db import get_conn as _gc  # type: ignore
+                from datetime import timedelta as _td
+                _cutoff = (datetime.now(timezone.utc) - _td(hours=cooldown_h)).isoformat()
+                with _gc() as _c:
+                    _recent = _c.execute(
+                        "SELECT COUNT(*) FROM alert_outcomes WHERE symbol=? AND created_ts_utc > ?",
+                        (symbol, _cutoff),
+                    ).fetchone()[0]
+                if _recent > 0:
+                    logger.info(
+                        "[COOLDOWN] %s: %d alert_outcome row(s) in last %.1fh — skipping paper re-entry",
+                        symbol, _recent, cooldown_h,
+                    )
+                    return False
+        except Exception as _cd_err:
+            logger.debug("symbol cooldown check error: %s", _cd_err)
+
     # Too many concurrent positions?
     open_count = _count_open_positions()
     if open_count >= MAX_OPEN_POSITIONS:

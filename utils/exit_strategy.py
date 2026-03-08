@@ -1,11 +1,12 @@
+# -*- coding: utf-8 -*-
 """
-exit_strategy.py — Adaptive exit rule engine.
+exit_strategy.py - Adaptive exit rule engine.
 
 Learns from alert_outcomes which exit timing produced the best historical
 returns for a given (regime_label, score_range, confidence) profile.
 
-Entry point: build_exit_plan(signal) → exit config dict
-Check loop:  should_exit(trade, current_price, peak_price) → { exit, pct_to_sell, reason }
+Entry point: build_exit_plan(signal) -> exit config dict
+Check loop:  should_exit(trade, current_price, peak_price) -> { exit, pct_to_sell, reason }
 Learning:    update_exit_learnings(trade_id, exit_reason, pnl_pct)
 """
 
@@ -19,36 +20,45 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# ── Paths ──────────────────────────────────────────────────────────────────────
+# -- Paths ----------------------------------------------------------------------
 
 _DB_PATH = Path(__file__).parent.parent / "data_storage" / "engine.db"
 _LEARNINGS_PATH = Path(__file__).parent.parent / "data_storage" / "exit_outcomes.json"
 _PROFILES_PATH  = Path(__file__).parent.parent / "data_storage" / "exit_profiles.json"
 
-# ── Defaults (conservative) ───────────────────────────────────────────────────
+# -- Defaults (conservative) ---------------------------------------------------
 
 DEFAULT_STOP_LOSS_PCT   = float(os.getenv("STOP_LOSS_PCT", "0.18"))   # -18%
-DEFAULT_TP1_PCT         = 0.25      # +25% → sell 40% of position
+DEFAULT_TP1_PCT         = 0.25      # +25% -> sell 40% of position
 DEFAULT_TP1_SELL_PCT    = 0.40
-DEFAULT_TP2_PCT         = 0.60      # +60% → sell another 40%
+DEFAULT_TP2_PCT         = 0.60      # +60% -> sell another 40%
 DEFAULT_TP2_SELL_PCT    = 0.40
 DEFAULT_TRAILING_PCT    = 0.12      # 12% trail after TP1
 DEFAULT_MAX_HOLD_HOURS  = float(os.getenv("MAX_HOLD_HOURS", "24"))
 MIN_SAMPLES_TO_LEARN    = 5         # need at least 5 outcomes before adapting
 
-# ── Scalp override — hard-coded tight parameters, bypass all learning ──────────
-_SCALP_STOP_PCT     = -0.008   # -0.8% stop loss
-_SCALP_TP1_PCT      =  0.015   # +1.5% take profit
+# -- Scalp override - hard-coded tight parameters, bypass all learning ----------
+_SCALP_STOP_PCT     = -0.012   # -1.2% stop loss
+_SCALP_TP1_PCT      =  0.025   # +2.5% take profit
 _SCALP_TP1_SELL_PCT =  1.0     # 100% exit at TP1 (no partial)
-_SCALP_TP2_PCT      =  0.015   # same as TP1 (signals no second level)
+_SCALP_TP2_PCT      =  0.025   # same as TP1 (signals no second level)
 _SCALP_TP2_SELL_PCT =  0.0
-_SCALP_TRAILING_PCT =  0.008   # 0.8% tight trail
-_SCALP_MAX_HOLD_H   =  0.33    # 20 minutes max hold
+_SCALP_TRAILING_PCT =  0.012   # 1.2% tight trail
+_SCALP_MAX_HOLD_H   =  0.75    # 45 minutes max hold
+
+# -- MID override - medium hold, learn 1-8h coin behaviour -------------------
+_MID_STOP_PCT       = -0.04    # -4% stop loss
+_MID_TP1_PCT        =  0.08    # +8% first take profit
+_MID_TP1_SELL_PCT   =  0.60    # sell 60% at TP1
+_MID_TP2_PCT        =  0.15    # +15% second target
+_MID_TP2_SELL_PCT   =  0.40    # sell remaining 40%
+_MID_TRAILING_PCT   =  0.04    # 4% trail after TP1
+_MID_MAX_HOLD_H     =  6.0     # 6 hours max hold
 
 
-# ── DB helper ─────────────────────────────────────────────────────────────────
+# -- DB helper -----------------------------------------------------------------
 
-_STALENESS_CUTOFF_DAYS = 30   # outcomes older than this get 0.8× weight in learning
+_STALENESS_CUTOFF_DAYS = 30   # outcomes older than this get 0.8* weight in learning
 _STALENESS_WEIGHT      = 0.80
 
 
@@ -62,7 +72,7 @@ def _query_outcomes(
     """
     Pull alert_outcomes matching the signal's profile.
     Outcomes older than _STALENESS_CUTOFF_DAYS are tagged with weight=0.8
-    for use in weighted median calculations (staleness decay — A4).
+    for use in weighted median calculations (staleness decay - A4).
     """
     if not _DB_PATH.exists():
         return []
@@ -115,20 +125,21 @@ def _load_exit_profiles() -> dict:
         return {}
 
 
-# ── Exit plan builder ─────────────────────────────────────────────────────────
+# -- Exit plan builder ---------------------------------------------------------
 
 def build_exit_plan(signal: dict) -> dict:
     """
     Compute an adaptive exit plan for a new trade based on historical outcomes
-    that share the same (regime_label, score ±10, confidence) profile.
+    that share the same (regime_label, score +/-10, confidence) profile.
 
     Falls back to conservative defaults if fewer than MIN_SAMPLES_TO_LEARN
     historical outcomes are found.
 
     Special case: if signal contains scalp_mode=True, returns hard-coded scalp
     parameters (tight TP/SL, short hold) bypassing the learning system entirely.
+    If signal contains mid_mode=True, returns hard-coded medium-hold parameters.
     """
-    # ── Scalp mode: hard-coded tight parameters, no learning ──────────────────
+    # -- Scalp mode: hard-coded tight parameters, no learning ------------------
     if signal.get("scalp_mode") is True:
         return {
             "stop_loss_pct":     _SCALP_STOP_PCT,
@@ -144,20 +155,24 @@ def build_exit_plan(signal: dict) -> dict:
             "cycle_phase":       "SCALP",
         }
 
-    Returns:
-    {
-        stop_loss_pct    — negative float, e.g. -0.18
-        tp1_pct          — positive float, e.g. 0.25
-        tp1_sell_pct     — fraction to sell at TP1, e.g. 0.40
-        tp2_pct          — positive float, e.g. 0.60
-        tp2_sell_pct     — fraction to sell at TP2, e.g. 0.40
-        trailing_stop_pct — trail after TP1, e.g. 0.12
-        max_hold_hours   — time-based failsafe
-        learned_from     — n outcomes used to calibrate
-        best_horizon_h   — 1 / 4 / 24 (whichever horizon had best median return)
-        profile_key      — human-readable profile string
-    }
-    """
+    # -- MID mode: medium hold (1-8h), partial exits, no learning --------------
+    if signal.get("mid_mode") is True:
+        return {
+            "stop_loss_pct":     _MID_STOP_PCT,
+            "tp1_pct":           _MID_TP1_PCT,
+            "tp1_sell_pct":      _MID_TP1_SELL_PCT,
+            "tp2_pct":           _MID_TP2_PCT,
+            "tp2_sell_pct":      _MID_TP2_SELL_PCT,
+            "trailing_stop_pct": _MID_TRAILING_PCT,
+            "max_hold_hours":    _MID_MAX_HOLD_H,
+            "learned_from":      0,
+            "best_horizon_h":    4,
+            "profile_key":       "MID|fixed",
+            "cycle_phase":       "MID",
+        }
+
+    # Returns: stop_loss_pct, tp1_pct, tp1_sell_pct, tp2_pct, tp2_sell_pct,
+    #          trailing_stop_pct, max_hold_hours, learned_from, best_horizon_h, profile_key
     regime       = signal.get("regime_label", "UNKNOWN")
     score        = float(signal.get("score", 0) or 0)
     conf         = signal.get("confidence", "C")
@@ -177,12 +192,12 @@ def build_exit_plan(signal: dict) -> dict:
         regime_profile = profiles.get("by_regime", {}).get(regime)
         if regime_profile and regime_profile.get("count", 0) >= 3:
             logger.info(
-                "exit_strategy: n=%d < %d for %s — using exit_profiles.json baseline",
+                "exit_strategy: n=%d < %d for %s - using exit_profiles.json baseline",
                 n, MIN_SAMPLES_TO_LEARN, profile_key,
             )
         else:
             logger.info(
-                "exit_strategy: n=%d < %d for %s — using cycle defaults (%s)",
+                "exit_strategy: n=%d < %d for %s - using cycle defaults (%s)",
                 n, MIN_SAMPLES_TO_LEARN, profile_key, cycle_phase,
             )
         return _default_plan(profile_key, n, cycle_phase=cycle_phase)
@@ -239,13 +254,13 @@ def build_exit_plan(signal: dict) -> dict:
 
     # TP1 = 60th percentile of wins (conservative capture)
     tp1_pct = percentile(wins, 60) / 100 if wins else DEFAULT_TP1_PCT
-    tp1_pct = max(0.10, min(1.0, tp1_pct))   # clamp 10–100%
+    tp1_pct = max(0.10, min(1.0, tp1_pct))   # clamp 10-100%
 
     # TP2 = 85th percentile of wins (let runners run)
     tp2_pct = percentile(wins, 85) / 100 if wins else DEFAULT_TP2_PCT
     tp2_pct = max(tp1_pct + 0.10, min(3.0, tp2_pct))  # at least TP1+10%
 
-    # Stop = 1.5× weighted avg loss (wider = gives more room; stale losses count less)
+    # Stop = 1.5* weighted avg loss (wider = gives more room; stale losses count less)
     if losses:
         total_loss_w = sum(w for _, w in losses)
         avg_loss = abs(sum(v * w for v, w in losses) / total_loss_w) if total_loss_w > 0 else DEFAULT_STOP_LOSS_PCT
@@ -287,7 +302,7 @@ def _default_plan(profile_key: str, learned_from: int = 0,
     """
     Return conservative defaults, adjusted by market cycle phase (Phase 3).
 
-    If the cycle playbook has enough samples (≥10), learned values override defaults.
+    If the cycle playbook has enough samples (>=10), learned values override defaults.
     Otherwise, use the phase-specific hard-coded defaults from market_cycle.py.
     """
     try:
@@ -320,7 +335,7 @@ def _default_plan(profile_key: str, learned_from: int = 0,
     }
 
 
-# ── Exit condition checker ────────────────────────────────────────────────────
+# -- Exit condition checker ----------------------------------------------------
 
 def should_exit(
     trade: dict,
@@ -408,7 +423,7 @@ def should_exit(
     return {"exit": False, "pct_to_sell": 0.0, "reason": "hold"}
 
 
-# ── Exit learnings sidecar ────────────────────────────────────────────────────
+# -- Exit learnings sidecar ----------------------------------------------------
 
 def update_exit_learnings(
     trade_id: int,

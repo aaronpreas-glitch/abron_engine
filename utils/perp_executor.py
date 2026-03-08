@@ -30,6 +30,25 @@ import requests
 
 logger = logging.getLogger(__name__)
 
+
+def _parse_notes(notes: str) -> dict:
+    """Parse pipe-delimited notes string into a dict. e.g. 'ml_wp=0.38|ev=48.1' → {'ml_wp':'0.38','ev':'48.1'}"""
+    result: dict = {}
+    for pair in (notes or "").split("|"):
+        if "=" in pair:
+            k, v = pair.split("=", 1)
+            result[k.strip()] = v.strip()
+    return result
+
+
+def _tg_perp(title: str, body: str, emoji: str = "🤖") -> None:
+    """Send a Telegram notification for a perp trade event. Silent on failure."""
+    try:
+        from utils.telegram_alerts import send_telegram_sync  # type: ignore
+        send_telegram_sync(title=title, body=body, emoji=emoji)
+    except Exception as _e:
+        logger.debug("Telegram perp notify failed: %s", _e)
+
 # ── Config ────────────────────────────────────────────────────────────────────
 
 def _bool(key: str, default: bool) -> bool:
@@ -183,6 +202,25 @@ def _open_perp_position(
         cur = c.cursor()
         cur.execute("SELECT * FROM perp_positions WHERE id=?", (position_id,))
         row = cur.fetchone()
+        if row:
+            # ── Telegram: Trade Opened ──────────────────────────────────────
+            try:
+                _nd = _parse_notes(notes)
+                _tag  = "[SIMULATE]" if dry_run else "[LIVE]"
+                _emj  = "🔵" if dry_run else "🟠"
+                _sp   = abs((stop_price  - entry_price) / entry_price * 100) if entry_price else 0
+                _tp1p = abs((tp1_price   - entry_price) / entry_price * 100) if entry_price else 0
+                _tp2p = abs((tp2_price   - entry_price) / entry_price * 100) if entry_price else 0
+                _body = (
+                    f"Entry: ${entry_price:.4g}  Size: ${size_usd:.0f}  {leverage:.0f}× lev\n"
+                    f"Stop: ${stop_price:.4g} (-{_sp:.1f}%)  TP1: +{_tp1p:.0f}%  TP2: +{_tp2p:.0f}%\n"
+                    f"Regime: {regime_label}  src: {_nd.get('source', '?')}\n"
+                    f"ML: wp={_nd.get('ml_wp','?')}  ret={_nd.get('ml_ret','?')}%  "
+                    f"conf={_nd.get('ml_conf','?')}  EV={_nd.get('ev','?')}"
+                )
+                _tg_perp(f"{_tag} {symbol.upper()} {side.upper()} OPENED", _body, _emj)
+            except Exception as _te:
+                logger.debug("Telegram open format failed: %s", _te)
         return dict(row) if row else None
 
 
@@ -258,6 +296,26 @@ def _close_perp_position(
         logger.warning("perp_outcomes insert failed: %s", _oe)
 
     pos.update({"exit_price": exit_price, "pnl_pct": leveraged_pct, "pnl_usd": pnl_usd, "exit_reason": exit_reason})
+
+    # ── Telegram: Trade Closed ──────────────────────────────────────────────
+    try:
+        _emj  = "✅" if leveraged_pct > 0 else "❌"
+        _tag  = "[SIMULATE]" if pos.get("dry_run") else "[LIVE]"
+        _pnl  = f"+{leveraged_pct:.2f}%" if leveraged_pct > 0 else f"{leveraged_pct:.2f}%"
+        _usd  = f"(${pnl_usd:+.2f})"
+        try:
+            _odt  = datetime.fromisoformat(pos["opened_ts_utc"].replace("Z","").replace("+00:00","").split(".")[0])
+            _hold = f"{(datetime.utcnow() - _odt).total_seconds() / 3600:.1f}h"
+        except Exception:
+            _hold = "?"
+        _body = (
+            f"Reason: {exit_reason}\n"
+            f"${pos['entry_price']:.4g} → ${exit_price:.4g}  hold: {_hold}\n"
+            f"Regime: {pos.get('regime_label', '?')}"
+        )
+        _tg_perp(f"{_tag} {pos['symbol']} {side} CLOSED  {_pnl} {_usd}", _body, _emj)
+    except Exception as _te:
+        logger.debug("Telegram close format failed: %s", _te)
 
     # Broadcast trade close event to dashboard WebSocket clients
     try:
