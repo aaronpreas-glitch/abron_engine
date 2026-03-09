@@ -226,6 +226,10 @@ def get_next_best_move(_user=Depends(get_current_user)):
         _npos = _cp.execute(
             "SELECT COUNT(*) FROM perp_positions WHERE status='OPEN' AND notes LIKE '%TIER%'"
         ).fetchone()[0]
+        _col_row = _cp.execute(
+            "SELECT SUM(collateral_usd) FROM perp_positions WHERE status='OPEN' AND notes LIKE '%TIER%'"
+        ).fetchone()
+        _col = float(_col_row[0] or 0)
         _cp.close()
 
         if _buf < 0:
@@ -239,10 +243,11 @@ def get_next_best_move(_user=Depends(get_current_user)):
                 "blockers": [f"BUFFER=${_buf:.0f}"], "confidence": "high",
             })
         elif _npos > 0:
+            _buf_note = f"buffer=${_buf:.0f} (no TP profits yet)" if _buf == 0 else f"buffer=${_buf:.0f}"
             candidates.append({
                 "_rank": 5, "action": "HOLD", "system": "PERP", "symbol": None,
                 "priority": "LOW",
-                "reason": f"{_npos} open position(s), buffer=${_buf:.0f}. Positions healthy — hold.",
+                "reason": f"{_npos} TIER position(s), ${_col:.0f} deployed, {_buf_note}. Hold — no action needed.",
                 "blockers": [], "confidence": "high",
             })
     except Exception as exc:
@@ -269,7 +274,7 @@ def get_next_best_move(_user=Depends(get_current_user)):
                     pass
 
             _open_cnt = _cm.execute(
-                "SELECT COUNT(DISTINCT token_mint) FROM memecoin_signal_outcomes WHERE status='OPEN'"
+                "SELECT COUNT(DISTINCT mint) FROM memecoin_signal_outcomes WHERE status='OPEN'"
             ).fetchone()[0]
 
             _lt_row = _cm.execute(
@@ -369,14 +374,18 @@ def get_next_best_move(_user=Depends(get_current_user)):
                 "SELECT value FROM kv_store WHERE key='spot_current_signals'"
             ).fetchone()
         if _sr:
-            _spot_map = _j.loads(_sr[0])
+            # spot_current_signals is stored as {"data": {SYM: {...}}, "updated_at": "..."}
+            _raw2 = _j.loads(_sr[0])
+            _spot_map = _raw2.get("data", _raw2) if isinstance(_raw2, dict) else {}
+            # gap key in spot signals is "gap", not "portfolio_gap"
             _dca = sorted(
-                [(sym, d) for sym, d in _spot_map.items() if (d.get("portfolio_gap") or 0) > 0],
-                key=lambda x: x[1].get("portfolio_gap", 0), reverse=True,
+                [(sym, d) for sym, d in _spot_map.items()
+                 if isinstance(d, dict) and (d.get("gap") or 0) > 0],
+                key=lambda x: x[1].get("gap", 0), reverse=True,
             )
             if _dca:
                 _sym2, _d2 = _dca[0]
-                _gap2 = _d2.get("portfolio_gap", 0)
+                _gap2 = _d2.get("gap", 0)
                 _sig2 = _d2.get("signal_type", "WATCH")
                 candidates.append({
                     "_rank": 35 if _sig2 == "DCA_NOW" else 12,
@@ -396,7 +405,8 @@ def get_next_best_move(_user=Depends(get_current_user)):
     for c in candidates:
         c.pop("_rank", None)
 
-    no_action = not candidates or candidates[0]["action"] == "HOLD"
+    # HOLD and WAIT both mean "stand by — no capital action needed right now"
+    no_action = not candidates or candidates[0]["action"] in ("HOLD", "WAIT")
 
     if not candidates:
         best = {
