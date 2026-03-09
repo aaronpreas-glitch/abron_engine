@@ -44,7 +44,9 @@ function fmtUsd(n: number | null | undefined): string {
 
 function fmtAge(ts: string | null): string {
   if (!ts) return '—'
-  const diff = (Date.now() - new Date(ts + 'Z').getTime()) / 1000
+  // Normalise: strip any existing tz suffix then re-add Z so Date.parse is unambiguous
+  const norm = ts.slice(0, 19) + 'Z'
+  const diff = (Date.now() - new Date(norm).getTime()) / 1000
   if (diff < 60)    return `${Math.floor(diff)}s ago`
   if (diff < 3600)  return `${Math.floor(diff / 60)}m ago`
   if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`
@@ -641,7 +643,7 @@ function TopBuysPanel({
                 fontSize: 12, color: 'var(--text2)', flex: 1,
               }}>{c.symbol}</span>
               <span style={{ fontFamily: 'JetBrains Mono, monospace', fontSize: 10, color: 'var(--muted)' }}>
-                {c.score.toFixed(0)}
+                {(c.score ?? 0).toFixed(0)}
               </span>
               {c.signal_blockers.length > 0 && (
                 <span style={{
@@ -704,7 +706,7 @@ function TopBuysPanel({
                      : entry.portfolio_gap < 0 ? 'var(--red)'
                      : 'var(--dim)',
               }}>
-                {entry.portfolio_gap > 0 ? '+' : ''}{entry.portfolio_gap.toFixed(1)}%
+                {(entry.portfolio_gap ?? 0) > 0 ? '+' : ''}{(entry.portfolio_gap ?? 0).toFixed(1)}%
               </span>
             </div>
           ))}
