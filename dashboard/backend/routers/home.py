@@ -188,3 +188,230 @@ def _whale_summary() -> dict:
     except Exception as e:
         log.debug("whale_summary error: %s", e)
         return {"total": 0, "in_range": 0, "scanner_pass": 0, "alerts_sent": 0, "last_ts": None}
+
+
+# ── Patch 190: Next Best Move — unified cross-system recommendation ────────────
+
+@router.get("/next-best-move")
+def get_next_best_move(_user=Depends(get_current_user)):
+    """
+    Cross-system 'what to do next' recommendation. P190.
+    Aggregates PERP buffer health, MEMECOIN gate state, and SPOT portfolio gap
+    into a single ranked action + 2 alternatives.
+    Decision support only — no auto-trading changes.
+
+    Actions: MANAGE (urgent) > BUY (meme signal) > DCA (spot gap) >
+             WATCH (gates open, no signal) > WAIT (gate closed) > HOLD (nothing to do)
+    """
+    import sys
+    import json as _j
+    from datetime import datetime, timezone
+
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    if root not in sys.path:
+        sys.path.insert(0, root)
+
+    from utils.db import get_conn  # type: ignore
+
+    candidates = []
+
+    # ── 1. Perp — profit buffer health ────────────────────────────────────────
+    try:
+        import sqlite3
+        _db = os.path.join(root, "data_storage", "engine.db")
+        _cp = sqlite3.connect(_db)
+        _cp.row_factory = sqlite3.Row
+        from utils.tier_manager import get_profit_buffer  # type: ignore
+        _buf  = get_profit_buffer(_cp)
+        _npos = _cp.execute(
+            "SELECT COUNT(*) FROM perp_positions WHERE status='OPEN' AND notes LIKE '%TIER%'"
+        ).fetchone()[0]
+        _cp.close()
+
+        if _buf < 0:
+            candidates.append({
+                "_rank": 100, "action": "MANAGE", "system": "PERP", "symbol": None,
+                "priority": "URGENT",
+                "reason": (
+                    f"Profit buffer is negative (${_buf:.0f}). "
+                    "Check open positions — consider reducing exposure or adding collateral."
+                ),
+                "blockers": [f"BUFFER=${_buf:.0f}"], "confidence": "high",
+            })
+        elif _npos > 0:
+            candidates.append({
+                "_rank": 5, "action": "HOLD", "system": "PERP", "symbol": None,
+                "priority": "LOW",
+                "reason": f"{_npos} open position(s), buffer=${_buf:.0f}. Positions healthy — hold.",
+                "blockers": [], "confidence": "high",
+            })
+    except Exception as exc:
+        log.debug("next_best_move perp: %s", exc)
+
+    # ── 2. Memecoin — gate state ───────────────────────────────────────────────
+    try:
+        _auto_buy = os.getenv("MEMECOIN_AUTO_BUY", "false").lower() == "true"
+        _dry_run  = os.getenv("MEMECOIN_DRY_RUN",  "true").lower()  == "true"
+        _max_open = int(os.getenv("MEMECOIN_MAX_OPEN", "3"))
+        _fg_val    = None
+        _open_cnt  = 0
+        _bands     = []
+        _multi     = False
+
+        with get_conn() as _cm:
+            _fg_row = _cm.execute(
+                "SELECT value FROM kv_store WHERE key='shared_fear_greed'"
+            ).fetchone()
+            if _fg_row:
+                try:
+                    _fg_val = _j.loads(_fg_row[0]).get("value")
+                except Exception:
+                    pass
+
+            _open_cnt = _cm.execute(
+                "SELECT COUNT(DISTINCT token_mint) FROM memecoin_signal_outcomes WHERE status='OPEN'"
+            ).fetchone()[0]
+
+            _lt_row = _cm.execute(
+                "SELECT value FROM kv_store WHERE key='memecoin_learned_thresholds'"
+            ).fetchone()
+            if _lt_row:
+                try:
+                    _lt    = _j.loads(_lt_row[0])
+                    _bands = _lt.get("bands", [])
+                    _multi = bool(_lt.get("multi_band_mode", False))
+                except Exception:
+                    pass
+
+        _fg_thr = 35 if not _dry_run else 25
+        _fg_ok  = _fg_val is not None and _fg_val > _fg_thr
+        _cap_ok = _open_cnt < _max_open
+
+        _m_blk = []
+        if not _auto_buy:
+            _m_blk.append("AUTO_BUY=false")
+        if not _fg_ok:
+            _m_blk.append(f"F&G={_fg_val or '?'} (need >{_fg_thr})")
+        if not _cap_ok:
+            _m_blk.append(f"CAPACITY {_open_cnt}/{_max_open}")
+
+        _best_sig = None
+        try:
+            from utils.memecoin_scanner import get_cached_signals  # type: ignore
+            _sigs = sorted(
+                get_cached_signals(), key=lambda s: s.get("score", 0), reverse=True
+            )
+            if _sigs:
+                _s0 = _sigs[0]
+                _sc = _s0.get("score", 0)
+                if _multi and _bands:
+                    _in = any(b["lo"] <= _sc < b["hi"] for b in _bands)
+                else:
+                    _in = _sc >= float(os.getenv("MEMECOIN_BUY_SCORE_MIN", "65"))
+                if _in:
+                    _best_sig = _s0
+        except Exception:
+            pass
+
+        if not _m_blk and _best_sig:
+            candidates.append({
+                "_rank": 60, "action": "BUY", "system": "MEMECOINS",
+                "symbol": _best_sig.get("symbol"), "priority": "NORMAL",
+                "reason": (
+                    f"All gates pass — {_best_sig.get('symbol')} "
+                    f"score={_best_sig.get('score', 0):.0f} in active band. Auto-buy would fire."
+                ),
+                "blockers": [], "confidence": "high",
+            })
+        elif not _m_blk:
+            candidates.append({
+                "_rank": 20, "action": "WATCH", "system": "MEMECOINS", "symbol": None,
+                "priority": "LOW",
+                "reason": "All system gates open — no signal in active band right now. Check at next scan.",
+                "blockers": [], "confidence": "medium",
+            })
+        elif not _fg_ok:
+            _bstr = ""
+            if _bands:
+                _bstr = " Active bands: " + " + ".join(
+                    f"{b['lo']}-{b['hi']}" for b in _bands[:3]
+                ) + "."
+            candidates.append({
+                "_rank": 15, "action": "WAIT", "system": "MEMECOINS", "symbol": None,
+                "priority": "LOW",
+                "reason": (
+                    f"F&G={_fg_val or '?'} — below {'pilot' if not _dry_run else 'paper'} "
+                    f"gate (>{_fg_thr}). Extreme fear — wait for recovery.{_bstr}"
+                ),
+                "blockers": _m_blk, "confidence": "high",
+            })
+        elif not _auto_buy:
+            candidates.append({
+                "_rank": 8, "action": "WAIT", "system": "MEMECOINS", "symbol": None,
+                "priority": "LOW",
+                "reason": "MEMECOIN_AUTO_BUY=false — scanner in advisory mode, no buys execute.",
+                "blockers": _m_blk, "confidence": "high",
+            })
+        else:
+            candidates.append({
+                "_rank": 10, "action": "HOLD", "system": "MEMECOINS", "symbol": None,
+                "priority": "LOW",
+                "reason": f"Position capacity full ({_open_cnt}/{_max_open}). Wait for resolutions.",
+                "blockers": _m_blk, "confidence": "high",
+            })
+    except Exception as exc:
+        log.debug("next_best_move meme: %s", exc)
+
+    # ── 3. Spot — portfolio gap ────────────────────────────────────────────────
+    try:
+        with get_conn() as _cs:
+            _sr = _cs.execute(
+                "SELECT value FROM kv_store WHERE key='spot_current_signals'"
+            ).fetchone()
+        if _sr:
+            _spot_map = _j.loads(_sr[0])
+            _dca = sorted(
+                [(sym, d) for sym, d in _spot_map.items() if (d.get("portfolio_gap") or 0) > 0],
+                key=lambda x: x[1].get("portfolio_gap", 0), reverse=True,
+            )
+            if _dca:
+                _sym2, _d2 = _dca[0]
+                _gap2 = _d2.get("portfolio_gap", 0)
+                _sig2 = _d2.get("signal_type", "WATCH")
+                candidates.append({
+                    "_rank": 35 if _sig2 == "DCA_NOW" else 12,
+                    "action": "DCA", "system": "SPOT", "symbol": _sym2,
+                    "priority": "NORMAL" if _sig2 == "DCA_NOW" else "LOW",
+                    "reason": (
+                        f"{_sym2} is {_gap2:+.1f}% under target allocation. "
+                        f"Signal: {_sig2}. Manual buy at discretion."
+                    ),
+                    "blockers": ["MANUAL_ONLY"], "confidence": "medium",
+                })
+    except Exception as exc:
+        log.debug("next_best_move spot: %s", exc)
+
+    # ── Rank + assemble ────────────────────────────────────────────────────────
+    candidates.sort(key=lambda c: c["_rank"], reverse=True)
+    for c in candidates:
+        c.pop("_rank", None)
+
+    no_action = not candidates or candidates[0]["action"] == "HOLD"
+
+    if not candidates:
+        best = {
+            "action": "HOLD", "system": None, "symbol": None, "priority": "LOW",
+            "reason": "All systems healthy — no immediate action required. Monitor positions.",
+            "blockers": [], "confidence": "medium",
+        }
+        alts = []
+    else:
+        best = candidates[0]
+        alts = candidates[1:3]
+
+    return {
+        "next_best_move":        best,
+        "alternatives":          alts,
+        "no_action_recommended": no_action,
+        "generated_at":          datetime.now(timezone.utc).isoformat(),
+    }

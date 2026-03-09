@@ -83,8 +83,9 @@ interface ScoreAnalysis {
   optimal_window: { lo: number; hi: number; n: number; wr: number; avg_24h: number } | null
   tuner: {
     min_score: number; max_score: number; confidence: string; sample_size: number; win_rate: number
-    score_bands?: Array<{ lo: number; hi: number; n: number; wr: number; avg_4h: number; expectancy: number }>
+    score_bands?: Array<{ lo: number; hi: number; n: number; wr: number; avg_24h: number; expectancy: number }>
     multi_band_mode?: boolean
+    optimization_horizon?: string
   } | null
   bought_split: {
     bought:     { n: number; avg_score: number; wr: number; avg_24h: number }
@@ -96,7 +97,8 @@ interface ScoreAnalysis {
     bands_4h:           Array<{ lo: number; hi: number; n: number; wr: number; avg_ret: number; expectancy: number }>
     bands_24h:          Array<{ lo: number; hi: number; n: number; wr: number; avg_ret: number; expectancy: number }>
     bands_missed_by_4h: Array<{ lo: number; hi: number; n: number; wr: number; avg_ret: number; expectancy: number }>
-    verdict: { label: 'SWITCH_RECOMMENDED' | 'ALIGNED' | 'INSUFFICIENT_DATA'; message: string }
+    active_horizon?: string
+    verdict: { label: 'SWITCH_RECOMMENDED' | 'ALIGNED' | 'INSUFFICIENT_DATA' | 'ALREADY_SWITCHED' | 'CURRENTLY_OPTIMAL'; message: string }
     error?: string
   }
 }
@@ -448,7 +450,7 @@ function ScoreAnalysisPanel({ sa }: { sa: ScoreAnalysis }) {
               {sa.tuner?.multi_band_mode && sa.tuner.score_bands && sa.tuner.score_bands.length > 0 ? (
                 <div style={{ marginTop: 6 }}>
                   <div style={{ color: 'var(--dim)', fontSize: 7, letterSpacing: '0.08em', ...MONO, marginBottom: 4 }}>
-                    TUNER BANDS (4H-OPTIMIZED)
+                    TUNER BANDS ({sa.tuner.optimization_horizon?.toUpperCase() ?? '24H'}-OPTIMIZED)
                   </div>
                   {sa.tuner.score_bands.map((b, i) => {
                     const bColor = b.wr >= 60 ? '#00d48a' : b.wr >= 50 ? '#f59e0b' : '#8a9ab0'
@@ -463,7 +465,7 @@ function ScoreAnalysisPanel({ sa }: { sa: ScoreAnalysis }) {
                           {b.lo}–{b.hi}
                         </span>
                         <span style={{ color: 'var(--dim)', fontSize: 7, ...MONO }}>
-                          WR {b.wr.toFixed(0)}% · 4h {b.avg_4h >= 0 ? '+' : ''}{b.avg_4h.toFixed(1)}%
+                          WR {b.wr.toFixed(0)}% · 24h {b.avg_24h >= 0 ? '+' : ''}{b.avg_24h.toFixed(1)}%
                         </span>
                       </div>
                     )
@@ -513,25 +515,29 @@ function ScoreAnalysisPanel({ sa }: { sa: ScoreAnalysis }) {
         </div>
       </div>
 
-      {/* Patch 184: Horizon comparison — 4h vs 24h tuner optimization */}
+      {/* P184/P186: Horizon comparison — 4h vs 24h tuner optimization */}
       {sa.horizon_comparison && !sa.horizon_comparison.error && (() => {
         const hc = sa.horizon_comparison!
         const hvLabel  = hc.verdict.label
         const hvColor  = hvLabel === 'SWITCH_RECOMMENDED' ? '#f59e0b'
-          : hvLabel === 'ALIGNED' ? '#00d48a' : '#4a6280'
+          : hvLabel === 'ALREADY_SWITCHED'  ? '#00d48a'
+          : hvLabel === 'CURRENTLY_OPTIMAL' ? '#00d48a'
+          : hvLabel === 'ALIGNED'           ? '#00d48a' : '#4a6280'
+        const activeHz = hc.active_horizon?.toUpperCase() ?? null
         return (
           <div style={{
             marginTop: 12, borderTop: '1px solid rgba(255,255,255,0.05)', paddingTop: 10,
           }}>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
               <span style={{ color: 'var(--dim)', fontSize: 7, letterSpacing: '0.08em', ...MONO }}>
-                TUNER HORIZON COMPARISON · {hc.n_both} dual-outcome samples
+                TUNER HORIZON COMPARISON · {hc.n_both} samples
+                {activeHz && <span style={{ color: '#00d48a', marginLeft: 4 }}>· ACTIVE: {activeHz}</span>}
               </span>
               <span style={{
                 color: hvColor, fontSize: 7, ...MONO, fontWeight: 700,
                 background: `${hvColor}15`, border: `1px solid ${hvColor}30`,
                 borderRadius: 3, padding: '2px 5px',
-              }}>{hvLabel.replace('_', ' ')}</span>
+              }}>{hvLabel.replace(/_/g, ' ')}</span>
             </div>
 
             {/* Side-by-side band columns */}
@@ -545,18 +551,20 @@ function ScoreAnalysisPanel({ sa }: { sa: ScoreAnalysis }) {
                       {hz.toUpperCase()} BANDS ({bList.length})
                     </div>
                     {bList.map((b, i) => {
-                      const isMissed = hz === '24h' && hc.bands_missed_by_4h.some(m => m.lo === b.lo && m.hi === b.hi)
-                      const bColor   = b.wr >= 60 ? '#00d48a' : b.wr >= 50 ? '#f59e0b' : '#8a9ab0'
+                      const isMissed    = hz === '24h' && hc.bands_missed_by_4h.some(m => m.lo === b.lo && m.hi === b.hi)
+                      const alreadyFixed = isMissed && hvLabel === 'ALREADY_SWITCHED'
+                      const missColor   = alreadyFixed ? '#00d48a' : '#f59e0b'
+                      const bColor      = b.wr >= 60 ? '#00d48a' : b.wr >= 50 ? '#f59e0b' : '#8a9ab0'
                       return (
                         <div key={i} style={{
                           display: 'flex', justifyContent: 'space-between', alignItems: 'center',
                           padding: '3px 6px', marginBottom: 2, borderRadius: 3,
-                          background: isMissed ? '#f59e0b10' : 'rgba(255,255,255,0.02)',
-                          border: isMissed ? '1px solid #f59e0b30' : '1px solid transparent',
+                          background: isMissed ? `${missColor}10` : 'rgba(255,255,255,0.02)',
+                          border: isMissed ? `1px solid ${missColor}30` : '1px solid transparent',
                         }}>
                           <span style={{ color: bColor, fontSize: 9, fontWeight: 700, ...MONO }}>
                             {b.lo}–{b.hi}
-                            {isMissed && <span style={{ color: '#f59e0b', fontSize: 7, marginLeft: 3 }}>★</span>}
+                            {isMissed && <span style={{ color: missColor, fontSize: 7, marginLeft: 3 }}>{alreadyFixed ? '✓' : '★'}</span>}
                           </span>
                           <span style={{ color: 'var(--dim)', fontSize: 7, ...MONO }}>
                             WR {b.wr.toFixed(0)}% · {hz === '4h' ? '4h' : '24h'} {b.avg_ret >= 0 ? '+' : ''}{b.avg_ret.toFixed(1)}%

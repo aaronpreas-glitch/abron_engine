@@ -253,6 +253,467 @@ function FundingPanel({ data, loading }: { data: FundingData | undefined; loadin
   )
 }
 
+// ── Next Best Move Types ──────────────────────────────────────────────────────
+
+interface NBMCandidate {
+  action:     string
+  system:     string | null
+  symbol:     string | null
+  priority:   string
+  reason:     string
+  blockers:   string[]
+  confidence: string
+}
+
+interface NBMData {
+  next_best_move:        NBMCandidate
+  alternatives:          NBMCandidate[]
+  no_action_recommended: boolean
+  generated_at:          string | null
+  error?:                string
+}
+
+// ── Next Best Move colors ─────────────────────────────────────────────────────
+
+const ACTION_COLOR: Record<string, string> = {
+  MANAGE: 'var(--red)',
+  BUY:    'var(--green)',
+  DCA:    '#f59e0b',
+  WATCH:  '#60a5fa',
+  WAIT:   'var(--dim)',
+  HOLD:   'var(--dim)',
+}
+
+const PRIORITY_COLOR: Record<string, string> = {
+  URGENT: 'var(--red)',
+  NORMAL: 'var(--green)',
+  LOW:    'var(--dim)',
+}
+
+const SYS_COLOR: Record<string, string> = {
+  PERP:      'var(--green)',
+  MEMECOINS: '#60a5fa',
+  SPOT:      '#f59e0b',
+}
+
+// ── Next Best Move Panel ──────────────────────────────────────────────────────
+
+function NextBestMovePanel({ data, loading }: { data: NBMData | undefined; loading: boolean }) {
+  const nbm    = data?.next_best_move
+  const alts   = data?.alternatives ?? []
+  const aColor = nbm ? (ACTION_COLOR[nbm.action] ?? 'rgba(255,255,255,0.15)') : 'rgba(255,255,255,0.15)'
+
+  return (
+    <div style={{
+      background:           'rgba(255,255,255,0.02)',
+      border:               '1px solid rgba(255,255,255,0.10)',
+      borderTop:            `2px solid ${aColor}`,
+      borderRadius:         '0 0 12px 12px',
+      backdropFilter:       'blur(20px) saturate(160%)',
+      WebkitBackdropFilter: 'blur(20px) saturate(160%)',
+      overflow:             'hidden',
+    }}>
+
+      {/* Header */}
+      <div style={{
+        padding: '9px 16px 7px',
+        borderBottom: '1px solid rgba(255,255,255,0.06)',
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+      }}>
+        <span style={{
+          color: 'var(--text2)', fontFamily: 'JetBrains Mono, monospace',
+          fontWeight: 700, fontSize: 10, letterSpacing: '0.14em',
+        }}>NEXT BEST MOVE</span>
+        <span style={{ color: 'var(--dim)', fontFamily: 'JetBrains Mono, monospace', fontSize: 9 }}>
+          {data?.generated_at ? fmtAge(data.generated_at.slice(0, 19)) : (loading ? '…' : '—')} · P190
+        </span>
+      </div>
+
+      {/* Top recommendation */}
+      {loading && !nbm && (
+        <div style={{ padding: '12px 16px', color: 'var(--dim)', fontFamily: 'JetBrains Mono, monospace', fontSize: 10 }}>
+          loading…
+        </div>
+      )}
+      {data?.error && (
+        <div style={{ padding: '12px 16px', color: 'var(--red)', fontFamily: 'JetBrains Mono, monospace', fontSize: 10 }}>
+          {data.error}
+        </div>
+      )}
+      {nbm && !data?.error && (
+        <div style={{ padding: '12px 16px', display: 'flex', alignItems: 'flex-start', gap: 14, flexWrap: 'wrap' }}>
+
+          {/* Action */}
+          <span style={{
+            fontFamily: 'JetBrains Mono, monospace', fontWeight: 700, fontSize: 18,
+            color: aColor, flexShrink: 0, minWidth: 64, lineHeight: 1,
+            paddingTop: 1,
+          }}>
+            {nbm.action}
+          </span>
+
+          {/* Detail block */}
+          <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 5 }}>
+
+            {/* System · symbol · priority chips */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 5, flexWrap: 'wrap' }}>
+              {nbm.system && (
+                <span className="badge" style={{
+                  fontSize: 8,
+                  color: SYS_COLOR[nbm.system] ?? 'var(--dim)',
+                  background: `${SYS_COLOR[nbm.system] ?? 'var(--dim)'}18`,
+                  border: `1px solid ${SYS_COLOR[nbm.system] ?? 'var(--dim)'}44`,
+                }}>
+                  {nbm.system}
+                </span>
+              )}
+              {nbm.symbol && (
+                <span style={{
+                  fontFamily: 'JetBrains Mono, monospace', fontWeight: 600,
+                  fontSize: 12, color: 'var(--text2)',
+                }}>
+                  {nbm.symbol}
+                </span>
+              )}
+              <span className="badge" style={{
+                fontSize: 8,
+                color: PRIORITY_COLOR[nbm.priority] ?? 'var(--dim)',
+                background: `${PRIORITY_COLOR[nbm.priority] ?? 'rgba(255,255,255,0.05)'}18`,
+                border: `1px solid ${PRIORITY_COLOR[nbm.priority] ?? 'var(--dim)'}44`,
+              }}>
+                {nbm.priority}
+              </span>
+            </div>
+
+            {/* Reason */}
+            <span style={{
+              fontFamily: 'JetBrains Mono, monospace', fontSize: 10,
+              color: 'var(--text2)', lineHeight: 1.55,
+            }}>
+              {nbm.reason}
+            </span>
+
+            {/* Blocker pills */}
+            {nbm.blockers.length > 0 && (
+              <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+                {nbm.blockers.map(b => (
+                  <span key={b} className="badge" style={{
+                    fontSize: 8,
+                    color: 'var(--red)',
+                    background: 'rgba(239,68,68,0.07)',
+                    border: '1px solid rgba(239,68,68,0.22)',
+                  }}>{b}</span>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Alternatives row */}
+      {alts.length > 0 && (
+        <div style={{
+          borderTop: '1px solid rgba(255,255,255,0.05)',
+          padding: '5px 16px 8px',
+          display: 'flex', alignItems: 'center', gap: 20, flexWrap: 'wrap',
+        }}>
+          <span style={{
+            fontFamily: 'JetBrains Mono, monospace', fontSize: 8,
+            color: 'var(--dim)', letterSpacing: '0.1em', flexShrink: 0,
+          }}>ALT</span>
+          {alts.map((alt, i) => (
+            <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+              <span style={{
+                fontFamily: 'JetBrains Mono, monospace', fontWeight: 700,
+                fontSize: 10, color: ACTION_COLOR[alt.action] ?? 'var(--dim)',
+              }}>
+                {alt.action}
+              </span>
+              {alt.system && (
+                <span style={{
+                  fontFamily: 'JetBrains Mono, monospace', fontSize: 9,
+                  color: SYS_COLOR[alt.system] ?? 'var(--dim)',
+                }}>
+                  {alt.system}
+                </span>
+              )}
+              {alt.symbol && (
+                <span style={{
+                  fontFamily: 'JetBrains Mono, monospace', fontSize: 9, color: 'var(--text2)',
+                }}>
+                  {alt.symbol}
+                </span>
+              )}
+              <span style={{
+                fontFamily: 'JetBrains Mono, monospace', fontSize: 8,
+                color: 'var(--dim)',
+                maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+              }}>
+                — {alt.reason}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── Top Buys Types ────────────────────────────────────────────────────────────
+
+interface TopCandidate {
+  symbol:          string
+  score:           number
+  status:          'BUY_NOW' | 'WATCH' | 'BLOCKED'
+  blockers:        string[]
+  signal_blockers: string[]
+  rug_label:       string
+  buy_pressure:    number
+  narrative:       string | null
+  scanned_at:      string | null
+}
+
+interface TopCandidatesData {
+  candidates:      TopCandidate[]
+  signal_count:    number
+  open_count:      number
+  max_open:        number
+  dry_run:         boolean
+  auto_buy:        boolean
+  fg_value:        number | null
+  fg_favorable:    boolean
+  multi_band_mode: boolean
+  active_bands:    { lo: number; hi: number; wr: number | null }[]
+  sys_blockers:    string[]
+  error?:          string
+}
+
+interface SpotSignalEntry {
+  signal_type:   string
+  score:         number
+  portfolio_gap: number
+}
+
+interface SpotSignalsData {
+  signals:            Record<string, SpotSignalEntry>
+  signals_updated_at: string | null
+  learning: {
+    total:           number
+    complete:        number
+    tuner_threshold: number
+    complete_pct:    number
+    confidence:      string
+  }
+}
+
+// ── Top Buys Panel ────────────────────────────────────────────────────────────
+
+const STATUS_COLOR: Record<string, string> = {
+  BUY_NOW: 'var(--green)',
+  WATCH:   '#f59e0b',
+  BLOCKED: 'var(--dim)',
+}
+
+const SPOT_SIGNAL_COLOR: Record<string, string> = {
+  DCA_NOW: 'var(--green)',
+  WATCH:   '#f59e0b',
+  HOLD:    'var(--dim)',
+  AVOID:   'var(--red)',
+}
+
+function TopBuysPanel({
+  meme,
+  spot,
+}: {
+  meme: TopCandidatesData | undefined
+  spot: SpotSignalsData | undefined
+}) {
+  const spotEntries = spot?.signals
+    ? Object.entries(spot.signals)
+        .map(([sym, s]) => ({ sym, ...s }))
+        .sort((a, b) => (b.portfolio_gap ?? 0) - (a.portfolio_gap ?? 0))
+        .slice(0, 6)
+    : []
+
+  const memeCands = (meme?.candidates ?? []).slice(0, 6)
+
+  const rowStyle = {
+    display: 'flex', alignItems: 'center', gap: 6,
+    padding: '3px 0', borderBottom: '1px solid rgba(255,255,255,0.04)',
+  }
+
+  return (
+    <div style={{
+      background:           'rgba(255,255,255,0.015)',
+      border:               '1px solid rgba(255,255,255,0.08)',
+      borderTop:            '2px solid rgba(255,255,255,0.08)',
+      borderRadius:         '0 0 12px 12px',
+      backdropFilter:       'blur(20px) saturate(160%)',
+      WebkitBackdropFilter: 'blur(20px) saturate(160%)',
+      overflow:             'hidden',
+    }}>
+
+      {/* Panel header */}
+      <div style={{
+        padding:        '10px 16px 8px',
+        borderBottom:   '1px solid rgba(255,255,255,0.06)',
+        display:        'flex',
+        alignItems:     'center',
+        justifyContent: 'space-between',
+      }}>
+        <span style={{
+          color:       'var(--text2)',
+          fontFamily:  'JetBrains Mono, monospace',
+          fontWeight:  700, fontSize: 10, letterSpacing: '0.14em',
+        }}>TOP BUYS</span>
+        <span style={{
+          color:      'var(--dim)',
+          fontFamily: 'JetBrains Mono, monospace',
+          fontSize:   9,
+        }}>DECISION SUPPORT · P189</span>
+      </div>
+
+      {/* Two-column body */}
+      <div style={{ display: 'flex', minHeight: 100 }}>
+
+        {/* Left: Memecoins */}
+        <div style={{ flex: 1, padding: '10px 16px', minWidth: 0 }}>
+          <div style={{
+            color: '#60a5fa', fontFamily: 'JetBrains Mono, monospace',
+            fontWeight: 700, fontSize: 9, letterSpacing: '0.12em', marginBottom: 6,
+          }}>MEMECOINS</div>
+
+          {/* Context badges */}
+          <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap', marginBottom: 6 }}>
+            {meme && (
+              <>
+                <span className="badge" style={{
+                  fontSize: 8,
+                  color:      meme.dry_run ? 'var(--amber)' : 'var(--green)',
+                  background: meme.dry_run ? 'rgba(245,158,11,0.1)' : 'rgba(0,212,138,0.1)',
+                  border: `1px solid ${meme.dry_run ? 'rgba(245,158,11,0.3)' : 'rgba(0,212,138,0.3)'}`,
+                }}>{meme.dry_run ? 'PAPER' : 'LIVE'}</span>
+                <span className="badge" style={{ fontSize: 8, color: 'var(--dim)' }}>
+                  {meme.open_count}/{meme.max_open} pos
+                </span>
+                {meme.fg_value != null && (
+                  <span className="badge" style={{
+                    fontSize:   8,
+                    color:      meme.fg_favorable ? 'var(--green)' : 'var(--red)',
+                    background: meme.fg_favorable ? 'rgba(0,212,138,0.08)' : 'rgba(239,68,68,0.08)',
+                    border: `1px solid ${meme.fg_favorable ? 'rgba(0,212,138,0.25)' : 'rgba(239,68,68,0.25)'}`,
+                  }}>F&G={meme.fg_value}</span>
+                )}
+                {meme.multi_band_mode && meme.active_bands.length > 0 && (
+                  <span className="badge" style={{ fontSize: 8, color: '#60a5fa' }}>
+                    {meme.active_bands.map(b => `${b.lo}–${b.hi}`).join(' + ')}
+                  </span>
+                )}
+              </>
+            )}
+          </div>
+
+          {/* Candidates */}
+          {!meme && (
+            <div style={{ color: 'var(--dim)', fontFamily: 'JetBrains Mono, monospace', fontSize: 10 }}>loading…</div>
+          )}
+          {meme?.error && (
+            <div style={{ color: 'var(--red)', fontFamily: 'JetBrains Mono, monospace', fontSize: 10 }}>{meme.error}</div>
+          )}
+          {meme && !meme.error && meme.signal_count === 0 && (
+            <div style={{ color: 'var(--dim)', fontFamily: 'JetBrains Mono, monospace', fontSize: 10 }}>
+              scanner cache empty — waiting for next scan
+            </div>
+          )}
+          {meme && !meme.error && meme.signal_count > 0 && memeCands.length === 0 && (
+            <div style={{ color: 'var(--dim)', fontFamily: 'JetBrains Mono, monospace', fontSize: 10 }}>
+              {meme.signal_count} signal(s) — none reach candidate threshold
+            </div>
+          )}
+          {memeCands.map(c => (
+            <div key={c.symbol} style={rowStyle}>
+              <span style={{
+                fontFamily: 'JetBrains Mono, monospace', fontSize: 8, fontWeight: 700,
+                color: STATUS_COLOR[c.status] ?? 'var(--dim)', minWidth: 54, flexShrink: 0,
+              }}>{c.status}</span>
+              <span style={{
+                fontFamily: 'JetBrains Mono, monospace', fontWeight: 600,
+                fontSize: 12, color: 'var(--text2)', flex: 1,
+              }}>{c.symbol}</span>
+              <span style={{ fontFamily: 'JetBrains Mono, monospace', fontSize: 10, color: 'var(--muted)' }}>
+                {c.score.toFixed(0)}
+              </span>
+              {c.signal_blockers.length > 0 && (
+                <span style={{
+                  fontFamily: 'JetBrains Mono, monospace', fontSize: 8, color: 'var(--dim)',
+                  maxWidth: 90, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                }}>{c.signal_blockers[0]}</span>
+              )}
+            </div>
+          ))}
+        </div>
+
+        {/* Divider */}
+        <div style={{ width: 1, background: 'rgba(255,255,255,0.07)', flexShrink: 0 }} />
+
+        {/* Right: Spot */}
+        <div style={{ flex: 1, padding: '10px 16px', minWidth: 0 }}>
+          <div style={{
+            color: '#f59e0b', fontFamily: 'JetBrains Mono, monospace',
+            fontWeight: 700, fontSize: 9, letterSpacing: '0.12em', marginBottom: 6,
+          }}>SPOT ACCUMULATION</div>
+
+          {/* Context badges */}
+          <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap', marginBottom: 6 }}>
+            {spot && (
+              <>
+                <span className="badge" style={{ fontSize: 8, color: 'var(--amber)' }}>MANUAL BUYS</span>
+                <span className="badge" style={{ fontSize: 8, color: 'var(--dim)' }}>
+                  {Object.keys(spot.signals).length} tokens
+                </span>
+                {spot.signals_updated_at && (
+                  <span className="badge" style={{ fontSize: 8, color: 'var(--dim)' }}>
+                    {fmtAge(spot.signals_updated_at)}
+                  </span>
+                )}
+              </>
+            )}
+          </div>
+
+          {/* Signals */}
+          {!spot && (
+            <div style={{ color: 'var(--dim)', fontFamily: 'JetBrains Mono, monospace', fontSize: 10 }}>loading…</div>
+          )}
+          {spot && spotEntries.length === 0 && (
+            <div style={{ color: 'var(--dim)', fontFamily: 'JetBrains Mono, monospace', fontSize: 10 }}>no basket tokens</div>
+          )}
+          {spotEntries.map(entry => (
+            <div key={entry.sym} style={rowStyle}>
+              <span style={{
+                fontFamily: 'JetBrains Mono, monospace', fontSize: 8, fontWeight: 700,
+                color: SPOT_SIGNAL_COLOR[entry.signal_type] ?? 'var(--dim)',
+                minWidth: 54, flexShrink: 0,
+              }}>{entry.signal_type}</span>
+              <span style={{
+                fontFamily: 'JetBrains Mono, monospace', fontWeight: 600,
+                fontSize: 12, color: 'var(--text2)', flex: 1,
+              }}>{entry.sym}</span>
+              <span style={{
+                fontFamily: 'JetBrains Mono, monospace', fontSize: 10,
+                color: entry.portfolio_gap > 0 ? 'var(--green)'
+                     : entry.portfolio_gap < 0 ? 'var(--red)'
+                     : 'var(--dim)',
+              }}>
+                {entry.portfolio_gap > 0 ? '+' : ''}{entry.portfolio_gap.toFixed(1)}%
+              </span>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 export function HomePage() {
@@ -268,6 +729,27 @@ export function HomePage() {
     queryFn:  () => api.get('/funding/current').then(r => r.data),
     refetchInterval: 120_000,
     staleTime: 60_000,
+  })
+
+  const nbmQ = useQuery<NBMData>({
+    queryKey: ['home-next-best-move'],
+    queryFn:  () => api.get('/home/next-best-move').then(r => r.data),
+    refetchInterval: 30_000,
+    staleTime:       15_000,
+  })
+
+  const topCandQ = useQuery<TopCandidatesData>({
+    queryKey: ['meme-top-candidates'],
+    queryFn:  () => api.get('/memecoins/top-candidates').then(r => r.data),
+    refetchInterval: 30_000,
+    staleTime:       15_000,
+  })
+
+  const spotSigsQ = useQuery<SpotSignalsData>({
+    queryKey: ['spot-signals'],
+    queryFn:  () => api.get('/spot/signals').then(r => r.data),
+    refetchInterval: 60_000,
+    staleTime:       30_000,
   })
 
   const s       = summary.data
@@ -302,6 +784,9 @@ export function HomePage() {
           all systems · real-time status
         </span>
       </div>
+
+      {/* ── Next Best Move ───────────────────────────────────────────────── */}
+      <NextBestMovePanel data={nbmQ.data} loading={nbmQ.isLoading} />
 
       {/* ── 4 System Cards ──────────────────────────────────────────────── */}
       <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
@@ -374,6 +859,9 @@ export function HomePage() {
         </SystemCard>
 
       </div>
+
+      {/* ── Top Buys ─────────────────────────────────────────────────────── */}
+      <TopBuysPanel meme={topCandQ.data} spot={spotSigsQ.data} />
 
       {/* ── Market Conditions ────────────────────────────────────────────── */}
       <FundingPanel data={fundingQ.data} loading={fundingQ.isLoading} />
