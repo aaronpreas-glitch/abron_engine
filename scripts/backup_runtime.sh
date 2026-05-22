@@ -17,6 +17,7 @@ if [[ -f "$ENGINE_ROOT/data_storage/engine.db" ]]; then
     cp "$ENGINE_ROOT/data_storage/engine.db" "$DEST/engine.db"
   fi
   gzip -1f "$DEST/engine.db"
+  chmod 600 "$DEST/engine.db.gz"
 fi
 
 if [[ -f "$ENGINE_ROOT/.env" ]]; then
@@ -26,6 +27,7 @@ fi
 
 if [[ -d "$ENGINE_ROOT/logs" ]]; then
   tar -C "$ENGINE_ROOT" -czf "$DEST/logs.tgz" logs
+  chmod 600 "$DEST/logs.tgz"
 fi
 
 find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d -mtime +"$RETENTION_DAYS" -exec rm -rf {} +
