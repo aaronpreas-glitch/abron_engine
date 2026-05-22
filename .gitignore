@@ -24,6 +24,10 @@ data_storage/*.jsonl
 logs/
 *.log
 engine_state.json
+backups/
+tmp_diag_sync/
+Users/
+*.bak_*
 
 # Keys / secrets
 *.pem
