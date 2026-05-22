@@ -21,6 +21,7 @@ build/
 *.sqlite3
 data_storage/*.json
 data_storage/*.jsonl
+data_storage/*.session
 logs/
 *.log
 engine_state.json
@@ -28,6 +29,7 @@ backups/
 tmp_diag_sync/
 Users/
 *.bak_*
+*.bak
 
 # Keys / secrets
 *.pem
