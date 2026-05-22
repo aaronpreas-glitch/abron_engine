@@ -28,7 +28,7 @@ _JUP_V1_POS = "https://perps-api.jup.ag/v1/positions"
 _HOME_SHORT_CACHE_TTL_SECONDS = float(os.getenv("HOME_SHORT_CACHE_TTL_SECONDS", "15"))
 _ACTION_BOARD_OVERLAY_TIMEOUT_SECONDS = max(
     0.5,
-    float(os.getenv("HOME_ACTION_BOARD_OVERLAY_TIMEOUT_SECONDS", "3.0")),
+    float(os.getenv("HOME_ACTION_BOARD_OVERLAY_TIMEOUT_SECONDS", "0.5")),
 )
 _GOOD_BUY_BATCH_ENRICH_LIMIT = max(3, int(os.getenv("GOOD_BUY_BATCH_ENRICH_LIMIT", "20")))
 _CONFLICT_REVIEW_STALE_HOURS = max(1.0, float(os.getenv("GOOD_BUY_CONFLICT_REVIEW_STALE_HOURS", "6")))
@@ -5416,7 +5416,7 @@ async def get_home_ai_analyst(
             _build,
             fresh_s=max(120, int(max_age_minutes) * 60),
             stale_s=7200,
-            wait_timeout_s=3,
+            wait_timeout_s=0.25,
         )
     except Exception as exc:
         return {
@@ -15464,17 +15464,6 @@ async def home_action_board(_: str = Depends(get_current_user), limit: int = 5):
                 )
             except Exception:
                 return _action_board_stale_payload(payload, detail="Cached action-board schema is older than the current frontend.")
-        if (
-            isinstance(payload, dict)
-            and str(((payload.get("_snapshot") or {}).get("status") or "")).upper() == "STALE"
-        ):
-            try:
-                return await _aio.wait_for(
-                    _aio.to_thread(_build_action_board_fast_payload, limit, payload),
-                    timeout=_ACTION_BOARD_OVERLAY_TIMEOUT_SECONDS,
-                )
-            except Exception:
-                return _action_board_stale_payload(payload, detail="Fast decision overlay timed out; serving stale snapshot.")
         return payload
     except Exception as exc:
         try:
