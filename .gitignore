@@ -9,6 +9,7 @@ dist/
 build/
 .eggs/
 *.egg
+**/.venv/
 
 # Environment
 .env
@@ -22,6 +23,7 @@ build/
 data_storage/*.json
 data_storage/*.jsonl
 data_storage/*.session
+data_storage/*.session-journal
 logs/
 *.log
 engine_state.json
