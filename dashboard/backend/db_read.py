@@ -275,6 +275,35 @@ def get_outcome_recap(lookback_hours: int = 48, limit: int = 15) -> list[dict]:
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=max(1, int(lookback_hours)))).isoformat()
     try:
         with _ro_conn() as conn:
+            recent_memecoin = conn.execute(
+                """
+                SELECT COUNT(*) AS n
+                FROM memecoin_signal_outcomes
+                WHERE datetime(scanned_at) >= datetime(?)
+                  AND (return_1h_pct IS NOT NULL OR return_4h_pct IS NOT NULL OR return_24h_pct IS NOT NULL)
+                """,
+                (cutoff,),
+            ).fetchone()
+            if int(recent_memecoin["n"] or 0) > 0:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        symbol,
+                        COUNT(*) AS alerts,
+                        AVG(return_1h_pct) AS avg_1h,
+                        AVG(return_4h_pct) AS avg_4h,
+                        AVG(return_24h_pct) AS avg_24h,
+                        SUM(CASE WHEN return_4h_pct > 0 THEN 1 ELSE 0 END) AS wins_4h,
+                        SUM(CASE WHEN return_4h_pct IS NOT NULL THEN 1 ELSE 0 END) AS n_4h
+                    FROM memecoin_signal_outcomes
+                    WHERE datetime(scanned_at) >= datetime(?)
+                    GROUP BY symbol
+                    ORDER BY alerts DESC, COALESCE(avg_4h, -9999) DESC
+                    LIMIT ?
+                    """,
+                    (cutoff, max(1, int(limit))),
+                ).fetchall()
+                return [dict(r) for r in rows]
             rows = conn.execute(
                 """
                 SELECT
@@ -329,6 +358,7 @@ def get_leaderboard(lookback_hours: int = 24, limit: int = 20) -> list[dict]:
 def get_outcome_winrates(lookback_days: int = 7) -> dict[str, Any]:
     cutoff = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).isoformat()
     with _ro_conn() as conn:
+        source = "alert_outcomes"
         row = conn.execute(
             """
             SELECT
@@ -341,14 +371,35 @@ def get_outcome_winrates(lookback_days: int = 7) -> dict[str, Any]:
                 COUNT(return_24h_pct) AS n24,
                 COALESCE(AVG(return_24h_pct), 0) AS avg24,
                 COALESCE(SUM(CASE WHEN return_24h_pct > 0 THEN 1 ELSE 0 END), 0) AS w24
-            FROM alert_outcomes
-            WHERE created_ts_utc >= ?
+            FROM memecoin_signal_outcomes
+            WHERE datetime(scanned_at) >= datetime(?)
             """,
             (cutoff,),
         ).fetchone()
+        if row and (int(row["n1"] or 0) or int(row["n4"] or 0) or int(row["n24"] or 0)):
+            source = "memecoin_signal_outcomes"
+        else:
+            row = conn.execute(
+                """
+                SELECT
+                    COUNT(return_1h_pct) AS n1,
+                    COALESCE(AVG(return_1h_pct), 0) AS avg1,
+                    COALESCE(SUM(CASE WHEN return_1h_pct > 0 THEN 1 ELSE 0 END), 0) AS w1,
+                    COUNT(return_4h_pct) AS n4,
+                    COALESCE(AVG(return_4h_pct), 0) AS avg4,
+                    COALESCE(SUM(CASE WHEN return_4h_pct > 0 THEN 1 ELSE 0 END), 0) AS w4,
+                    COUNT(return_24h_pct) AS n24,
+                    COALESCE(AVG(return_24h_pct), 0) AS avg24,
+                    COALESCE(SUM(CASE WHEN return_24h_pct > 0 THEN 1 ELSE 0 END), 0) AS w24
+                FROM alert_outcomes
+                WHERE created_ts_utc >= ?
+                """,
+                (cutoff,),
+            ).fetchone()
     n1, n4, n24 = int(row["n1"]), int(row["n4"]), int(row["n24"])
     return {
         "lookback_days": lookback_days,
+        "source": source,
         "outcomes_1h": {"n": n1, "wins": int(row["w1"]), "avg": float(row["avg1"]), "win_rate": (float(row["w1"]) / n1 * 100) if n1 else 0.0},
         "outcomes_4h": {"n": n4, "wins": int(row["w4"]), "avg": float(row["avg4"]), "win_rate": (float(row["w4"]) / n4 * 100) if n4 else 0.0},
         "outcomes_24h": {"n": n24, "wins": int(row["w24"]), "avg": float(row["avg24"]), "win_rate": (float(row["w24"]) / n24 * 100) if n24 else 0.0},

@@ -5397,12 +5397,35 @@ async def get_home_ai_analyst(
     window_days: int = 90,
 ):
     """Latest advisory memo from the runtime-owned AI analyst service."""
-    from utils.ai_analyst import get_or_refresh_ai_analyst_snapshot
+    key = f"home:ai-analyst:{max(30, int(max_age_minutes))}:{max(7, int(window_days))}"
 
-    return await get_or_refresh_ai_analyst_snapshot(
-        max_age_minutes=max(30, int(max_age_minutes)),
-        window_days=max(7, int(window_days)),
-    )
+    def _build() -> dict:
+        from utils.ai_analyst import get_or_refresh_ai_analyst_snapshot
+        import asyncio as _asyncio
+        import inspect as _inspect
+
+        result = get_or_refresh_ai_analyst_snapshot(
+            max_age_minutes=max(30, int(max_age_minutes)),
+            window_days=max(7, int(window_days)),
+        )
+        return _asyncio.run(result) if _inspect.isawaitable(result) else result
+
+    try:
+        return await snapshot_or_build(
+            key,
+            _build,
+            fresh_s=max(120, int(max_age_minutes) * 60),
+            stale_s=7200,
+            wait_timeout_s=3,
+        )
+    except Exception as exc:
+        return {
+            **_warming_snapshot(key),
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "status": "WARMING",
+            "summary": "AI analyst snapshot is warming.",
+            "detail": str(exc),
+        }
 
 
 def _tiers_summary(root: str) -> dict:

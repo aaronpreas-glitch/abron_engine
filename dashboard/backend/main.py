@@ -2395,27 +2395,48 @@ async def signals_calibration(
     conn.row_factory = _sqlite3.Row
     cutoff = f"datetime('now', '-{lookback_days} days')"
     try:
+        source = "memecoin_signal_outcomes"
         rows = conn.execute(f"""
             SELECT
-                CAST(ROUND(s.score_total / 5) * 5 AS INTEGER) AS band_mid,
+                CAST(ROUND(score / 5) * 5 AS INTEGER) AS band_mid,
                 COUNT(*)                        AS n,
-                AVG(o.return_1h_pct)            AS avg_1h,
-                AVG(o.return_4h_pct)            AS avg_4h,
-                AVG(o.return_24h_pct)           AS avg_24h,
-                SUM(CASE WHEN o.return_1h_pct  > 0 THEN 1 ELSE 0 END) * 100.0 / COUNT(*) AS wr_1h,
-                SUM(CASE WHEN o.return_4h_pct  > 0 THEN 1 ELSE 0 END) * 100.0 / COUNT(*) AS wr_4h,
-                SUM(CASE WHEN o.return_24h_pct > 0 THEN 1 ELSE 0 END) * 100.0 / COUNT(*) AS wr_24h
-            FROM signals s
-            INNER JOIN alert_outcomes o
-                ON  o.symbol = s.symbol
-                AND ABS(JULIANDAY(o.created_ts_utc) - JULIANDAY(s.ts_utc)) < 0.02
-            WHERE s.ts_utc >= {cutoff}
-              AND s.score_total IS NOT NULL
-              AND o.return_4h_pct IS NOT NULL
+                AVG(return_1h_pct)              AS avg_1h,
+                AVG(return_4h_pct)              AS avg_4h,
+                AVG(return_24h_pct)             AS avg_24h,
+                SUM(CASE WHEN return_1h_pct  > 0 THEN 1 ELSE 0 END) * 100.0 / COUNT(*) AS wr_1h,
+                SUM(CASE WHEN return_4h_pct  > 0 THEN 1 ELSE 0 END) * 100.0 / COUNT(*) AS wr_4h,
+                SUM(CASE WHEN return_24h_pct > 0 THEN 1 ELSE 0 END) * 100.0 / COUNT(*) AS wr_24h
+            FROM memecoin_signal_outcomes
+            WHERE datetime(scanned_at) >= {cutoff}
+              AND score IS NOT NULL
+              AND return_4h_pct IS NOT NULL
             GROUP BY band_mid
             HAVING n >= 3
             ORDER BY band_mid ASC
         """).fetchall()
+        if not rows:
+            source = "alert_outcomes"
+            rows = conn.execute(f"""
+                SELECT
+                    CAST(ROUND(s.score_total / 5) * 5 AS INTEGER) AS band_mid,
+                    COUNT(*)                        AS n,
+                    AVG(o.return_1h_pct)            AS avg_1h,
+                    AVG(o.return_4h_pct)            AS avg_4h,
+                    AVG(o.return_24h_pct)           AS avg_24h,
+                    SUM(CASE WHEN o.return_1h_pct  > 0 THEN 1 ELSE 0 END) * 100.0 / COUNT(*) AS wr_1h,
+                    SUM(CASE WHEN o.return_4h_pct  > 0 THEN 1 ELSE 0 END) * 100.0 / COUNT(*) AS wr_4h,
+                    SUM(CASE WHEN o.return_24h_pct > 0 THEN 1 ELSE 0 END) * 100.0 / COUNT(*) AS wr_24h
+                FROM signals s
+                INNER JOIN alert_outcomes o
+                    ON  o.symbol = s.symbol
+                    AND ABS(JULIANDAY(o.created_ts_utc) - JULIANDAY(s.ts_utc)) < 0.02
+                WHERE s.ts_utc >= {cutoff}
+                  AND s.score_total IS NOT NULL
+                  AND o.return_4h_pct IS NOT NULL
+                GROUP BY band_mid
+                HAVING n >= 3
+                ORDER BY band_mid ASC
+            """).fetchall()
 
         # Find the optimal threshold (band_mid with best wr_4h and positive avg_4h)
         bands = [dict(r) for r in rows]
@@ -2435,6 +2456,7 @@ async def signals_calibration(
             "optimal_avg_4h": round(best_band["avg_4h"], 2) if best_band else None,
             "lookback_days": lookback_days,
             "total_outcomes": sum(b["n"] for b in bands),
+            "source": source,
         }
     finally:
         conn.close()

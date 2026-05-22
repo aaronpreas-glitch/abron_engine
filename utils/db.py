@@ -2984,6 +2984,7 @@ def get_weekly_tuning_report(
         )
         blocked_regime_scores = [float(row["regime_score"]) for row in cur.fetchall()]
 
+        outcome_source = "memecoin_signal_outcomes"
         cur.execute(
             """
             SELECT
@@ -2996,12 +2997,32 @@ def get_weekly_tuning_report(
                 COUNT(return_24h_pct) AS n24,
                 COALESCE(AVG(return_24h_pct), 0) AS avg24,
                 COALESCE(SUM(CASE WHEN return_24h_pct > 0 THEN 1 ELSE 0 END), 0) AS w24
-            FROM alert_outcomes
-            WHERE created_ts_utc >= ?
+            FROM memecoin_signal_outcomes
+            WHERE datetime(scanned_at) >= datetime(?)
             """,
             (cutoff_iso,),
         )
         out_row = cur.fetchone()
+        if not out_row or not int(out_row["n4"] or 0):
+            outcome_source = "alert_outcomes"
+            cur.execute(
+                """
+                SELECT
+                    COUNT(return_1h_pct) AS n1,
+                    COALESCE(AVG(return_1h_pct), 0) AS avg1,
+                    COALESCE(SUM(CASE WHEN return_1h_pct > 0 THEN 1 ELSE 0 END), 0) AS w1,
+                    COUNT(return_4h_pct) AS n4,
+                    COALESCE(AVG(return_4h_pct), 0) AS avg4,
+                    COALESCE(SUM(CASE WHEN return_4h_pct > 0 THEN 1 ELSE 0 END), 0) AS w4,
+                    COUNT(return_24h_pct) AS n24,
+                    COALESCE(AVG(return_24h_pct), 0) AS avg24,
+                    COALESCE(SUM(CASE WHEN return_24h_pct > 0 THEN 1 ELSE 0 END), 0) AS w24
+                FROM alert_outcomes
+                WHERE created_ts_utc >= ?
+                """,
+                (cutoff_iso,),
+            )
+            out_row = cur.fetchone()
 
     alert_rate = (alerts / scan_runs * 100.0) if scan_runs else 0.0
     block_rate = (regime_blocks / scan_runs * 100.0) if scan_runs else 0.0
@@ -3027,7 +3048,7 @@ def get_weekly_tuning_report(
 
     # Outcome-first tuning (4h is primary signal quality window).
     optimizer = None
-    if outcomes_4h_count >= min_outcomes_4h:
+    if outcome_source == "alert_outcomes" and outcomes_4h_count >= min_outcomes_4h:
         optimizer = optimize_thresholds_from_outcomes(
             lookback_days=lookback_days,
             min_outcomes_4h=min_outcomes_4h,
@@ -3098,6 +3119,7 @@ def get_weekly_tuning_report(
         "outcomes_1h_count": outcomes_1h_count,
         "outcomes_4h_count": outcomes_4h_count,
         "outcomes_24h_count": outcomes_24h_count,
+        "outcome_source": outcome_source,
         "avg_return_1h": avg_return_1h,
         "avg_return_4h": avg_return_4h,
         "avg_return_24h": avg_return_24h,
