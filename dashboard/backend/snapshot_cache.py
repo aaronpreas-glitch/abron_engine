@@ -164,10 +164,16 @@ async def _refresh_snapshot(name: str, builder: Callable[[], Any]) -> None:
         _last_refresh_started[name] = time.monotonic()
         try:
             result = await asyncio.to_thread(builder)
-            store_snapshot(name, result, status="OK")
+            await asyncio.to_thread(store_snapshot, name, result, status="OK")
         except Exception as exc:
             snap = load_snapshot(name)
-            store_snapshot(name, snap.get("data") if snap else {}, status="ERROR", error=str(exc))
+            await asyncio.to_thread(
+                store_snapshot,
+                name,
+                snap.get("data") if snap else {},
+                status="ERROR",
+                error=str(exc),
+            )
             log.warning("snapshot refresh failed for %s: %s", name, exc)
 
 
@@ -195,18 +201,24 @@ async def snapshot_or_build(
     age = float(snap.get("_age_seconds") if snap else 10**9)
     if snap and age <= fresh_s:
         return _with_snapshot_meta(snap.get("data"), snap, stale=False)
+    if snap and snap.get("data") not in (None, {}, []):
+        schedule_refresh(name, builder, min_interval_s=1.0 if age > stale_s else 10.0)
+        return _with_snapshot_meta(snap.get("data"), snap, stale=True)
+
     if not _SCHEDULE_REFRESH_ENABLED:
+        lock = _locks.setdefault(name, asyncio.Lock())
+        if lock.locked():
+            raise TimeoutError(f"snapshot_warming:{name}:refresh_in_progress")
         try:
-            result = await asyncio.wait_for(
-                asyncio.to_thread(builder),
-                timeout=min(float(wait_timeout_s), _LIVE_BUILD_TIMEOUT_SECONDS),
-            )
+            async with lock:
+                _last_refresh_started[name] = time.monotonic()
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(builder),
+                    timeout=min(float(wait_timeout_s), _LIVE_BUILD_TIMEOUT_SECONDS),
+                )
             if _STORE_LIVE_BUILDS_ENABLED:
                 try:
-                    await asyncio.wait_for(
-                        asyncio.to_thread(store_snapshot, name, result, status="OK"),
-                        timeout=_WRITE_TIMEOUT_SECONDS + 1.0,
-                    )
+                    asyncio.create_task(asyncio.to_thread(store_snapshot, name, result, status="OK"))
                 except Exception as store_exc:
                     log.debug("snapshot live store failed for %s: %s", name, store_exc)
             return _with_live_meta(result, name)
