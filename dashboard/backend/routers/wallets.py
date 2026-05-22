@@ -146,9 +146,37 @@ def get_accumulations(limit: int = 20, _user=Depends(get_current_user)):
         return {"accumulations": [], "error": str(e)}
 
 
+def _system_grade(conn) -> str:
+    """Grade the overall signal quality of active wallets.
+
+    Criteria (all require outcome_status='COMPLETE' rows):
+      PROVEN      — ≥1 active wallet: n≥30, WR≥55%
+      PROMISING   — ≥1 active wallet: n≥15, WR≥45%
+      WEAK        — ≥1 active wallet: n≥10, WR≥30%
+      UNPROVEN    — no active wallet meets minimum bar
+    """
+    rows = conn.execute("""
+        SELECT
+            COUNT(CASE WHEN b.outcome_status='COMPLETE' THEN 1 END)                             AS n,
+            ROUND(AVG(CASE WHEN b.outcome_status='COMPLETE'
+                           AND b.return_24h_pct > 0 THEN 1.0 ELSE 0.0 END) * 100, 1)           AS wr
+        FROM smart_wallets w
+        LEFT JOIN smart_wallet_buys b ON b.wallet_address = w.address
+        WHERE w.active = 1
+        GROUP BY w.id
+    """).fetchall()
+    proven    = any((r[0] or 0) >= 30 and (r[1] or 0) >= 55 for r in rows)
+    promising = any((r[0] or 0) >= 15 and (r[1] or 0) >= 45 for r in rows)
+    weak      = any((r[0] or 0) >= 10 and (r[1] or 0) >= 30 for r in rows)
+    if proven:    return "PROVEN"
+    if promising: return "PROMISING"
+    if weak:      return "WEAK"
+    return "UNPROVEN"
+
+
 @router.get("/stats")
 def get_stats(_user=Depends(get_current_user)):
-    """Return summary stats and phase info."""
+    """Return summary stats, phase info, and signal quality grade."""
     try:
         with _get_db() as conn:
             total_wallets = conn.execute(
@@ -172,6 +200,7 @@ def get_stats(_user=Depends(get_current_user)):
                 SELECT ROUND(AVG(CASE WHEN return_24h_pct > 0 THEN 1.0 ELSE 0.0 END)*100, 1)
                 FROM smart_wallet_buys WHERE outcome_status='COMPLETE' AND {_active_filter}
             """).fetchone()[0]
+            grade = _system_grade(conn)
 
         phase = _phase_info(total_buys)
         return {
@@ -183,6 +212,7 @@ def get_stats(_user=Depends(get_current_user)):
             "phase":           phase["phase"],
             "phase_label":     phase["label"],
             "next_milestone":  phase["next"],
+            "system_grade":    grade,
         }
     except Exception as e:
         log.warning("[WALLETS] /stats error: %s", e)
@@ -190,5 +220,6 @@ def get_stats(_user=Depends(get_current_user)):
             "total_wallets": 0, "total_buys": 0, "complete_buys": 0,
             "accumulations": 0, "wr_24h": None,
             "phase": "OBSERVE", "phase_label": "Building dataset", "next_milestone": 10,
+            "system_grade": "UNPROVEN",
             "error": str(e),
         }

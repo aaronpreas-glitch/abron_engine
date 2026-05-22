@@ -130,12 +130,9 @@ def get_recent_launches(limit: int = 50) -> list[dict]:
 def _fetch_dexscreener_token(mint: str) -> Optional[dict]:
     """Fetch token data from DexScreener for a given mint address."""
     try:
-        url = DEXSCREENER_PAIRS_URL.format(mint=mint)
-        resp = requests.get(url, timeout=8)
-        if resp.status_code != 200:
-            return None
-        data = resp.json()
-        pairs = data.get("pairs") or []
+        from data.dexscreener import fetch_token_pairs  # type: ignore
+
+        pairs = fetch_token_pairs(mint, reason="launch_token_fetch_429")
         if not pairs:
             return None
 
@@ -446,27 +443,23 @@ async def _dexscreener_poll_loop():
     seconds and process any new mints we haven't seen before.
     """
     log.info("DexScreener launch poll starting (interval=%ds)", LAUNCH_DEX_POLL_INTERVAL)
-    headers = {"User-Agent": "memecoin-engine/1.0"}
-
     while True:
         try:
-            resp = await asyncio.get_event_loop().run_in_executor(
+            profiles = await asyncio.get_event_loop().run_in_executor(
                 None,
-                lambda: requests.get(DEXSCREENER_PROFILES_URL, headers=headers, timeout=10)
+                lambda: __import__("data.dexscreener", fromlist=["fetch_latest_profiles"]).fetch_latest_profiles(reason="launch_profiles_429")
             )
-            if resp.status_code == 200:
-                profiles = resp.json()
-                if isinstance(profiles, list):
-                    for profile in profiles:
-                        mint = (
-                            profile.get("tokenAddress")
-                            or profile.get("address")
-                            or profile.get("mint")
-                        )
-                        chain = profile.get("chainId", "")
-                        if not mint or chain != "solana":
-                            continue
-                        asyncio.create_task(_process_mint(mint, "dexscreener_profile"))
+            if isinstance(profiles, list):
+                for profile in profiles:
+                    mint = (
+                        profile.get("tokenAddress")
+                        or profile.get("address")
+                        or profile.get("mint")
+                    )
+                    chain = profile.get("chainId", "")
+                    if not mint or chain != "solana":
+                        continue
+                    asyncio.create_task(_process_mint(mint, "dexscreener_profile"))
         except Exception as e:
             log.debug("DexScreener poll error: %s", e)
 

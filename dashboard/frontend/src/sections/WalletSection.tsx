@@ -23,6 +23,19 @@ function fp(p: number) {
 }
 function short(w: string) { return w?.length > 12 ? `${w.slice(0, 6)}…${w.slice(-4)}` : w }
 
+function liqDistancePct(mark: number, liq: number): number | null {
+  if (!mark || !liq || liq <= 0) return null
+  return (mark - liq) / mark * 100
+}
+
+function actionBadge(distPct: number | null, liqNear: boolean): { label: string; color: string } {
+  if (distPct === null) return { label: 'HOLD', color: '#4d5a6e' }
+  if (distPct < 10 || liqNear) return { label: 'CLOSE',  color: '#ef4444' }
+  if (distPct < 15)            return { label: 'REDUCE', color: '#f97316' }
+  if (distPct < 20)            return { label: 'WATCH',  color: '#f59e0b' }
+  return { label: 'HOLD', color: '#4d5a6e' }
+}
+
 export function WalletSection({ wallet, positions, solBalance, solPrice, loading, error }: Props) {
   const totalPnl = positions.reduce((s, p) => s + p.pnl_usd, 0)
   const totalVal = positions.reduce((s, p) => s + p.value_usd, 0)
@@ -48,7 +61,6 @@ export function WalletSection({ wallet, positions, solBalance, solPrice, loading
 
       {/* Stats bar */}
       <div className="kpi-strip">
-        {/* SOL */}
         {solVal !== null && (
           <div className="stat-tile">
             <div className="stat-label">SOL SPOT</div>
@@ -59,7 +71,6 @@ export function WalletSection({ wallet, positions, solBalance, solPrice, loading
             <div style={{ fontSize: 10, color: 'var(--dim)', ...MONO }}>${solVal.toLocaleString('en-US', { maximumFractionDigits: 2 })}</div>
           </div>
         )}
-        {/* Perp PnL */}
         {positions.length > 0 && (
           <div className="stat-tile">
             <div className="stat-label">PERP PnL</div>
@@ -69,7 +80,6 @@ export function WalletSection({ wallet, positions, solBalance, solPrice, loading
             <div style={{ fontSize: 10, color: 'var(--dim)', ...MONO }}>of ${totalVal.toFixed(0)} value</div>
           </div>
         )}
-        {/* Position count */}
         {positions.length > 0 && (
           <div className="stat-tile">
             <div className="stat-label">POSITIONS</div>
@@ -100,32 +110,55 @@ export function WalletSection({ wallet, positions, solBalance, solPrice, loading
                 <th style={{ textAlign: 'right' }}>PnL</th>
                 <th style={{ textAlign: 'right' }}>Lev</th>
                 <th style={{ textAlign: 'right' }}>Liq</th>
+                <th style={{ textAlign: 'right' }}>Dist</th>
+                <th style={{ textAlign: 'right' }}>Action</th>
               </tr>
             </thead>
             <tbody>
-              {positions.map((p, i) => (
-                <tr key={i}>
-                  <td style={{ fontWeight: 700, color: '#c0cfe0' }}>{p.market}</td>
-                  <td>
-                    <span style={{ color: p.side === 'LONG' ? '#00d48a' : '#f59e0b', fontWeight: 700, fontSize: 10 }}>
-                      {p.side}
-                    </span>
-                  </td>
-                  <td style={{ textAlign: 'right', color: '#5a7a9a' }}>{fp(p.entry_price)}</td>
-                  <td style={{ textAlign: 'right', color: '#a0aec0' }}>{fp(p.mark_price)}</td>
-                  <td style={{ textAlign: 'right', color: '#5a7a9a', fontSize: 10 }}>${p.size_usd.toFixed(0)}</td>
-                  <td style={{ textAlign: 'right', color: pc(p.pnl_usd), fontWeight: 700 }}>
-                    {p.pnl_usd >= 0 ? '+' : ''}${p.pnl_usd.toFixed(2)}
-                    <span style={{ color: pc(p.pnl_usd), opacity: 0.7, fontSize: 9, marginLeft: 4 }}>
-                      ({p.pnl_pct >= 0 ? '+' : ''}{p.pnl_pct.toFixed(1)}%)
-                    </span>
-                  </td>
-                  <td style={{ textAlign: 'right', color: '#5a7a9a', fontSize: 10 }}>{p.leverage.toFixed(1)}×</td>
-                  <td style={{ textAlign: 'right', color: p.liq_near ? '#ef4444' : 'var(--dim)', fontSize: 10, fontWeight: p.liq_near ? 700 : 400 }}>
-                    {fp(p.liq_price)}{p.liq_near && ' ⚠'}
-                  </td>
-                </tr>
-              ))}
+              {positions.map((p, i) => {
+                const dist = liqDistancePct(p.mark_price, p.liq_price)
+                const badge = actionBadge(dist, p.liq_near)
+                return (
+                  <tr key={i}>
+                    <td style={{ fontWeight: 700, color: '#c0cfe0' }}>{p.market}</td>
+                    <td>
+                      <span style={{ color: p.side === 'LONG' ? '#00d48a' : '#f59e0b', fontWeight: 700, fontSize: 10 }}>
+                        {p.side}
+                      </span>
+                    </td>
+                    <td style={{ textAlign: 'right', color: '#5a7a9a' }}>{fp(p.entry_price)}</td>
+                    <td style={{ textAlign: 'right', color: '#a0aec0' }}>{fp(p.mark_price)}</td>
+                    <td style={{ textAlign: 'right', color: '#5a7a9a', fontSize: 10 }}>{p.size_usd != null ? `$${p.size_usd.toFixed(0)}` : '—'}</td>
+                    <td style={{ textAlign: 'right', color: pc(p.pnl_usd), fontWeight: 700 }}>
+                      {p.pnl_usd != null ? `${p.pnl_usd >= 0 ? '+' : ''}$${p.pnl_usd.toFixed(2)}` : '—'}
+                      <span style={{ color: pc(p.pnl_usd), opacity: 0.7, fontSize: 9, marginLeft: 4 }}>
+                        {p.pnl_pct != null ? `(${p.pnl_pct >= 0 ? '+' : ''}${p.pnl_pct.toFixed(1)}%)` : ''}
+                      </span>
+                    </td>
+                    <td style={{ textAlign: 'right', color: '#5a7a9a', fontSize: 10 }}>{p.leverage != null ? `${p.leverage.toFixed(1)}×` : '—'}</td>
+                    <td style={{ textAlign: 'right', color: p.liq_near ? '#ef4444' : 'var(--dim)', fontSize: 10, fontWeight: p.liq_near ? 700 : 400 }}>
+                      {fp(p.liq_price)}{p.liq_near && ' ⚠'}
+                    </td>
+                    <td style={{ textAlign: 'right', fontSize: 10 }}>
+                      {dist !== null ? (
+                        <span style={{ color: dist < 10 ? '#ef4444' : dist < 15 ? '#f59e0b' : 'var(--dim)', fontWeight: dist < 15 ? 700 : 400 }}>
+                          {dist.toFixed(1)}%
+                        </span>
+                      ) : '—'}
+                    </td>
+                    <td style={{ textAlign: 'right' }}>
+                      <span style={{
+                        color: badge.color, fontWeight: 700, fontSize: 8,
+                        background: `${badge.color}12`, border: `1px solid ${badge.color}28`,
+                        borderRadius: 3, padding: '1px 5px',
+                        fontFamily: 'JetBrains Mono, monospace',
+                      }}>
+                        {badge.label}
+                      </span>
+                    </td>
+                  </tr>
+                )
+              })}
             </tbody>
           </table>
           </div>
@@ -133,7 +166,7 @@ export function WalletSection({ wallet, positions, solBalance, solPrice, loading
             {positions.map((p, i) => (
               <div key={i} style={{ fontSize: 9, color: 'var(--dim)', ...MONO }}>
                 <span style={{ color: 'var(--muted)' }}>{p.market}</span>
-                {' '}col ${p.collateral_usd.toFixed(2)} · fees ${p.total_fees_usd.toFixed(2)}
+                {' '}col {p.collateral_usd != null ? `$${p.collateral_usd.toFixed(2)}` : '—'} · fees {p.total_fees_usd != null ? `$${p.total_fees_usd.toFixed(2)}` : '—'}
               </div>
             ))}
           </div>

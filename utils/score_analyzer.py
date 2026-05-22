@@ -249,3 +249,222 @@ def build_env_updates(component_analysis: dict, keyword_analysis: dict) -> dict:
 def get_analysis_summary() -> dict:
     """Return the most recent analysis for dashboard display."""
     return _load_existing()
+
+
+# ── Memecoin outcome attribution ─────────────────────────────────────────────
+
+_MEMECOIN_WEIGHT_STATE_PATH = Path(__file__).parent.parent / "data_storage" / "memecoin_weight_state.json"
+_MIN_MEMECOIN_N = 30          # min outcomes needed to recommend weight changes
+_MEMECOIN_CONSISTENCY_WEEKS = 3  # consecutive weeks same direction before applying
+
+
+def _load_memecoin_state() -> dict:
+    try:
+        return json.loads(_MEMECOIN_WEIGHT_STATE_PATH.read_text())
+    except Exception:
+        return {}
+
+
+def _save_memecoin_state(state: dict) -> None:
+    try:
+        _MEMECOIN_WEIGHT_STATE_PATH.write_text(json.dumps(state, indent=2))
+    except Exception:
+        pass
+
+
+def _reconstruct_components(row: dict) -> dict | None:
+    """Reconstruct the four scoring components from raw inputs stored in memecoin_signal_outcomes."""
+    try:
+        ch1  = float(row.get("change_1h_at_scan") or 0.0)
+        top  = float(row.get("top_holder_pct")     or 0.0)
+        accel = float(row.get("vol_acceleration")  or 0.0)
+        mcap  = float(row.get("mcap_at_scan")      or 0.0)
+    except (TypeError, ValueError):
+        return None
+
+    # h1_score — lower spike = better
+    abs_ch1 = abs(ch1)
+    if abs_ch1 <= 5:
+        h1 = 40.0
+    elif abs_ch1 <= 10:
+        h1 = 35.0
+    elif abs_ch1 <= 15:
+        h1 = 25.0
+    elif abs_ch1 <= 20:
+        h1 = 10.0
+    else:
+        h1 = 0.0
+
+    # holder_score — lower concentration = better
+    if top < 2:
+        ho = 25.0
+    elif top < 4:
+        ho = 15.0
+    elif top < 8:
+        ho = 5.0
+    else:
+        ho = 0.0
+
+    # accel_score — moderate acceleration sweet spot
+    if 2 <= accel < 5:
+        ac = 20.0
+    elif 5 <= accel < 10:
+        ac = 15.0
+    elif 10 <= accel < 20:
+        ac = 10.0
+    elif accel >= 20:
+        ac = 0.0
+    else:
+        ac = 5.0
+
+    # mcap_score — Patch 277 bands (mcap in USD)
+    mcap_m = mcap / 1_000_000
+    if 3 <= mcap_m < 10:
+        mc = 15.0
+    elif 1.5 <= mcap_m < 3:
+        mc = 10.0
+    elif 10 <= mcap_m < 25:
+        mc = 7.0
+    elif 25 <= mcap_m < 50:
+        mc = 4.0
+    else:
+        mc = 0.0
+
+    return {"h1_score": h1, "holder_score": ho, "accel_score": ac, "mcap_score": mc}
+
+
+def _pearson(xs: list[float], ys: list[float]) -> float | None:
+    """Compute Pearson correlation coefficient between two equal-length lists."""
+    n = len(xs)
+    if n < 5:
+        return None
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    num   = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    denom = (sum((x - mx) ** 2 for x in xs) * sum((y - my) ** 2 for y in ys)) ** 0.5
+    if denom == 0:
+        return None
+    return num / denom
+
+
+def analyze_memecoin_score_components(lookback_days: int = 60) -> dict:
+    """
+    Compute per-component Pearson correlation against 4h returns using raw inputs
+    already stored in memecoin_signal_outcomes. Tracks consistency across weekly
+    runs and recommends MEMECOIN_SCORE_WEIGHTS multipliers when stable.
+    """
+    import sqlite3
+    from datetime import datetime, timezone, timedelta
+
+    db_path = Path(__file__).parent.parent / "data_storage" / "engine.db"
+    cutoff  = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).isoformat()
+
+    try:
+        con = sqlite3.connect(str(db_path))
+        con.row_factory = sqlite3.Row
+        cur = con.execute("""
+            SELECT change_1h_at_scan, top_holder_pct, vol_acceleration, mcap_at_scan,
+                   return_4h_pct
+            FROM   memecoin_signal_outcomes
+            WHERE  status = 'COMPLETE'
+              AND  return_4h_pct IS NOT NULL
+              AND  change_1h_at_scan IS NOT NULL
+              AND  top_holder_pct IS NOT NULL
+              AND  vol_acceleration IS NOT NULL
+              AND  mcap_at_scan IS NOT NULL
+              AND  mcap_at_scan > 0
+              AND  scanned_at >= ?
+        """, (cutoff,))
+        rows = [dict(r) for r in cur.fetchall()]
+        con.close()
+    except Exception as exc:
+        return {"error": str(exc), "components": [], "ready_to_apply": False}
+
+    n = len(rows)
+    if n < _MIN_MEMECOIN_N:
+        return {"n": n, "components": [], "ready_to_apply": False,
+                "note": f"insufficient data ({n} < {_MIN_MEMECOIN_N})"}
+
+    component_keys = ["h1_score", "holder_score", "accel_score", "mcap_score"]
+    buckets: dict[str, list[float]] = {k: [] for k in component_keys}
+    returns: list[float] = []
+
+    for row in rows:
+        comps = _reconstruct_components(row)
+        if comps is None:
+            continue
+        for k in component_keys:
+            buckets[k].append(comps[k])
+        returns.append(float(row["return_4h_pct"]))
+
+    components = []
+    directions: dict[str, str] = {}
+    for k in component_keys:
+        corr = _pearson(buckets[k], returns)
+        if corr is None:
+            multiplier, direction = 1.0, "neutral"
+        elif corr > 0.15:
+            multiplier = round(min(1.30, 1.0 + corr * 0.6), 4)
+            direction  = "up"
+        elif corr < -0.05:
+            multiplier = round(max(0.70, 1.0 + corr * 0.3), 4)
+            direction  = "down"
+        else:
+            multiplier, direction = 1.0, "neutral"
+
+        components.append({
+            "component":  k,
+            "correlation": round(corr, 4) if corr is not None else None,
+            "multiplier":  multiplier,
+            "direction":   direction,
+            "n":           len(buckets[k]),
+        })
+        directions[k] = direction
+
+    # ── Consistency tracking ──────────────────────────────────────────────────
+    state = _load_memecoin_state()
+    prev_dirs = state.get("directions", {})
+    consistency = state.get("consistency_weeks", 0)
+
+    if prev_dirs and all(directions.get(k) == prev_dirs.get(k) for k in component_keys):
+        consistency += 1
+    else:
+        consistency = 1
+
+    state.update({
+        "directions":         directions,
+        "consistency_weeks":  consistency,
+        "last_run":           datetime.now(timezone.utc).isoformat(),
+        "n":                  n,
+    })
+    _save_memecoin_state(state)
+
+    ready = consistency >= _MEMECOIN_CONSISTENCY_WEEKS and n >= _MIN_MEMECOIN_N
+
+    return {
+        "n":                  n,
+        "components":         components,
+        "consistency_weeks":  consistency,
+        "ready_to_apply":     ready,
+    }
+
+
+def build_memecoin_env_updates(analysis: dict) -> dict:
+    """
+    Return env var updates for MEMECOIN_SCORE_WEIGHTS when analysis is ready.
+    Returns empty dict if not ready or no meaningful changes.
+    """
+    if not analysis.get("ready_to_apply"):
+        return {}
+
+    weights = {}
+    for c in analysis.get("components", []):
+        mult = c.get("multiplier", 1.0)
+        if abs(mult - 1.0) >= 0.05:   # only update if meaningful shift
+            weights[c["component"]] = mult
+
+    if not weights:
+        return {}
+
+    import json
+    return {"MEMECOIN_SCORE_WEIGHTS": json.dumps(weights)}

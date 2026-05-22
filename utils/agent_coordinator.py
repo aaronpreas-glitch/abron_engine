@@ -87,6 +87,7 @@ def get_fear_greed(cache_ttl_min: int = 15) -> dict:
     if cached:
         age_min = (time.time() - cached.get("_ts", 0)) / 60
         if age_min < cache_ttl_min:
+            cached.setdefault("source", "alternative.me")  # backfill pre-291 entries
             return cached
 
     # Fetch fresh
@@ -94,18 +95,25 @@ def get_fear_greed(cache_ttl_min: int = 15) -> dict:
         r = requests.get(FEAR_GREED_URL, timeout=6)
         d = r.json()["data"][0]
         value = int(d["value"])
-        label = d["value_classification"]
+        label = d.get("value_classification", "")
+        # Patch 255: validate before caching — alternative.me occasionally returns
+        # value=0/label="" as a degenerate error payload.  Caching this poisons the
+        # shared cache for the entire TTL window.  Reject it: return stale cache if
+        # available, otherwise the standard error fallback.
+        if not (1 <= value <= 100) or not label:
+            return cached if cached else {"value": None, "label": "UNKNOWN", "favorable": True, "source": "alternative.me", "_ts": time.time()}
         result: dict = {
             "value":     value,
             "label":     label,
             "favorable": value > 25,  # extreme fear <= 25 → don't auto-deploy capital
+            "source":    "alternative.me",
             "_ts":       time.time(),
         }
         _kv_set(FEAR_GREED_KEY, result)
         _check_fg_crossing(cached, result)   # Patch 142 — threshold crossing alert
         return result
     except Exception:
-        return {"value": None, "label": "UNKNOWN", "favorable": True, "_ts": time.time()}
+        return {"value": None, "label": "UNKNOWN", "favorable": True, "source": "alternative.me", "_ts": time.time()}
 
 
 def _check_fg_crossing(prev: dict, curr: dict) -> None:
@@ -148,6 +156,30 @@ def _check_fg_crossing(prev: dict, curr: dict) -> None:
 
 
 # ── 2. Data integrity check ───────────────────────────────────────────────────
+
+def get_market_context() -> dict:
+    """Return consolidated market context for scoring engines. Patch 304.
+
+    Wraps get_fear_greed() and provides a stable dict shape that includes
+    fear_greed_value for spot_signal_engine (Patch 153+) and a placeholder
+    for altcoin_season until that data source is wired in.
+
+    Returns:
+        {
+            "fear_greed_value": int | None,
+            "fear_greed_label": str,
+            "favorable":        bool,
+            "altcoin_season":   None,   # placeholder — not yet implemented
+        }
+    """
+    fg = get_fear_greed()
+    return {
+        "fear_greed_value": fg.get("value"),
+        "fear_greed_label": fg.get("label", ""),
+        "favorable":        fg.get("favorable", True),
+        "altcoin_season":   None,   # future: altcoin season index source
+    }
+
 
 def data_integrity_step() -> dict:
     """Real data integrity checks — runs every 5 min.

@@ -13,13 +13,7 @@ import os
 from functools import lru_cache
 from typing import Any
 
-import requests
-
 log = logging.getLogger("dashboard.dex")
-
-_DEX_BASE = "https://api.dexscreener.com"
-_HEADERS = {"User-Agent": "memecoin-dashboard/1.0"}
-_TIMEOUT = 8
 
 
 def _parse_watchlist_entries() -> list[dict[str, str]]:
@@ -63,11 +57,9 @@ def _classify_status(row: dict) -> tuple[str, str]:
 def _fetch_token(address: str) -> dict[str, Any] | None:
     """Fetch token pair data from DexScreener by mint address."""
     try:
-        url = f"{_DEX_BASE}/latest/dex/tokens/{address}"
-        resp = requests.get(url, headers=_HEADERS, timeout=_TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json()
-        pairs = data.get("pairs") or []
+        from data.dexscreener import fetch_token_pairs  # type: ignore
+
+        pairs = fetch_token_pairs(address, reason="dashboard_dex_proxy_429")
         if not pairs:
             return None
         # Pick the pair with the most liquidity

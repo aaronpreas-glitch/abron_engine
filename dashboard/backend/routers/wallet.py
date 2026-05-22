@@ -9,18 +9,18 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 
 from auth import get_current_user
+from snapshot_cache import snapshot_or_build
 
 log = logging.getLogger("dashboard")
 router = APIRouter(prefix="/api/wallet", tags=["wallet"])
 
-_WALLET = "6YeATB75AyJKM8ujv3qQXtzCKrACmQgzpgf4EmjihhF4"
-
 _MINT = {
-    "So11111111111111111111111111111111111111112":  "SOL",
-    "9n4nbM75f5Ui33ZbPYXn59EwSgE8CGsHtAeTH5YFeJ9E": "BTC",
+    "So11111111111111111111111111111111111111112":   "SOL",
+    "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh": "BTC",   # Jupiter Perps market mint
+    "9n4nbM75f5Ui33ZbPYXn59EwSgE8CGsHtAeTH5YFeJ9E": "BTC",   # legacy/token mint fallback
     "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs": "ETH",
     "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": "USDC",
     "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So":  "mSOL",
@@ -34,11 +34,50 @@ def _f(val, divisor: float = 1.0) -> float:
         return 0.0
 
 
-def _get_positions():
+def _get_wallet_address() -> str:
+    """Resolve the configured wallet from the shared Jupiter perps keypair."""
+    try:
+        from utils.jupiter_perps_trade import get_wallet_address  # type: ignore
+        return str(get_wallet_address() or "").strip()
+    except Exception as exc:
+        log.warning("wallet address resolution failed: %s", exc)
+        return ""
+
+
+def _read_wallet_cache(wallet: str) -> float | None:
+    """
+    Read the last-known-good SOL balance from the shared wallet cache so the UI
+    does not flicker to zero on transient RPC failures.
+    """
+    if not wallet:
+        return None
+    try:
+        import json
+        import os
+        import sqlite3
+        root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+        db_path = os.path.join(root, "data_storage", "engine.db")
+        with sqlite3.connect(db_path) as conn:
+            row = conn.execute(
+                "SELECT value FROM kv_store WHERE key=?", ("spot_wallet_fallback",)
+            ).fetchone()
+        if not row:
+            return None
+        cached = json.loads(row[0])
+        if str(cached.get("wallet") or "") != wallet:
+            return None
+        balances = cached.get("balances") or {}
+        sol = float(balances.get("SOL") or 0.0)
+        return sol if sol > 0 else None
+    except Exception:
+        return None
+
+
+def _get_positions(wallet: str):
     import requests as _req
     r = _req.get(
         "https://perps-api.jup.ag/v1/positions",
-        params={"walletAddress": _WALLET},
+        params={"walletAddress": wallet},
         timeout=10,
     )
     if r.status_code != 200:
@@ -83,28 +122,64 @@ def _get_positions():
     return positions, None
 
 
-def _get_sol_balance() -> float:
+def _get_sol_balance(wallet: str) -> float | None:
     import requests as _req
     r = _req.post(
         "https://api.mainnet-beta.solana.com",
-        json={"jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [_WALLET]},
+        json={"jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [wallet]},
         timeout=5,
     )
-    return r.json().get("result", {}).get("value", 0) / 1_000_000_000
+    lamports = r.json().get("result", {}).get("value")
+    if lamports is None:
+        return None
+    return lamports / 1_000_000_000
+
+
+def _build_wallet_positions_payload() -> dict:
+    try:
+        wallet = _get_wallet_address()
+        if not wallet:
+            return {"wallet": None, "positions": [], "sol_balance": None, "error": "wallet not configured"}
+
+        positions, err = _get_positions(wallet)
+        if positions is None:
+            return {"wallet": wallet, "positions": [], "sol_balance": None, "error": err}
+        try:
+            sol_balance = _get_sol_balance(wallet)
+        except Exception:
+            sol_balance = None
+        if not sol_balance:
+            cached_balance = _read_wallet_cache(wallet)
+            if cached_balance:
+                sol_balance = cached_balance
+        return {"wallet": wallet, "positions": positions, "sol_balance": sol_balance, "error": None}
+    except Exception as exc:
+        log.warning("wallet_positions_ep error: %s", exc)
+        return {"wallet": None, "positions": [], "sol_balance": None, "error": str(exc)}
 
 
 @router.get("/positions")
 async def wallet_positions_ep(_: str = Depends(get_current_user)):
     """Read-only: fetch all open Jupiter Perp positions for the configured wallet."""
     try:
-        positions, err = await asyncio.to_thread(_get_positions)
-        if positions is None:
-            return {"wallet": _WALLET, "positions": [], "sol_balance": None, "error": err}
-        try:
-            sol_balance = await asyncio.to_thread(_get_sol_balance)
-        except Exception:
-            sol_balance = None
-        return {"wallet": _WALLET, "positions": positions, "sol_balance": sol_balance, "error": None}
+        return await snapshot_or_build(
+            "wallet:positions",
+            _build_wallet_positions_payload,
+            fresh_s=20,
+            stale_s=180,
+            wait_timeout_s=4,
+        )
     except Exception as exc:
-        log.warning("wallet_positions_ep error: %s", exc)
-        return {"wallet": _WALLET, "positions": [], "sol_balance": None, "error": str(exc)}
+        return {
+            "wallet": None,
+            "positions": [],
+            "sol_balance": None,
+            "error": f"wallet_positions_warming:{exc}",
+            "_snapshot": {
+                "name": "wallet:positions",
+                "updated_at": None,
+                "age_seconds": None,
+                "status": "WARMING",
+                "source": "fallback",
+            },
+        }

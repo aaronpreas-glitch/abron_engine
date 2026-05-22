@@ -7,7 +7,14 @@ import App from './App.tsx'
 
 const queryClient = new QueryClient({
   defaultOptions: {
-    queries: { staleTime: 15_000, retry: 1, refetchOnWindowFocus: false },
+    queries: {
+      staleTime: 15_000,
+      retry: 1,
+      refetchOnWindowFocus: false,
+      refetchOnReconnect: true,
+      refetchOnMount: true,
+      refetchIntervalInBackground: false,
+    },
   },
 })
 
@@ -23,7 +30,7 @@ class ErrorBoundary extends Component<{ children: ReactNode }, { error: Error | 
       }}>
         <div style={{ fontSize: 13, marginBottom: 12, color: '#a0aec0' }}>⚠ Terminal crashed</div>
         <div style={{ fontSize: 11, whiteSpace: 'pre-wrap' }}>{(error as Error).message}</div>
-        <div style={{ fontSize: 10, color: '#4d5a6e', marginTop: 12, whiteSpace: 'pre-wrap' }}>
+        <div style={{ fontSize: 10, color: 'var(--chrome)', marginTop: 12, whiteSpace: 'pre-wrap' }}>
           {(error as Error).stack}
         </div>
         <button

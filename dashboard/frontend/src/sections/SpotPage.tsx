@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from '../api'
 
@@ -128,6 +128,40 @@ interface SpotSignalsResponse {
   }
 }
 
+// Spot Portfolio OS — Step 1: Position Thesis
+interface SpotThesisRow {
+  symbol:                 string
+  thesis_text:            string | null
+  target_pct:             number | null
+  invalidation_condition: string | null
+  status:                 string
+  updated_at:             string | null
+}
+
+interface SpotThesisResponse {
+  thesis: Record<string, SpotThesisRow>
+}
+
+// Patch 304 — Spot Posture types
+interface SpotPostureItem {
+  symbol:          string
+  signal_type:     string
+  score:           number | null
+  fg:              number | null
+  fg_bucket:       string | null
+  posture:         string
+  reason:          string
+  contradiction:   boolean
+  bucket_n:        number | null
+  bucket_win_rate: number | null
+  bucket_avg_ret:  number | null
+}
+
+interface SpotPostureResponse {
+  postures:     SpotPostureItem[]
+  generated_at: string
+}
+
 // ── Formatting helpers ────────────────────────────────────────────────────────
 
 const MONO: React.CSSProperties = { fontFamily: 'JetBrains Mono, monospace' }
@@ -195,28 +229,15 @@ function WeightBar({ current, target }: { current: number; target: number }) {
 
 // ── TrendBadge — Patch 130 ────────────────────────────────────────────────────
 
-function TrendBadge({ trend, held }: { trend?: string; held: boolean }) {
+function TrendBadge({ trend }: { trend?: string }) {
   if (!trend || trend === 'NEUTRAL') {
     return <span style={{ color: '#2d4060', fontSize: 9, ...MONO }}>—</span>
   }
   if (trend === 'UPTREND') {
     return <span style={{ color: '#00d48a', fontSize: 9, fontWeight: 700, ...MONO }}>▲</span>
   }
-  // DOWNTREND
-  return (
-    <span style={{ display: 'inline-flex', flexDirection: 'column', alignItems: 'center', gap: 2 }}>
-      <span style={{ color: '#ef4444', fontSize: 9, fontWeight: 700, ...MONO }}>▼</span>
-      {held && (
-        <span style={{
-          fontSize: 6, fontWeight: 700, letterSpacing: '0.06em',
-          padding: '1px 4px', borderRadius: 2,
-          background: 'rgba(245,158,11,0.08)',
-          border: '1px solid rgba(245,158,11,0.28)',
-          color: '#f59e0b', whiteSpace: 'nowrap', ...MONO,
-        }}>SELL?</span>
-      )}
-    </span>
-  )
+  // DOWNTREND — show direction only; downtrend on a long-term hold is not a sell signal
+  return <span style={{ color: '#ef4444', fontSize: 9, fontWeight: 700, ...MONO }}>▼</span>
 }
 
 // ── SignalBadge — Patch 134 ───────────────────────────────────────────────────
@@ -259,6 +280,55 @@ function SignalBadge({ signalType }: { signalType?: string }) {
   return null
 }
 
+// ── PostureBadge — Patch 304 ──────────────────────────────────────────────────
+// Outcome-conditioned entry verdict badge. Shown inline next to SignalBadge.
+// Uses a different visual language (square corners, lighter) to distinguish
+// empirical posture from the raw signal tier.
+
+function PostureBadge({ posture, contradiction, reason }: {
+  posture:       string | undefined
+  contradiction: boolean
+  reason:        string | undefined
+}) {
+  if (!posture) return null
+
+  let bg    = 'rgba(255,255,255,0.03)'
+  let border = 'rgba(255,255,255,0.07)'
+  let color  = '#4d5a6e'
+  let label  = posture
+
+  if (posture === 'PRIME_ENTRY') {
+    bg = 'rgba(0,212,138,0.08)'; border = 'rgba(0,212,138,0.35)'; color = '#00d48a'; label = 'PRIME'
+  } else if (posture === 'ACCUMULATE') {
+    bg = 'rgba(0,190,255,0.07)'; border = 'rgba(0,190,255,0.28)'; color = '#38bdf8'; label = 'ACCUM'
+  } else if (posture === 'HOLD') {
+    bg = 'rgba(255,255,255,0.03)'; border = 'rgba(255,255,255,0.09)'; color = '#4d5a6e'; label = 'HOLD'
+  } else if (posture === 'POOR_CONDITIONS') {
+    bg = 'rgba(239,68,68,0.07)'; border = 'rgba(239,68,68,0.30)'; color = '#ef4444'; label = 'POOR'
+  } else if (posture === 'INSUFFICIENT_DATA') {
+    bg = 'rgba(255,255,255,0.02)'; border = 'rgba(255,255,255,0.06)'; color = '#2d4060'; label = 'INSUF'
+  } else if (posture === 'F&G_FEED_DOWN') {
+    bg = 'rgba(245,158,11,0.05)'; border = 'rgba(245,158,11,0.15)'; color = '#4d5a6e'; label = 'F&G?'
+  }
+
+  return (
+    <span
+      title={reason || posture}
+      style={{
+        fontSize: 6, fontWeight: 700, letterSpacing: '0.05em',
+        padding: '1px 4px', borderRadius: 2,
+        background: bg, border: `1px solid ${border}`, color,
+        whiteSpace: 'nowrap', cursor: 'default', ...MONO,
+      }}
+    >
+      {label}
+      {contradiction && (
+        <span style={{ color: '#f59e0b', marginLeft: 2, fontSize: 7 }}>!</span>
+      )}
+    </span>
+  )
+}
+
 // ── Shared style constants ────────────────────────────────────────────────────
 
 const CARD: React.CSSProperties = {
@@ -280,6 +350,7 @@ interface HoldingsTableProps {
   buyAmts:     Record<string, string>
   setBuyAmts:  React.Dispatch<React.SetStateAction<Record<string, string>>>
   signalData:  Record<string, SpotSignal>
+  postureData: Record<string, SpotPostureItem>   // Patch 304
   doBuy:       (h: SpotHolding) => void
   doSell:      (h: SpotHolding) => void
 }
@@ -287,7 +358,7 @@ interface HoldingsTableProps {
 function HoldingsTable({
   holdings, isLoading, learningData, heldCount,
   buyBusy, sellBusy, buyAmts, setBuyAmts,
-  signalData, doBuy, doSell,
+  signalData, postureData, doBuy, doSell,
 }: HoldingsTableProps) {
   return (
     <div style={{
@@ -382,7 +453,7 @@ function HoldingsTable({
                   }}
                 >
 
-                  {/* TOKEN + trend badge (Patch 130) + signal badge (Patch 134) */}
+                  {/* TOKEN + trend badge (Patch 130) + signal badge (Patch 134) + posture badge (Patch 304) */}
                   <td style={{ padding: '11px 12px' }}>
                     <div style={{ display: 'flex', alignItems: 'flex-start', gap: 6 }}>
                       <div>
@@ -391,8 +462,13 @@ function HoldingsTable({
                         </div>
                         <div style={{ color: '#1e2d3d', fontSize: 8, marginTop: 2 }}>{h.name}</div>
                       </div>
-                      <TrendBadge trend={h.trend} held={held} />
+                      <TrendBadge trend={h.trend} />
                       <SignalBadge signalType={signalData[h.symbol]?.signal_type} />
+                      <PostureBadge
+                        posture={postureData[h.symbol]?.posture}
+                        contradiction={postureData[h.symbol]?.contradiction ?? false}
+                        reason={postureData[h.symbol]?.reason}
+                      />
                     </div>
                   </td>
 
@@ -401,7 +477,7 @@ function HoldingsTable({
                     <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
                       <WeightBar current={h.current_pct} target={h.target_pct} />
                       <span style={{ color: held ? '#7c9fd4' : '#2d4060', fontSize: 9, minWidth: 32 }}>
-                        {held ? `${h.current_pct.toFixed(1)}%` : '0%'}
+                        {held && h.current_pct != null ? `${h.current_pct.toFixed(1)}%` : '0%'}
                       </span>
                       <span style={{ color: '#1e2d3d', fontSize: 8 }}>→</span>
                       <span style={{ color: '#3d5a78', fontSize: 9 }}>{h.target_pct}%</span>
@@ -418,7 +494,7 @@ function HoldingsTable({
                         color: h.price_change_24h > 0 ? '#00d48a' : h.price_change_24h < 0 ? '#ef4444' : '#4d5a6e',
                         fontSize: 8, marginTop: 2, ...MONO,
                       }}>
-                        {h.price_change_24h > 0 ? '+' : ''}{h.price_change_24h.toFixed(1)}%
+                        {h.price_change_24h != null ? `${h.price_change_24h > 0 ? '+' : ''}${h.price_change_24h.toFixed(1)}%` : '—'}
                       </div>
                     )}
                   </td>
@@ -431,7 +507,7 @@ function HoldingsTable({
                           {fUsd(h.current_value)}
                         </div>
                         <div style={{ color: '#3d5a78', fontSize: 8, marginTop: 2 }}>
-                          {h.token_amount.toFixed(4)}
+                          {h.token_amount != null ? h.token_amount.toFixed(4) : '—'}
                         </div>
                       </>
                     ) : (
@@ -542,12 +618,13 @@ function HoldingsTable({
 // ── AnalyticsPanel ────────────────────────────────────────────────────────────
 
 interface AnalyticsPanelProps {
-  signalData:   Record<string, SpotSignal>
-  an:           SpotAnalytics | undefined
-  learningData: SpotSignalsResponse['learning'] | undefined
+  signalData:        Record<string, SpotSignal>
+  an:                SpotAnalytics | undefined
+  learningData:      SpotSignalsResponse['learning'] | undefined
+  signalsUpdatedAt?: string | null
 }
 
-function AnalyticsPanel({ signalData, an, learningData }: AnalyticsPanelProps) {
+function AnalyticsPanel({ signalData, an, learningData, signalsUpdatedAt }: AnalyticsPanelProps) {
   return (
     <div style={{
       background: 'rgba(255,255,255,0.018)',
@@ -597,8 +674,13 @@ function AnalyticsPanel({ signalData, an, learningData }: AnalyticsPanelProps) {
         {/* ── Current Signals Table ── */}
         {Object.keys(signalData).length > 0 && (
           <div>
-            <div style={{ color: '#2d4060', fontSize: 7, letterSpacing: '0.1em', ...MONO, marginBottom: 8, fontWeight: 700 }}>
-              CURRENT SIGNALS
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+              <span style={{ color: '#2d4060', fontSize: 7, letterSpacing: '0.1em', ...MONO, fontWeight: 700 }}>
+                CURRENT SIGNALS
+              </span>
+              {signalsUpdatedAt && (
+                <span style={{ color: '#1e2d3d', fontSize: 7, ...MONO }}>{relTime(signalsUpdatedAt)}</span>
+              )}
             </div>
             <table style={{ width: '100%', borderCollapse: 'collapse', ...MONO }}>
               <thead>
@@ -648,7 +730,7 @@ function AnalyticsPanel({ signalData, an, learningData }: AnalyticsPanelProps) {
                           padding: '7px 10px', textAlign: 'right', fontSize: 9,
                           color: sv.gap > 5 ? '#7c9fd4' : sv.gap < -5 ? '#f59e0b' : '#3d5a78',
                         }}>
-                          {sv.gap >= 0 ? '+' : ''}{sv.gap.toFixed(1)}%
+                          {sv.gap != null ? `${sv.gap >= 0 ? '+' : ''}${sv.gap.toFixed(1)}%` : '—'}
                         </td>
                         <td style={{ padding: '7px 10px', textAlign: 'right', fontSize: 9, color: '#4d5a6e' }}>
                           {sv.fg ?? '—'}
@@ -788,7 +870,7 @@ function AnalyticsPanel({ signalData, an, learningData }: AnalyticsPanelProps) {
                       <div>
                         <div style={{ color: '#1e2d3d', fontSize: 7, ...MONO }}>MIN SCORE</div>
                         <div style={{ color: '#c0cfe0', fontSize: 16, fontWeight: 800, ...MONO, marginTop: 2 }}>
-                          {an.tuner.min_score.toFixed(0)}
+                          {an.tuner.min_score != null ? an.tuner.min_score.toFixed(0) : '—'}
                         </div>
                       </div>
                       <div>
@@ -797,7 +879,7 @@ function AnalyticsPanel({ signalData, an, learningData }: AnalyticsPanelProps) {
                           fontSize: 16, fontWeight: 800, ...MONO, marginTop: 2,
                           color: wrColor(an.tuner.win_rate),
                         }}>
-                          {an.tuner.win_rate.toFixed(0)}%
+                          {an.tuner.win_rate != null ? `${an.tuner.win_rate.toFixed(0)}%` : '—'}
                         </div>
                       </div>
                     </div>
@@ -935,6 +1017,968 @@ function AnalyticsPanel({ signalData, an, learningData }: AnalyticsPanelProps) {
   )
 }
 
+// ── Spot Portfolio OS: ThesisCard ────────────────────────────────────────────
+
+interface ThesisCardProps {
+  symbol:          string
+  row:             SpotThesisRow | null
+  onSaved:         () => void
+  currentInvested: number
+  sumInvested:     number
+}
+
+function ThesisCard({ symbol, row, onSaved, currentInvested, sumInvested }: ThesisCardProps) {
+  const [thesisText,   setThesisText]   = useState(row?.thesis_text            ?? '')
+  const [targetPct,    setTargetPct]    = useState(row?.target_pct != null ? String(row.target_pct) : '')
+  const [invalidation, setInvalidation] = useState(row?.invalidation_condition ?? '')
+  const [status,       setStatus]       = useState(row?.status ?? 'HOLD')
+  const [saving,       setSaving]       = useState(false)
+  const [saved,        setSaved]        = useState(false)
+  const [dirty,        setDirty]        = useState(false)
+
+  // Sync from row if it arrives after mount (query resolves)
+  useEffect(() => {
+    if (row && !dirty) {
+      setThesisText(row.thesis_text            ?? '')
+      setTargetPct(row.target_pct != null ? String(row.target_pct) : '')
+      setInvalidation(row.invalidation_condition ?? '')
+      setStatus(row.status ?? 'HOLD')
+    }
+  }, [row]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  function touch(setter: (v: string) => void) {
+    return (v: string) => { setter(v); setDirty(true); setSaved(false) }
+  }
+
+  async function save() {
+    setSaving(true)
+    try {
+      await api.post('/spot/thesis', {
+        symbol,
+        thesis_text:            thesisText    || null,
+        target_pct:             targetPct     ? parseFloat(targetPct) : null,
+        invalidation_condition: invalidation  || null,
+        status,
+      })
+      setDirty(false)
+      setSaved(true)
+      onSaved()
+      setTimeout(() => setSaved(false), 2500)
+    } catch { /* keep dirty */ }
+    setSaving(false)
+  }
+
+  const hasThesis   = !!(thesisText || row?.thesis_text)
+  const statusColor = status === 'HOLD' ? '#00d48a' : status === 'WATCH' ? '#f59e0b' : '#ef4444'
+
+  // Concentration — always uses persisted target, not unsaved form value
+  const currentPct     = sumInvested > 0 ? (currentInvested / sumInvested * 100) : 0
+  const persistedTarget = row?.target_pct ?? null
+  const delta           = persistedTarget != null ? currentPct - persistedTarget : null
+
+  let concLabel: string
+  let concColor: string
+  if (persistedTarget == null) {
+    concLabel = 'NO TARGET SET'; concColor = '#2d4060'
+  } else if (delta! > 5) {
+    concLabel = 'ABOVE TARGET';  concColor = '#f59e0b'
+  } else if (delta! < -5) {
+    concLabel = 'UNDER TARGET';  concColor = '#7c9fd4'
+  } else {
+    concLabel = 'NEAR TARGET';   concColor = '#4d5a6e'
+  }
+
+  return (
+    <div style={{
+      background: 'rgba(255,255,255,0.015)',
+      border: `1px solid ${hasThesis ? 'rgba(255,255,255,0.06)' : 'rgba(245,158,11,0.14)'}`,
+      borderRadius: 6, padding: '12px 14px',
+    }}>
+
+      {/* Card header */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+        <span style={{ color: '#c0cfe0', fontSize: 12, fontWeight: 700, ...MONO }}>{symbol}</span>
+        <span style={{
+          fontSize: 7, fontWeight: 700, letterSpacing: '0.06em',
+          padding: '2px 7px', borderRadius: 3,
+          background: status === 'HOLD' ? 'rgba(0,212,138,0.08)'
+            : status === 'WATCH' ? 'rgba(245,158,11,0.08)'
+            : 'rgba(239,68,68,0.08)',
+          border: `1px solid ${statusColor}44`,
+          color: statusColor, ...MONO,
+        }}>
+          {status}
+        </span>
+        {!hasThesis && (
+          <span style={{ color: '#f59e0b', fontSize: 7, ...MONO }}>— thesis not set</span>
+        )}
+        <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8 }}>
+          {dirty  && !saving && <span style={{ color: '#3d5a78', fontSize: 7, ...MONO }}>unsaved</span>}
+          {saved  && <span style={{ color: '#00d48a', fontSize: 7, ...MONO }}>saved</span>}
+        </div>
+      </div>
+
+      {/* Concentration row — live exposure vs persisted target */}
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap',
+        padding: '8px 0', marginBottom: 4,
+        borderTop:    '1px solid rgba(255,255,255,0.04)',
+        borderBottom: '1px solid rgba(255,255,255,0.04)',
+      }}>
+        <span style={{ color: '#1e2d3d', fontSize: 7, letterSpacing: '0.1em', ...MONO }}>EXPOSURE</span>
+        <span style={{ color: '#8a9ab0', fontSize: 11, fontWeight: 700, ...MONO }}>
+          {sumInvested > 0 ? currentPct.toFixed(1) : '—'}%
+        </span>
+        {persistedTarget != null && (
+          <>
+            <span style={{ color: '#1e2d3d', fontSize: 8, ...MONO }}>vs</span>
+            <span style={{ color: '#3d5a78', fontSize: 9, ...MONO }}>{persistedTarget}% target</span>
+            <span style={{
+              fontSize: 9, fontWeight: 700, ...MONO,
+              color: delta! > 0 ? '#f59e0b' : delta! < 0 ? '#7c9fd4' : '#4d5a6e',
+            }}>
+              {delta! > 0 ? '+' : ''}{delta!.toFixed(1)}%
+            </span>
+          </>
+        )}
+        <span style={{ marginLeft: 'auto' }}>
+          <span style={{
+            fontSize: 7, fontWeight: 700, letterSpacing: '0.08em',
+            padding: '2px 6px', borderRadius: 3,
+            background: concLabel === 'ABOVE TARGET'  ? 'rgba(245,158,11,0.08)'
+              : concLabel === 'UNDER TARGET' ? 'rgba(124,159,212,0.08)'
+              : concLabel === 'NO TARGET SET' ? 'rgba(45,64,96,0.04)'
+              : 'rgba(77,90,110,0.06)',
+            border: `1px solid ${concColor}44`,
+            color: concColor, ...MONO,
+          }}>
+            {concLabel}
+          </span>
+        </span>
+      </div>
+
+      {/* Fields */}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 12 }}>
+
+        {/* Thesis text */}
+        <div>
+          <label style={{ color: '#2d4060', fontSize: 7, letterSpacing: '0.1em', ...MONO, display: 'block', marginBottom: 5 }}>
+            WHY HELD
+          </label>
+          <textarea
+            rows={2}
+            placeholder="Why is this position held? What is the long-term thesis?"
+            value={thesisText}
+            onChange={e => touch(setThesisText)(e.target.value)}
+            style={{
+              width: '100%', padding: '7px 10px', boxSizing: 'border-box',
+              background: 'rgba(255,255,255,0.03)',
+              border: '1px solid rgba(255,255,255,0.07)',
+              borderRadius: 4, color: '#8a9ab0',
+              fontFamily: 'JetBrains Mono, monospace', fontSize: 9,
+              resize: 'vertical', outline: 'none',
+            }}
+          />
+        </div>
+
+        {/* Invalidation condition */}
+        <div>
+          <label style={{ color: '#2d4060', fontSize: 7, letterSpacing: '0.1em', ...MONO, display: 'block', marginBottom: 5 }}>
+            INVALIDATION
+          </label>
+          <textarea
+            rows={1}
+            placeholder="What would make this thesis wrong? When would you exit?"
+            value={invalidation}
+            onChange={e => touch(setInvalidation)(e.target.value)}
+            style={{
+              width: '100%', padding: '7px 10px', boxSizing: 'border-box',
+              background: 'rgba(255,255,255,0.03)',
+              border: '1px solid rgba(255,255,255,0.07)',
+              borderRadius: 4, color: '#8a9ab0',
+              fontFamily: 'JetBrains Mono, monospace', fontSize: 9,
+              resize: 'none', outline: 'none',
+            }}
+          />
+        </div>
+
+        {/* Target pct + Status row */}
+        <div style={{ display: 'flex', gap: 20, alignItems: 'flex-end' }}>
+          <div>
+            <label style={{ color: '#2d4060', fontSize: 7, letterSpacing: '0.1em', ...MONO, display: 'block', marginBottom: 5 }}>
+              TARGET % OF SPOT CAPITAL
+            </label>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <input
+                type="number"
+                min={1} max={100} step={1}
+                placeholder="—"
+                value={targetPct}
+                onChange={e => touch(setTargetPct)(e.target.value)}
+                style={{
+                  width: 60, padding: '5px 8px',
+                  background: 'rgba(255,255,255,0.03)',
+                  border: '1px solid rgba(255,255,255,0.07)',
+                  borderRadius: 4, color: '#8a9ab0',
+                  fontFamily: 'JetBrains Mono, monospace', fontSize: 10,
+                  outline: 'none',
+                }}
+              />
+              <span style={{ color: '#1e2d3d', fontSize: 9, ...MONO }}>%</span>
+            </div>
+          </div>
+
+          <div>
+            <label style={{ color: '#2d4060', fontSize: 7, letterSpacing: '0.1em', ...MONO, display: 'block', marginBottom: 5 }}>
+              STATUS
+            </label>
+            <select
+              value={status}
+              onChange={e => { touch(setStatus)(e.target.value) }}
+              style={{
+                padding: '5px 8px',
+                background: 'rgba(255,255,255,0.03)',
+                border: '1px solid rgba(255,255,255,0.07)',
+                borderRadius: 4,
+                color: statusColor,
+                fontFamily: 'JetBrains Mono, monospace', fontSize: 9,
+                outline: 'none', cursor: 'pointer',
+              }}
+            >
+              <option value="HOLD">HOLD</option>
+              <option value="WATCH">WATCH</option>
+              <option value="EXIT">EXIT</option>
+            </select>
+          </div>
+        </div>
+      </div>
+
+      {/* Save button */}
+      <button
+        onClick={save}
+        disabled={saving || !dirty}
+        style={{
+          padding: '5px 14px',
+          background: saving || !dirty ? 'transparent' : 'rgba(124,159,212,0.08)',
+          border: `1px solid ${saving || !dirty ? 'rgba(255,255,255,0.06)' : 'rgba(124,159,212,0.25)'}`,
+          borderRadius: 4,
+          color: saving || !dirty ? '#1e2d3d' : '#7c9fd4',
+          cursor: saving || !dirty ? 'default' : 'pointer',
+          fontFamily: 'JetBrains Mono, monospace',
+          fontSize: 8, fontWeight: 700, letterSpacing: '0.1em',
+        }}
+      >
+        {saving ? 'SAVING…' : 'SAVE'}
+      </button>
+    </div>
+  )
+}
+
+// ── Spot Portfolio OS: ThesisPanel ────────────────────────────────────────────
+
+function ThesisPanel({ heldSymbols, holdings }: { heldSymbols: string[], holdings: SpotHolding[] }) {
+  const qc = useQueryClient()
+
+  const thesisQ = useQuery<SpotThesisResponse>({
+    queryKey:        ['spot-thesis'],
+    queryFn:         async () => (await api.get('/spot/thesis')).data,
+    refetchInterval: 0,
+  })
+
+  function onSaved() {
+    qc.invalidateQueries({ queryKey: ['spot-thesis'] })
+  }
+
+  // Total invested across all held positions — denominator for concentration %
+  const sumInvested = holdings
+    .filter(h => h.token_amount > 0)
+    .reduce((acc, h) => acc + h.total_invested, 0)
+
+  if (heldSymbols.length === 0) return null
+
+  return (
+    <div style={{
+      background: 'rgba(255,255,255,0.018)',
+      border: '1px solid rgba(255,255,255,0.06)',
+      borderRadius: 8, padding: '14px 16px',
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
+        <div>
+          <span style={{ color: '#3d5a78', fontSize: 8, letterSpacing: '0.12em', ...MONO, fontWeight: 700 }}>
+            POSITION THESIS
+          </span>
+          <div style={{ color: '#1e2d3d', fontSize: 7, marginTop: 3, ...MONO }}>
+            SPOT PORTFOLIO OS · LONG-TERM HOLD CONTEXT · WHY HELD · TARGET ALLOCATION · INVALIDATION
+          </div>
+        </div>
+        <span style={{ color: '#1e2d3d', fontSize: 7, ...MONO }}>
+          {heldSymbols.length} held position{heldSymbols.length !== 1 ? 's' : ''}
+        </span>
+      </div>
+
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+        {heldSymbols.map(symbol => {
+          const row             = thesisQ.data?.thesis[symbol] ?? null
+          const currentInvested = holdings.find(h => h.symbol === symbol)?.total_invested ?? 0
+          // key switches from 'empty' to 'loaded' once data arrives,
+          // remounting the card with correct initial state from row
+          return (
+            <ThesisCard
+              key={`${symbol}-${row ? 'loaded' : 'empty'}`}
+              symbol={symbol}
+              row={row}
+              onSaved={onSaved}
+              currentInvested={currentInvested}
+              sumInvested={sumInvested}
+            />
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+// ── Spot Portfolio OS: RebalanceTrackerPanel (Step 4) ────────────────────────
+
+interface RebalanceToken {
+  symbol:          string
+  target_pct:      number
+  status:          string
+  target_dollars:  number
+  current_dollars: number
+  dollar_gap:      number
+  state:           'AT TARGET' | 'BUILD NEEDED' | 'ABOVE TARGET'
+  is_anchor:       boolean
+}
+
+interface RebalanceTrackerResponse {
+  implied_book_size: number
+  current_deployed:  number
+  additional_needed: number
+  anchor_count:      number
+  anchors_used:      string[]
+  tokens:            RebalanceToken[]
+}
+
+function RebalanceTrackerPanel() {
+  const trackerQ = useQuery<RebalanceTrackerResponse>({
+    queryKey:        ['spot-rebalance-tracker'],
+    queryFn:         async () => (await api.get('/spot/rebalance-tracker')).data,
+    refetchInterval: 60_000,
+  })
+
+  const d = trackerQ.data
+
+  function stateColor(state: string): string {
+    if (state === 'AT TARGET')    return '#00d48a'
+    if (state === 'BUILD NEEDED') return '#7c9fd4'
+    return '#f59e0b'
+  }
+
+  function stateBg(state: string): string {
+    if (state === 'AT TARGET')    return 'rgba(0,212,138,0.06)'
+    if (state === 'BUILD NEEDED') return 'rgba(124,159,212,0.06)'
+    return 'rgba(245,158,11,0.06)'
+  }
+
+  function stateBorder(state: string): string {
+    if (state === 'AT TARGET')    return 'rgba(0,212,138,0.20)'
+    if (state === 'BUILD NEEDED') return 'rgba(124,159,212,0.20)'
+    return 'rgba(245,158,11,0.20)'
+  }
+
+  if (trackerQ.isLoading || !d) {
+    return (
+      <div style={{
+        background: 'rgba(255,255,255,0.018)',
+        border: '1px solid rgba(255,255,255,0.06)',
+        borderRadius: 8, padding: '14px 16px',
+      }}>
+        <span style={{ color: '#1e2d3d', fontSize: 9, ...MONO }}>loading rebalance tracker…</span>
+      </div>
+    )
+  }
+
+  const hasAnchor = d.anchor_count > 0
+
+  return (
+    <div style={{
+      background: 'rgba(255,255,255,0.018)',
+      border: '1px solid rgba(255,255,255,0.06)',
+      borderRadius: 8, padding: '14px 16px',
+    }}>
+
+      {/* Panel header */}
+      <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 14, flexWrap: 'wrap', gap: 8 }}>
+        <div>
+          <span style={{ color: '#3d5a78', fontSize: 8, letterSpacing: '0.12em', ...MONO, fontWeight: 700 }}>
+            CAPITAL BUILD-OUT ROADMAP
+          </span>
+          <div style={{ color: '#1e2d3d', fontSize: 7, marginTop: 3, ...MONO }}>
+            SPOT PORTFOLIO OS · ANCHOR-BASED TARGET BOOK · READ-ONLY PLANNING SURFACE
+          </div>
+        </div>
+        {hasAnchor && (
+          <span style={{ color: '#1e2d3d', fontSize: 7, ...MONO }}>
+            anchor{d.anchor_count > 1 ? 's' : ''}: {d.anchors_used.join(' · ')}
+          </span>
+        )}
+      </div>
+
+      {/* Summary strip */}
+      {hasAnchor ? (
+        <div style={{
+          display: 'flex', gap: 0, marginBottom: 14,
+          background: 'rgba(0,0,0,0.12)',
+          border: '1px solid rgba(255,255,255,0.04)',
+          borderRadius: 6, overflow: 'hidden',
+        }}>
+          {[
+            { lbl: 'DEPLOYED',        val: `$${d.current_deployed.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`,  col: '#7c9fd4' },
+            { lbl: 'IMPLIED BOOK',    val: `$${d.implied_book_size.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`, col: '#c0cfe0' },
+            { lbl: 'STILL NEEDED',    val: `$${d.additional_needed.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`, col: '#f59e0b' },
+          ].map((s, i) => (
+            <div key={s.lbl} style={{
+              flex: 1, padding: '10px 14px', textAlign: 'center',
+              borderRight: i < 2 ? '1px solid rgba(255,255,255,0.04)' : 'none',
+            }}>
+              <div style={{ color: '#1e2d3d', fontSize: 7, letterSpacing: '0.1em', ...MONO, marginBottom: 5 }}>{s.lbl}</div>
+              <div style={{ color: s.col, fontSize: 16, fontWeight: 800, lineHeight: 1, ...MONO }}>{s.val}</div>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div style={{
+          padding: '10px 12px', marginBottom: 14,
+          background: 'rgba(245,158,11,0.04)',
+          border: '1px solid rgba(245,158,11,0.14)',
+          borderRadius: 5,
+        }}>
+          <span style={{ color: '#f59e0b', fontSize: 8, ...MONO }}>
+            No anchor available — need at least one held position with a thesis target to infer implied book size
+          </span>
+        </div>
+      )}
+
+      {/* Per-token table */}
+      {d.tokens.length > 0 && (
+        <div style={{ overflowX: 'auto' }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse', ...MONO }}>
+            <thead>
+              <tr style={{ borderBottom: '1px solid rgba(255,255,255,0.05)' }}>
+                {[
+                  { l: 'TOKEN',    a: 'left'   },
+                  { l: 'STATUS',   a: 'center' },
+                  { l: 'TARGET %', a: 'right'  },
+                  { l: 'TARGET $', a: 'right'  },
+                  { l: 'CURRENT $', a: 'right' },
+                  { l: 'GAP $',    a: 'right'  },
+                  { l: '',         a: 'center' },
+                ].map(c => (
+                  <th key={c.l} style={{
+                    padding: '0 10px 8px',
+                    textAlign: c.a as 'left' | 'right' | 'center',
+                    color: '#1e2d3d', fontSize: 7, letterSpacing: '0.1em', fontWeight: 700,
+                  }}>
+                    {c.l}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {d.tokens.map(t => (
+                <tr
+                  key={t.symbol}
+                  style={{
+                    borderTop: '1px solid rgba(255,255,255,0.03)',
+                    background: t.is_anchor ? 'rgba(0,212,138,0.012)' : 'transparent',
+                  }}
+                >
+                  {/* TOKEN */}
+                  <td style={{ padding: '9px 10px' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                      <span style={{
+                        color: t.is_anchor ? '#c0cfe0' : '#4d5a6e',
+                        fontWeight: t.is_anchor ? 700 : 400,
+                        fontSize: 11,
+                      }}>
+                        {t.symbol}
+                      </span>
+                      {t.is_anchor && (
+                        <span style={{
+                          fontSize: 6, fontWeight: 700, letterSpacing: '0.06em',
+                          padding: '1px 4px', borderRadius: 2,
+                          background: 'rgba(0,212,138,0.06)',
+                          border: '1px solid rgba(0,212,138,0.18)',
+                          color: '#00d48a', ...MONO,
+                        }}>ANCHOR</span>
+                      )}
+                    </div>
+                  </td>
+
+                  {/* STATUS */}
+                  <td style={{ padding: '9px 10px', textAlign: 'center' }}>
+                    <span style={{
+                      fontSize: 7, fontWeight: 700, letterSpacing: '0.06em',
+                      padding: '2px 5px', borderRadius: 2,
+                      color: t.status === 'HOLD' ? '#00d48a' : t.status === 'EXIT' ? '#ef4444' : '#f59e0b',
+                      background: t.status === 'HOLD' ? 'rgba(0,212,138,0.06)' : t.status === 'EXIT' ? 'rgba(239,68,68,0.06)' : 'rgba(245,158,11,0.06)',
+                      border: `1px solid ${t.status === 'HOLD' ? 'rgba(0,212,138,0.20)' : t.status === 'EXIT' ? 'rgba(239,68,68,0.20)' : 'rgba(245,158,11,0.20)'}`,
+                    }}>
+                      {t.status}
+                    </span>
+                  </td>
+
+                  {/* TARGET % */}
+                  <td style={{ padding: '9px 10px', textAlign: 'right', color: '#3d5a78', fontSize: 9 }}>
+                    {t.target_pct}%
+                  </td>
+
+                  {/* TARGET $ */}
+                  <td style={{ padding: '9px 10px', textAlign: 'right', color: '#4d5a6e', fontSize: 9 }}>
+                    {hasAnchor ? `$${t.target_dollars.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}` : '—'}
+                  </td>
+
+                  {/* CURRENT $ */}
+                  <td style={{ padding: '9px 10px', textAlign: 'right', color: t.current_dollars > 0 ? '#8a9ab0' : '#2d4060', fontSize: 9 }}>
+                    {t.current_dollars > 0
+                      ? `$${t.current_dollars.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`
+                      : '—'}
+                  </td>
+
+                  {/* GAP $ */}
+                  <td style={{
+                    padding: '9px 10px', textAlign: 'right',
+                    fontSize: 10, fontWeight: 700,
+                    color: hasAnchor ? stateColor(t.state) : '#2d4060',
+                  }}>
+                    {hasAnchor
+                      ? (t.dollar_gap > 0 ? '+' : '') + `$${Math.abs(t.dollar_gap).toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`
+                      : '—'}
+                  </td>
+
+                  {/* STATE BADGE */}
+                  <td style={{ padding: '9px 10px', textAlign: 'center' }}>
+                    {hasAnchor && (
+                      <span style={{
+                        fontSize: 7, fontWeight: 700, letterSpacing: '0.06em',
+                        padding: '2px 6px', borderRadius: 2,
+                        background: stateBg(t.state),
+                        border: `1px solid ${stateBorder(t.state)}`,
+                        color: stateColor(t.state),
+                      }}>
+                        {t.state}
+                      </span>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {/* Footer note */}
+      <div style={{ marginTop: 10, color: '#1e2d3d', fontSize: 7, ...MONO }}>
+        planning surface only · no sell recommendations · gaps are informational · targets update as positions are added
+      </div>
+    </div>
+  )
+}
+
+// ── Spot Portfolio OS: AddCandidatePanel (Step 3) ────────────────────────────
+
+interface AddPlanCandidate {
+  symbol:         string
+  current_pct:    number
+  target_pct:     number
+  gap_pct:        number
+  signal_type:    string
+  signal_score:   number
+  rank_score:     number
+  suggested_usd:  number
+  fg:             number | null
+  last_add_ts:    string | null
+  days_since_add: number | null
+  cooldown_state: 'ELIGIBLE' | 'COOLING_DOWN'
+}
+
+interface AddPlanExcluded {
+  symbol: string
+  reason: string
+}
+
+interface AddPlanResponse {
+  budget:        number
+  fg:            number | null
+  fear_weight:   number
+  min_score:     number
+  floor_usd:     number
+  candidates:    AddPlanCandidate[]
+  excluded:      AddPlanExcluded[]
+  floor_skipped: AddPlanExcluded[]
+}
+
+function AddCandidatePanel({ onApply }: { onApply: (symbol: string, usd: number) => void }) {
+  const [planBudget, setPlanBudget] = useState('500')
+  const [plan,       setPlan]       = useState<AddPlanResponse | null>(null)
+  const [loading,    setLoading]    = useState(false)
+  const [error,      setError]      = useState<string | null>(null)
+
+  async function compute() {
+    const amt = parseFloat(planBudget)
+    if (!amt || amt < 5) { setError('Budget must be at least $5'); return }
+    setError(null)
+    setLoading(true)
+    try {
+      const r = await api.get(`/spot/add-plan?budget=${amt}`)
+      setPlan(r.data)
+    } catch (e: any) {
+      setError(e?.response?.data?.detail ?? e.message)
+    }
+    setLoading(false)
+  }
+
+  // F&G label helper
+  function fgLabel(fg: number | null): string {
+    if (fg == null) return '—'
+    if (fg < 25)  return `${fg} FEAR`
+    if (fg <= 40) return `${fg} CAUTIOUS`
+    return `${fg} NEUTRAL+`
+  }
+
+  function signalColor(st: string): string {
+    if (st === 'DCA_NOW') return '#00d48a'
+    if (st === 'WATCH')   return '#f59e0b'
+    if (st === 'AVOID')   return '#ef4444'
+    return '#4d5a6e'
+  }
+
+  return (
+    <div style={{
+      background: 'rgba(255,255,255,0.018)',
+      border: '1px solid rgba(255,255,255,0.06)',
+      borderRadius: 8, padding: '14px 16px',
+    }}>
+      {/* Panel header */}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14, flexWrap: 'wrap', gap: 8 }}>
+        <div>
+          <span style={{ color: '#3d5a78', fontSize: 8, letterSpacing: '0.12em', ...MONO, fontWeight: 700 }}>
+            ADD-CANDIDATE ENGINE
+          </span>
+          <div style={{ color: '#1e2d3d', fontSize: 7, marginTop: 3, ...MONO }}>
+            SPOT PORTFOLIO OS · RANKS BASKET BY PORTFOLIO GAP + SIGNAL + F&G · ADVISORY ONLY
+          </div>
+        </div>
+        {plan && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+            <span style={{ color: '#1e2d3d', fontSize: 7, ...MONO }}>
+              F&G {fgLabel(plan.fg)} · fear weight {(plan.fear_weight * 100).toFixed(0)}%
+            </span>
+            <span style={{
+              fontSize: 7, fontWeight: 700, letterSpacing: '0.06em',
+              padding: '1px 5px', borderRadius: 2,
+              background: 'rgba(61,90,120,0.08)',
+              border: '1px solid rgba(61,90,120,0.20)',
+              color: '#3d5a78', ...MONO,
+            }}>
+              floor ${plan.floor_usd}
+            </span>
+          </div>
+        )}
+      </div>
+
+      {/* Budget input row */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 12 }}>
+        <span style={{ color: '#4d5a6e', fontSize: 9, ...MONO }}>BUDGET</span>
+        <div style={{ display: 'flex' }}>
+          <span style={{
+            padding: '4px 7px',
+            background: 'rgba(255,255,255,0.03)',
+            border: '1px solid rgba(255,255,255,0.08)',
+            borderRight: 'none',
+            borderRadius: '4px 0 0 4px',
+            color: '#3d5a78', fontSize: 10, ...MONO,
+          }}>$</span>
+          <input
+            type="number"
+            value={planBudget}
+            onChange={e => { setPlanBudget(e.target.value); setPlan(null) }}
+            onKeyDown={e => e.key === 'Enter' && compute()}
+            style={{
+              width: 80, padding: '4px 8px',
+              background: 'rgba(255,255,255,0.03)',
+              border: '1px solid rgba(255,255,255,0.08)',
+              borderLeft: 'none',
+              borderRadius: '0 4px 4px 0',
+              color: '#c0cfe0',
+              fontFamily: 'JetBrains Mono, monospace', fontSize: 11,
+              outline: 'none',
+            }}
+          />
+        </div>
+        <button
+          onClick={compute}
+          disabled={loading}
+          style={{
+            padding: '4px 12px',
+            background: loading ? 'transparent' : 'rgba(124,159,212,0.08)',
+            border: '1px solid rgba(124,159,212,0.25)',
+            borderRadius: 4,
+            color: loading ? '#2d4060' : '#7c9fd4',
+            cursor: loading ? 'default' : 'pointer',
+            fontFamily: 'JetBrains Mono, monospace',
+            fontSize: 8, fontWeight: 700, letterSpacing: '0.1em',
+          }}
+        >
+          {loading ? 'RANKING…' : 'RANK CANDIDATES'}
+        </button>
+      </div>
+
+      {error && (
+        <div style={{ color: '#ef4444', fontSize: 9, ...MONO, marginBottom: 10 }}>✗ {error}</div>
+      )}
+
+      {/* Results */}
+      {plan && (
+        <>
+          {/* Candidates table */}
+          {plan.candidates.length > 0 ? (
+            <div style={{ overflowX: 'auto', marginBottom: 12 }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse', ...MONO }}>
+                <thead>
+                  <tr style={{ borderBottom: '1px solid rgba(255,255,255,0.05)' }}>
+                    {[
+                      { l: 'RANK',             a: 'center' },
+                      { l: 'TOKEN',            a: 'left'   },
+                      { l: 'LAST ADD',         a: 'center' },
+                      { l: 'SIGNAL',           a: 'center' },
+                      { l: 'SCORE',            a: 'right'  },
+                      { l: 'EXPOSURE → TARGET', a: 'right' },
+                      { l: 'GAP',              a: 'right'  },
+                      { l: 'RANK SCR',         a: 'right'  },
+                      { l: 'SUGGEST',          a: 'right'  },
+                      { l: '',                 a: 'center' },
+                    ].map(c => (
+                      <th key={c.l} style={{
+                        padding: '0 10px 8px',
+                        textAlign: c.a as 'left' | 'right' | 'center',
+                        color: '#1e2d3d', fontSize: 7, letterSpacing: '0.1em', fontWeight: 700,
+                      }}>
+                        {c.l}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {plan.candidates.map((c, i) => {
+                    const cooling = c.cooldown_state === 'COOLING_DOWN'
+                    const rowOpacity = cooling ? 0.42 : 1
+                    return (
+                    <tr key={c.symbol} style={{
+                      borderTop: '1px solid rgba(255,255,255,0.03)',
+                      opacity: rowOpacity,
+                    }}>
+
+                      {/* RANK */}
+                      <td style={{ padding: '9px 10px', textAlign: 'center', color: '#1e2d3d', fontSize: 8 }}>
+                        {!cooling && i === 0
+                          ? <span style={{ color: '#f59e0b', fontWeight: 700 }}>#{i + 1}</span>
+                          : <span style={{ color: '#2d4060' }}>#{i + 1}</span>
+                        }
+                      </td>
+
+                      {/* TOKEN */}
+                      <td style={{ padding: '9px 10px' }}>
+                        <span style={{ color: cooling ? '#3d5a78' : '#c0cfe0', fontWeight: 700, fontSize: 11 }}>
+                          {c.symbol}
+                        </span>
+                      </td>
+
+                      {/* LAST ADD + COOLDOWN */}
+                      <td style={{ padding: '9px 10px', textAlign: 'center' }}>
+                        {cooling ? (
+                          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2 }}>
+                            <span style={{
+                              fontSize: 7, fontWeight: 700, letterSpacing: '0.06em',
+                              padding: '2px 5px', borderRadius: 2,
+                              background: 'rgba(239,68,68,0.06)',
+                              border: '1px solid rgba(239,68,68,0.18)',
+                              color: '#ef4444', ...MONO,
+                            }}>COOLING</span>
+                            <span style={{ color: '#2d4060', fontSize: 7, ...MONO }}>
+                              {c.days_since_add != null ? `${Math.floor(c.days_since_add)}d ago` : ''}
+                            </span>
+                          </div>
+                        ) : c.days_since_add != null ? (
+                          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2 }}>
+                            <span style={{
+                              fontSize: 7, fontWeight: 700, letterSpacing: '0.06em',
+                              padding: '2px 5px', borderRadius: 2,
+                              background: 'rgba(0,212,138,0.06)',
+                              border: '1px solid rgba(0,212,138,0.18)',
+                              color: '#00d48a', ...MONO,
+                            }}>ELIGIBLE</span>
+                            <span style={{ color: '#2d4060', fontSize: 7, ...MONO }}>
+                              {Math.floor(c.days_since_add)}d ago
+                            </span>
+                          </div>
+                        ) : (
+                          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2 }}>
+                            <span style={{
+                              fontSize: 7, fontWeight: 700, letterSpacing: '0.06em',
+                              padding: '2px 5px', borderRadius: 2,
+                              background: 'rgba(124,159,212,0.06)',
+                              border: '1px solid rgba(124,159,212,0.18)',
+                              color: '#7c9fd4', ...MONO,
+                            }}>ELIGIBLE</span>
+                            <span style={{ color: '#1e2d3d', fontSize: 7, ...MONO }}>first add</span>
+                          </div>
+                        )}
+                      </td>
+
+                      {/* SIGNAL badge */}
+                      <td style={{ padding: '9px 10px', textAlign: 'center' }}>
+                        <span style={{
+                          fontSize: 7, fontWeight: 700, letterSpacing: '0.06em',
+                          padding: '2px 5px', borderRadius: 2,
+                          background: `${signalColor(c.signal_type)}18`,
+                          border: `1px solid ${signalColor(c.signal_type)}40`,
+                          color: signalColor(c.signal_type),
+                        }}>
+                          {c.signal_type}
+                        </span>
+                      </td>
+
+                      {/* SIGNAL SCORE */}
+                      <td style={{ padding: '9px 10px', textAlign: 'right', color: '#8a9ab0', fontSize: 9 }}>
+                        {c.signal_score.toFixed(1)}
+                      </td>
+
+                      {/* EXPOSURE → TARGET */}
+                      <td style={{ padding: '9px 10px', textAlign: 'right' }}>
+                        <span style={{ color: '#4d5a6e', fontSize: 9 }}>{c.current_pct.toFixed(1)}%</span>
+                        <span style={{ color: '#1e2d3d', fontSize: 8, margin: '0 4px' }}>→</span>
+                        <span style={{ color: '#3d5a78', fontSize: 9 }}>{c.target_pct}%</span>
+                      </td>
+
+                      {/* GAP */}
+                      <td style={{
+                        padding: '9px 10px', textAlign: 'right',
+                        color: c.gap_pct > 0 ? '#7c9fd4' : '#f59e0b',
+                        fontSize: 9, fontWeight: 700,
+                      }}>
+                        {c.gap_pct > 0 ? '+' : ''}{c.gap_pct.toFixed(1)}%
+                      </td>
+
+                      {/* RANK SCORE */}
+                      <td style={{ padding: '9px 10px', textAlign: 'right', color: '#3d5a78', fontSize: 8 }}>
+                        {c.rank_score.toFixed(3)}
+                      </td>
+
+                      {/* SUGGEST — greyed if cooling */}
+                      <td style={{ padding: '9px 10px', textAlign: 'right' }}>
+                        <span style={{
+                          color: cooling ? '#2d4060' : '#00d48a',
+                          fontSize: 10, fontWeight: 700,
+                          textDecoration: cooling ? 'line-through' : 'none',
+                        }}>
+                          ${c.suggested_usd.toFixed(0)}
+                        </span>
+                      </td>
+
+                      {/* Apply button — disabled if cooling */}
+                      <td style={{ padding: '9px 10px', textAlign: 'center' }}>
+                        <button
+                          onClick={() => !cooling && onApply(c.symbol, c.suggested_usd)}
+                          disabled={cooling}
+                          style={{
+                            padding: '3px 8px',
+                            background: cooling ? 'transparent' : 'rgba(0,212,138,0.06)',
+                            border: `1px solid ${cooling ? 'rgba(255,255,255,0.05)' : 'rgba(0,212,138,0.18)'}`,
+                            borderRadius: 3,
+                            cursor: cooling ? 'default' : 'pointer',
+                            color: cooling ? '#1e2d3d' : '#00d48a',
+                            fontFamily: 'JetBrains Mono, monospace',
+                            fontSize: 7, fontWeight: 700, letterSpacing: '0.06em',
+                          }}
+                        >
+                          APPLY
+                        </button>
+                      </td>
+                    </tr>
+                  )})}
+
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <div style={{ color: '#2d4060', fontSize: 9, ...MONO, marginBottom: 12 }}>
+              No eligible candidates — check thesis targets and signal data
+            </div>
+          )}
+
+          {/* Floor-skipped tokens */}
+          {plan.floor_skipped.length > 0 && (
+            <div style={{
+              borderTop: '1px solid rgba(255,255,255,0.04)',
+              paddingTop: 10,
+              marginBottom: plan.excluded.length > 0 ? 8 : 0,
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 7 }}>
+                <span style={{ color: '#3d5a78', fontSize: 7, letterSpacing: '0.1em', ...MONO }}>
+                  FLOOR SKIPPED
+                </span>
+                <span style={{
+                  fontSize: 6, fontWeight: 700, letterSpacing: '0.06em',
+                  padding: '1px 4px', borderRadius: 2,
+                  background: 'rgba(61,90,120,0.08)',
+                  border: '1px solid rgba(61,90,120,0.20)',
+                  color: '#3d5a78', ...MONO,
+                }}>
+                  min ${plan.floor_usd}
+                </span>
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                {plan.floor_skipped.map(ex => (
+                  <div key={ex.symbol} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <span style={{ color: '#3d5a78', fontSize: 9, fontWeight: 700, ...MONO, minWidth: 48 }}>
+                      {ex.symbol}
+                    </span>
+                    <span style={{ color: '#2d4060', fontSize: 8, ...MONO }}>{ex.reason}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Excluded tokens */}
+          {plan.excluded.length > 0 && (
+            <div style={{
+              borderTop: '1px solid rgba(255,255,255,0.04)',
+              paddingTop: 10,
+            }}>
+              <div style={{ color: '#1e2d3d', fontSize: 7, letterSpacing: '0.1em', ...MONO, marginBottom: 7 }}>
+                EXCLUDED
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                {plan.excluded.map(ex => (
+                  <div key={ex.symbol} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <span style={{ color: '#2d4060', fontSize: 9, fontWeight: 700, ...MONO, minWidth: 48 }}>
+                      {ex.symbol}
+                    </span>
+                    <span style={{ color: '#1e2d3d', fontSize: 8, ...MONO }}>{ex.reason}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  )
+}
+
 // ── SpotPage ─────────────────────────────────────────────────────────────────
 
 export function SpotPage() {
@@ -976,6 +2020,14 @@ export function SpotPage() {
     refetchInterval: 120_000,
   })
 
+  // Patch 304 — Spot Posture (outcome-conditioned entry verdicts)
+  const postureQ = useQuery<SpotPostureResponse>({
+    queryKey:        ['spot-posture'],
+    queryFn:         async () => (await api.get('/spot/posture')).data,
+    refetchInterval: 120_000,
+    staleTime:       60_000,
+  })
+
   const data     = spotQ.data
   const holdings = data?.holdings ?? []
   const dryRun   = data?.dry_run ?? true
@@ -989,6 +2041,12 @@ export function SpotPage() {
   const signalData   = signalsQ.data?.signals ?? {}
   const learningData = signalsQ.data?.learning
   const an           = analyticsQ.data
+
+  // Patch 304 — posture keyed by symbol for O(1) lookup in HoldingsTable
+  const postureData: Record<string, SpotPostureItem> = {}
+  for (const p of postureQ.data?.postures ?? []) {
+    postureData[p.symbol] = p
+  }
 
   // ── Action helpers ────────────────────────────────────────────────────────
 
@@ -1016,13 +2074,13 @@ export function SpotPage() {
   }
 
   function applyChip(item: AdviceItem) {
-    setBuyAmts(prev => ({ ...prev, [item.symbol]: item.suggested_usd.toFixed(2) }))
+    setBuyAmts(prev => ({ ...prev, [item.symbol]: (item.suggested_usd ?? 0).toFixed(2) }))
   }
 
   function applyAll() {
     if (!advice) return
     const updates: Record<string, string> = {}
-    advice.forEach(a => { updates[a.symbol] = a.suggested_usd.toFixed(2) })
+    advice.forEach(a => { updates[a.symbol] = (a.suggested_usd ?? 0).toFixed(2) })
     setBuyAmts(prev => ({ ...prev, ...updates }))
   }
 
@@ -1331,7 +2389,7 @@ export function SpotPage() {
               <button
                 key={a.symbol}
                 onClick={() => applyChip(a)}
-                title={`Target ${a.target_pct}% · current ${a.current_pct.toFixed(1)}% · gap ${a.gap_pct.toFixed(1)}%`}
+                title={`Target ${a.target_pct}% · current ${a.current_pct != null ? a.current_pct.toFixed(1) : '—'}% · gap ${a.gap_pct != null ? a.gap_pct.toFixed(1) : '—'}%`}
                 style={{
                   ...MONO, fontSize: 9, fontWeight: 700,
                   padding: '3px 9px', borderRadius: 3, cursor: 'pointer',
@@ -1342,7 +2400,7 @@ export function SpotPage() {
               >
                 {a.symbol}
                 <span style={{ color: '#2d4060', fontWeight: 400, marginLeft: 4 }}>
-                  ${a.suggested_usd.toFixed(0)}
+                  {a.suggested_usd != null ? `$${a.suggested_usd.toFixed(0)}` : '—'}
                 </span>
               </button>
             ))}
@@ -1385,8 +2443,27 @@ export function SpotPage() {
         buyAmts={buyAmts}
         setBuyAmts={setBuyAmts}
         signalData={signalData}
+        postureData={postureData}
         doBuy={doBuy}
         doSell={doSell}
+      />
+
+      {/* ── Position Thesis (Spot Portfolio OS Step 1 + 2) ── */}
+      {heldCount > 0 && (
+        <ThesisPanel
+          heldSymbols={holdings.filter(h => h.token_amount > 0).map(h => h.symbol)}
+          holdings={holdings}
+        />
+      )}
+
+      {/* ── Capital Build-Out Roadmap (Spot Portfolio OS Step 4) ── */}
+      <RebalanceTrackerPanel />
+
+      {/* ── Add-Candidate Engine (Spot Portfolio OS Step 3) ── */}
+      <AddCandidatePanel
+        onApply={(symbol, usd) =>
+          setBuyAmts(prev => ({ ...prev, [symbol]: usd.toFixed(2) }))
+        }
       />
 
       {/* ── Transaction History ── */}
@@ -1484,6 +2561,7 @@ export function SpotPage() {
         signalData={signalData}
         an={an}
         learningData={learningData}
+        signalsUpdatedAt={signalsQ.data?.signals_updated_at}
       />
 
     </div>

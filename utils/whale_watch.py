@@ -21,8 +21,7 @@ import os
 import re
 import time
 from datetime import datetime, timezone
-
-import requests
+from typing import Optional
 
 log = logging.getLogger(__name__)
 
@@ -67,6 +66,7 @@ _TIER_TARGETS = {
 def init_whale_watch_table() -> None:
     """Create whale_watch_alerts and cross_agent_signals tables if they don't exist."""
     from utils.db import get_conn
+    from utils.arkham_client import ensure_arkham_tables
     with get_conn() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS whale_watch_alerts (
@@ -77,6 +77,9 @@ def init_whale_watch_table() -> None:
                 kol_name         TEXT,
                 token_symbol     TEXT,
                 token_mint       TEXT,           -- resolved from DexScreener
+                token_pair_address TEXT,
+                mint_resolution_source TEXT,
+                mint_resolution_reason TEXT,
                 buy_amount_usd   REAL,
                 market_cap_usd   REAL,
                 mc_tier          TEXT,           -- micro | sweet_spot | mid | large
@@ -84,15 +87,29 @@ def init_whale_watch_table() -> None:
                 scanner_pass     INTEGER,             -- 1 = gates pass, 0 = fail, NULL = not checked
                 scanner_score    REAL,
                 scanner_rug_label TEXT,
+                scanner_reason   TEXT,
                 alert_sent       INTEGER DEFAULT 0,
                 price_at_alert   REAL,
+                price_source     TEXT,
+                price_resolution_reason TEXT,
                 price_1h         REAL,
                 price_4h         REAL,
                 price_24h        REAL,
                 return_1h_pct    REAL,
                 return_4h_pct    REAL,
                 return_24h_pct   REAL,
-                outcome_status   TEXT DEFAULT 'PENDING'
+                outcome_status   TEXT DEFAULT 'PENDING',
+                arkham_status    TEXT,
+                arkham_signal_quality TEXT,
+                arkham_signal_score REAL,
+                arkham_entity_holder_count INTEGER,
+                arkham_top_entity_name TEXT,
+                arkham_top_entity_type TEXT,
+                arkham_top_entity_pct_of_cap REAL,
+                arkham_top_flow_entity_name TEXT,
+                arkham_top_flow_entity_type TEXT,
+                arkham_net_flow_usd REAL,
+                arkham_enriched_at TEXT
             )
         """)
         # Upgrade path: add mc_tier column if missing (Patch 139 → 141)
@@ -100,8 +117,35 @@ def init_whale_watch_table() -> None:
             cols = [r[1] for r in conn.execute("PRAGMA table_info(whale_watch_alerts)").fetchall()]
             if "mc_tier" not in cols:
                 conn.execute("ALTER TABLE whale_watch_alerts ADD COLUMN mc_tier TEXT")
+            if "scanner_reason" not in cols:
+                conn.execute("ALTER TABLE whale_watch_alerts ADD COLUMN scanner_reason TEXT")
+            for _col, _type in [
+                ("token_pair_address", "TEXT"),
+                ("mint_resolution_source", "TEXT"),
+                ("mint_resolution_reason", "TEXT"),
+                ("price_source", "TEXT"),
+                ("price_resolution_reason", "TEXT"),
+            ]:
+                if _col not in cols:
+                    conn.execute(f"ALTER TABLE whale_watch_alerts ADD COLUMN {_col} {_type}")
+            for _col, _type in [
+                ("arkham_status", "TEXT"),
+                ("arkham_signal_quality", "TEXT"),
+                ("arkham_signal_score", "REAL"),
+                ("arkham_entity_holder_count", "INTEGER"),
+                ("arkham_top_entity_name", "TEXT"),
+                ("arkham_top_entity_type", "TEXT"),
+                ("arkham_top_entity_pct_of_cap", "REAL"),
+                ("arkham_top_flow_entity_name", "TEXT"),
+                ("arkham_top_flow_entity_type", "TEXT"),
+                ("arkham_net_flow_usd", "REAL"),
+                ("arkham_enriched_at", "TEXT"),
+            ]:
+                if _col not in cols:
+                    conn.execute(f"ALTER TABLE whale_watch_alerts ADD COLUMN {_col} {_type}")
         except Exception:
             pass
+        ensure_arkham_tables(conn)
 
         # Cross-agent signal bus
         conn.execute("""
@@ -252,84 +296,122 @@ def parse_whale_alert(text: str) -> dict | None:
     return result
 
 
-# ── DexScreener lookup ────────────────────────────────────────────────────────
+# ── Token resolver ────────────────────────────────────────────────────────────
 
-def _resolve_token(symbol: str) -> dict | None:
+def _resolve_token(symbol: str, market_cap_hint: float | None = None) -> dict:
     """
-    Search DexScreener for a Solana token by symbol.
-    Returns the highest-liquidity Solana pair data, or None.
+    Resolve a Solana token by symbol using the shared cache-first resolver.
+
+    Returns:
+      {
+        "pair": dict | None,
+        "mint": str,
+        "source": str | None,
+        "reason": str | None,
+        "candidate_count": int,
+      }
     """
     try:
-        r = requests.get(
-            f"https://api.dexscreener.com/latest/dex/search?q={symbol}",
-            timeout=REQUEST_TIMEOUT,
-            headers={"User-Agent": "memecoin-engine/1.0"},
-        )
-        if r.status_code != 200:
-            return None
-        pairs = r.json().get("pairs") or []
-        sol_pairs = [
-            p for p in pairs
-            if isinstance(p, dict) and p.get("chainId") == "solana"
-            and (p.get("baseToken") or {}).get("symbol", "").upper() == symbol.upper()
-        ]
-        if not sol_pairs:
-            # Relax: any Solana pair containing the symbol
-            sol_pairs = [
-                p for p in pairs
-                if isinstance(p, dict) and p.get("chainId") == "solana"
-            ]
-        if not sol_pairs:
-            return None
-        # Pick highest liquidity
-        best = max(
-            sol_pairs,
-            key=lambda p: float((p.get("liquidity") or {}).get("usd", 0) or 0),
-        )
-        return best
+        from utils.token_resolver import resolve_solana_token  # type: ignore
+
+        return resolve_solana_token(symbol, market_cap_hint=market_cap_hint)
     except Exception as e:
-        log.debug("[WHALE] DexScreener lookup failed for %s: %s", symbol, e)
+        log.debug("[WHALE] token resolver failed for %s: %s", symbol, e)
+        return {
+            "pair": None,
+            "mint": "",
+            "source": None,
+            "reason": "resolver_error",
+            "candidate_count": 0,
+        }
+
+
+def _pair_price_usd(pair: dict) -> Optional[float]:
+    """Best-effort USD price from the resolved DexScreener pair payload."""
+    try:
+        price_raw = pair.get("priceUsd")
+        if price_raw is None:
+            return None
+        price = float(price_raw)
+        return price if price > 0 else None
+    except Exception:
         return None
 
 
-def _get_token_price(mint: str) -> float:
-    """Fetch current price for a mint. Primary: DexScreener. Fallback: Jupiter price API.
-    price.jup.ag is dead (DNS removed) — do not use. Patch 150.
-    """
-    # Primary: DexScreener (no auth required)
+def _register_price_feed_mint(mint: str) -> None:
+    """Register newly seen whale mints with the shared price feed when available."""
     try:
-        r = requests.get(
-            f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
-            timeout=REQUEST_TIMEOUT,
-            headers={"User-Agent": "memecoin-engine/1.0"},
-        )
-        if r.status_code == 200:
-            pairs = r.json().get("pairs") or []
-            sol_pairs = [p for p in pairs if p.get("chainId") == "solana"]
-            if sol_pairs:
-                best = max(sol_pairs, key=lambda p: float((p.get("liquidity") or {}).get("usd", 0) or 0))
-                price = float(best.get("priceUsd", 0) or 0)
-                if price > 0:
-                    return price
+        from utils import ws_price_feed  # type: ignore
+        ws_price_feed.register_mint(mint)
     except Exception:
         pass
-    # Fallback: Jupiter price API v2 (requires API key)
+
+
+def _get_token_price(mint: str) -> Optional[float]:
+    """Fetch current USD price using the active price paths in this codebase."""
     try:
-        jup_key = os.environ.get("JUPITER_API_KEY", "")
-        headers = {"x-api-key": jup_key} if jup_key else {}
-        r = requests.get(
-            f"https://api.jup.ag/price/v2?ids={mint}",
-            headers=headers,
-            timeout=6,
-        )
-        if r.status_code == 200:
-            data = r.json().get("data", {})
-            td = data.get(mint)
-            if td and td.get("price"):
-                return float(td["price"])
+        from utils import ws_price_feed  # type: ignore
+        cached = ws_price_feed.get_price(mint)
+        if cached and cached > 0:
+            return float(cached)
     except Exception:
         pass
-    return 0.0
+    try:
+        import asyncio as _asyncio
+        from utils.jupiter_swap import get_token_price_usd  # type: ignore
+        price = _asyncio.run(get_token_price_usd(mint))
+        if price and price > 0:
+            return float(price)
+    except Exception:
+        pass
+    return None
+
+
+def _get_token_price_with_source(mint: str) -> tuple[Optional[float], Optional[str]]:
+    try:
+        from utils import ws_price_feed  # type: ignore
+        cached = ws_price_feed.get_price(mint)
+        if cached and cached > 0:
+            return float(cached), "ws_price_feed"
+    except Exception:
+        pass
+    try:
+        import asyncio as _asyncio
+        from utils.jupiter_swap import get_token_price_usd  # type: ignore
+        price = _asyncio.run(get_token_price_usd(mint))
+        if price and price > 0:
+            return float(price), "jupiter"
+    except Exception:
+        pass
+    try:
+        from data.birdeye import fetch_birdeye_price  # type: ignore
+        price = fetch_birdeye_price(mint)
+        if price and price > 0:
+            return float(price), "birdeye"
+    except Exception:
+        pass
+    try:
+        from data.dexscreener import fetch_token_snapshot  # type: ignore
+
+        snap = fetch_token_snapshot(mint) or {}
+        price = float(snap.get("price") or 0)
+        if price > 0:
+            return price, "dex_token_budgeted"
+    except Exception:
+        pass
+    return None, None
+
+
+def _resolve_alert_price(mint: str, pair: dict | None = None) -> dict:
+    if not mint:
+        return {"price": None, "source": None, "reason": "missing_mint"}
+    pair_price = _pair_price_usd(pair or {})
+    if pair_price and pair_price > 0:
+        return {"price": pair_price, "source": "dex_pair", "reason": None}
+    price, source = _get_token_price_with_source(mint)
+    if price and price > 0:
+        return {"price": price, "source": source, "reason": None}
+    return {"price": None, "source": None, "reason": "price_unavailable"}
 
 
 # ── Scanner gate check ────────────────────────────────────────────────────────
@@ -404,54 +486,147 @@ def _detect_accumulation(symbol: str, current_id: int) -> bool:
 
 def _log_alert(parsed: dict, raw_text: str) -> int:
     """Insert a new alert row. Returns the inserted row id."""
-    from utils.db import get_conn
+    from utils.db import get_conn, with_db_retry
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     mc = parsed.get("market_cap_usd") or 0
     in_range = 1 if MC_MIN_USD <= mc <= MC_MAX_USD else 0
     tier = _mc_tier(mc)
 
-    with get_conn() as conn:
-        cur = conn.execute("""
-            INSERT INTO whale_watch_alerts
-                (ts_utc, raw_text, alert_type, kol_name, token_symbol,
-                 buy_amount_usd, market_cap_usd, mc_tier, mc_in_range)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            ts,
-            raw_text,
-            parsed.get("alert_type"),
-            parsed.get("kol_name"),
-            parsed.get("token_symbol"),
-            parsed.get("buy_amount_usd"),
-            parsed.get("market_cap_usd"),
-            tier,
-            in_range,
-        ))
-        return cur.lastrowid
+    def _write() -> int:
+        with get_conn() as conn:
+            cur = conn.execute("""
+                INSERT INTO whale_watch_alerts
+                    (ts_utc, raw_text, alert_type, kol_name, token_symbol,
+                     buy_amount_usd, market_cap_usd, mc_tier, mc_in_range)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                ts,
+                raw_text,
+                parsed.get("alert_type"),
+                parsed.get("kol_name"),
+                parsed.get("token_symbol"),
+                parsed.get("buy_amount_usd"),
+                parsed.get("market_cap_usd"),
+                tier,
+                in_range,
+            ))
+            return int(cur.lastrowid)
+
+    return int(with_db_retry(_write, retries=5, base_sleep_s=0.35))
 
 
-def _update_alert_scanner(alert_id: int, mint: str, price: float, scanner: dict) -> None:
-    """Update alert row with resolved mint, price, and scanner result."""
-    from utils.db import get_conn
-    with get_conn() as conn:
-        conn.execute("""
-            UPDATE whale_watch_alerts
-            SET token_mint=?, price_at_alert=?, scanner_pass=?, scanner_score=?, scanner_rug_label=?
-            WHERE id=?
-        """, (
-            mint,
-            price,
-            1 if scanner["pass"] else 0,
-            scanner["score"],
-            scanner["rug_label"],
-            alert_id,
-        ))
+def _update_alert_resolution(
+    alert_id: int,
+    *,
+    mint: str | None = None,
+    pair_address: str | None = None,
+    market_cap_usd: float | None = None,
+    mint_resolution_source: str | None = None,
+    mint_resolution_reason: str | None = None,
+    price: Optional[float] = None,
+    price_source: str | None = None,
+    price_resolution_reason: str | None = None,
+) -> None:
+    from utils.db import get_conn, with_db_retry
+
+    def _write() -> None:
+        with get_conn() as conn:
+            conn.execute("""
+                UPDATE whale_watch_alerts
+                SET token_mint=COALESCE(?, token_mint),
+                    token_pair_address=COALESCE(?, token_pair_address),
+                    market_cap_usd=COALESCE(?, market_cap_usd),
+                    mint_resolution_source=?,
+                    mint_resolution_reason=?,
+                    price_at_alert=COALESCE(?, price_at_alert),
+                    price_source=?,
+                    price_resolution_reason=?
+                WHERE id=?
+            """, (
+                mint,
+                pair_address,
+                market_cap_usd,
+                mint_resolution_source,
+                mint_resolution_reason,
+                price,
+                price_source,
+                price_resolution_reason,
+                alert_id,
+            ))
+
+    with_db_retry(_write, retries=5, base_sleep_s=0.25)
+
+
+def _update_alert_scanner(alert_id: int, scanner: dict) -> None:
+    """Update alert row with scanner result."""
+    from utils.db import get_conn, with_db_retry
+
+    def _write() -> None:
+        with get_conn() as conn:
+            conn.execute("""
+                UPDATE whale_watch_alerts
+                SET scanner_pass=?, scanner_score=?, scanner_rug_label=?, scanner_reason=?
+                WHERE id=?
+            """, (
+                1 if scanner["pass"] else 0,
+                scanner["score"],
+                scanner["rug_label"],
+                scanner.get("reason"),
+                alert_id,
+            ))
+
+    with_db_retry(_write, retries=5, base_sleep_s=0.25)
+
+
+def _update_alert_arkham(alert_id: int, intel: dict) -> None:
+    """Persist Arkham token enrichment onto the alert row for downstream lanes."""
+    from utils.db import get_conn, with_db_retry
+
+    def _write() -> None:
+        with get_conn() as conn:
+            conn.execute(
+                """
+                UPDATE whale_watch_alerts
+                SET arkham_status=?,
+                    arkham_signal_quality=?,
+                    arkham_signal_score=?,
+                    arkham_entity_holder_count=?,
+                    arkham_top_entity_name=?,
+                    arkham_top_entity_type=?,
+                    arkham_top_entity_pct_of_cap=?,
+                    arkham_top_flow_entity_name=?,
+                    arkham_top_flow_entity_type=?,
+                    arkham_net_flow_usd=?,
+                    arkham_enriched_at=?
+                WHERE id=?
+                """,
+                (
+                    intel.get("status"),
+                    intel.get("signal_quality"),
+                    intel.get("signal_score"),
+                    intel.get("entity_holder_count"),
+                    intel.get("top_entity_name"),
+                    intel.get("top_entity_type"),
+                    intel.get("top_entity_pct_of_cap"),
+                    intel.get("top_flow_entity_name"),
+                    intel.get("top_flow_entity_type"),
+                    intel.get("net_flow_usd"),
+                    intel.get("updated_ts_utc"),
+                    alert_id,
+                ),
+            )
+
+    with_db_retry(_write, retries=5, base_sleep_s=0.25)
 
 
 def _mark_alert_sent(alert_id: int) -> None:
-    from utils.db import get_conn
-    with get_conn() as conn:
-        conn.execute("UPDATE whale_watch_alerts SET alert_sent=1 WHERE id=?", (alert_id,))
+    from utils.db import get_conn, with_db_retry
+
+    def _write() -> None:
+        with get_conn() as conn:
+            conn.execute("UPDATE whale_watch_alerts SET alert_sent=1 WHERE id=?", (alert_id,))
+
+    with_db_retry(_write, retries=5, base_sleep_s=0.25)
 
 
 def _write_cross_signal(alert_id: int, parsed: dict, mc: float, scanner: dict, mint: str) -> None:
@@ -462,13 +637,13 @@ def _write_cross_signal(alert_id: int, parsed: dict, mc: float, scanner: dict, m
     Phase 3+ (100 outcomes): memecoin_scanner reads WHALE_CONFIRM for sweet_spot tokens
     Phase 4+ (250 outcomes): spot_accumulator reads WHALE_CONFIRM for mid/large tokens
     """
-    from utils.db import get_conn
+    from utils.db import get_conn, with_db_retry
     from datetime import timedelta
     tier   = _mc_tier(mc)
     target = _TIER_TARGETS.get(tier, "observation")
     expires = (datetime.now(timezone.utc) + timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")
 
-    try:
+    def _write() -> None:
         with get_conn() as conn:
             conn.execute("""
                 INSERT INTO cross_agent_signals
@@ -490,6 +665,9 @@ def _write_cross_signal(alert_id: int, parsed: dict, mc: float, scanner: dict, m
                 expires,
                 alert_id,
             ))
+
+    try:
+        with_db_retry(_write, retries=5, base_sleep_s=0.25)
         log.info("[WHALE] Cross-signal written: %s → %s (tier=%s)",
                  parsed.get("token_symbol"), target, tier)
     except Exception as e:
@@ -507,24 +685,25 @@ def whale_watch_outcome_step() -> None:
     now = datetime.now(timezone.utc)
     cutoff_24h = (now.timestamp() - 86400)
 
-    # Patch 150: close out rows where price_at_alert was never captured (stuck forever)
+    # Patch 218: mark untrackable rows UNRESOLVED before TTL sees them.
+    # Rows with no mint / no entry price are cross-chain tokens (ETH-native,
+    # stablecoins) whose prices can't be resolved via the Solana/DexScreener
+    # oracle.  Writing -100.0 for these is false data — use UNRESOLVED so the
+    # stats query excludes them from WR and avg_return calculations.
+    from utils.db import get_conn as _gc218  # local alias to avoid shadowing
+    with _gc218() as conn:
+        conn.execute("""
+            UPDATE whale_watch_alerts
+            SET outcome_status = 'UNRESOLVED'
+            WHERE outcome_status = 'PENDING'
+              AND (token_mint IS NULL OR token_mint = ''
+                   OR price_at_alert IS NULL OR price_at_alert = 0)
+        """)
+
+    # Patch 151: universal TTL enforcer — closes any PENDING rows older than 48h
+    from utils.outcome_ttl import close_stale_pending  # type: ignore
     with get_conn() as conn:
-        no_price_rows = conn.execute("""
-            SELECT id, ts_utc FROM whale_watch_alerts
-            WHERE outcome_status='PENDING'
-              AND (price_at_alert IS NULL OR price_at_alert = 0)
-        """).fetchall()
-        for r in no_price_rows:
-            try:
-                ts = datetime.strptime(r["ts_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-                if (now - ts).total_seconds() >= 86400:
-                    conn.execute("""
-                        UPDATE whale_watch_alerts
-                        SET outcome_status='COMPLETE', price_24h=0, return_24h_pct=NULL
-                        WHERE id=?
-                    """, (r["id"],))
-            except Exception:
-                pass
+        close_stale_pending(conn, table="whale_watch_alerts")
 
     with get_conn() as conn:
         rows = conn.execute("""
@@ -553,7 +732,7 @@ def whale_watch_outcome_step() -> None:
             current_price = _get_token_price(mint)
 
             # Patch 150: if token is dead/delisted and 24h has elapsed, close out anyway
-            if current_price <= 0:
+            if not current_price or current_price <= 0:
                 if age_s >= 86400:
                     # Token dead — mark COMPLETE with worst-case returns
                     from utils.db import get_conn as _gc
@@ -607,6 +786,7 @@ async def _handle_whale_message(text: str) -> None:
     """Process one message from the Whale Watch channel."""
     from utils import orchestrator
     from utils.telegram_alerts import send_telegram_sync
+    from utils.arkham_client import enrich_token
 
     if not text or not text.strip():
         return
@@ -632,39 +812,99 @@ async def _handle_whale_message(text: str) -> None:
         log.info("[WHALE] MC $%.1fM outside $5M-$50M range — logged, not scanning", mc / 1e6)
         return
 
-    # Resolve token via DexScreener
-    pair = await asyncio.to_thread(_resolve_token, symbol)
-    if not pair:
-        log.info("[WHALE] Could not resolve %s on DexScreener", symbol)
+    # Resolve token cache-first, then use budgeted live providers only if needed.
+    resolution = await asyncio.to_thread(_resolve_token, symbol, mc or None)
+    pair = resolution.get("pair")
+    mint = str(resolution.get("mint") or "").strip()
+    mint_source = resolution.get("source")
+    mint_reason = resolution.get("reason")
+    candidate_count = int(resolution.get("candidate_count") or 0)
+
+    if not pair or not mint:
+        await asyncio.to_thread(
+            _update_alert_resolution,
+            alert_id,
+            market_cap_usd=mc or None,
+            mint_resolution_source=mint_source,
+            mint_resolution_reason=mint_reason or "mint_unresolved",
+        )
+        log.info(
+            "[WHALE] Mint unresolved for %s: reason=%s candidates=%d",
+            symbol,
+            mint_reason or "mint_unresolved",
+            candidate_count,
+        )
         return
 
-    mint = (pair.get("baseToken") or {}).get("address", "")
-    if not mint:
-        log.info("[WHALE] No mint address found for %s", symbol)
-        return
+    pair_address = str(pair.get("pairAddress") or "").strip() or None
 
     # If MC was missing from alert, use DexScreener value and check range
     if mc == 0:
         mc = float(pair.get("fdv") or pair.get("marketCap") or 0)
         if mc > 0 and not (MC_MIN_USD <= mc <= MC_MAX_USD):
-            log.info("[WHALE] DexScreener MC $%.1fM outside range — skipping scanner", mc / 1e6)
-            from utils.db import get_conn
-            with get_conn() as conn:
-                conn.execute(
-                    "UPDATE whale_watch_alerts SET token_mint=?, market_cap_usd=? WHERE id=?",
-                    (mint, mc, alert_id),
-                )
+            await asyncio.to_thread(
+                _update_alert_resolution,
+                alert_id,
+                mint=mint,
+                pair_address=pair_address,
+                market_cap_usd=mc,
+                mint_resolution_source=mint_source,
+                mint_resolution_reason=mint_reason,
+            )
+            log.info(
+                "[WHALE] DexScreener MC $%.1fM outside range — skipping scanner for %s",
+                mc / 1e6,
+                symbol,
+            )
             return
 
-    # Get price
-    price = await asyncio.to_thread(_get_token_price, mint)
+    # Register the mint with the shared feed so follow-up outcome tracking can warm naturally.
+    await asyncio.to_thread(_register_price_feed_mint, mint)
+
+    price_info = await asyncio.to_thread(_resolve_alert_price, mint, pair)
+    price = price_info.get("price")
+    price_source = price_info.get("source")
+    price_reason = price_info.get("reason")
+
+    await asyncio.to_thread(
+        _update_alert_resolution,
+        alert_id,
+        mint=mint,
+        pair_address=pair_address,
+        market_cap_usd=mc or None,
+        mint_resolution_source=mint_source,
+        mint_resolution_reason=mint_reason,
+        price=price,
+        price_source=price_source,
+        price_resolution_reason=price_reason,
+    )
+
+    log.info(
+        "[WHALE] Resolution %s: mint_source=%s price_source=%s price_reason=%s",
+        symbol,
+        mint_source or "unknown",
+        price_source or "none",
+        price_reason or "ok",
+    )
+
+    # Arkham token/entity enrichment — fail-open support context only.
+    intel = await asyncio.to_thread(enrich_token, mint, "solana")
+    await asyncio.to_thread(_update_alert_arkham, alert_id, intel)
 
     # Run scanner gates
     scanner = await asyncio.to_thread(_run_scanner_check, pair, mint)
-    await asyncio.to_thread(_update_alert_scanner, alert_id, mint, price, scanner)
+    await asyncio.to_thread(_update_alert_scanner, alert_id, scanner)
 
     log.info("[WHALE] Scanner check: pass=%s score=%.1f rug=%s reason=%s",
              scanner["pass"], scanner["score"], scanner["rug_label"], scanner["reason"])
+    if intel.get("status") == "LIVE":
+        log.info(
+            "[WHALE] Arkham enrich: quality=%s score=%.1f top_entity=%s net_flow=$%.0f",
+            intel.get("signal_quality"),
+            float(intel.get("signal_score") or 0),
+            intel.get("top_entity_name") or "n/a",
+            float(intel.get("net_flow_usd") or 0),
+        )
 
     # Check accumulation pattern
     is_accum = await asyncio.to_thread(_detect_accumulation, symbol, alert_id)
@@ -680,7 +920,7 @@ async def _handle_whale_message(text: str) -> None:
         body  = (
             f"<b>${symbol}</b> | MC {mc_str} | bought {buy_str}\n"
             f"Score: {scanner['score']:.0f} | Safety: {scanner['rug_label']}\n"
-            f"Price: ${price:.6g}"
+            + (f"Price: ${price:.6g}" if price and price > 0 else "Price: unavailable")
         )
         await asyncio.to_thread(send_telegram_sync, title, body, "🚨")
         await asyncio.to_thread(_mark_alert_sent, alert_id)

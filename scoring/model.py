@@ -411,50 +411,13 @@ def score_token(token: dict) -> tuple[float, dict]:
     breakdown["breakout_timing"] = breakout_score
 
     # ═══════════════════════════════════════════════════════════
-    # 10. SECOND LEG / ATH DRAWDOWN SIGNAL (12 pts)
-    # "Ape conviction bags AFTER 80-90% drawdown from ATH"
-    # The Murad/Sniper framework: CT thinks it's dead = your entry.
-    # First leg = exit liquidity. Second leg = life-changing gains.
-    # Third leg = whale territory, trade with them or exit gracefully.
-    #
-    # Scoring:
-    #   SECOND_LEG (75-95% from ATH) = max bonus — ideal entry zone
-    #   DRAWDOWN (30-75%) = small bonus — too early, whales still exiting
-    #   FIRST_LEG (0-30%) = neutral — could be pumping or just launched
-    #   THIRD_LEG (recovering back to ATH) = penalty — already played out
+    # 10. LEGACY ATH / SECOND-LEG SIGNAL (retired)
+    # Kept as compatibility metadata only. Modern memecoin decisions come from
+    # timing, safety, market quality, support, and readiness instead.
     # ═══════════════════════════════════════════════════════════
     leg_score   = 0.0
     leg         = token.get("leg", "UNKNOWN")
     drawdown    = float(token.get("drawdown_pct") or 0)
-    is_2nd_leg  = token.get("is_second_leg", False)
-
-    if leg == "SECOND_LEG":
-        # Core entry zone — graduated by depth of drawdown
-        if drawdown >= 90:
-            leg_score = 12     # 90%+ down, maximum conviction entry
-        elif drawdown >= 85:
-            leg_score = 10     # Ideal zone
-        elif drawdown >= 80:
-            leg_score = 8      # Good zone
-        else:
-            leg_score = 5      # 75-80% — entering the zone
-    elif leg == "DRAWDOWN":
-        # Still distributing — whales haven't fully exited yet
-        # Small bonus: moving in right direction but too early
-        if drawdown >= 60:
-            leg_score = 2      # Getting close
-        else:
-            leg_score = 0      # Too early
-    elif leg == "FIRST_LEG":
-        # At or near ATH — first pump or newly launched
-        # Neutral: could be valid new launch, don't penalize
-        leg_score = 0
-    elif leg == "THIRD_LEG":
-        # Already recovered — this is whale territory
-        # If we're in third leg and price is running, it's late
-        leg_score = -4
-
-    leg_score = max(-4, min(12, leg_score))
     score += leg_score
     breakdown["second_leg"] = leg_score
     breakdown["leg_phase"]  = leg

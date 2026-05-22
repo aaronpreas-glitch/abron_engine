@@ -1,150 +1,30 @@
 import { useQuery } from '@tanstack/react-query'
-import { useEffect, useRef, useState } from 'react'
-import { api } from './api'
-import { TradesSection } from './sections/TradesSection'
-import { WalletSection } from './sections/WalletSection'
+import { Suspense, lazy, useEffect, useRef, useState } from 'react'
+import { api, getDashboardRequestMetrics } from './api'
+import { liveBudgetedInterval, slowBudgetedInterval } from './queryBudget'
 import type { JupiterPosition } from './sections/WalletSection'
-import { PriceStrip } from './sections/PriceStrip'
-import { TierSection } from './sections/TierSection'
-import { PortfolioSection } from './sections/PortfolioSection'
-import { FeedSection } from './sections/FeedSection'
-import { NewsTicker } from './sections/NewsTicker'
-import { MemecoinsPage } from './sections/MemecoinsPage'
-import { SpotPage } from './sections/SpotPage'
-import { HomePage } from './sections/HomePage'
-import { WhalePage } from './sections/WhalePage'
-import { ConfluencePage } from './sections/ConfluencePage'
-import { WalletsPage } from './sections/WalletsPage'
-import { MarketOverviewBar } from './sections/MarketOverviewBar'  // Patch 152
 
-// ── Health types ──────────────────────────────────────────────────────────────
-interface SystemHealth {
-  status: 'HEALTHY' | 'WARN' | 'DEGRADED' | 'CRITICAL' | 'UNKNOWN'
-  ts: string | null
-  db: boolean | null
-  issues: string[]
-  warnings: string[]
-  agents_total: number
-  agents_stalled: number
-  agents_slow: number
-  scan_age_min: number | null
-  open_meme: number
-  // Patch 122
-  fear_greed?: { value: number | null; label: string; favorable: boolean } | null
-  auto_buy_enabled?: boolean
-}
+const HomePage = lazy(() =>
+  import('./sections/HomePage').then(m => ({ default: m.HomePage })),
+)
+const MemecoinsPage = lazy(() =>
+  import('./sections/MemecoinsPage').then(m => ({ default: m.MemecoinsPage })),
+)
+const SystemPage = lazy(() =>
+  import('./sections/SystemPage').then(m => ({ default: m.SystemPage })),
+)
+const AuditPage = lazy(() =>
+  import('./sections/AuditPage').then(m => ({ default: m.AuditPage })),
+)
 
-// ── System Health Bar ─────────────────────────────────────────────────────────
-function SystemHealthBar({ health }: { health: SystemHealth | undefined }) {
-  if (!health) return null
-
-  const dotColor =
-    health.status === 'HEALTHY' ? '#00d48a' :
-    health.status === 'WARN'    ? '#f59e0b' :
-    health.status === 'DEGRADED'? '#f59e0b' :
-    health.status === 'CRITICAL'? '#ef4444' : '#4d5a6e'
-
-  const allIssues = [...health.issues, ...health.warnings]
-
-  return (
-    <div style={{
-      background: '#050d14',
-      borderTop: `1px solid ${dotColor}22`,
-      borderBottom: '1px solid #0d1f2d',
-      padding: '3px 20px',
-      display: 'flex',
-      alignItems: 'center',
-      gap: 10,
-      fontSize: 9,
-      fontFamily: 'JetBrains Mono, monospace',
-    }}>
-      {/* Status dot + label */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 5, flexShrink: 0 }}>
-        <span style={{
-          width: 6, height: 6, borderRadius: '50%',
-          background: dotColor,
-          display: 'inline-block',
-          boxShadow: health.status === 'HEALTHY' ? `0 0 5px ${dotColor}88` : 'none',
-        }} />
-        <span style={{ color: dotColor, fontWeight: 700, letterSpacing: '0.1em' }}>
-          {health.status}
-        </span>
-      </div>
-
-      <span style={{ color: 'var(--sep)' }}>·</span>
-
-      {/* Agent summary */}
-      <span style={{ color: '#2d4060', flexShrink: 0 }}>
-        <span style={{ color: '#4d5a6e' }}>agents </span>
-        <span style={{ color: health.agents_stalled > 0 ? '#ef4444' : '#00d48a' }}>
-          {health.agents_total - health.agents_stalled}/{health.agents_total}
-        </span>
-        {health.agents_slow > 0 && (
-          <span style={{ color: '#f59e0b' }}> · {health.agents_slow} slow</span>
-        )}
-      </span>
-
-      {/* Scan age */}
-      {health.scan_age_min !== null && (
-        <>
-          <span style={{ color: 'var(--sep)' }}>·</span>
-          <span style={{ color: health.scan_age_min > 15 ? '#f59e0b' : '#2d4060', flexShrink: 0 }}>
-            <span style={{ color: '#4d5a6e' }}>scan </span>
-            {health.scan_age_min > 1 ? `${health.scan_age_min.toFixed(0)}m ago` : 'fresh'}
-          </span>
-        </>
-      )}
-
-      {/* F&G index — Patch 122 */}
-      {health.fear_greed && (
-        <>
-          <span style={{ color: 'var(--sep)' }}>·</span>
-          <span style={{ flexShrink: 0 }}>
-            <span style={{ color: '#4d5a6e' }}>F&amp;G </span>
-            <span style={{ color: health.fear_greed.favorable ? '#00d48a' : '#ef4444', fontWeight: 600 }}>
-              {health.fear_greed.value ?? '—'} {health.fear_greed.label}
-            </span>
-          </span>
-        </>
-      )}
-      {/* Auto-buy state — Patch 122 */}
-      {health.auto_buy_enabled !== undefined && (
-        <>
-          <span style={{ color: 'var(--sep)' }}>·</span>
-          <span style={{ color: health.auto_buy_enabled ? '#00d48a' : '#4d5a6e', flexShrink: 0 }}>
-            AUTO-BUY {health.auto_buy_enabled ? 'ON' : 'OFF'}
-          </span>
-        </>
-      )}
-
-      {/* Issues / warnings scrolling */}
-      {allIssues.length > 0 && (
-        <>
-          <span style={{ color: 'var(--sep)' }}>·</span>
-          <div style={{ overflow: 'hidden', flex: 1, minWidth: 0 }}>
-            <span style={{ color: health.issues.length > 0 ? '#ef4444' : '#f59e0b' }}>
-              {allIssues.join(' · ')}
-            </span>
-          </div>
-        </>
-      )}
-
-      {/* DB dot */}
-      {health.db !== null && (
-        <span
-          title="Database"
-          style={{ marginLeft: 'auto', flexShrink: 0, color: health.db ? '#2d4060' : '#ef4444' }}
-        >
-          DB {health.db ? '✓' : '✗'}
-        </span>
-      )}
-    </div>
-  )
+interface SystemModes {
+  perp: string
+  memecoins: string
+  spot: string
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
-// Kept for section files that import these (not rendered, but TypeScript checks them)
 export interface ChecklistItem {
   id: string; label: string; pass: boolean; value: number | string; target: number | string
 }
@@ -174,6 +54,41 @@ export interface PerpsStatus {
   enabled?: boolean
 }
 
+// ── Mode pill helper ──────────────────────────────────────────────────────────
+
+function ModePill({ label, mode }: { label: string; mode: string }) {
+  const isLive = mode === 'LIVE'
+  const color = isLive ? '#00d48a' : mode === 'SIM' ? '#f59e0b' : '#60a5fa'
+  return (
+    <span style={{
+      display: 'inline-flex', alignItems: 'center', gap: 4,
+      background: `${color}10`, border: `1px solid ${color}30`,
+      borderRadius: 3, padding: '2px 8px',
+      fontFamily: 'JetBrains Mono, monospace', fontSize: 9,
+      color: 'var(--chrome)',
+    }}>
+      <span style={{ color: 'var(--chrome)' }}>{label}</span>
+      <span style={{ color, fontWeight: 700 }}>:{mode}</span>
+    </span>
+  )
+}
+
+function PageLoadingFallback() {
+  return (
+    <div style={{
+      maxWidth: 1200,
+      margin: '0 auto',
+      padding: '20px 24px',
+      color: 'var(--chrome)',
+      fontSize: 10,
+      fontFamily: 'JetBrains Mono, monospace',
+      letterSpacing: '0.08em',
+    }}>
+      LOADING PAGE…
+    </div>
+  )
+}
+
 // ── Notifications ─────────────────────────────────────────────────────────────
 
 function notify(title: string, body: string) {
@@ -191,19 +106,47 @@ interface Props {
   onLogout: () => void
 }
 
-type Page = 'home' | 'trading' | 'memecoins' | 'spot' | 'whale' | 'confluence' | 'wallets'
+type Page = 'home' | 'system' | 'memecoins' | 'audit'
+
+const PAGE_LABEL: Record<Page, string> = {
+  home: 'Home',
+  system: 'System',
+  memecoins: 'Memecoins',
+  audit: 'Ops',
+}
+
+const PRIMARY_PAGES: Page[] = ['home', 'system', 'audit']
 
 export function Terminal({ onLogout }: Props) {
   const [page, setPage] = useState<Page>('home')
+  const [requestMetrics, setRequestMetrics] = useState(getDashboardRequestMetrics)
 
-  // ── Notification permission ───────────────────────────────────────────────
   useEffect(() => {
     if ('Notification' in window && Notification.permission === 'default') {
       Notification.requestPermission()
     }
   }, [])
 
+  useEffect(() => {
+    const id = window.setInterval(() => setRequestMetrics(getDashboardRequestMetrics()), 5_000)
+    return () => window.clearInterval(id)
+  }, [])
+
   // ── Data fetches ──────────────────────────────────────────────────────────
+
+  const modesQuery = useQuery<SystemModes>({
+    queryKey: ['system-modes'],
+    queryFn: async () => {
+      const r = await api.get('/home/modes')
+      return r.data
+    },
+    refetchInterval: slowBudgetedInterval(120_000),
+    staleTime: 60_000,
+  })
+
+  const modes = modesQuery.data
+  const perpsMode = String(modes?.perp || '').toUpperCase()
+  const perpsHeaderActive = perpsMode === 'LIVE' || perpsMode === 'SIM'
 
   const perpsStatus = useQuery<PerpsStatus>({
     queryKey: ['perps-status'],
@@ -211,8 +154,12 @@ export function Terminal({ onLogout }: Props) {
       const r = await api.get('/perps/status')
       return r.data
     },
-    refetchInterval: 30_000,
+    refetchInterval: slowBudgetedInterval(300_000, perpsHeaderActive),
+    staleTime: 120_000,
+    enabled: perpsHeaderActive,
   })
+
+  const perpsOpen = (perpsStatus.data?.open_positions ?? 0) > 0
 
   const closedTrades = useQuery<ClosedTrade[]>({
     queryKey: ['closed-trades'],
@@ -220,27 +167,9 @@ export function Terminal({ onLogout }: Props) {
       const r = await api.get('/perps/closed?limit=20')
       return r.data?.trades ?? r.data ?? []
     },
-    refetchInterval: 30_000,
-  })
-
-  const portfolio = useQuery<{
-    signals: Array<{
-      coin: string; signal: 'ACCUMULATE' | 'HOLD' | 'REDUCE'
-      price_usd: number | null; reason: string | null
-      fear_greed: number | null; btc_dom_pct: number | null
-      regime: string | null; regime_score: number | null
-      chg_4w_pct: number | null; ts_utc: string
-    }>
-    fear_greed: number | null
-    btc_dom_pct: number | null
-    last_updated: string | null
-  }>({
-    queryKey: ['portfolio'],
-    queryFn: async () => {
-      const r = await api.get('/portfolio/signals')
-      return r.data
-    },
-    refetchInterval: 60_000,
+    refetchInterval: slowBudgetedInterval(300_000, perpsOpen),
+    staleTime: 120_000,
+    enabled: perpsOpen,
   })
 
   const walletQuery = useQuery<{
@@ -254,64 +183,8 @@ export function Terminal({ onLogout }: Props) {
       const r = await api.get('/wallet/positions')
       return r.data
     },
-    refetchInterval: 30_000,
-  })
-
-  const pricesQuery = useQuery<{
-    prices: Array<{ coin: string; price: number; chg24: number | null }>
-  }>({
-    queryKey: ['prices'],
-    queryFn: async () => {
-      const r = await api.get('/prices')
-      // API returns {BTC: {price, change_24h}, ...} — transform to {prices: [...]}
-      const raw = r.data as Record<string, { price: number; change_24h: number | null }>
-      const prices = Object.entries(raw).map(([coin, d]) => ({
-        coin,
-        price: d.price,
-        chg24: d.change_24h,
-      }))
-      return { prices }
-    },
-    refetchInterval: 60_000,
-  })
-
-  const healthQuery = useQuery<SystemHealth>({
-    queryKey: ['system-health'],
-    queryFn: async () => {
-      const r = await api.get('/health/status')
-      return r.data
-    },
-    refetchInterval: 60_000,
-  })
-
-  const memoryQuery = useQuery<MemoryEntry[]>({
-    queryKey: ['memory'],
-    queryFn: async () => {
-      const r = await api.get('/orchestrator/memory?lines=80')
-      const raw: string = r.data?.memory ?? ''
-      // Parse "## [2026-03-01 18:30:00 UTC] AGENT\nmessage" blocks
-      const entries: MemoryEntry[] = []
-      const lines = raw.split('\n')
-      let i = 0
-      while (i < lines.length) {
-        const m = lines[i].match(/^##\s+\[(.+?)\s*UTC\]\s+(.+)$/)
-        if (m) {
-          const ts   = m[1].trim()   // "2026-03-01 18:30:00" — strip UTC for ISO compat
-          const agent = m[2].trim()
-          const msgParts: string[] = []
-          i++
-          while (i < lines.length && !lines[i].startsWith('##')) {
-            if (lines[i].trim()) msgParts.push(lines[i].trim())
-            i++
-          }
-          if (msgParts.length) entries.push({ ts, agent, message: msgParts.join(' ') })
-        } else {
-          i++
-        }
-      }
-      return entries.reverse()  // newest first
-    },
-    refetchInterval: 15_000,
+    refetchInterval: liveBudgetedInterval(120_000),
+    staleTime: 60_000,
   })
 
   // ── Trade notifications ───────────────────────────────────────────────────
@@ -352,23 +225,22 @@ export function Terminal({ onLogout }: Props) {
   // ── Derived ───────────────────────────────────────────────────────────────
 
   const isDryRun = perpsStatus.data?.dry_run !== false
-  const mode     = isDryRun ? 'SIMULATE' : 'LIVE'
   const regime   = perpsStatus.data?.market_regime ?? '—'
   const engineOn = perpsStatus.data?.enabled !== false
 
-  // Jupiter wallet
   const walletPositions = walletQuery.data?.positions ?? []
   const perpPnlUsd   = walletPositions.reduce((s, p) => s + p.pnl_usd, 0)
   const perpValueUsd = walletPositions.reduce((s, p) => s + p.value_usd, 0)
   const hasPerpValue = walletPositions.length > 0
 
-  // SOL spot
   const solBalance  = walletQuery.data?.sol_balance ?? null
-  const solPrice    = pricesQuery.data?.prices.find(p => p.coin === 'SOL')?.price ?? null
-  const solValueUsd = solBalance !== null && solPrice ? solBalance * solPrice : null
+  const netUsd = hasPerpValue ? perpValueUsd : 0
 
-  // Net portfolio
-  const netUsd = (solValueUsd ?? 0) + (hasPerpValue ? perpValueUsd : 0)
+  const dashboardTone =
+    requestMetrics.failed_60s > 0 ? '#ef4444'
+    : requestMetrics.slow_60s > 0 ? '#f59e0b'
+    : requestMetrics.requests_60s > 45 ? '#f59e0b'
+    : '#00d48a'
 
   // ── Layout ────────────────────────────────────────────────────────────────
 
@@ -385,7 +257,7 @@ export function Terminal({ onLogout }: Props) {
         display: 'flex', alignItems: 'center', justifyContent: 'space-between',
         padding: '0 20px', position: 'sticky', top: 0, zIndex: 10,
       }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 18 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
 
           {/* Engine name + status dot */}
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -395,20 +267,24 @@ export function Terminal({ onLogout }: Props) {
               display: 'inline-block',
               boxShadow: engineOn && !isDryRun ? '0 0 6px #00d48a88' : 'none',
             }} />
-            <span style={{ color: '#c0cfe0', fontWeight: 700, letterSpacing: '0.12em', fontSize: 13 }}>
+            <span style={{ color: 'var(--text)', fontWeight: 700, letterSpacing: '0.14em', fontSize: 11 }}>
               ABRON ENGINE
             </span>
           </div>
 
           <span style={{ color: 'var(--sep)' }}>|</span>
 
-          <span style={{ color: mode === 'LIVE' ? '#00d48a' : '#f59e0b', fontSize: 11, fontWeight: 700 }}>
-            {mode}
-          </span>
+          {/* Mode pills */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+            <ModePill label="PERP" mode={modes?.perp ?? (isDryRun ? 'SIM' : 'LIVE')} />
+            <ModePill label="MEME" mode={modes?.memecoins ?? 'PAPER'} />
+            <ModePill label="SPOT" mode={modes?.spot ?? 'PAPER'} />
+          </div>
+
+          <span style={{ color: 'var(--sep)' }}>|</span>
 
           {regime !== '—' && (
             <>
-              <span style={{ color: 'var(--sep)' }}>|</span>
               <span style={{
                 color: regime.toLowerCase().includes('bull') ? '#00d48a'
                   : regime.toLowerCase().includes('bear') ? '#ef4444'
@@ -417,57 +293,62 @@ export function Terminal({ onLogout }: Props) {
               }}>
                 {regime.toUpperCase()}
               </span>
+              <span style={{ color: 'var(--sep)' }}>|</span>
             </>
           )}
 
           {/* SOL spot */}
-          {solValueUsd !== null && (
+          {solBalance !== null && (
             <>
-              <span style={{ color: 'var(--sep)' }}>|</span>
               <span style={{ fontSize: 11 }}>
-                <span style={{ color: '#4d5a6e' }}>SOL </span>
-                <span style={{ color: '#8a9ab0', fontWeight: 700 }}>{solBalance!.toFixed(3)}</span>
-                <span style={{ color: '#2d4060', fontSize: 10 }}> · ${solValueUsd.toLocaleString('en-US', { maximumFractionDigits: 0 })}</span>
+                <span style={{ color: 'var(--chrome)' }}>SOL </span>
+                <span style={{ color: '#8a9ab0', fontWeight: 700 }}>{solBalance.toFixed(3)}</span>
               </span>
+              <span style={{ color: 'var(--sep)' }}>|</span>
             </>
           )}
 
           {/* PERP PnL */}
           {hasPerpValue && (
             <>
-              <span style={{ color: 'var(--sep)' }}>|</span>
               <span style={{ fontSize: 11 }}>
-                <span style={{ color: '#4d5a6e' }}>PERP </span>
+                <span style={{ color: 'var(--chrome)' }}>PERP </span>
                 <span style={{ color: perpPnlUsd >= 0 ? '#00d48a' : '#ef4444', fontWeight: 700 }}>
                   {perpPnlUsd >= 0 ? '+' : ''}${perpPnlUsd.toFixed(2)}
                 </span>
-                <span style={{ color: '#2d4060', fontSize: 10 }}> · ${perpValueUsd.toFixed(0)}</span>
+                <span style={{ color: 'var(--recessed)', fontSize: 10 }}> · ${perpValueUsd.toFixed(0)}</span>
               </span>
+              <span style={{ color: 'var(--sep)' }}>|</span>
             </>
           )}
 
           {/* Net total */}
           {netUsd > 0 && (
-            <>
-              <span style={{ color: 'var(--sep)' }}>|</span>
-              <span style={{ fontSize: 10, color: '#2d4060' }}>
-                NET <span style={{ color: '#5a7a9a', fontWeight: 700 }}>${netUsd.toLocaleString('en-US', { maximumFractionDigits: 0 })}</span>
-              </span>
-            </>
+            <span style={{ fontSize: 10, color: 'var(--recessed)' }}>
+              NET <span style={{ color: '#5a7a9a', fontWeight: 700 }}>${netUsd.toLocaleString('en-US', { maximumFractionDigits: 0 })}</span>
+            </span>
           )}
+
+          <span style={{ color: 'var(--sep)' }}>|</span>
+          <span
+            title={`Dashboard requests last 60s: ${requestMetrics.requests_60s}; slow: ${requestMetrics.slow_60s}; failed: ${requestMetrics.failed_60s}; inflight: ${requestMetrics.inflight}`}
+            style={{ fontSize: 9, color: dashboardTone, letterSpacing: '0.06em' }}
+          >
+            UI {requestMetrics.requests_60s}/m · {requestMetrics.avg_ms}ms
+          </span>
         </div>
 
         <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
 
           {/* ── Page tabs ── */}
           <div className="nav-tabs-row">
-            {(['home', 'trading', 'memecoins', 'spot', 'whale', 'confluence', 'wallets'] as Page[]).map(p => (
+            {PRIMARY_PAGES.map(p => (
               <button
                 key={p}
                 onClick={() => setPage(p)}
                 className={`nav-tab${page === p ? ' active' : ''}`}
               >
-                {p.toUpperCase()}
+                {PAGE_LABEL[p]}
               </button>
             ))}
           </div>
@@ -495,135 +376,18 @@ export function Terminal({ onLogout }: Props) {
         </div>
       </div>
 
-      {/* ── Price Strip ── */}
-      <PriceStrip
-        prices={pricesQuery.data?.prices ?? []}
-        loading={pricesQuery.isLoading}
-      />
-
-      {/* ── News Ticker ── */}
-      <NewsTicker />
-
-      {/* ── System Health Bar ── */}
-      <SystemHealthBar health={healthQuery.data} />
-
-      {/* ── Market Overview Bar ── */}
-      <MarketOverviewBar />  {/* Patch 152 */}
-
       {/* ── Pages ── */}
-      {page === 'home' ? (
-        <HomePage />
-      ) : page === 'wallets' ? (
-        <WalletsPage />
-      ) : page === 'confluence' ? (
-        <ConfluencePage />
-      ) : page === 'whale' ? (
-        <WhalePage />
-      ) : page === 'spot' ? (
-        <SpotPage />
-      ) : page === 'memecoins' ? (
-        <MemecoinsPage />
-      ) : (
-        <div style={{ maxWidth: 1200, margin: '0 auto', padding: '16px 20px', display: 'flex', flexDirection: 'column', gap: 12 }}>
-
-          {/* ── Trading page header ── */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
-            <span style={{
-              color: '#00d48a', fontFamily: 'JetBrains Mono, monospace',
-              fontWeight: 700, fontSize: 13, letterSpacing: '0.14em',
-            }}>
-              TRADING
-            </span>
-            <span className="badge" style={{
-              color: isDryRun ? 'var(--amber)' : 'var(--green)',
-              background: isDryRun ? 'rgba(245,158,11,0.1)' : 'rgba(0,212,138,0.1)',
-              border: `1px solid ${isDryRun ? 'rgba(245,158,11,0.25)' : 'rgba(0,212,138,0.25)'}`,
-              fontSize: 9,
-            }}>
-              {isDryRun ? 'SIMULATE' : 'LIVE'}
-            </span>
-            <span style={{ color: 'var(--dim)', fontFamily: 'JetBrains Mono, monospace', fontSize: 10 }}>
-              Jupiter Perps · 3× SOL · 5× BTC · 10× ETH
-            </span>
-            <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 16 }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                <span style={{ color: 'var(--dim)', fontSize: 10, fontFamily: 'JetBrains Mono, monospace' }}>positions</span>
-                <span style={{
-                  color: (perpsStatus.data?.open_positions ?? 0) > 0 ? 'var(--green)' : 'var(--dim)',
-                  fontFamily: 'JetBrains Mono, monospace', fontWeight: 700, fontSize: 12,
-                }}>
-                  {walletPositions.length > 0 ? walletPositions.length : (perpsStatus.data?.open_positions ?? '—')}
-                </span>
-              </div>
-              {hasPerpValue && (
-                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                  <span style={{ color: 'var(--dim)', fontSize: 10, fontFamily: 'JetBrains Mono, monospace' }}>perp PnL</span>
-                  <span style={{
-                    color: perpPnlUsd >= 0 ? 'var(--green)' : 'var(--red)',
-                    fontFamily: 'JetBrains Mono, monospace', fontWeight: 700, fontSize: 12,
-                  }}>
-                    {perpPnlUsd >= 0 ? '+' : ''}${perpPnlUsd.toFixed(2)}
-                  </span>
-                </div>
-              )}
-              {regime !== '—' && (
-                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                  <span style={{ color: 'var(--dim)', fontSize: 10, fontFamily: 'JetBrains Mono, monospace' }}>regime</span>
-                  <span style={{
-                    color: regime.toLowerCase().includes('bull') ? 'var(--green)'
-                      : regime.toLowerCase().includes('bear') ? 'var(--red)' : 'var(--muted)',
-                    fontFamily: 'JetBrains Mono, monospace', fontWeight: 700, fontSize: 11,
-                  }}>
-                    {regime.toUpperCase()}
-                  </span>
-                </div>
-              )}
-            </div>
-          </div>
-
-          <div className="card">
-            <TierSection jupiterPositions={walletPositions} />
-          </div>
-
-          <div className="card">
-            <WalletSection
-              wallet={walletQuery.data?.wallet ?? null}
-              positions={walletPositions}
-              solBalance={solBalance}
-              solPrice={solPrice}
-              loading={walletQuery.isLoading}
-              error={walletQuery.data?.error ?? null}
-            />
-          </div>
-
-          <div className="card">
-            <PortfolioSection
-              signals={portfolio.data?.signals ?? []}
-              fearGreed={portfolio.data?.fear_greed ?? null}
-              btcDom={portfolio.data?.btc_dom_pct ?? null}
-              lastUpdated={portfolio.data?.last_updated ?? null}
-              loading={portfolio.isLoading}
-              livePrices={pricesQuery.data?.prices ?? []}
-            />
-          </div>
-
-          <div className="card">
-            <TradesSection
-              perpsStatus={perpsStatus.data}
-              closedTrades={closedTrades.data ?? []}
-              loading={closedTrades.isLoading || perpsStatus.isLoading}
-            />
-          </div>
-
-          <div className="card">
-            <FeedSection
-              entries={memoryQuery.data ?? []}
-              loading={memoryQuery.isLoading}
-            />
-          </div>
-
-        </div>
-      )}
+      <Suspense fallback={<PageLoadingFallback />}>
+        {page === 'home' ? (
+          <HomePage />
+        ) : page === 'system' ? (
+          <SystemPage />
+        ) : page === 'memecoins' ? (
+          <MemecoinsPage />
+        ) : (
+          <AuditPage />
+        )}
+      </Suspense>
     </div>
   )
 }

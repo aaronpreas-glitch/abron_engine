@@ -193,18 +193,9 @@ def _resolve_token(mint: str) -> dict:
     Returns dict (may have None fields on failure).
     """
     try:
-        r = requests.get(
-            f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
-            timeout=8,
-            headers={"User-Agent": "Mozilla/5.0"},
-        )
-        if r.status_code == 429:  # Patch 163: 429 = rate limited; alert and skip
-            log.warning("[SWT] DexScreener 429 rate limit resolving %s", mint[:12])
-            _alert_dex_429_swt()
-            return {"symbol": None, "price_usd": None, "market_cap_usd": None}
-        if r.status_code != 200:
-            return {"symbol": None, "price_usd": None, "market_cap_usd": None}
-        pairs = r.json().get("pairs") or []
+        from data.dexscreener import fetch_token_pairs  # type: ignore
+
+        pairs = fetch_token_pairs(mint, reason="smart_wallet_resolve_429")
         # Pick SOL-base pair with most liquidity
         sol_pairs = [p for p in pairs if p.get("chainId") == "solana"]
         if not sol_pairs:
@@ -258,31 +249,7 @@ def _log_buy(conn, wallet: dict, buy: dict, token: dict) -> bool:
             log.info("[SWT] New buy: %s → %s %.4f SOL src=%s",
                      wallet["label"], token.get("symbol") or buy["mint"][:12],
                      buy["sol_spent"], buy["source"])
-            # Wire to cross_agent_signals for confluence engine (Patch 146)
-            try:
-                expires = (
-                    datetime.now(timezone.utc) + timedelta(hours=48)
-                ).strftime("%Y-%m-%dT%H:%M:%SZ")
-                conn.execute("""
-                    INSERT INTO cross_agent_signals
-                      (source, target, signal_type, token_symbol, token_mint,
-                       buy_amount_usd, market_cap_usd, scanner_score, scanner_rug_label,
-                       expires_ts)
-                    VALUES (?,?,?,?,?,?,?,?,?,?)
-                """, (
-                    "smart_wallet",
-                    "confluence_engine",
-                    "SMART_WALLET_BUY",
-                    token.get("symbol"),
-                    buy["mint"],
-                    round(buy_usd, 2),
-                    token.get("market_cap_usd"),
-                    round(buy["sol_spent"], 4),  # sol_spent stored in scanner_score
-                    wallet["label"],             # wallet label stored in scanner_rug_label
-                    expires,
-                ))
-            except Exception as _e:
-                log.debug("[SWT] cross_agent_signals write error: %s", _e)
+            # cross_agent_signals INSERT removed Patch 233 — confluence_engine never consumed these
             return True
     except Exception as e:
         log.debug("[SWT] log_buy error: %s", e)

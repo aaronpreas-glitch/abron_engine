@@ -1,0 +1,17 @@
+[Unit]
+Description=Memecoin Engine
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/memecoin_engine
+EnvironmentFile=/root/memecoin_engine/.env
+ExecStart=/usr/bin/python3 headless_engine.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

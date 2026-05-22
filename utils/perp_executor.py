@@ -12,7 +12,8 @@ Env vars:
   PERP_DRY_RUN           = true | false   (default true — paper trading)
   MAX_OPEN_PERPS         = int            (default 2)
   PERP_SIZE_USD          = float          (default 100.0 per position)
-  PERP_DEFAULT_LEVERAGE  = float          (default 2.0)
+  PERP_DEFAULT_LEVERAGE  = float          (default 5.0)
+  PERP_HIGH_CONF_LEVERAGE = float         (default 7.0)
   PERP_COOLDOWN_HOURS    = float          (default 3.0 — min gap between same-symbol signals)
   PERP_MAX_HOLD_HOURS    = float          (default 48.0)
   PERP_STOP_PCT          = float          (default 8.0 — % from entry)
@@ -27,6 +28,7 @@ import sqlite3
 from datetime import datetime, timezone, timedelta
 
 import requests
+from utils.db import record_capital_event
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +73,8 @@ PERP_ENABLED        = lambda: _bool("PERP_EXECUTOR_ENABLED", False)
 PERP_DRY_RUN        = lambda: _bool("PERP_DRY_RUN", True)
 MAX_OPEN_PERPS      = lambda: _int("MAX_OPEN_PERPS", 2)
 PERP_SIZE_USD       = lambda: _float("PERP_SIZE_USD", 100.0)
-PERP_LEVERAGE       = lambda: _float("PERP_DEFAULT_LEVERAGE", 2.0)
+PERP_LEVERAGE       = lambda: _float("PERP_DEFAULT_LEVERAGE", 5.0)
+PERP_HIGH_CONF_LEVERAGE = lambda: max(_float("PERP_HIGH_CONF_LEVERAGE", 7.0), PERP_LEVERAGE())
 PERP_COOLDOWN_H     = lambda: _float("PERP_COOLDOWN_HOURS", 3.0)
 PERP_MAX_HOLD_H     = lambda: _float("PERP_MAX_HOLD_HOURS", 48.0)
 PERP_STOP_PCT       = lambda: _float("PERP_STOP_PCT", 8.0)
@@ -89,6 +92,7 @@ SCALP_MAX_HOLD_MIN  = lambda: _float("SCALP_MAX_HOLD_MINUTES", 30.0)
 SCALP_COOLDOWN_MIN  = lambda: _float("SCALP_COOLDOWN_MINUTES", 2.0)
 SCALP_MAX_OPEN      = lambda: _int("SCALP_MAX_OPEN", 15)
 SCALP_5M_THRESHOLD  = lambda: _float("SCALP_5M_THRESHOLD", 0.15)
+PERP_MIN_COLLATERAL_USD = lambda: max(_float("PERP_MIN_COLLATERAL_USD", 10.0), 0.0)
 
 DB_PATH = os.path.join(
     os.path.dirname(os.path.dirname(__file__)), "data_storage", "engine.db"
@@ -113,6 +117,25 @@ def _conn():
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _normalize_live_order_size(size_usd: float, leverage: float) -> tuple[float, float, bool]:
+    """
+    Ensure live orders meet the exchange collateral floor.
+
+    Returns (size_usd, collateral_usd, resized).
+    """
+    if leverage <= 0:
+        return size_usd, 0.0, False
+
+    collateral_usd = size_usd / leverage
+    min_collateral_usd = PERP_MIN_COLLATERAL_USD()
+    if collateral_usd + 1e-9 >= min_collateral_usd:
+        return size_usd, collateral_usd, False
+
+    collateral_usd = min_collateral_usd
+    size_usd = round(collateral_usd * leverage, 2)
+    return size_usd, collateral_usd, True
 
 
 def _fetch_price(symbol: str) -> float | None:
@@ -174,6 +197,20 @@ def _get_open_perp_positions(dry_run_filter: int | None = None) -> list[dict]:
         return [dict(r) for r in cur.fetchall()]
 
 
+def _resolve_swing_leverage(signal: dict) -> float:
+    """Default swing perps to 5x; step up to 7x only for high-confidence entries."""
+    if signal.get("leverage") is not None:
+        try:
+            return float(signal.get("leverage"))
+        except Exception:
+            pass
+
+    confidence = str(signal.get("confidence") or "").strip().upper()
+    if confidence in {"A", "HIGH"}:
+        return float(PERP_HIGH_CONF_LEVERAGE())
+    return float(PERP_LEVERAGE())
+
+
 def _open_perp_position(
     symbol: str, side: str, entry_price: float,
     stop_price: float, tp1_price: float, tp2_price: float,
@@ -198,6 +235,17 @@ def _open_perp_position(
         ))
         position_id = cur.lastrowid
         c.commit()
+    record_capital_event(
+        "perps",
+        "DEPLOY",
+        collateral,
+        f"{'PAPER' if dry_run else 'LIVE'} {side.upper()} {symbol.upper()} {leverage:.1f}x",
+        symbol=symbol,
+        ref_table="perp_positions",
+        ref_id=int(position_id),
+        dry_run=bool(dry_run),
+        ts_utc=ts,
+    )
     with _conn() as c:
         cur = c.cursor()
         cur.execute("SELECT * FROM perp_positions WHERE id=?", (position_id,))
@@ -240,6 +288,65 @@ def _close_perp_position(
     side  = pos["side"].upper()
     size  = pos["size_usd"]
     lev   = pos["leverage"]
+    is_live = not pos.get("dry_run")
+    jup_key = pos.get("jupiter_position_key") or ""
+
+    # ── Live: close on Jupiter first ──────────────────────────────────────
+    _tx_sig_close = ""
+    if is_live and jup_key:
+        try:
+            from utils.jupiter_perps_trade import close_perp_sync  # type: ignore[import]
+            jup_close = close_perp_sync(
+                position_pubkey=jup_key,
+                dry_run=False,
+                symbol=pos["symbol"],
+            )
+        except Exception as _jup_exc:
+            logger.error("LIVE PERP close_perp_sync failed for id=%s: %s", position_id, _jup_exc)
+            jup_close = {"success": False, "error": str(_jup_exc)}
+
+        if not jup_close.get("success"):
+            _close_err = str(jup_close.get("error", "unknown"))
+            _missing_on_chain = "invalid_position" in _close_err.lower() or "position not found" in _close_err.lower()
+            if _missing_on_chain:
+                logger.warning(
+                    "LIVE PERP: Jupiter reports id=%s key=%s already missing on-chain; "
+                    "reconciling DB position as closed.",
+                    position_id, jup_key[:16],
+                )
+                exit_reason = f"{exit_reason}|ONCHAIN_MISSING"
+            else:
+                logger.error(
+                    "LIVE PERP: Jupiter close FAILED for id=%s key=%s — %s  "
+                    "Position may still be open on-chain! Manual close required.",
+                    position_id, jup_key[:16], _close_err,
+                )
+                # Mark position as needing manual intervention, do NOT mark CLOSED
+                try:
+                    with _conn() as c:
+                        c.cursor().execute(
+                            "UPDATE perp_positions SET notes = notes || ? WHERE id = ?",
+                            ("\n[CLOSE_FAILED] " + _close_err[:100], position_id),
+                        )
+                        c.commit()
+                except Exception:
+                    pass
+                return None  # signal failure — position stays OPEN in DB
+
+        _tx_sig_close = jup_close.get("tx_sig") or ""
+        # Use Jupiter's reported PnL if available (more accurate than local calc)
+        _jup_pnl = jup_close.get("pnl_usd")
+        logger.info(
+            "LIVE PERP: closed id=%s on Jupiter — tx=%s pnl=$%.4f",
+            position_id, _tx_sig_close[:16] if _tx_sig_close else "?",
+            _jup_pnl if _jup_pnl else 0,
+        )
+    elif is_live and not jup_key:
+        logger.warning(
+            "LIVE PERP: closing id=%s in DB only — no jupiter_position_key stored. "
+            "Position may be orphaned on-chain.",
+            position_id,
+        )
 
     # PnL calculation (leveraged)
     if side == "LONG":
@@ -256,10 +363,33 @@ def _close_perp_position(
         cur.execute("""
             UPDATE perp_positions
             SET status='CLOSED', closed_ts_utc=?, exit_price=?,
-                pnl_pct=?, pnl_usd=?, exit_reason=?
+                pnl_pct=?, pnl_usd=?, exit_reason=?, tx_sig_close=?
             WHERE id=?
-        """, (ts, exit_price, round(leveraged_pct, 4), round(pnl_usd, 4), exit_reason, position_id))
+        """, (ts, exit_price, round(leveraged_pct, 4), round(pnl_usd, 4),
+              exit_reason, _tx_sig_close, position_id))
         c.commit()
+    record_capital_event(
+        "perps",
+        "RELEASE",
+        float(pos.get("collateral_usd") or 0.0),
+        f"{'PAPER' if pos.get('dry_run') else 'LIVE'} close {pos['symbol']} [{exit_reason}]",
+        symbol=pos["symbol"],
+        ref_table="perp_positions",
+        ref_id=int(position_id),
+        dry_run=bool(pos.get("dry_run")),
+        ts_utc=ts,
+    )
+    record_capital_event(
+        "perps",
+        "REALIZED_PNL",
+        pnl_usd,
+        f"{'PAPER' if pos.get('dry_run') else 'LIVE'} close {pos['symbol']} [{exit_reason}]",
+        symbol=pos["symbol"],
+        ref_table="perp_positions",
+        ref_id=int(position_id),
+        dry_run=bool(pos.get("dry_run")),
+        ts_utc=ts,
+    )
 
     # Write completed outcome to perp_outcomes for the learning loop
     try:
@@ -424,6 +554,28 @@ async def execute_perp_signal(signal: dict) -> bool:
         logger.debug("Perp executor disabled — skipping")
         return False
 
+    # ── Roadmap 3: authority bridge observe-mode check ────────────────────────
+    try:
+        from authority import resolve_action  # type: ignore[import]
+        _auth = resolve_action("new_entry", "perps", executor="perps")
+        if _auth["verdict"] == "BLOCK":
+            # ── Proving-window exception: perps only, env-gated, temporary ──
+            _proving = os.getenv("PERP_PROVING_WINDOW", "false").lower() == "true"
+            if _proving:
+                logger.warning(
+                    "PROVING_WINDOW: perp authority BLOCK overridden — %s",
+                    "; ".join(_auth["reasons"]),
+                )
+            else:
+                logger.debug(
+                    "AUTHORITY_BLOCK: perp_executor skipping signal — %s",
+                    "; ".join(_auth["reasons"]),
+                )
+                return False
+    except Exception as _auth_exc:
+        logger.debug("authority check skipped: %s", _auth_exc)
+    # ── End authority bridge ──────────────────────────────────────────────────
+
     symbol = str(signal.get("symbol", "SOL")).upper()
     side   = str(signal.get("side", "LONG")).upper()
 
@@ -458,6 +610,37 @@ async def execute_perp_signal(signal: dict) -> bool:
             logger.info("Already have open %s %s %s — skipping", mode_tag, symbol, side)
             return False
 
+    # Patch 273: regime-direction filter — SCALP only
+    # Fear (F&G ≤ 40): suppress LONG entries (counter-trend in bear/fear regime)
+    # Greed (F&G ≥ 60): suppress SHORT entries (counter-trend in bull/greed regime)
+    # Neutral (41–59): allow both directions
+    if is_scalp:
+        try:
+            import json as _json
+            with _conn() as _c:
+                _fg_row = _c.execute(
+                    "SELECT value FROM kv_store WHERE key='shared_fear_greed'"
+                ).fetchone()
+            _fg_val = None
+            if _fg_row:
+                _fg_data = _json.loads(_fg_row[0])
+                _fg_val = _fg_data.get("value")
+            if _fg_val is not None:
+                if _fg_val <= 40 and side == "LONG":
+                    logger.info(
+                        "[SCALP REGIME FILTER] blocked LONG %s — F&G=%d (fear≤40, bear regime)",
+                        symbol, _fg_val,
+                    )
+                    return False
+                if _fg_val >= 60 and side == "SHORT":
+                    logger.info(
+                        "[SCALP REGIME FILTER] blocked SHORT %s — F&G=%d (greed≥60, bull regime)",
+                        symbol, _fg_val,
+                    )
+                    return False
+        except Exception as _e:
+            logger.warning("[SCALP REGIME FILTER] F&G read failed, allowing both sides: %s", _e)
+
     # Fetch live price
     entry_price = _fetch_price(symbol)
     if not entry_price or entry_price <= 0:
@@ -467,6 +650,10 @@ async def execute_perp_signal(signal: dict) -> bool:
     regime  = str(signal.get("regime_label", "NEUTRAL"))
     dry_run = PERP_DRY_RUN()
     paper_tag = "PAPER" if dry_run else "LIVE"
+
+    requested_size_usd = 0.0
+    collateral = 0.0
+    collateral_floor_applied = False
 
     # Compute exit levels — scalp uses tight TP/SL, swing uses wide swing targets
     if is_scalp:
@@ -492,7 +679,7 @@ async def execute_perp_signal(signal: dict) -> bool:
         )
     else:
         size_usd   = float(signal.get("size_usd", PERP_SIZE_USD()))
-        leverage   = float(signal.get("leverage", PERP_LEVERAGE()))
+        leverage   = _resolve_swing_leverage(signal)
         stop_pct   = PERP_STOP_PCT() / 100
         tp1_pct    = PERP_TP1_PCT() / 100
         tp2_pct    = PERP_TP2_PCT() / 100
@@ -506,6 +693,7 @@ async def execute_perp_signal(signal: dict) -> bool:
             tp2_price  = entry_price * (1 - tp2_pct)
         notes = (
             f"mode=SWING|source={signal.get('source','auto')}|regime={regime}"
+            f"|confidence={str(signal.get('confidence') or '').upper() or 'UNSET'}"
             f"|leverage={leverage}|tp1={round(tp1_price, 4)}|tp2={round(tp2_price, 4)}"
         )
         logger.info(
@@ -513,19 +701,73 @@ async def execute_perp_signal(signal: dict) -> bool:
             paper_tag, side, symbol, entry_price, stop_price, tp1_price, tp2_price, size_usd, leverage,
         )
 
+    requested_size_usd = size_usd
+    collateral = (size_usd / leverage) if leverage > 0 else 0.0
+    if not dry_run:
+        size_usd, collateral, collateral_floor_applied = _normalize_live_order_size(size_usd, leverage)
+        if collateral_floor_applied:
+            logger.warning(
+                "[%s LIVE] Raised size from $%.2f to $%.2f to satisfy minimum collateral $%.2f at %.1fx",
+                mode_tag, requested_size_usd, size_usd, collateral, leverage,
+            )
+            notes += (
+                f"|requested_size_usd={round(requested_size_usd, 2)}"
+                f"|collateral_floor_applied=1|min_collateral_usd={round(collateral, 2)}"
+            )
+
     if dry_run:
         pos = _open_perp_position(
             symbol, side, entry_price, stop_price, tp1_price, tp2_price,
             size_usd, leverage, regime, dry_run=True, notes=notes,
         )
     else:
-        # Live: would call Jupiter Perps open API here
-        # For now: open in DB as live (dry_run=0) and log warning
-        logger.warning("LIVE PERP: Jupiter Perps open API not yet integrated — recording in DB only")
+        # ── Live: call Jupiter Perps open API, then record in DB ──────────
+        try:
+            from utils.jupiter_perps_trade import open_perp_sync
+            jup_result = open_perp_sync(
+                symbol=symbol, side=side,
+                collateral_usd=collateral, leverage=leverage,
+                dry_run=False,
+            )
+        except Exception as _jup_exc:
+            logger.error("LIVE PERP open_perp_sync import/call failed: %s", _jup_exc)
+            jup_result = {"success": False, "error": str(_jup_exc)}
+
+        if not jup_result.get("success"):
+            logger.error(
+                "LIVE PERP: Jupiter open FAILED for %s %s — %s",
+                side, symbol, jup_result.get("error", "unknown"),
+            )
+            return False  # do NOT record a phantom position in the DB
+
+        # Jupiter succeeded — record position with on-chain keys
+        _jup_entry = jup_result.get("entry_price_usd")
+        if _jup_entry and _jup_entry > 0:
+            entry_price = _jup_entry  # use the actual fill price
+
         pos = _open_perp_position(
             symbol, side, entry_price, stop_price, tp1_price, tp2_price,
             size_usd, leverage, regime, dry_run=False, notes=notes,
         )
+        # Store Jupiter on-chain keys for later close
+        if pos:
+            _jpk = jup_result.get("position_pubkey") or ""
+            _txs = jup_result.get("tx_sig") or ""
+            try:
+                with _conn() as c:
+                    c.cursor().execute(
+                        "UPDATE perp_positions SET jupiter_position_key=?, tx_sig_open=? WHERE id=?",
+                        (_jpk, _txs, pos["id"]),
+                    )
+                    c.commit()
+                pos["jupiter_position_key"] = _jpk
+                pos["tx_sig_open"] = _txs
+            except Exception as _db_exc:
+                logger.warning("LIVE PERP: failed to store jupiter keys: %s", _db_exc)
+            logger.info(
+                "LIVE PERP: %s %s opened on Jupiter — pos_key=%s tx=%s",
+                side, symbol, _jpk[:16] if _jpk else "?", _txs[:16] if _txs else "?",
+            )
 
     if pos:
         _queue_perp_outcome(symbol, side, entry_price, regime)
@@ -585,6 +827,13 @@ def get_perp_status() -> dict:
 
 async def force_close_perp(position_id: int) -> dict:
     """Force-close a perp position at current market price."""
+    # ── Roadmap 3: authority observation (close_position always permitted) ────
+    try:
+        from authority import resolve_action  # type: ignore[import]
+        resolve_action("close_position", "perps", executor="perps_force")
+    except Exception:
+        pass
+    # ── End authority observation ─────────────────────────────────────────────
     with _conn() as c:
         cur = c.cursor()
         cur.execute("SELECT * FROM perp_positions WHERE id=?", (position_id,))
@@ -707,6 +956,13 @@ async def perp_monitor_step():
                 exit_reason = "TIME_LIMIT"
 
         if exit_reason:
+            # ── Roadmap 3: authority observation (close always permitted) ─────
+            try:
+                from authority import resolve_action  # type: ignore[import]
+                resolve_action("close_position", "perps", executor="perps_monitor")
+            except Exception:
+                pass
+            # ── End authority observation ─────────────────────────────────────
             result = _close_perp_position(pos_id, price, exit_reason)
             mode   = "PAPER" if pos["dry_run"] else "LIVE"
             if result:

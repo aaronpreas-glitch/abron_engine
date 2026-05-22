@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 # ── Config ─────────────────────────────────────────────────────────────────────
 
 BIRDEYE_API_KEY   = os.getenv("BIRDEYE_API_KEY", "")
-BIRDEYE_WS_URL    = "wss://public-api.birdeye.so/socket?chain=solana"
+BIRDEYE_WS_URL    = "wss://public-api.birdeye.so/socket/solana"
 JUPITER_PRICE_URL = "https://api.jup.ag/price/v2"
 POLL_INTERVAL_SEC = int(os.getenv("WS_PRICE_POLL_INTERVAL", "8"))   # fallback poll rate
 WS_RECONNECT_SEC  = int(os.getenv("WS_PRICE_RECONNECT_SEC", "5"))   # delay before WS reconnect
@@ -157,14 +157,16 @@ async def _birdeye_ws_loop() -> None:
 
     while True:
         try:
-            headers = {"x-chain": "solana", "X-API-KEY": BIRDEYE_API_KEY}
-            async with websockets.connect(
-                BIRDEYE_WS_URL,
-                additional_headers=headers,
-                ping_interval=WS_PING_INTERVAL,
-                ping_timeout=30,
-                close_timeout=5,
-            ) as ws:
+            ws_url = f"{BIRDEYE_WS_URL}?x-api-key={BIRDEYE_API_KEY}"
+            connect_kwargs = {
+                "ping_interval": WS_PING_INTERVAL,
+                "ping_timeout": 30,
+                "close_timeout": 5,
+                "subprotocols": ["echo-protocol"],
+                "origin": "https://birdeye.so",
+            }
+
+            async with websockets.connect(ws_url, **connect_kwargs) as ws:
                 _ws_connected = True
                 logger.info("ws_price_feed: Birdeye WS connected")
 

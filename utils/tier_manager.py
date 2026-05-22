@@ -806,6 +806,15 @@ def tier_monitor_step():
     except Exception:
         pass
 
+    # Safety gate — honour global PERP_DRY_RUN flag.
+    # tier_manager uses hardcoded dry_run=False for all close/open calls.
+    # When PERP_DRY_RUN=true we must skip all live execution to avoid
+    # unintended Jupiter API calls against the real wallet.
+    import os as _os
+    if _os.environ.get("PERP_DRY_RUN", "true").lower() == "true":
+        log.debug("[TIER] PERP_DRY_RUN=true — skipping tier execution (monitor-only mode)")
+        return
+
     from utils.jupiter_perps_trade import close_perp_sync, get_wallet_address  # local import
 
     conn = _get_db()

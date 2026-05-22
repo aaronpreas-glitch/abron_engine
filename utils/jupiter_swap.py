@@ -22,6 +22,8 @@ from typing import Optional
 
 import httpx
 
+import config as _config  # noqa: F401  # ensures .env is loaded for ad-hoc imports
+
 logger = logging.getLogger(__name__)
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -211,12 +213,13 @@ async def get_sol_price_usd() -> float:
 
     # Fallback: try DexScreener
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get("https://api.dexscreener.com/latest/dex/tokens/" + SOL_MINT)
-            r.raise_for_status()
-            pairs = r.json().get("pairs", [])
-            if pairs:
-                return float(pairs[0].get("priceUsd", 0) or 0)
+        pairs = await asyncio.to_thread(
+            __import__("data.dexscreener", fromlist=["fetch_token_pairs"]).fetch_token_pairs,
+            SOL_MINT,
+            reason="jupiter_swap_sol_fallback_429",
+        )
+        if pairs:
+            return float(pairs[0].get("priceUsd", 0) or 0)
     except Exception:
         pass
 

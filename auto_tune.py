@@ -633,6 +633,30 @@ async def run_auto_tune(dry_run: bool = False) -> int:
     except Exception as exc:
         log.warning("Score analyzer failed: %s", exc)
 
+    # ── Phase 2 A3b: Memecoin-specific score component attribution ────────────
+    try:
+        from utils.score_analyzer import (
+            analyze_memecoin_score_components,
+            build_memecoin_env_updates,
+        )
+        memecoin_comp_analysis = analyze_memecoin_score_components(lookback_days=60)
+        memecoin_env_updates   = build_memecoin_env_updates(memecoin_comp_analysis)
+        if memecoin_env_updates:
+            env_updates.update(memecoin_env_updates)
+            reasons.append(
+                f"Memecoin score weights applied: {list(memecoin_env_updates.keys())}"
+            )
+            log.info("Memecoin score analyzer env updates: %s", memecoin_env_updates)
+        else:
+            log.info(
+                "Memecoin score analyzer: not yet ready (n=%s, consistency=%s/%s)",
+                memecoin_comp_analysis.get("n", 0),
+                memecoin_comp_analysis.get("consistency_weeks", 0),
+                3,
+            )
+    except Exception as exc:
+        log.warning("Memecoin score analyzer failed: %s", exc)
+
     # ── Phase 2 A4: Exit learnings → exit_profiles.json ───────────────────────
     exit_profiles: dict = {}
     try:

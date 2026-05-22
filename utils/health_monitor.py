@@ -102,16 +102,21 @@ def health_watchdog_step() -> None:
     # ── 3. Memecoin scan freshness ────────────────────────────────────────────
     scan_age_min: float | None = None
     try:
-        cached = _kv_get("memecoin_scan_cache")
-        if cached:
-            data = json.loads(cached)
-            scan_ts_str = data.get("_ts") if isinstance(data, dict) else None
-            if not scan_ts_str and isinstance(data, list) and data:
-                # Signals list — pick _ts from first element or separate key
-                scan_ts_str = None  # no embedded timestamp in list format
-            if scan_ts_str:
-                scan_ts = datetime.fromisoformat(scan_ts_str.replace("Z", "+00:00"))
-                scan_age_min = (ts_utc - scan_ts).total_seconds() / 60
+        scan_ts_str = None
+        meta = _kv_get("memecoin_scan_cache_meta")
+        if meta:
+            data = json.loads(meta)
+            if isinstance(data, dict):
+                scan_ts_str = data.get("saved_at")
+        if not scan_ts_str:
+            cached = _kv_get("memecoin_scan_cache_last_nonempty")
+            if cached:
+                data = json.loads(cached)
+                if isinstance(data, dict):
+                    scan_ts_str = data.get("saved_at")
+        if scan_ts_str:
+            scan_ts = datetime.fromisoformat(str(scan_ts_str).replace("Z", "+00:00"))
+            scan_age_min = (ts_utc - scan_ts).total_seconds() / 60
         # Also check memecoin_scan agent heartbeat
         scan_agent = next((a for a in agents if a["name"] == "memecoin_scan"), None)
         if scan_agent and scan_agent["last_beat_ago_s"] is not None:

@@ -1,0 +1,7 @@
+[Unit]
+Description=Memecoin Engine Runtime Backup
+
+[Service]
+Type=oneshot
+Environment=MEMECOIN_ENGINE_ROOT=/root/memecoin_engine
+ExecStart=/usr/local/bin/memecoin-backup

@@ -1,3 +1,9 @@
+from __future__ import annotations
+
+import copy
+import os
+import time
+
 import requests
 
 from config import (
@@ -14,6 +20,10 @@ from config import (
 
 _STABLE_SYMBOLS = {"USDC", "USDT", "USDS", "USD1", "DAI", "FDUSD", "PYUSD"}
 _SOL_SYMBOLS = {"SOL", "WSOL"}
+_PROVIDER = "dexscreener"
+_COOLDOWN_SECONDS = int(os.getenv("DEXSCREENER_COOLDOWN_SECONDS", "900"))
+_CACHE_TTL_SECONDS = int(os.getenv("DEXSCREENER_CACHE_TTL_SECONDS", "600"))
+_CACHE: dict[str, tuple[float, object]] = {}
 
 
 def _to_float(value, default=0.0):
@@ -27,6 +37,165 @@ def _to_float(value, default=0.0):
 
 def _base_url():
     return DEXSCREENER_API_URL or "https://api.dexscreener.com"
+
+
+def _cache_get(key: str):
+    cached = _CACHE.get(key)
+    if not cached:
+        return None
+    ts, value = cached
+    if time.monotonic() - ts > _CACHE_TTL_SECONDS:
+        return None
+    return copy.deepcopy(value)
+
+
+def _cache_set(key: str, value):
+    _CACHE[key] = (time.monotonic(), copy.deepcopy(value))
+    if len(_CACHE) > 64:
+        oldest = min(_CACHE, key=lambda k: _CACHE[k][0])
+        _CACHE.pop(oldest, None)
+
+
+def _provider_in_cooldown(provider: str = _PROVIDER) -> bool:
+    try:
+        from utils.db import provider_in_cooldown  # type: ignore
+        active, _state = provider_in_cooldown(provider)
+        return bool(active)
+    except Exception:
+        return False
+
+
+def _mark_degraded(reason: str, detail: str | None = None, provider: str = _PROVIDER) -> None:
+    try:
+        from utils.db import mark_provider_degraded  # type: ignore
+        mark_provider_degraded(
+            provider,
+            cooldown_seconds=max(300, _COOLDOWN_SECONDS),
+            reason=reason,
+            detail=detail or reason,
+        )
+    except Exception:
+        pass
+
+
+def _mark_active(detail: str, provider: str = _PROVIDER) -> None:
+    try:
+        from utils.db import mark_provider_active  # type: ignore
+        mark_provider_active(provider, detail=detail)
+    except Exception:
+        pass
+
+
+def _request_json(
+    endpoint: str,
+    *,
+    params: dict | None = None,
+    cache_key: str,
+    reason: str,
+    provider: str = _PROVIDER,
+    reserve: bool = False,
+):
+    cached = _cache_get(cache_key)
+    provider = str(provider or _PROVIDER).strip().lower()
+    if _provider_in_cooldown(provider):
+        return cached
+    try:
+        from utils.provider_budget import provider_budget_allow  # type: ignore
+        budget = provider_budget_allow(provider, lane=reason, reserve=reserve)
+        if not budget.get("allowed"):
+            return cached
+    except Exception:
+        pass
+    try:
+        response = requests.get(
+            endpoint,
+            params=params,
+            timeout=15,
+            headers={"User-Agent": "memecoin-engine/1.0"},
+        )
+        if response.status_code == 429:
+            _mark_degraded(reason, detail=f"{endpoint} {params or ''}".strip(), provider=provider)
+            return cached
+        response.raise_for_status()
+        payload = response.json() or {}
+        _cache_set(cache_key, payload)
+        _mark_active(f"{reason}_ok", provider=provider)
+        return payload
+    except requests.exceptions.RequestException:
+        return cached
+    except ValueError:
+        return cached
+
+
+def fetch_search_pairs(query: str, *, reason: str = "search_429", provider: str = _PROVIDER, reserve: bool = False) -> list[dict]:
+    """
+    Budgeted DexScreener search helper for resolver/scanner paths that need raw pairs.
+    """
+    query = str(query or "").strip()
+    if not query:
+        return []
+    endpoint = f"{_base_url().rstrip('/')}/latest/dex/search"
+    data = _request_json(
+        endpoint,
+        params={"q": query},
+        cache_key=f"{provider}:search_pairs:{query}",
+        reason=reason,
+        provider=provider,
+        reserve=reserve,
+    )
+    if not data:
+        return []
+    pairs = data.get("pairs") or []
+    return [p for p in pairs if isinstance(p, dict)]
+
+
+def fetch_token_pairs(addresses, *, reason: str = "token_pairs_429", provider: str = _PROVIDER, reserve: bool = False) -> list[dict]:
+    """
+    Budgeted raw pair fetch for one mint or a comma/list batch of mints.
+    """
+    if isinstance(addresses, (list, tuple, set)):
+        address = ",".join(str(x).strip() for x in addresses if str(x or "").strip())
+    else:
+        address = str(addresses or "").strip()
+    if not address:
+        return []
+    endpoint = f"{_base_url().rstrip('/')}/latest/dex/tokens/{address}"
+    data = _request_json(
+        endpoint,
+        cache_key=f"{provider}:token_pairs:{address}",
+        reason=reason,
+        provider=provider,
+        reserve=reserve,
+    )
+    if not data:
+        return []
+    pairs = data.get("pairs") or []
+    return [p for p in pairs if isinstance(p, dict)]
+
+
+def fetch_latest_profiles(*, reason: str = "profiles_latest_429", provider: str = _PROVIDER) -> list[dict]:
+    endpoint = f"{_base_url().rstrip('/')}/token-profiles/latest/v1"
+    data = _request_json(
+        endpoint,
+        cache_key=f"{provider}:token_profiles_latest",
+        reason=reason,
+        provider=provider,
+    )
+    return data if isinstance(data, list) else []
+
+
+def fetch_token_boosts(kind: str = "top", *, reason: str | None = None, provider: str = _PROVIDER) -> list[dict]:
+    clean_kind = str(kind or "top").strip().lower()
+    if clean_kind not in {"top", "latest"}:
+        clean_kind = "top"
+    endpoint = f"{_base_url().rstrip('/')}/token-boosts/{clean_kind}/v1"
+    data = _request_json(
+        endpoint,
+        cache_key=f"{provider}:token_boosts:{clean_kind}",
+        reason=reason or f"boosts_{clean_kind}_429",
+        provider=provider,
+    )
+    return data if isinstance(data, list) else []
 
 
 def _is_chain_match(pair):
@@ -124,17 +293,7 @@ def fetch_token_snapshot(address):
     """
     if not address:
         return None
-    try:
-        endpoint = f"{_base_url().rstrip('/')}/latest/dex/tokens/{address}"
-        response = requests.get(endpoint, timeout=15)
-        response.raise_for_status()
-        data = response.json() or {}
-    except requests.exceptions.RequestException:
-        return None
-    except ValueError:
-        return None
-
-    pairs = data.get("pairs", []) or []
+    pairs = fetch_token_pairs(address, reason="token_snapshot_429")
     normalized = [p for p in (_normalize_pair(pair) for pair in pairs) if p]
     if not normalized:
         return None
@@ -150,27 +309,26 @@ def fetch_sol_market_proxy(query="SOL"):
     pairs = []
 
     if SOL_PROXY_MINT:
-        try:
-            endpoint = f"{_base_url().rstrip('/')}/latest/dex/tokens/{SOL_PROXY_MINT}"
-            response = requests.get(endpoint, timeout=15)
-            response.raise_for_status()
-            data = response.json() or {}
+        endpoint = f"{_base_url().rstrip('/')}/latest/dex/tokens/{SOL_PROXY_MINT}"
+        data = _request_json(
+            endpoint,
+            cache_key=f"sol_proxy_token:{SOL_PROXY_MINT}",
+            reason="sol_proxy_token_429",
+        )
+        if data:
             pairs = data.get("pairs", []) or []
-        except requests.exceptions.RequestException:
-            pairs = []
-        except ValueError:
-            pairs = []
 
     if not pairs:
-        try:
-            endpoint = f"{_base_url().rstrip('/')}/latest/dex/search"
-            response = requests.get(endpoint, params={"q": query or "SOL"}, timeout=15)
-            response.raise_for_status()
-            data = response.json() or {}
+        endpoint = f"{_base_url().rstrip('/')}/latest/dex/search"
+        data = _request_json(
+            endpoint,
+            params={"q": query or "SOL"},
+            cache_key=f"sol_proxy_search:{query or 'SOL'}",
+            reason="sol_proxy_search_429",
+        )
+        if data:
             pairs = data.get("pairs", []) or []
-        except requests.exceptions.RequestException:
-            return None
-        except ValueError:
+        else:
             return None
 
     normalized = [p for p in (_normalize_sol_proxy_pair(pair) for pair in pairs) if p]
@@ -190,141 +348,152 @@ def fetch_market_data():
     Fetch market data from DexScreener API based on a query (e.g., "SOL").
     The function assumes an API URL that provides token data in a structured format.
     """
-    try:
-        endpoint = f"{_base_url().rstrip('/')}/latest/dex/search"
-        queries = DEXSCREENER_SEARCH_QUERIES or ["SOL"]
-        unique_tokens = {}
+    endpoint = f"{_base_url().rstrip('/')}/latest/dex/search"
+    queries = DEXSCREENER_SEARCH_QUERIES or ["SOL"]
+    unique_tokens = {}
 
-        for query in queries:
-            response = requests.get(
-                endpoint,
-                params={"q": query},
-                timeout=15,
-            )
-            response.raise_for_status()
+    for query in queries:
+        data = _request_json(
+            endpoint,
+            params={"q": query},
+            cache_key=f"market_search:{query}",
+            reason="market_search_429",
+        )
+        if not data:
+            continue
+        pairs = data.get("pairs", []) or []
 
-            data = response.json()
-            pairs = data.get("pairs", []) or []
+        for pair in pairs[:max(1, DEXSCREENER_PAIRS_PER_QUERY)]:
+            token = _normalize_pair(pair)
+            if not token:
+                continue
 
-            for pair in pairs[:max(1, DEXSCREENER_PAIRS_PER_QUERY)]:
-                token = _normalize_pair(pair)
-                if not token:
-                    continue
+            existing = unique_tokens.get(token["address"])
+            if not existing or token["volume_24h"] > existing["volume_24h"]:
+                unique_tokens[token["address"]] = token
 
-                existing = unique_tokens.get(token["address"])
-                if not existing or token["volume_24h"] > existing["volume_24h"]:
-                    unique_tokens[token["address"]] = token
-
-        tokens = list(unique_tokens.values())
-        tokens.sort(key=lambda t: (t["volume_24h"], t["liquidity"]), reverse=True)
-        return tokens[:max(1, MAX_TOKENS_PER_SCAN)]
-
-    except requests.exceptions.RequestException as e:
-        print(f"Error fetching market data: {e}")
-        return []
+    tokens = list(unique_tokens.values())
+    tokens.sort(key=lambda t: (t["volume_24h"], t["liquidity"]), reverse=True)
+    return tokens[:max(1, MAX_TOKENS_PER_SCAN)]
 
 
 def fetch_runner_watch_candidates(queries, pairs_per_query: int = 24, limit: int = 100):
     """
     Fetch broad DexScreener candidates intended for watchlist-style new-runner alerts.
     """
-    try:
-        endpoint = f"{_base_url().rstrip('/')}/latest/dex/search"
-        unique_tokens = {}
+    endpoint = f"{_base_url().rstrip('/')}/latest/dex/search"
+    unique_tokens = {}
 
-        for query in (queries or ["SOL"]):
-            response = requests.get(
-                endpoint,
-                params={"q": query},
-                timeout=15,
+    for query in (queries or ["SOL"]):
+        data = _request_json(
+            endpoint,
+            params={"q": query},
+            cache_key=f"runner_search:{query}",
+            reason="runner_search_429",
+        )
+        if not data:
+            continue
+        pairs = data.get("pairs", []) or []
+        for pair in pairs[:max(1, pairs_per_query)]:
+            token = _normalize_pair(pair)
+            if not token:
+                continue
+
+            existing = unique_tokens.get(token["address"])
+            if not existing:
+                unique_tokens[token["address"]] = token
+                continue
+
+            if (token.get("liquidity") or 0) > (existing.get("liquidity") or 0):
+                unique_tokens[token["address"]] = token
+                continue
+            if (token.get("volume_24h") or 0) > (existing.get("volume_24h") or 0):
+                unique_tokens[token["address"]] = token
+
+    if NEW_RUNNER_USE_LATEST_PROFILES:
+        profiles_endpoint = f"{_base_url().rstrip('/')}/token-profiles/latest/v1"
+        profiles = _request_json(
+            profiles_endpoint,
+            cache_key="runner_profiles_latest",
+            reason="runner_profiles_429",
+        ) or []
+        if not isinstance(profiles, list):
+            profiles = []
+
+        picked = []
+        for p in profiles[:max(1, NEW_RUNNER_PROFILE_LIMIT)]:
+            if str(p.get("chainId") or "").strip().lower() != DEXSCREENER_CHAIN_ID:
+                continue
+            token_address = p.get("tokenAddress")
+            if not token_address:
+                continue
+            picked.append(p)
+            if len(picked) >= max(1, NEW_RUNNER_PROFILE_SAMPLE):
+                break
+
+        profile_by_address = {
+            str(profile.get("tokenAddress") or "").strip(): profile
+            for profile in picked
+            if str(profile.get("tokenAddress") or "").strip()
+        }
+        profile_snapshots: dict[str, dict] = {}
+        if profile_by_address:
+            pairs = fetch_token_pairs(
+                list(profile_by_address.keys()),
+                reason="runner_profile_batch_429",
             )
-            response.raise_for_status()
-
-            data = response.json() or {}
-            pairs = data.get("pairs", []) or []
-            for pair in pairs[:max(1, pairs_per_query)]:
-                token = _normalize_pair(pair)
-                if not token:
-                    continue
-
-                existing = unique_tokens.get(token["address"])
-                if not existing:
-                    unique_tokens[token["address"]] = token
-                    continue
-
-                if (token.get("liquidity") or 0) > (existing.get("liquidity") or 0):
-                    unique_tokens[token["address"]] = token
-                    continue
-                if (token.get("volume_24h") or 0) > (existing.get("volume_24h") or 0):
-                    unique_tokens[token["address"]] = token
-
-        if NEW_RUNNER_USE_LATEST_PROFILES:
-            try:
-                profiles_endpoint = f"{_base_url().rstrip('/')}/token-profiles/latest/v1"
-                profiles_resp = requests.get(profiles_endpoint, timeout=15)
-                profiles_resp.raise_for_status()
-                profiles = profiles_resp.json() or []
-                if not isinstance(profiles, list):
-                    profiles = []
-            except requests.exceptions.RequestException:
-                profiles = []
-            except ValueError:
-                profiles = []
-
-            picked = []
-            for p in profiles[:max(1, NEW_RUNNER_PROFILE_LIMIT)]:
-                if str(p.get("chainId") or "").strip().lower() != DEXSCREENER_CHAIN_ID:
-                    continue
-                token_address = p.get("tokenAddress")
-                if not token_address:
-                    continue
-                picked.append(p)
-                if len(picked) >= max(1, NEW_RUNNER_PROFILE_SAMPLE):
-                    break
-
-            for profile in picked:
-                token_address = profile.get("tokenAddress")
-                if not token_address:
-                    continue
-                snapshot = fetch_token_snapshot(token_address)
+            for pair in pairs:
+                snapshot = _normalize_pair(pair)
                 if not snapshot:
                     continue
-                links = profile.get("links") or []
-                if isinstance(links, list):
-                    social_count = len([x for x in links if isinstance(x, dict) and x.get("type") in {"twitter", "telegram", "discord"}])
-                    website_count = len([x for x in links if isinstance(x, dict) and x.get("type") == "website"])
-                else:
-                    social_count = 0
-                    website_count = 0
+                address = str(snapshot.get("address") or "").strip()
+                existing = profile_snapshots.get(address)
+                if not existing or (
+                    (snapshot.get("liquidity") or 0),
+                    (snapshot.get("volume_24h") or 0),
+                ) > (
+                    (existing.get("liquidity") or 0),
+                    (existing.get("volume_24h") or 0),
+                ):
+                    profile_snapshots[address] = snapshot
 
-                snapshot["description"] = profile.get("description") or ""
-                snapshot["social_links"] = max(int(snapshot.get("social_links") or 0), social_count)
-                snapshot["website_links"] = max(int(snapshot.get("website_links") or 0), website_count)
-                snapshot["source"] = "dexscreener_profile+snapshot"
+        for token_address, profile in profile_by_address.items():
+            snapshot = profile_snapshots.get(token_address)
+            if not snapshot:
+                continue
+            links = profile.get("links") or []
+            if isinstance(links, list):
+                social_count = len([x for x in links if isinstance(x, dict) and x.get("type") in {"twitter", "telegram", "discord"}])
+                website_count = len([x for x in links if isinstance(x, dict) and x.get("type") == "website"])
+            else:
+                social_count = 0
+                website_count = 0
 
-                existing = unique_tokens.get(snapshot["address"])
-                if not existing:
-                    unique_tokens[snapshot["address"]] = snapshot
-                    continue
-                if (snapshot.get("liquidity") or 0) > (existing.get("liquidity") or 0):
-                    unique_tokens[snapshot["address"]] = snapshot
-                    continue
-                if (snapshot.get("volume_24h") or 0) > (existing.get("volume_24h") or 0):
-                    unique_tokens[snapshot["address"]] = snapshot
+            snapshot["description"] = profile.get("description") or ""
+            snapshot["social_links"] = max(int(snapshot.get("social_links") or 0), social_count)
+            snapshot["website_links"] = max(int(snapshot.get("website_links") or 0), website_count)
+            snapshot["source"] = "dexscreener_profile+snapshot"
 
-        tokens = list(unique_tokens.values())
-        tokens.sort(
-            key=lambda t: (
-                t.get("volume_24h") or 0,
-                t.get("liquidity") or 0,
-                t.get("txns_h1") or 0,
-            ),
-            reverse=True,
-        )
-        return tokens[:max(1, limit)]
+            existing = unique_tokens.get(snapshot["address"])
+            if not existing:
+                unique_tokens[snapshot["address"]] = snapshot
+                continue
+            if (snapshot.get("liquidity") or 0) > (existing.get("liquidity") or 0):
+                unique_tokens[snapshot["address"]] = snapshot
+                continue
+            if (snapshot.get("volume_24h") or 0) > (existing.get("volume_24h") or 0):
+                unique_tokens[snapshot["address"]] = snapshot
 
-    except requests.exceptions.RequestException:
-        return []
+    tokens = list(unique_tokens.values())
+    tokens.sort(
+        key=lambda t: (
+            t.get("volume_24h") or 0,
+            t.get("liquidity") or 0,
+            t.get("txns_h1") or 0,
+        ),
+        reverse=True,
+    )
+    return tokens[:max(1, limit)]
 
 
 # Broad keyword set that covers the established Solana memecoin universe.
@@ -351,39 +520,33 @@ def fetch_legacy_recovery_candidates(
     Falls back to _LEGACY_BROAD_QUERIES when no custom queries provided.
     """
     use_queries = queries if queries else _LEGACY_BROAD_QUERIES
-    try:
-        endpoint = f"{_base_url().rstrip('/')}/latest/dex/search"
-        unique_tokens = {}
+    endpoint = f"{_base_url().rstrip('/')}/latest/dex/search"
+    unique_tokens = {}
 
-        for query in use_queries:
-            try:
-                response = requests.get(
-                    endpoint,
-                    params={"q": query},
-                    timeout=15,
-                )
-                response.raise_for_status()
-                data = response.json() or {}
-                pairs = data.get("pairs", []) or []
-                for pair in pairs[:max(1, pairs_per_query)]:
-                    token = _normalize_pair(pair)
-                    if not token:
-                        continue
-                    addr = token["address"]
-                    existing = unique_tokens.get(addr)
-                    if not existing:
-                        unique_tokens[addr] = token
-                    elif (token.get("liquidity") or 0) > (existing.get("liquidity") or 0):
-                        unique_tokens[addr] = token
-            except requests.exceptions.RequestException:
-                continue
-
-        tokens = list(unique_tokens.values())
-        tokens.sort(
-            key=lambda t: (t.get("liquidity") or 0, t.get("volume_24h") or 0),
-            reverse=True,
+    for query in use_queries:
+        data = _request_json(
+            endpoint,
+            params={"q": query},
+            cache_key=f"legacy_search:{query}",
+            reason="legacy_search_429",
         )
-        return tokens[:max(1, limit)]
+        if not data:
+            continue
+        pairs = data.get("pairs", []) or []
+        for pair in pairs[:max(1, pairs_per_query)]:
+            token = _normalize_pair(pair)
+            if not token:
+                continue
+            addr = token["address"]
+            existing = unique_tokens.get(addr)
+            if not existing:
+                unique_tokens[addr] = token
+            elif (token.get("liquidity") or 0) > (existing.get("liquidity") or 0):
+                unique_tokens[addr] = token
 
-    except Exception:
-        return []
+    tokens = list(unique_tokens.values())
+    tokens.sort(
+        key=lambda t: (t.get("liquidity") or 0, t.get("volume_24h") or 0),
+        reverse=True,
+    )
+    return tokens[:max(1, limit)]

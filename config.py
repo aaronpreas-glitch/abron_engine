@@ -91,6 +91,10 @@ BIRDEYE_MIN_INTERVAL_SECONDS = float(os.getenv("BIRDEYE_MIN_INTERVAL_SECONDS", "
 BIRDEYE_BACKOFF_SECONDS = float(os.getenv("BIRDEYE_BACKOFF_SECONDS", "1.0"))
 BIRDEYE_TOKENLIST_ENABLED = _env_bool("BIRDEYE_TOKENLIST_ENABLED", default=True)
 BIRDEYE_TOKENLIST_COOLDOWN_SECONDS = int(os.getenv("BIRDEYE_TOKENLIST_COOLDOWN_SECONDS", "60"))
+# Intentional provider independence mode. Use this when BirdEye billing/key access is
+# unavailable so the engine skips BirdEye calls instead of treating them as auth failures.
+NO_BIRDEYE_MODE = _env_bool("NO_BIRDEYE_MODE", default=False)
+INDEPENDENT_SOURCE_MODE = _env_bool("INDEPENDENT_SOURCE_MODE", default=NO_BIRDEYE_MODE)
 
 # Refresh key market fields immediately before alert send to reduce source drift.
 ALERT_DATA_REFRESH_ENABLED = _env_bool("ALERT_DATA_REFRESH_ENABLED", default=True)

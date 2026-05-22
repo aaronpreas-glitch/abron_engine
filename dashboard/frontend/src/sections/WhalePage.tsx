@@ -20,6 +20,8 @@ interface TierData {
   wr_24h: number | null
   avg_return_24h: number | null
   avg_return_1h: number | null
+  trackability_status?: string
+  unresolved_count?: number
 }
 
 interface CrossSignal {
@@ -78,10 +80,10 @@ interface WhaleAlert {
 // ── MC Tier config ─────────────────────────────────────────────────────────────
 
 const TIERS = {
-  micro:      { label: 'MICRO',      range: '< $5M',       color: '#f87171', bg: 'rgba(248,113,113,0.05)', border: 'rgba(248,113,113,0.2)',  desc: 'Observation only — too risky to act on',   status: 'LOG ONLY'         },
-  sweet_spot: { label: 'SWEET SPOT', range: '$5M – $50M',  color: '#00d48a', bg: 'rgba(0,212,138,0.05)',   border: 'rgba(0,212,138,0.2)',    desc: 'Active zone — scanner-integrated',          status: '✓ SCANNER ACTIVE' },
-  mid:        { label: 'MID CAP',    range: '$50M – $200M',color: '#60a5fa', bg: 'rgba(96,165,250,0.05)',  border: 'rgba(96,165,250,0.2)',   desc: 'Future: Spot basket integration (Phase 4)', status: 'PHASE 4 →'        },
-  large:      { label: 'LARGE CAP',  range: '$200M+',      color: '#f59e0b', bg: 'rgba(245,158,11,0.05)',  border: 'rgba(245,158,11,0.2)',   desc: 'Future: Macro flow signal (Phase 4)',        status: 'PHASE 4 →'        },
+  micro:      { label: 'MICRO',      range: '< $5M',       color: '#f87171', bg: 'rgba(248,113,113,0.05)', border: 'rgba(248,113,113,0.2)',  desc: 'Observation only — too risky to act on',   status: 'LOG ONLY',          trackable: false },
+  sweet_spot: { label: 'SWEET SPOT', range: '$5M – $50M',  color: '#00d48a', bg: 'rgba(0,212,138,0.05)',   border: 'rgba(0,212,138,0.2)',    desc: 'Active zone — scanner-integrated',          status: 'SCANNER OBS',       trackable: true  },
+  mid:        { label: 'MID CAP',    range: '$50M – $200M',color: '#60a5fa', bg: 'rgba(96,165,250,0.05)',  border: 'rgba(96,165,250,0.2)',   desc: 'Future: Spot basket integration (Phase 4)', status: 'PHASE 4 →',         trackable: false },
+  large:      { label: 'LARGE CAP',  range: '$200M+',      color: '#f59e0b', bg: 'rgba(245,158,11,0.05)',  border: 'rgba(245,158,11,0.2)',   desc: 'Future: Macro flow signal (Phase 4)',        status: 'PHASE 4 →',         trackable: false },
 } as const
 
 type TierKey = keyof typeof TIERS
@@ -136,9 +138,10 @@ function tierLabel(tier: string | null): string {
 function LearningLoop({ stats }: { stats: WhaleStats | undefined }) {
   const outcomes   = stats?.outcomes ?? 0
   const phase      = stats?.phase ?? 1
-  const nextMs     = stats?.next_milestone ?? 50
+  // null = past final milestone (COMPLETE); undefined = not yet loaded (use 50 placeholder)
+  const nextMs     = stats !== undefined ? (stats.next_milestone ?? null) : 50
   const milestones = stats?.milestones ?? []
-  const pct        = nextMs > 0 ? Math.min(100, (outcomes / nextMs) * 100) : 100
+  const pct        = nextMs != null && nextMs > 0 ? Math.min(100, (outcomes / nextMs) * 100) : 100
 
   return (
     <div>
@@ -218,7 +221,7 @@ function LearningLoop({ stats }: { stats: WhaleStats | undefined }) {
       {/* Progress bar to next milestone */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
         <span style={{ color: 'var(--muted)', fontSize: 10, fontFamily: 'JetBrains Mono, monospace', flexShrink: 0, minWidth: 100 }}>
-          {outcomes} / {nextMs ?? '✓'} outcomes
+          {nextMs != null ? `${outcomes} / ${nextMs} outcomes` : `${outcomes} outcomes`}
         </span>
         <div className="mini-bar-track" style={{ flex: 1 }}>
           <div className="mini-bar-fill" style={{
@@ -269,14 +272,25 @@ function TierCard({ tierKey, data }: { tierKey: TierKey; data: TierData | undefi
             {cfg.range}
           </div>
         </div>
-        <span className="badge" style={{
-          color: cfg.color,
-          background: `${cfg.color}18`,
-          border: `1px solid ${cfg.color}44`,
-          fontSize: 8,
-        }}>
-          {cfg.status}
-        </span>
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 4 }}>
+          <span className="badge" style={{
+            color: cfg.color,
+            background: `${cfg.color}18`,
+            border: `1px solid ${cfg.color}44`,
+            fontSize: 8,
+          }}>
+            {cfg.status}
+          </span>
+          <span style={{
+            fontSize: 7, fontFamily: 'JetBrains Mono, monospace', fontWeight: 700,
+            color: cfg.trackable ? '#00d48a' : '#2d4060',
+            background: cfg.trackable ? 'rgba(0,212,138,0.08)' : 'rgba(255,255,255,0.03)',
+            border: `1px solid ${cfg.trackable ? 'rgba(0,212,138,0.2)' : 'rgba(255,255,255,0.06)'}`,
+            borderRadius: 3, padding: '1px 5px', letterSpacing: '0.08em',
+          }}>
+            {cfg.trackable ? 'TRACKABLE' : 'UNTRACKABLE'}
+          </span>
+        </div>
       </div>
 
       {/* Divider */}
@@ -284,6 +298,8 @@ function TierCard({ tierKey, data }: { tierKey: TierKey; data: TierData | undefi
 
       {/* Metrics */}
       <TierMetric label="alerts"      value={d.total} />
+      <TierMetric label="outcomes"    value={d.complete}
+        color={d.complete > 0 ? cfg.color : undefined} />
       <TierMetric label="scanner pass" value={d.scanner_pass}
         color={d.scanner_pass > 0 ? cfg.color : undefined} />
       <TierMetric
@@ -301,6 +317,23 @@ function TierCard({ tierKey, data }: { tierKey: TierKey; data: TierData | undefi
       <div style={{ color: 'var(--dim)', fontSize: 9, fontFamily: 'JetBrains Mono, monospace', marginTop: 2, lineHeight: 1.5 }}>
         {cfg.desc}
       </div>
+
+      {/* Trackability note — shown when backend confirms unresolvable outcomes */}
+      {d.trackability_status === 'UNTRACKABLE' && d.complete === 0 && d.total > 0 && (
+        <div style={{
+          marginTop: 6,
+          padding: '4px 7px',
+          background: 'rgba(255,255,255,0.03)',
+          border: '1px solid rgba(255,255,255,0.07)',
+          borderRadius: 4,
+          color: 'rgba(255,255,255,0.25)',
+          fontSize: 8,
+          fontFamily: 'JetBrains Mono, monospace',
+          lineHeight: 1.5,
+        }}>
+          price tracking unavailable — {d.unresolved_count ?? d.total} alerts unresolvable by design
+        </div>
+      )}
     </div>
   )
 }

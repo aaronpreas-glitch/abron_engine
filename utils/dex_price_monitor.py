@@ -123,9 +123,13 @@ async def fetch_multi_dex_prices(mint: str) -> dict:
     }
 
     async with httpx.AsyncClient(timeout=8.0) as client:
-        # Fire both requests concurrently
+        # Fire Jupiter and the budgeted DexScreener helper concurrently.
         jup_task = client.get(_JUPITER_PRICE_URL, params={"ids": mint})
-        dex_task  = client.get(_DEXSCREENER_PAIRS_URL.format(mint=mint))
+        dex_task = asyncio.to_thread(
+            __import__("data.dexscreener", fromlist=["fetch_token_pairs"]).fetch_token_pairs,
+            mint,
+            reason="dex_price_monitor_429",
+        )
 
         try:
             jup_resp, dex_resp = await asyncio.gather(jup_task, dex_task, return_exceptions=True)
@@ -148,10 +152,9 @@ async def fetch_multi_dex_prices(mint: str) -> dict:
 
         # Parse DexScreener per-DEX prices
         dex_prices: dict[str, float] = {}
-        if not isinstance(dex_resp, Exception) and dex_resp.status_code == 200:
+        if not isinstance(dex_resp, Exception):
             try:
-                dex_data = dex_resp.json()
-                pairs = dex_data.get("pairs") or []
+                pairs = dex_resp or []
                 for pair in pairs:
                     dex_name = pair.get("dexId", "unknown")
                     price_str = pair.get("priceUsd")

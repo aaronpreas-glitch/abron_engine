@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-SERVER="root@69.62.71.67"
+SERVER="root@68.183.148.183"
 SSH_KEY="$HOME/.ssh/memecoin_deploy"
 REMOTE_ROOT="/root/memecoin_engine/dashboard"
 LOCAL_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -21,8 +21,13 @@ if [[ "$MODE" == "all" || "$MODE" == "--frontend" ]]; then
     echo "📦 Building React..."
     (cd "$LOCAL_DIR/frontend" && npm run build)
     echo "📤 Uploading dist/ → VPS..."
-    rsync -avz -e "ssh -i $SSH_KEY" --delete "$LOCAL_DIR/frontend/dist/" "$SERVER:$REMOTE_ROOT/frontend/dist/"
-    echo "  ✓ frontend/dist uploaded"
+    ssh -i "$SSH_KEY" "$SERVER" "mkdir -p '$REMOTE_ROOT/frontend/dist/assets'"
+    # Keep prior hashed assets available for stale browser bundles during rollout.
+    rsync -avz -e "ssh -i $SSH_KEY" --delete --exclude 'assets/' \
+        "$LOCAL_DIR/frontend/dist/" "$SERVER:$REMOTE_ROOT/frontend/dist/"
+    rsync -avz -e "ssh -i $SSH_KEY" \
+        "$LOCAL_DIR/frontend/dist/assets/" "$SERVER:$REMOTE_ROOT/frontend/dist/assets/"
+    echo "  ✓ frontend/dist uploaded (hashed assets preserved for cache-safe rollout)"
 fi
 
 if [[ "$MODE" == "all" || "$MODE" == "--backend" ]]; then

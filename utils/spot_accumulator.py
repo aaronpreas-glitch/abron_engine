@@ -29,9 +29,12 @@ log = logging.getLogger("spot_accumulator")
 
 REQUEST_TIMEOUT  = 8
 DEXSCREENER_BASE = "https://api.dexscreener.com"
+DEXSCREENER_SPOT_PROVIDER = "dexscreener_spot"
 KV_KEY_PRICES    = "spot_prices"
 KV_KEY_ENRICHED  = "spot_enriched"   # Patch 130 — cached enriched price+trend data
+KV_KEY_WALLET    = "spot_wallet_fallback"
 CACHE_TTL_S      = 300               # 5 min — refresh interval matching spot_monitor_step
+WALLET_CACHE_TTL_S = 1800            # 30 min — smooth over intermittent RPC failures
 
 # ── Curated basket ────────────────────────────────────────────────────────────
 
@@ -87,12 +90,72 @@ _COINGECKO_IDS: dict[str, str] = {
     "W":      "wormhole",
 }
 
+_SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
+
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
 
 def _get_conn():
     from utils.db import get_conn  # type: ignore
     return get_conn()
+
+
+def _record_capital_event(*args, **kwargs):
+    from utils.db import record_capital_event  # type: ignore
+    return record_capital_event(*args, **kwargs)
+
+
+def _spot_wallet_address() -> str:
+    wallet = (os.getenv("SOLANA_WALLET_ADDRESS") or "").strip()
+    if wallet:
+        return wallet
+    try:
+        from utils.jupiter_perps_trade import get_wallet_address  # type: ignore
+        wallet = str(get_wallet_address() or "").strip()
+        if wallet:
+            return wallet
+    except Exception:
+        pass
+    return ""
+
+
+def _fetch_live_spot_balances(wallet: str) -> dict[str, float]:
+    """
+    Read wallet SPL balances for basket mints directly from chain.
+    Used as a read-only fallback when the internal spot_holdings ledger is empty.
+    Returns {symbol: token_amount_ui}.
+    """
+    if not wallet:
+        return {}
+    out: dict[str, float] = {}
+    headers = {"Content-Type": "application/json"}
+    for token in BASKET:
+        try:
+            payload = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getTokenAccountsByOwner",
+                "params": [
+                    wallet,
+                    {"mint": token["mint"]},
+                    {"encoding": "jsonParsed"},
+                ],
+            }
+            r = requests.post(_SOLANA_RPC_URL, json=payload, timeout=REQUEST_TIMEOUT, headers=headers)
+            if r.status_code != 200:
+                continue
+            vals = ((r.json().get("result") or {}).get("value") or [])
+            amount = 0.0
+            for row in vals:
+                info = (((row or {}).get("account") or {}).get("data") or {}).get("parsed", {}).get("info", {})
+                ta = ((info.get("tokenAmount") or {}).get("uiAmount"))
+                if ta is not None:
+                    amount += float(ta or 0.0)
+            if amount > 0:
+                out[token["symbol"]] = round(amount, 9)
+        except Exception as exc:
+            log.debug("spot live balance fetch failed for %s: %s", token["symbol"], exc)
+    return out
 
 
 # ── Price fetching ────────────────────────────────────────────────────────────
@@ -109,17 +172,19 @@ def _fetch_basket_enriched() -> dict[str, dict]:
     }
     mints = [b["mint"] for b in BASKET]
     batch_str = ",".join(mints)
+    dex_cooldown_active = False
     try:
-        r = requests.get(
-            f"{DEXSCREENER_BASE}/latest/dex/tokens/{batch_str}",
-            timeout=REQUEST_TIMEOUT,
-            headers={"User-Agent": "memecoin-engine/1.0"},
-        )
-        if r.status_code != 200:
-            log.warning("DexScreener batch price HTTP %s", r.status_code)
-            pairs = []  # Don't try to parse non-200 body; CoinGecko fallback below
+        from utils.db import mark_provider_active, mark_provider_degraded, provider_in_cooldown  # type: ignore
+        dex_cooldown_active, _state = provider_in_cooldown(DEXSCREENER_SPOT_PROVIDER)
+        if dex_cooldown_active:
+            log.info("spot prices: DexScreener batch skipped — provider cooldown active")
+            pairs = []
         else:
-            pairs = r.json().get("pairs") or []
+            from data.dexscreener import fetch_token_pairs  # type: ignore
+
+            pairs = fetch_token_pairs(batch_str, reason="spot_batch_429", provider=DEXSCREENER_SPOT_PROVIDER)
+            if pairs:
+                mark_provider_active(DEXSCREENER_SPOT_PROVIDER, detail="spot batch pricing ok")
         # Build mint → best data map (highest liquidity pair wins)
         mint_data: dict[str, dict] = {}  # mint → {price, liq, h24, h6}
         for pair in pairs:
@@ -168,20 +233,17 @@ def _fetch_basket_enriched() -> dict[str, dict]:
         if result.get(b["symbol"], {}).get("price", 0.0) > 0
         and result.get(b["symbol"], {}).get("h6") is None
     ]
-    for tok in h6_missing:
-        try:
-            import requests as _req
-            r = _req.get(
-                f"https://api.dexscreener.com/latest/dex/tokens/{tok['mint']}",
-                timeout=5,
-                headers={"User-Agent": "Mozilla/5.0"},
-            )
-            pairs = (r.json().get("pairs") or []) if r.status_code == 200 else []
-            if pairs and pairs[0].get("priceChange", {}).get("h6") is not None:
-                result[tok["symbol"]]["h6"] = float(pairs[0]["priceChange"]["h6"])
-                log.debug("spot h6 fill: %s h6=%.2f%%", tok["symbol"], result[tok["symbol"]]["h6"])
-        except Exception:
-            pass
+    if not dex_cooldown_active:
+        for tok in h6_missing:
+            try:
+                from data.dexscreener import fetch_token_pairs  # type: ignore
+
+                pairs = fetch_token_pairs(tok["mint"], reason="spot_h6_fill_429", provider=DEXSCREENER_SPOT_PROVIDER)
+                if pairs and pairs[0].get("priceChange", {}).get("h6") is not None:
+                    result[tok["symbol"]]["h6"] = float(pairs[0]["priceChange"]["h6"])
+                    log.debug("spot h6 fill: %s h6=%.2f%%", tok["symbol"], result[tok["symbol"]]["h6"])
+            except Exception:
+                pass
 
     return result
 
@@ -282,6 +344,58 @@ def _read_enriched_cache(allow_stale: bool = False) -> dict[str, dict] | None:
         return None
 
 
+def _read_wallet_cache(wallet: str, allow_stale: bool = False) -> dict[str, float] | None:
+    """
+    Read last-known-good wallet balances from kv_store.
+    Used to avoid flickering back to empty ledger state when the RPC fallback fails.
+    """
+    if not wallet:
+        return None
+    try:
+        with _get_conn() as conn:
+            row = conn.execute(
+                "SELECT value FROM kv_store WHERE key=?", (KV_KEY_WALLET,)
+            ).fetchone()
+        if not row:
+            return None
+        cached = json.loads(row[0])
+        if str(cached.get("wallet") or "") != wallet:
+            return None
+        balances = cached.get("balances") or {}
+        if not any(float(v or 0.0) > 0 for v in balances.values()):
+            return None
+        if not allow_stale:
+            updated_at = cached.get("updated_at", "")
+            if updated_at:
+                age = (datetime.now(timezone.utc) - datetime.fromisoformat(updated_at)).total_seconds()
+                if age > WALLET_CACHE_TTL_S:
+                    return None
+        return {str(sym): float(amt or 0.0) for sym, amt in balances.items() if float(amt or 0.0) > 0}
+    except Exception:
+        return None
+
+
+def _write_wallet_cache(wallet: str, balances: dict[str, float]) -> None:
+    """Persist last-known-good wallet balances to kv_store."""
+    if not wallet or not balances:
+        return
+    try:
+        payload = json.dumps({
+            "wallet": wallet,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "balances": {str(sym): round(float(amt or 0.0), 9) for sym, amt in balances.items() if float(amt or 0.0) > 0},
+        })
+        with _get_conn() as conn:
+            conn.execute(
+                "INSERT INTO kv_store (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (KV_KEY_WALLET, payload),
+            )
+            conn.commit()
+    except Exception as exc:
+        log.debug("spot wallet cache write error: %s", exc)
+
+
 def fetch_basket_prices() -> dict[str, float]:
     """
     Fetch current USD prices for all basket tokens via DexScreener batch API.
@@ -321,6 +435,26 @@ def get_portfolio_state() -> dict:
     except Exception as exc:
         log.warning("get_portfolio_state DB read error: %s", exc)
 
+    holdings_source = "ledger"
+    if not any(float((h or {}).get("token_amount") or 0.0) > 0 for h in holdings_by_symbol.values()):
+        live_wallet = _spot_wallet_address()
+        live_balances = _fetch_live_spot_balances(live_wallet)
+        if live_balances:
+            _write_wallet_cache(live_wallet, live_balances)
+        else:
+            live_balances = _read_wallet_cache(live_wallet) or _read_wallet_cache(live_wallet, allow_stale=True) or {}
+        if live_balances:
+            holdings_source = "wallet_fallback"
+            for sym, amt in live_balances.items():
+                holdings_by_symbol[sym] = {
+                    "symbol": sym,
+                    "mint": _BASKET_BY_SYMBOL[sym]["mint"],
+                    "token_amount": amt,
+                    "total_invested": None,
+                    "avg_cost_usd": None,
+                    "last_buy_ts": None,
+                }
+
     # Build enriched basket list (all 7 tokens always present)
     total_invested = 0.0
     total_value    = 0.0
@@ -335,9 +469,11 @@ def get_portfolio_state() -> dict:
 
         if h and h.get("token_amount", 0) > 0:
             tok_amt     = float(h["token_amount"])
-            invested    = float(h["total_invested"])
-            avg_cost    = float(h["avg_cost_usd"])
+            invested_raw = h.get("total_invested")
+            avg_cost_raw = h.get("avg_cost_usd")
             value       = round(tok_amt * price, 4) if price > 0 else 0.0
+            invested    = float(invested_raw) if invested_raw is not None else value
+            avg_cost    = float(avg_cost_raw) if avg_cost_raw is not None else price
             pnl_usd     = round(value - invested, 4)
             pnl_pct     = round((value - invested) / invested * 100, 2) if invested > 0 else 0.0
             total_invested += invested
@@ -363,6 +499,7 @@ def get_portfolio_state() -> dict:
             "pnl_usd":          pnl_usd,
             "pnl_pct":          pnl_pct,
             "last_buy_ts":      h["last_buy_ts"] if h else None,
+            "basis_inferred":   bool(h and h.get("token_amount", 0) > 0 and (h.get("total_invested") is None or h.get("avg_cost_usd") is None)),
             # Patch 130 — trend signal fields
             "trend":            _compute_trend(price_data["h24"], price_data["h6"]),
             "price_change_24h": round(price_data["h24"], 2) if price_data["h24"] is not None else None,
@@ -388,6 +525,8 @@ def get_portfolio_state() -> dict:
         "total_pnl_usd":   total_pnl_usd,
         "total_pnl_pct":   total_pnl_pct,
         "dry_run":         os.getenv("SPOT_DRY_RUN", "true").lower() == "true",
+        "holdings_source": holdings_source,
+        "wallet_address":  _spot_wallet_address(),
         "prices_ts":       datetime.now(timezone.utc).isoformat(),
     }
 
@@ -483,6 +622,15 @@ def buy_spot(symbol: str, mint: str, amount_usd: float) -> dict:
     if amount_usd < 1.0:
         return {"success": False, "error": "amount_usd must be >= $1"}
 
+    # ── Roadmap 3: authority check (new_entry for spot lane) ──────────────
+    try:
+        from utils.authority import resolve_action  # type: ignore[import]
+        _auth = resolve_action("new_entry", "spot", executor="spot_buy")
+        if _auth["verdict"] == "BLOCK":
+            return {"success": False, "error": "authority_block", "reasons": _auth["reasons"]}
+    except Exception:
+        pass  # fail open — never block on import/db errors
+
     # Fetch price first (needed for both paper and live)
     prices    = fetch_basket_prices()
     price     = prices.get(symbol, 0.0)
@@ -548,7 +696,7 @@ def buy_spot(symbol: str, mint: str, amount_usd: float) -> dict:
                       ts_now, ts_now))
 
             # Audit log
-            conn.execute("""
+            cur = conn.execute("""
                 INSERT INTO spot_buys
                     (ts_utc, symbol, mint, side, amount_usd, token_amount, price_usd, tx_sig, dry_run)
                 VALUES (?, ?, ?, 'BUY', ?, ?, ?, ?, ?)
@@ -558,9 +706,22 @@ def buy_spot(symbol: str, mint: str, amount_usd: float) -> dict:
                   round(price, 8),
                   tx_sig,
                   1 if dry_run else 0))
+            buy_row_id = cur.lastrowid
     except Exception as exc:
         log.error("buy_spot DB update error: %s", exc)
         return {"success": False, "error": f"DB update failed: {exc}"}
+
+    _record_capital_event(
+        "spot",
+        "DEPLOY",
+        amount_usd,
+        f"{'PAPER' if dry_run else 'LIVE'} buy {symbol}",
+        symbol=symbol,
+        ref_table="spot_buys",
+        ref_id=int(buy_row_id),
+        dry_run=bool(dry_run),
+        ts_utc=ts_now,
+    )
 
     # Memory log
     try:
@@ -611,6 +772,14 @@ def sell_spot(symbol: str, mint: str, pct: float = 100.0) -> dict:
     if pct <= 0 or pct > 100:
         return {"success": False, "error": "pct must be 1–100"}
 
+    # ── Roadmap 3: authority observation (exits never blocked, just logged) ──
+    try:
+        from utils.authority import resolve_action  # type: ignore[import]
+        action = "reduce_risk" if pct < 95 else "close_position"
+        resolve_action(action, "spot", executor="spot_sell")
+    except Exception:
+        pass
+
     # Load holding
     holding = None
     try:
@@ -647,19 +816,23 @@ def sell_spot(symbol: str, mint: str, pct: float = 100.0) -> dict:
     # Update DB
     try:
         with _get_conn() as conn:
+            existing_tokens = float(holding["token_amount"])
+            existing_invested = float(holding["total_invested"])
             remaining = float(holding["token_amount"]) - tok_to_sell
             if remaining <= 1e-8:
                 # Full exit — clear the holding
+                principal_released = existing_invested
                 conn.execute("DELETE FROM spot_holdings WHERE symbol=?", (symbol,))
             else:
                 # Partial — keep avg_cost, reduce token_amount and total_invested
-                remain_invested = float(holding["total_invested"]) * (remaining / float(holding["token_amount"]))
+                remain_invested = existing_invested * (remaining / existing_tokens)
+                principal_released = max(0.0, existing_invested - remain_invested)
                 conn.execute("""
                     UPDATE spot_holdings SET token_amount=?, total_invested=?, last_buy_ts=?
                     WHERE symbol=?
                 """, (round(remaining, 6), round(remain_invested, 4), ts_now, symbol))
 
-            conn.execute("""
+            cur = conn.execute("""
                 INSERT INTO spot_buys
                     (ts_utc, symbol, mint, side, amount_usd, token_amount, price_usd, tx_sig, dry_run)
                 VALUES (?, ?, ?, 'SELL', ?, ?, ?, ?, ?)
@@ -669,8 +842,33 @@ def sell_spot(symbol: str, mint: str, pct: float = 100.0) -> dict:
                   round(price, 8),
                   tx_sig,
                   1 if dry_run else 0))
+            sell_row_id = cur.lastrowid
     except Exception as exc:
         return {"success": False, "error": f"DB update failed: {exc}"}
+
+    realized_pnl = round(usd_received - principal_released, 4)
+    _record_capital_event(
+        "spot",
+        "RELEASE",
+        principal_released,
+        f"{'PAPER' if dry_run else 'LIVE'} sell {symbol} {pct:.0f}%",
+        symbol=symbol,
+        ref_table="spot_buys",
+        ref_id=int(sell_row_id),
+        dry_run=bool(dry_run),
+        ts_utc=ts_now,
+    )
+    _record_capital_event(
+        "spot",
+        "REALIZED_PNL",
+        realized_pnl,
+        f"{'PAPER' if dry_run else 'LIVE'} sell {symbol} {pct:.0f}%",
+        symbol=symbol,
+        ref_table="spot_buys",
+        ref_id=int(sell_row_id),
+        dry_run=bool(dry_run),
+        ts_utc=ts_now,
+    )
 
     try:
         from utils import orchestrator  # type: ignore

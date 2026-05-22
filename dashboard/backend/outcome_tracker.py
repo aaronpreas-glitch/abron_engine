@@ -86,7 +86,7 @@ def _get_pending(limit: int = BATCH_SIZE) -> list[dict]:
                    evaluated_1h_ts_utc, evaluated_4h_ts_utc, evaluated_24h_ts_utc,
                    last_error, status
             FROM alert_outcomes
-            WHERE status != 'COMPLETE'
+            WHERE status = 'PENDING'
             ORDER BY created_ts_utc ASC
             LIMIT ?
             """,

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import threading
 import time
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -37,9 +38,10 @@ _agents: dict[str, dict] = {
     "research":         {"interval_s": 14400, "last_beat": 0.0, "status": "init"},  # Patch 120
     "spot_monitor":     {"interval_s": 300,   "last_beat": 0.0, "status": "init"},  # Patch 128
     "whale_watch":      {"interval_s": 120,   "last_beat": 0.0, "status": "init"},  # Patch 139
-    "confluence_engine":{"interval_s": 300,   "last_beat": 0.0, "status": "init"},  # Patch 143
+    "confluence_engine":{"interval_s": 300,   "last_beat": 0.0, "status": "init"},  # Patch 323
+    "token_intelligence":{"interval_s": 300,  "last_beat": 0.0, "status": "init"},
     "funding_monitor":  {"interval_s": 1800,  "last_beat": 0.0, "status": "init"},  # Patch 144
-    "smart_wallet_tracker": {"interval_s": 300, "last_beat": 0.0, "status": "init"},  # Patch 145
+    # smart_wallet_tracker removed Patch 233 — disabled via SMART_WALLET_ENABLED flag
 }
 
 _mem_lock = threading.Lock()   # protect concurrent writes to MEMORY.md
@@ -56,8 +58,43 @@ _cl_lock = threading.Lock()
 def heartbeat(agent: str) -> None:
     """Mark an agent as alive with the current timestamp."""
     if agent in _agents:
-        _agents[agent]["last_beat"] = time.time()
+        now = time.time()
+        _agents[agent]["last_beat"] = now
         _agents[agent]["status"] = "alive"
+        try:
+            from utils.db import get_conn  # type: ignore
+
+            payload = {
+                "name": agent,
+                "last_beat_unix": now,
+                "last_beat_at": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+                "interval_s": int(_agents[agent].get("interval_s") or 0),
+                "status": "alive",
+            }
+            with get_conn() as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO kv_store (key, value) VALUES (?, ?)",
+                    (f"agent_heartbeat:{agent}", json.dumps(payload, separators=(",", ":"))),
+                )
+        except Exception:
+            pass
+
+
+def _persistent_heartbeat(agent: str) -> dict:
+    try:
+        from utils.db import get_conn  # type: ignore
+
+        with get_conn() as conn:
+            row = conn.execute(
+                "SELECT value FROM kv_store WHERE key=?",
+                (f"agent_heartbeat:{agent}",),
+            ).fetchone()
+        if not row or not row[0]:
+            return {}
+        payload = json.loads(row[0])
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
 
 
 def get_status() -> list[dict]:
@@ -68,9 +105,12 @@ def get_status() -> list[dict]:
     now = time.time()
     result: list[dict] = []
     for name, d in _agents.items():
-        age_s = now - d["last_beat"] if d["last_beat"] > 0 else 999_999
+        persisted = _persistent_heartbeat(name)
+        last_beat = max(float(d.get("last_beat") or 0.0), float(persisted.get("last_beat_unix") or 0.0))
+        status = str(persisted.get("status") or d.get("status") or "init")
+        age_s = now - last_beat if last_beat > 0 else 999_999
         interval = d["interval_s"]
-        if d["last_beat"] == 0.0:
+        if last_beat == 0.0:
             health = "init"
         elif age_s < interval * 1.5:
             health = "alive"
@@ -82,8 +122,9 @@ def get_status() -> list[dict]:
             "name": name,
             "health": health,
             "interval_s": interval,
-            "last_beat_ago_s": round(age_s) if d["last_beat"] > 0 else None,
-            "status": d["status"],
+            "last_beat_ago_s": round(age_s) if last_beat > 0 else None,
+            "last_beat_at": persisted.get("last_beat_at"),
+            "status": status,
         })
     return result
 

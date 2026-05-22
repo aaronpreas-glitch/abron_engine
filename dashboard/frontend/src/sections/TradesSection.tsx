@@ -9,7 +9,7 @@ interface Props {
 const MONO = { fontFamily: 'JetBrains Mono, monospace' }
 
 function pc(p: number) { return p > 0 ? '#00d48a' : p < 0 ? '#ef4444' : '#a0aec0' }
-function fmt(p: number) { return `${p > 0 ? '+' : ''}${p.toFixed(2)}%` }
+function fmt(p: number | null) { if (p == null) return '—'; return `${p > 0 ? '+' : ''}${p.toFixed(2)}%` }
 function fmtDate(ts: string) {
   if (!ts) return '—'
   try {

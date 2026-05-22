@@ -191,6 +191,20 @@ async def execute_signal(signal: dict) -> bool:
         logger.debug("EXECUTOR_ENABLED=false — skipping %s", symbol)
         return False
 
+    # ── Roadmap 3: authority bridge observe-mode check ────────────────────────
+    try:
+        from authority import resolve_action  # type: ignore[import]
+        _auth = resolve_action("new_entry", signal.get("lane", "spot"), executor="spot")
+        if _auth["verdict"] == "BLOCK":
+            logger.debug(
+                "AUTHORITY_BLOCK: executor skipping %s — %s",
+                symbol, "; ".join(_auth["reasons"]),
+            )
+            return False
+    except Exception as _auth_exc:
+        logger.debug("authority check skipped: %s", _auth_exc)
+    # ── End authority bridge ──────────────────────────────────────────────────
+
     if not mint:
         logger.info("No mint for %s — cannot execute", symbol)
         return False
@@ -470,6 +484,15 @@ async def execute_exit(
     position_usd = state.get("position_usd", 0.0)
     exit_plan   = state.get("exit_plan", {})
 
+    # ── Roadmap 3: authority observation for exit (never blocks — protective) ──
+    action = "reduce_risk" if pct_to_sell < 0.95 else "close_position"
+    try:
+        from authority import resolve_action  # type: ignore[import]
+        resolve_action(action, "spot", executor="spot")
+    except Exception:
+        pass
+    # ── End authority observation ─────────────────────────────────────────────
+
     pnl_pct = ((current_price - entry_price) / entry_price * 100) if entry_price > 0 else 0.0
 
     is_full_exit = pct_to_sell >= 0.95
@@ -555,6 +578,14 @@ async def force_sell(symbol: str) -> dict:
     Called from dashboard API endpoint.
     Returns { success, message }
     """
+    # ── Roadmap 3: authority observation (close_position always permitted) ────
+    try:
+        from authority import resolve_action  # type: ignore[import]
+        resolve_action("close_position", "spot", executor="spot_force")
+    except Exception:
+        pass
+    # ── End authority observation ─────────────────────────────────────────────
+
     positions = _get_open_positions()
     target = next((p for p in positions if p.get("symbol", "").upper() == symbol.upper()), None)
 

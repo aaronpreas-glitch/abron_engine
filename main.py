@@ -357,20 +357,6 @@ def _enrich_token_for_scoring(token):
     except Exception as _he:
         logging.debug("Helius enrichment error for %s: %s", address, _he)
 
-    # ATH tracking — update and stamp leg classification onto token
-    try:
-        from utils.ath_tracker import update_ath  # type: ignore
-        _price = float(enriched.get("price") or 0)
-        if _price > 0:
-            _ts = datetime.utcnow().isoformat()
-            _ath = update_ath(address, enriched.get("symbol", ""), _price, _ts)
-            enriched["ath_price"]    = _ath.get("ath_price", 0.0)
-            enriched["drawdown_pct"] = _ath.get("drawdown_pct", 0.0)
-            enriched["leg"]          = _ath.get("leg", "UNKNOWN")
-            enriched["is_second_leg"] = _ath.get("is_second_leg", False)
-    except Exception as _ae:
-        logging.debug("ATH tracker error for %s: %s", address, _ae)
-
     return enriched
 _DAY_TO_WEEKDAY = {"MON": 0, "TUE": 1, "WED": 2, "THU": 3, "FRI": 4, "SAT": 5, "SUN": 6}
 _PROJECT_ROOT = Path(__file__).resolve().parent
@@ -1460,19 +1446,11 @@ def _detect_legacy_recovery(token: dict) -> dict | None:
     pattern_status = "Confirmed" if txns_h1 >= avg_hourly * 3 else "Forming"
     age_days = age_hours / 24.0
 
-    # Stamp second-leg status onto the enriched token
-    leg          = token.get("leg", "UNKNOWN")
-    drawdown_pct = float(token.get("drawdown_pct") or 0)
-    is_second_leg = token.get("is_second_leg", False)
-
     return {
         **token,
         "age_days":      age_days,
         "pattern_label": pattern_label,
         "pattern_status": pattern_status,
-        "leg":           leg,
-        "drawdown_pct":  drawdown_pct,
-        "is_second_leg": is_second_leg,
     }
 
 
@@ -1826,6 +1804,37 @@ async def run_watchlist_lane(context):
                     disable_web_page_preview=True,
                 )
 
+            # Patch 247 — capture score breakdown for watchlist lane so
+            # get_score_breakdown_stats() includes watchlist outcomes in
+            # factor-level win-rate analysis. Same pattern as new_runner lane.
+            # Note: watchlist alerts are status-change events; the breakdown
+            # reflects the token's current scoring state at alert time.
+            # Uses isinstance guard to skip string fields (leg_phase, mcap_tier)
+            # so the JSON is always non-None when the token is scoreable.
+            _wl_breakdown_json = None
+            _wl_score = 0.0  # Patch 251 — capture real score instead of discarding it
+            try:
+                import json as _json_wl
+                _wl_score, _wl_bd = calculate_token_score_with_breakdown(row)
+                _wl_breakdown_json = _json_wl.dumps(
+                    {k: round(float(v), 2) for k, v in _wl_bd.items()
+                     if isinstance(v, (int, float))}
+                )
+            except Exception:
+                pass
+
+            # Patch 250 — derive entry_context for watchlist alerts so operators
+            # can distinguish EXTENDED/PULLBACK/BREAKOUT setups at alert time,
+            # and so alert_outcomes gain a real attribution dimension instead of
+            # always defaulting to UNKNOWN.  Reuses the existing function; no
+            # new external calls; snapshot fields (change_24h/1h/6h) already
+            # present on the DexScreener token row.
+            _wl_entry_ctx = "UNKNOWN"
+            try:
+                _wl_entry_ctx = _derive_entry_context(row)
+            except Exception:
+                pass
+
             log_signal(
                 {
                     "symbol": symbol,
@@ -1836,7 +1845,8 @@ async def run_watchlist_lane(context):
                     "price": row.get("price"),
                     "change_24h": row.get("change_24h"),
                     "decision": decision,
-                    "notes": f"status={status} reason={row.get('reason', '')}",
+                    "score_breakdown": _wl_breakdown_json,
+                    "notes": f"status={status} reason={row.get('reason', '')} ctx={_wl_entry_ctx}",
                 }
             )
             # Track outcome for lane learning (watchlist lane)
@@ -1848,17 +1858,38 @@ async def run_watchlist_lane(context):
                         _wl_cycle = _gcp()
                     except Exception:
                         _wl_cycle = "TRANSITION"
+                    # Patch 248 — read last known market regime from kv_store
+                    # (written by run_engine each scan cycle). Cheap single-key
+                    # SELECT; falls back to RISK_NEUTRAL/50 if not yet written.
+                    _wl_regime_label, _wl_regime_score = "RISK_NEUTRAL", 50.0
+                    try:
+                        from utils.db import get_conn as _wl_rk_conn  # type: ignore
+                        with _wl_rk_conn() as _wlrc:
+                            _wl_rl = _wlrc.execute(
+                                "SELECT value FROM kv_store WHERE key='last_regime_label'"
+                            ).fetchone()
+                            _wl_rs = _wlrc.execute(
+                                "SELECT value FROM kv_store WHERE key='last_regime_score'"
+                            ).fetchone()
+                            if _wl_rl:
+                                _wl_regime_label = str(_wl_rl[0])
+                            if _wl_rs:
+                                _wl_regime_score = float(_wl_rs[0])
+                    except Exception:
+                        pass
                     queue_alert_outcome({
                         "symbol": symbol,
                         "mint": row.get("address"),
                         "entry_price": _wl_price,
-                        "score": 0,
-                        "regime_score": 0,
-                        "regime_label": status or "WATCHLIST",
+                        "score": _wl_score,
+                        "regime_score": _wl_regime_score,
+                        "regime_label": _wl_regime_label,
                         "confidence": "C",
                         "lane": "watchlist",
                         "source": "dexscreener",
                         "cycle_phase": _wl_cycle,
+                        "entry_context": _wl_entry_ctx,
+                        "setup_label": status,  # Patch 252 — Momentum/Reclaim/Breakdown
                     })
             alerts_sent += 1
 
@@ -4392,6 +4423,22 @@ async def run_legacy_recovery_scanner(context):
                     disable_web_page_preview=True,
                 )
 
+            # Patch 247 — capture score breakdown for legacy lane so
+            # get_score_breakdown_stats() includes legacy outcomes in
+            # factor-level win-rate analysis. Same pattern as new_runner lane.
+            # Uses isinstance guard to skip string fields (leg_phase, mcap_tier)
+            # so the JSON is always non-None when the token is scoreable.
+            _lr_breakdown_json = None
+            try:
+                import json as _json_lr
+                _, _lr_bd = calculate_token_score_with_breakdown(token)
+                _lr_breakdown_json = _json_lr.dumps(
+                    {k: round(float(v), 2) for k, v in _lr_bd.items()
+                     if isinstance(v, (int, float))}
+                )
+            except Exception:
+                pass
+
             log_signal({
                 "symbol": symbol,
                 "mint": token.get("address"),
@@ -4402,6 +4449,7 @@ async def run_legacy_recovery_scanner(context):
                 "price": token.get("price"),
                 "change_24h": token.get("change_24h"),
                 "decision": decision,
+                "score_breakdown": _lr_breakdown_json,
                 "notes": (
                     f"legacy_recovery age_d={token.get('age_days', 0):.1f} "
                     f"pattern={token.get('pattern_label')} sol={sol_status}"
@@ -4416,13 +4464,32 @@ async def run_legacy_recovery_scanner(context):
                         _lr_cycle = _gcp2()
                     except Exception:
                         _lr_cycle = "TRANSITION"
+                    # Patch 248 — read last known market regime from kv_store
+                    # (written by run_engine each scan cycle). Cheap single-key
+                    # SELECT; falls back to RISK_NEUTRAL/50 if not yet written.
+                    _lr_regime_label, _lr_regime_score = "RISK_NEUTRAL", 50.0
+                    try:
+                        from utils.db import get_conn as _lr_rk_conn  # type: ignore
+                        with _lr_rk_conn() as _lrrc:
+                            _lr_rl = _lrrc.execute(
+                                "SELECT value FROM kv_store WHERE key='last_regime_label'"
+                            ).fetchone()
+                            _lr_rs = _lrrc.execute(
+                                "SELECT value FROM kv_store WHERE key='last_regime_score'"
+                            ).fetchone()
+                            if _lr_rl:
+                                _lr_regime_label = str(_lr_rl[0])
+                            if _lr_rs:
+                                _lr_regime_score = float(_lr_rs[0])
+                    except Exception:
+                        pass
                     queue_alert_outcome({
                         "symbol": symbol,
                         "mint": token.get("address"),
                         "entry_price": _lr_price,
                         "score": float(token.get("score") or 0),
-                        "regime_score": 0,
-                        "regime_label": token.get("pattern_label") or "LEGACY",
+                        "regime_score": _lr_regime_score,
+                        "regime_label": _lr_regime_label,
                         "confidence": "C",
                         "lane": "legacy",
                         "source": "dexscreener",
@@ -4445,6 +4512,26 @@ async def run_engine(context):
             "decision": "SCAN_RUN",
             "notes": f"fetched_tokens={len(tokens)}",
         })
+
+        # Patch 246 — engine heartbeat. Written on every scan cycle so the
+        # dashboard can tell "engine ran and found nothing" from "engine is down."
+        # Stored as two simple kv_store keys (ISO timestamp + token count).
+        # Wrapped in try/except: a kv failure must never block the scan.
+        try:
+            from utils.db import get_conn as _hb_conn  # type: ignore
+            with _hb_conn() as _hbc:
+                _hbc.execute(
+                    "INSERT OR REPLACE INTO kv_store (key, value) VALUES ('last_scan_ts', ?)",
+                    (datetime.utcnow().isoformat(),),
+                )
+                _hbc.execute(
+                    "INSERT OR REPLACE INTO kv_store (key, value) VALUES"
+                    " ('last_scan_tokens_checked', ?)",
+                    (str(len(tokens)),),
+                )
+        except Exception:
+            pass  # heartbeat failure is non-fatal
+
         if not tokens:
             print("No valid tokens found (filters removed everything).")
             return
@@ -4474,6 +4561,20 @@ async def run_engine(context):
                         f"sol1h={sol_proxy.get('change_1h', 0):.2f}%",
                         policy.get("cycle_phase", "TRANSITION"),
                     ),
+                )
+                # Patch 248 — cache current regime label/score in kv_store so
+                # watchlist and legacy lanes can read it without an API call.
+                # Written in the same transaction: only updates on successful
+                # regime_snapshot INSERT, keeping regime state consistent.
+                _rc.execute(
+                    "INSERT OR REPLACE INTO kv_store (key, value)"
+                    " VALUES ('last_regime_label', ?)",
+                    (regime.get("label", "RISK_NEUTRAL"),),
+                )
+                _rc.execute(
+                    "INSERT OR REPLACE INTO kv_store (key, value)"
+                    " VALUES ('last_regime_score', ?)",
+                    (str(round(float(regime.get("score", 50) or 50), 1)),),
                 )
         except Exception as _re:
             logging.debug("regime_snapshot write error: %s", _re)
@@ -4522,6 +4623,31 @@ async def run_engine(context):
             })
             print(f"Risk governor blocked alerts: {block_reason}")
             return
+
+        # ── Roadmap 3: authority bridge scan-level gate ────────────────────────
+        try:
+            import sys as _sys
+            _auth_utils = os.path.join(os.path.dirname(__file__), "utils")
+            if _auth_utils not in _sys.path:
+                _sys.path.insert(0, _auth_utils)
+            from authority import resolve_action as _resolve_action  # type: ignore[import]
+            _scan_auth = _resolve_action("new_entry", "spot", executor="main_scan")
+            if _scan_auth["verdict"] == "BLOCK" and _scan_auth["enforce"]:
+                log_signal({
+                    "symbol": "ENGINE",
+                    "decision": "AUTHORITY_BLOCK",
+                    "regime_score": regime["score"],
+                    "regime_label": regime["label"],
+                    "notes": "; ".join(_scan_auth["reasons"]),
+                })
+                logging.debug(
+                    "AUTHORITY_BLOCK: main_scan halted — %s",
+                    "; ".join(_scan_auth["reasons"]),
+                )
+                return
+        except Exception as _auth_err:
+            logging.debug("authority scan gate skipped: %s", _auth_err)
+        # ── End authority bridge ───────────────────────────────────────────────
 
         # ── Loss Streak Radar: apply dynamic threshold escalation ──────────────
         try:
@@ -4673,6 +4799,7 @@ async def run_engine(context):
             "regime_score": regime["score"],
             "regime_label": regime["label"],
             "conviction": _CONFIDENCE_ORDER.get(best_token.get("confidence", "C"), 1),
+            "helius_grade": best_token.get("helius_grade"),   # Patch 242 — persist AQS grade
             "decision": "SCAN_BEST",
         })
         policy_cycle_cap = max(1, int(policy["max_alerts_per_cycle"]))
@@ -4806,7 +4933,10 @@ async def run_engine(context):
                 from scoring import calculate_token_score_with_breakdown as _score_with_bd
                 import json as _json_alert
                 _, _bd = _score_with_bd(token)
-                _score_breakdown_json = _json_alert.dumps({k: round(float(v), 2) for k, v in _bd.items()})
+                _score_breakdown_json = _json_alert.dumps(
+                    {k: round(float(v), 2) for k, v in _bd.items()
+                     if isinstance(v, (int, float))}
+                )
             except Exception:
                 pass
 
@@ -4819,6 +4949,7 @@ async def run_engine(context):
                 "conviction": _CONFIDENCE_ORDER.get(token.get("confidence", "C"), 1),
                 "decision": decision,
                 "score_breakdown": _score_breakdown_json,
+                "helius_grade": token.get("helius_grade"),   # Patch 242 — persist AQS grade
                 "notes": f"mcap_tier={token.get('mcap_tier','UNKNOWN')} helius={token.get('helius_grade','?')}",
             })
 
@@ -5338,87 +5469,23 @@ async def run_lev_monitor(context):
 
 
 async def cmd_sniper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show tokens currently in second-leg territory (75-95% below ATH)."""
+    """Legacy second-leg command retired in favor of readiness-driven memecoin flow."""
     if not _is_authorized(update):
         await _reject_unauthorized(update)
         return
-    try:
-        from utils.ath_tracker import get_second_leg_candidates, get_ath
-        from utils.db import get_conn
-        sep = "━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
-        # Get prime second-leg candidates (75%+ drawdown)
-        candidates = get_second_leg_candidates(min_drawdown_pct=75.0, limit=20)
-
-        # Also get honorable mentions from DB (60-74% drawdown)
-        honorable = []
-        try:
-            with get_conn() as conn:
-                rows = conn.execute(
-                    """SELECT mint, symbol, ath_price, last_price, pct_from_ath, leg, ath_ts_utc
-                       FROM token_ath
-                       WHERE pct_from_ath >= 0.60 AND pct_from_ath < 0.75
-                       ORDER BY pct_from_ath DESC LIMIT 5"""
-                ).fetchall()
-                honorable = [
-                    {
-                        "symbol": r[1], "ath_price": r[2], "last_price": r[3],
-                        "drawdown_pct": round(r[4] * 100, 1), "leg": r[5], "ath_ts_utc": r[6],
-                    }
-                    for r in rows
-                ]
-        except Exception:
-            pass
-
-        lines = [
-            f"<b>🎯 SNIPER WATCHLIST — Second Leg Candidates</b>",
-            f"<code>{sep}</code>",
-        ]
-
-        if not candidates:
-            lines.append("<code>No second-leg candidates yet.</code>")
-            lines.append("<code>Engine needs more scan cycles to build ATH history.</code>")
-            lines.append("<code>Check back in 24-48 hours.</code>")
-        else:
-            lines.append(f"<code>🔴 PRIME ZONE (75-95% below ATH) — {len(candidates)} tokens</code>")
-            lines.append(f"<code>{sep}</code>")
-            for i, c in enumerate(candidates[:10], 1):
-                dd = c.get('drawdown_pct', 0)
-                sym = c.get('symbol', '?')
-                ath = c.get('ath_price', 0)
-                last = c.get('last_price', 0)
-                # Depth indicator
-                if dd >= 90:
-                    depth = "🔥🔥"
-                elif dd >= 85:
-                    depth = "🔥"
-                else:
-                    depth = "📍"
-                ath_str = f"${ath:.6f}" if ath < 0.01 else f"${ath:.4f}"
-                last_str = f"${last:.6f}" if last < 0.01 else f"${last:.4f}"
-                lines.append(
-                    f"<code>{i:2}. {depth} {sym:<10} ↓{dd:.0f}%  ATH:{ath_str} Now:{last_str}</code>"
-                )
-
-        if honorable:
-            lines.append(f"<code>{sep}</code>")
-            lines.append(f"<code>🟡 APPROACHING (60-74% below ATH)</code>")
-            for c in honorable:
-                dd = c.get('drawdown_pct', 0)
-                sym = c.get('symbol', '?')
-                lines.append(f"<code>   📊 {sym:<10} ↓{dd:.0f}%</code>")
-
-        lines.append(f"<code>{sep}</code>")
-        lines.append(f"<code>Strategy: Ape conviction bags 80-90% below ATH</code>")
-        lines.append(f"<code>Wait for volume + social confirmation before entry</code>")
-
-        await update.effective_message.reply_text(
-            "\n".join(lines),
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-        )
-    except Exception as exc:
-        await update.effective_message.reply_text(f"❌ Sniper error: {exc}")
+    lines = [
+        "<b>🎯 SNIPER WATCHLIST</b>",
+        "<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>",
+        "<code>This legacy second-leg view has been retired.</code>",
+        "<code>Memecoin decisions now come from:</code>",
+        "<code>timing • safety • market quality • support • readiness</code>",
+        "<code>Use the V3 memecoin queue and Top 5 surface for the current engine view.</code>",
+    ]
+    await update.effective_message.reply_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
 
 
 def main():

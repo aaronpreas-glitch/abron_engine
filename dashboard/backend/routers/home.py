@@ -6,57 +6,5442 @@ Routes:
 """
 from __future__ import annotations
 
+import copy
+import functools
 import json
 import logging
 import os
+import sys
+import time
+from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 
+import config as _config  # noqa: F401  # ensures .env is loaded for ad-hoc router imports
 from auth import get_current_user
+from snapshot_cache import snapshot_or_build
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/home", tags=["home"])
 
+_JUP_V1_POS = "https://perps-api.jup.ag/v1/positions"
+_HOME_SHORT_CACHE_TTL_SECONDS = float(os.getenv("HOME_SHORT_CACHE_TTL_SECONDS", "15"))
+_ACTION_BOARD_OVERLAY_TIMEOUT_SECONDS = max(
+    0.5,
+    float(os.getenv("HOME_ACTION_BOARD_OVERLAY_TIMEOUT_SECONDS", "3.0")),
+)
+_GOOD_BUY_BATCH_ENRICH_LIMIT = max(3, int(os.getenv("GOOD_BUY_BATCH_ENRICH_LIMIT", "20")))
+_CONFLICT_REVIEW_STALE_HOURS = max(1.0, float(os.getenv("GOOD_BUY_CONFLICT_REVIEW_STALE_HOURS", "6")))
+_home_short_cache: dict[str, tuple[float, object]] = {}
 
-@router.get("/summary")
-def get_home_summary(_user=Depends(get_current_user)):
+
+def _ttl_cached(cache_key: str, ttl_seconds: float = _HOME_SHORT_CACHE_TTL_SECONDS):
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapped(*args, **kwargs):
+            now = time.monotonic()
+            cached = _home_short_cache.get(cache_key)
+            if cached and now - cached[0] <= ttl_seconds:
+                return copy.deepcopy(cached[1])
+            result = fn(*args, **kwargs)
+            _home_short_cache[cache_key] = (time.monotonic(), copy.deepcopy(result))
+            return result
+
+        return wrapped
+
+    return decorator
+
+
+def _fl(v, d: float = 1.0) -> float:
+    try:
+        return float(v) / d
+    except Exception:
+        return 0.0
+
+
+def _resolve_jup_wallet() -> str:
+    """Use the same wallet source as the live perps executor."""
+    try:
+        from utils.jupiter_perps_trade import get_wallet_address  # type: ignore
+        return str(get_wallet_address() or "").strip()
+    except Exception:
+        return ""
+
+
+def _home_reinforcement_weight(item: dict) -> int:
+    """Support-lane reinforcement for memecoin candidates inside Home."""
+    system = str(item.get("system") or "")
+    action = str(item.get("action") or "")
+    move_type = str(item.get("move_type") or "")
+    confidence = str(item.get("confidence") or "")
+    proof_state = str(item.get("proof_state") or "")
+    block_state = str(item.get("block_state") or "")
+    priority_score = int(item.get("priority_score") or 0)
+
+    if system == "WHALE":
+        bonus = 0
+        if action == "RESEARCH":
+            bonus += 5
+        elif action in ("MONITOR", "WATCH"):
+            bonus += 3
+        if block_state == "CLEAR":
+            bonus += 1
+        if confidence == "high":
+            bonus += 1
+        elif confidence == "medium":
+            bonus += 0
+        if priority_score >= 40:
+            bonus += 1
+        return bonus
+
+    if system == "CONFLUENCE":
+        bonus = 0
+        if action == "RESEARCH":
+            bonus += 5
+        if move_type in ("TRIPLE", "DUAL"):
+            bonus += 3
+        elif move_type in ("STRUCTURAL_TRIPLE", "STRUCTURAL_DUAL"):
+            bonus += 2
+        elif move_type:
+            bonus += 1
+        if proof_state in ("PROVEN", "STACKED", "EARLY_STACK"):
+            bonus += 1
+        return bonus
+
+    return 0
+
+
+def _home_reinforcement_bucket(score: int | float | None, tags: list[str] | None = None) -> str:
+    """Compact reinforcement family for Home-carried memecoin rows."""
+    val = float(score or 0.0)
+    tag_list = [str(t).strip() for t in (tags or []) if str(t).strip()]
+    if val >= 8.0 or len(tag_list) >= 2:
+        return "STRONG_REINFORCED"
+    if val >= 3.0 or bool(tag_list):
+        return "REINFORCED"
+    return "PLAIN"
+
+
+def _home_portfolio_pressure_context() -> dict:
+    """Compact broader-capital pressure state for Home memecoin rows."""
+    spot_invested = 0.0
+    try:
+        from utils.spot_accumulator import get_portfolio_state  # type: ignore
+        spot_state = get_portfolio_state() or {}
+        spot_invested = float(spot_state.get("total_invested") or 0.0)
+    except Exception:
+        spot_invested = 0.0
+
+    perps_collateral = 0.0
+    perps_positions = 0
+    try:
+        from utils.perp_executor import get_perp_status  # type: ignore
+        perp_status = get_perp_status() or {}
+        positions = perp_status.get("positions") or []
+        perps_collateral = round(sum(float((p or {}).get("collateral_usd") or 0.0) for p in positions), 2)
+    except Exception:
+        perps_collateral = 0.0
+
+    try:
+        from utils.db import get_conn  # type: ignore
+        with get_conn() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    COUNT(DISTINCT symbol) AS open_positions,
+                    COALESCE(SUM(collateral_usd), 0) AS collateral_usd
+                FROM perp_positions
+                WHERE status='OPEN'
+                """
+            ).fetchone()
+        if row:
+            perps_positions = int((row["open_positions"] or 0))
+            if perps_collateral <= 0:
+                perps_collateral = float((row["collateral_usd"] or 0.0))
+    except Exception:
+        pass
+
+    if perps_positions <= 0 and perps_collateral <= 0:
+        try:
+            perps_positions = 0
+        except Exception:
+            pass
+
+    total_deployed = max(0.0, spot_invested + perps_collateral)
+    if perps_positions > 0 or total_deployed >= 3000:
+        bucket = "HIGH"
+        note = "Broader portfolio exposure is already elevated."
+    elif total_deployed >= 1000:
+        bucket = "MEDIUM"
+        note = "Broader portfolio already has meaningful deployed capital."
+    else:
+        bucket = "LOW"
+        note = "Broader portfolio deployment is still light."
+
+    return {
+        "spot_invested_usd": round(spot_invested, 2),
+        "perps_collateral_usd": round(perps_collateral, 2),
+        "perps_positions": perps_positions,
+        "total_deployed_usd": round(total_deployed, 2),
+        "capital_pressure_bucket": bucket,
+        "capital_pressure_note": note,
+    }
+
+
+def _ensure_memecoin_outcome_label_schema(conn) -> None:
+    """Self-heal memecoin outcome label columns used by proof/calibration logic."""
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(memecoin_signal_outcomes)").fetchall()}
+    except Exception:
+        return
+    for col, defn in (
+        ("trust_label", "TEXT"),
+        ("triage_state", "TEXT"),
+        ("labeled_at", "TEXT"),
+        ("scanner_regime", "TEXT DEFAULT 'NORMAL'"),
+        ("scanner_relaxation_reason", "TEXT"),
+    ):
+        if col not in cols:
+            try:
+                conn.execute(f"ALTER TABLE memecoin_signal_outcomes ADD COLUMN {col} {defn}")
+            except Exception:
+                pass
+
+
+def _home_memecoin_allocator_context() -> dict:
+    """Home-side memecoin allocator snapshot aligned with the memecoin engine."""
+    _pressure_ctx = _home_portfolio_pressure_context()
+
+    _dry = os.getenv("MEMECOIN_DRY_RUN", "true").lower() == "true"
+    _pilot = os.getenv("MEMECOIN_PILOT_MODE", "false").lower() == "true"
+    _mode = "PAPER" if _dry else ("PILOT" if _pilot else "LIVE")
+    _auto = os.getenv("MEMECOIN_AUTO_BUY", "false").lower() == "true"
+    _max_open = int(os.getenv("MEMECOIN_MAX_OPEN", "3"))
+    _buy_usd = float(os.getenv("MEMECOIN_BUY_USD", "15"))
+    _pilot_max_usd = float(os.getenv("MEMECOIN_PILOT_MAX_USD", "10"))
+    _pilot_total_cap = float(os.getenv("MEMECOIN_PILOT_TOTAL_CAP_USD", "50"))
+    _reference_per_trade = _pilot_max_usd if _mode == "PILOT" else _buy_usd
+    _reference_total_cap = _pilot_total_cap if _mode == "PILOT" else (_buy_usd * max(_max_open, 1))
+
+    _open_count = 0
+    _open_exposure = 0.0
+    try:
+        from utils.db import get_conn  # type: ignore
+        with get_conn() as conn:
+            _where = "status='OPEN'"
+            if _mode == "PILOT":
+                _where += " AND is_pilot=1"
+            _row = conn.execute(
+                f"""
+                SELECT COUNT(*) AS open_count,
+                       COALESCE(SUM(amount_usd), 0) AS exposure_usd
+                FROM memecoin_trades
+                WHERE {_where}
+                """
+            ).fetchone()
+        if _row:
+            _open_count = int((_row["open_count"] or 0))
+            _open_exposure = float((_row["exposure_usd"] or 0.0))
+    except Exception:
+        pass
+
+    _remaining_slots = max(0, _max_open - _open_count)
+
+    _fg_value = None
+    _fg_bucket = "UNKNOWN"
+    try:
+        from utils.agent_coordinator import get_fear_greed  # type: ignore
+        _fg = get_fear_greed() or {}
+        _fg_value = _fg.get("value")
+        if _fg_value is not None:
+            _fg_i = int(_fg_value)
+            if _fg_i < 15:
+                _fg_bucket = "XFEAR"
+            elif _fg_i < 25:
+                _fg_bucket = "FEAR"
+            elif _fg_i < 40:
+                _fg_bucket = "CAUTIOUS"
+            else:
+                _fg_bucket = "NEUTRAL_PLUS"
+    except Exception:
+        pass
+
+    _cycle_phase = "TRANSITION"
+    try:
+        from utils.market_cycle import get_current_cycle_phase  # type: ignore
+        _cycle_phase = str(get_current_cycle_phase() or "TRANSITION").upper()
+    except Exception:
+        pass
+
+    _pressure_bucket = str(_pressure_ctx.get("capital_pressure_bucket") or "LOW")
+    _pressure_note = str(_pressure_ctx.get("capital_pressure_note") or "")
+    _spot_invested = float(_pressure_ctx.get("spot_invested_usd") or 0.0)
+    _perps_collateral = float(_pressure_ctx.get("perps_collateral_usd") or 0.0)
+
+    if _cycle_phase == "BEAR" or _fg_bucket in ("XFEAR", "FEAR"):
+        _regime_bucket = "RISK_OFF"
+        _regime_note = "Market regime is still risk-off for memecoin deployment."
+    elif _cycle_phase == "BULL" and _fg_bucket == "NEUTRAL_PLUS":
+        _regime_bucket = "RISK_ON"
+        _regime_note = "Market regime is supportive for continuation deployment."
+    else:
+        _regime_bucket = "MIXED"
+        _regime_note = "Market regime is mixed; keep memecoin deployment disciplined."
+
+    _total_deployed = max(0.0, _spot_invested + _perps_collateral)
+    if _total_deployed < 250:
+        _mix_bucket = "LIGHT"
+        _mix_note = "Broader portfolio is still lightly deployed."
+    elif _spot_invested >= max(250.0, _perps_collateral * 2.0):
+        _mix_bucket = "SPOT_HEAVY"
+        _mix_note = "Spot inventory dominates current portfolio deployment."
+    elif _perps_collateral >= max(150.0, _spot_invested * 1.25):
+        _mix_bucket = "PERP_HEAVY"
+        _mix_note = "Perp collateral is dominating current portfolio deployment."
+    else:
+        _mix_bucket = "BALANCED"
+        _mix_note = "Spot and perp deployment are relatively balanced."
+
+    _cap_pressure_mult = 0.55 if _pressure_bucket == "HIGH" else 0.8 if _pressure_bucket == "MEDIUM" else 1.0
+    _cap_regime_mult = 0.55 if _regime_bucket == "RISK_OFF" else 0.8 if _regime_bucket == "MIXED" else 1.0
+    _cap_mix_mult = 0.75 if _mix_bucket == "PERP_HEAVY" else 0.9 if _mix_bucket == "BALANCED" else 1.0
+    _effective_mult = max(0.2, round(_cap_pressure_mult * _cap_regime_mult * _cap_mix_mult, 3))
+    _effective_total_cap = round(max(_reference_total_cap * 0.2, _reference_total_cap * _effective_mult), 2)
+    _effective_per_trade = round(max(_reference_per_trade * 0.35, _reference_per_trade * _effective_mult), 2)
+    _effective_remaining_cap = round(max(0.0, _effective_total_cap - _open_exposure), 2)
+    if _effective_remaining_cap <= 0.0 or _remaining_slots <= 0:
+        _headroom_bucket = "EXHAUSTED"
+        _headroom_note = "Effective memecoin headroom is exhausted."
+    elif _effective_remaining_cap <= max(_effective_per_trade, 5.0):
+        _headroom_bucket = "THIN"
+        _headroom_note = "Only thin memecoin headroom remains."
+    elif _effective_remaining_cap <= max(_effective_per_trade * 2.0, 15.0) or _remaining_slots == 1:
+        _headroom_bucket = "WORKABLE"
+        _headroom_note = "Memecoin headroom is workable but not abundant."
+    else:
+        _headroom_bucket = "AMPLE"
+        _headroom_note = "Memecoin headroom is ample within current guardrails."
+    if _mode == "PAPER" or not _auto or _remaining_slots <= 0 or _effective_remaining_cap <= 0:
+        _window_bucket = "CLOSED"
+        _window_note = "Memecoin deployment window is effectively closed."
+    elif _effective_per_trade <= 5.0 or _effective_remaining_cap <= max(_effective_per_trade, 5.0):
+        _window_bucket = "MICRO_WINDOW"
+        _window_note = "Memecoin deployment window is open only for very small probes."
+    elif _effective_mult < 0.5 or _remaining_slots == 1 or _effective_remaining_cap <= 15.0:
+        _window_bucket = "LIMITED_WINDOW"
+        _window_note = "Memecoin deployment window is limited and should stay selective."
+    else:
+        _window_bucket = "OPEN_WINDOW"
+        _window_note = "Memecoin deployment window is open within current guardrails."
+    if _mode == "PAPER" or not _auto or _window_bucket == "CLOSED":
+        _route_bucket = "LOCKED"
+    elif _window_bucket == "MICRO_WINDOW" or _headroom_bucket == "THIN":
+        _route_bucket = "MICRO_PROBE_ONLY"
+    elif _window_bucket == "OPEN_WINDOW" and _headroom_bucket == "AMPLE" and _regime_bucket != "RISK_OFF":
+        _route_bucket = "SCALE_READY"
+    else:
+        _route_bucket = "DISCIPLINED_PROBE"
+
+    if _mode == "PAPER":
+        _allocator_stance = "PAPER_ONLY"
+        _allocator_note = "Runtime mode is PAPER. Memecoin capital stays planning-only."
+    elif not _auto:
+        _allocator_stance = "DISABLED"
+        _allocator_note = "Auto-buy is disabled. Memecoin deployment stays manual/planning-only."
+    elif _remaining_slots <= 0 or _effective_remaining_cap <= 0:
+        _allocator_stance = "SATURATED"
+        _allocator_note = "Adaptive memecoin budget or slot capacity is fully used."
+    elif _pressure_bucket == "HIGH" or _regime_bucket == "RISK_OFF":
+        _allocator_stance = "TIGHT"
+        _allocator_note = "Memecoin allocation is heavily throttled by portfolio pressure or regime."
+    elif _pressure_bucket == "MEDIUM" or _regime_bucket == "MIXED" or _mix_bucket in ("BALANCED", "PERP_HEAVY"):
+        _allocator_stance = "DISCIPLINED"
+        _allocator_note = "Memecoin allocation is open, but sizing stays disciplined."
+    else:
+        _allocator_stance = "OPEN"
+        _allocator_note = "Memecoin allocator conditions are supportive."
+
+    return {
+        "memecoins_mode": _mode,
+        "memecoins_auto_buy": _auto,
+        "memecoins_open_count": _open_count,
+        "memecoins_remaining_slots": _remaining_slots,
+        "memecoins_reference_per_trade_usd": round(_reference_per_trade, 2),
+        "memecoins_reference_total_cap_usd": round(_reference_total_cap, 2),
+        "memecoins_effective_per_trade_usd": _effective_per_trade,
+        "memecoins_effective_total_cap_usd": _effective_total_cap,
+        "memecoins_effective_remaining_cap_usd": _effective_remaining_cap,
+        "memecoins_effective_cap_multiplier": _effective_mult,
+        "memecoins_capital_pressure_bucket": _pressure_bucket,
+        "memecoins_capital_regime_bucket": _regime_bucket,
+        "memecoins_capital_mix_bucket": _mix_bucket,
+        "memecoins_capital_headroom_bucket": _headroom_bucket,
+        "memecoins_capital_headroom_note": _headroom_note,
+        "memecoins_capital_route_bucket": _route_bucket,
+        "memecoins_capital_window_bucket": _window_bucket,
+        "memecoins_capital_window_note": _window_note,
+        "memecoin_allocator_stance": _allocator_stance,
+        "memecoin_allocator_note": _allocator_note,
+    }
+
+
+def _build_cross_system_allocator_summary(capital: dict) -> dict:
+    """Compact allocator readout for Home/system-brain use."""
+    spot = float(capital.get("spot_invested_usd") or 0.0)
+    perps = float(capital.get("perps_collateral_usd") or 0.0)
+    total = float(capital.get("total_deployed_usd") or 0.0)
+    meme_stance = str(capital.get("memecoin_allocator_stance") or "UNKNOWN")
+    meme_note = str(capital.get("memecoin_allocator_note") or "")
+    meme_headroom = float(capital.get("memecoins_effective_remaining_cap_usd") or 0.0)
+    meme_per_trade = float(capital.get("memecoins_effective_per_trade_usd") or 0.0)
+    pressure = str(capital.get("memecoins_capital_pressure_bucket") or "UNKNOWN")
+    regime = str(capital.get("memecoins_capital_regime_bucket") or "UNKNOWN")
+    mix = str(capital.get("memecoins_capital_mix_bucket") or "UNKNOWN")
+    headroom = str(capital.get("memecoins_capital_headroom_bucket") or "UNKNOWN")
+    window = str(capital.get("memecoins_capital_window_bucket") or "UNKNOWN")
+    route = str(capital.get("memecoins_capital_route_bucket") or "UNKNOWN")
+
+    if total <= 0:
+        dominant = "UNDEPLOYED"
+    elif spot >= max(250.0, perps * 2.0):
+        dominant = "SPOT"
+    elif perps >= max(150.0, spot * 1.25):
+        dominant = "PERP"
+    else:
+        dominant = "BALANCED"
+
+    if meme_stance in ("PAPER_ONLY", "DISABLED", "SATURATED"):
+        allocator_posture = "DEFENSIVE"
+    elif pressure == "HIGH" or regime == "RISK_OFF":
+        allocator_posture = "TIGHT"
+    elif mix in ("BALANCED", "PERP_HEAVY"):
+        allocator_posture = "DISCIPLINED"
+    else:
+        allocator_posture = "OPEN"
+
+    if dominant == "SPOT":
+        dominant_note = "Spot inventory is currently the dominant deployed book."
+    elif dominant == "PERP":
+        dominant_note = "Perp collateral is currently the dominant deployed book."
+    elif dominant == "BALANCED":
+        dominant_note = "Spot and perp deployment are relatively balanced."
+    else:
+        dominant_note = "Broader portfolio deployment is still light."
+
+    return {
+        "dominant_book": dominant,
+        "dominant_book_note": dominant_note,
+        "allocator_posture": allocator_posture,
+        "memecoin_allocator_stance": meme_stance,
+        "memecoin_allocator_note": meme_note,
+        "memecoin_effective_headroom_usd": round(meme_headroom, 2),
+        "memecoin_effective_per_trade_usd": round(meme_per_trade, 2),
+        "pressure_bucket": pressure,
+        "regime_bucket": regime,
+        "mix_bucket": mix,
+        "headroom_bucket": headroom,
+        "window_bucket": window,
+        "route_bucket": route,
+    }
+
+
+def _build_operating_mode_snapshot(capital: dict | None = None, allocator_summary: dict | None = None) -> dict:
+    """Shared Roadmap 2 operating-mode layer for Home/system-brain surfaces."""
+    capital = dict(capital or {})
+    allocator_summary = dict(allocator_summary or {})
+
+    perp_dry = os.getenv("PERP_DRY_RUN", "true").lower() == "true"
+    meme_dry = os.getenv("MEMECOIN_DRY_RUN", "true").lower() == "true"
+    meme_pilot = os.getenv("MEMECOIN_PILOT_MODE", "false").lower() == "true"
+    meme_auto = os.getenv("MEMECOIN_AUTO_BUY", "false").lower() == "true"
+
+    perp_mode = "SIM" if perp_dry else "LIVE"
+    meme_mode = "PAPER" if meme_dry else ("PILOT" if meme_pilot else "LIVE")
+    spot_mode = "PAPER"
+
+    any_live = (not perp_dry) or (not meme_dry and not meme_pilot)
+    any_armed = (not perp_dry) or (not meme_dry)
+
+    total_deployed = float(capital.get("total_deployed_usd") or 0.0)
+    allocator_posture = str(allocator_summary.get("allocator_posture") or "UNKNOWN").strip().upper() or "UNKNOWN"
+    dominant_book = str(allocator_summary.get("dominant_book") or "UNKNOWN").strip().upper() or "UNKNOWN"
+    route_bucket = str(allocator_summary.get("route_bucket") or "UNKNOWN").strip().upper() or "UNKNOWN"
+    headroom_bucket = str(allocator_summary.get("headroom_bucket") or "UNKNOWN").strip().upper() or "UNKNOWN"
+    window_bucket = str(allocator_summary.get("window_bucket") or "UNKNOWN").strip().upper() or "UNKNOWN"
+
+    if any_live:
+        operating_mode = "LIVE_MANAGED"
+        operating_note = "At least one lane is armed for unrestricted live execution."
+        capital_policy = "Live execution is allowed, but still gated by lane authority and allocator policy."
+        allowed_now = ["manage_live_positions", "take_live_actions", "route_fresh_capital"]
+        planning_only = []
+        blocked_by_policy = []
+    elif any_armed:
+        operating_mode = "PILOT_CAPITAL"
+        operating_note = "Guardrailed real-capital deployment is armed in at least one lane."
+        capital_policy = "Pilot capital can move only when authority is stacked and route policy is supportive."
+        allowed_now = ["manage_pilot_positions", "take_guardrailed_actions", "route_small_fresh_capital"]
+        planning_only = ["scale_live_deployment"]
+        blocked_by_policy = ["unrestricted_live_scaling"]
+    elif total_deployed <= 0 and allocator_posture == "DEFENSIVE" and route_bucket in ("LOCKED", "UNKNOWN"):
+        operating_mode = "OBSERVATION"
+        operating_note = "No lane is armed for real-capital execution. Focus on observation, proof-building, and clean research."
+        capital_policy = "No new capital deployment is allowed. Build evidence, monitor conditions, and wait for authority."
+        allowed_now = ["observe_market", "research", "journal"]
+        planning_only = ["paper_actions", "allocator_planning"]
+        blocked_by_policy = ["new_real_capital_deployment", "memecoin_auto_execution", "perp_live_execution"]
+    else:
+        operating_mode = "PAPER_EXECUTION"
+        operating_note = "The system is operating in paper/advisory mode while managing existing exposure and building evidence."
+        capital_policy = "Use the system for paper execution, operator review, and disciplined planning; new execution stays policy-blocked."
+        allowed_now = ["manage_existing_positions", "paper_actions", "research", "journal"]
+        planning_only = ["memecoin_deployment", "perp_live_scaling", "cross_system_routing"]
+        blocked_by_policy = ["new_unrestricted_live_capital"]
+
+    return {
+        "operating_mode": operating_mode,
+        "operating_note": operating_note,
+        "policy_version": "ROADMAP2_PHASE1",
+        "capital_policy": capital_policy,
+        "allowed_now": allowed_now,
+        "planning_only": planning_only,
+        "blocked_by_policy": blocked_by_policy,
+        "perp_mode": perp_mode,
+        "memecoins_mode": meme_mode,
+        "spot_mode": spot_mode,
+        "any_live": any_live,
+        "any_armed": any_armed,
+        "meme_auto_buy": meme_auto,
+        "allocator_posture": allocator_posture,
+        "dominant_book": dominant_book,
+        "route_bucket": route_bucket,
+        "headroom_bucket": headroom_bucket,
+        "window_bucket": window_bucket,
+    }
+
+
+def _home_operating_status(item: dict | None, operating_mode_summary: dict | None) -> dict:
+    """Classify a Home item by what current policy actually allows."""
+    item = dict(item or {})
+    operating_mode_summary = dict(operating_mode_summary or {})
+
+    operating_mode = str(operating_mode_summary.get("operating_mode") or "OBSERVATION").strip().upper() or "OBSERVATION"
+    action = str(item.get("action") or "").strip().upper()
+    system = str(item.get("system") or "").strip().upper()
+    action_state = str(item.get("action_state") or "").strip().upper()
+    blockers = [str(b or "") for b in (item.get("blockers") or []) if str(b or "").strip()]
+
+    if action in ("RESEARCH",):
+        return {
+            "operating_status": "RESEARCH",
+            "operating_note": "This item is research-eligible under the current operating mode.",
+        }
+    if action in ("MONITOR", "WATCH"):
+        return {
+            "operating_status": "MONITOR",
+            "operating_note": "This item is monitor-only under the current operating mode.",
+        }
+    if action in ("WAIT", "HOLD") and not item.get("symbol"):
+        return {
+            "operating_status": "HOLD_CASH",
+            "operating_note": "Current policy favors waiting rather than deploying fresh capital.",
+        }
+
+    is_new_capital = action in ("ACT", "BUY", "DCA")
+    is_manage = action == "MANAGE"
+
+    if action_state == "GATED" or (blockers and is_new_capital):
+        return {
+            "operating_status": "GATED",
+            "operating_note": "The setup is structurally interesting, but current gates still block execution.",
+        }
+
+    if operating_mode == "OBSERVATION":
+        if is_new_capital or is_manage:
+            return {
+                "operating_status": "PLANNING_ONLY",
+                "operating_note": "Observation mode allows research and journaling, not live capital deployment.",
+            }
+    elif operating_mode == "PAPER_EXECUTION":
+        if is_new_capital:
+            return {
+                "operating_status": "PLANNING_ONLY",
+                "operating_note": "Paper execution mode keeps new capital deployment policy-blocked.",
+            }
+        if is_manage:
+            return {
+                "operating_status": "ACTIONABLE",
+                "operating_note": "Managing existing exposure is allowed in the current operating mode.",
+            }
+    elif operating_mode == "PILOT_CAPITAL":
+        if is_new_capital or is_manage:
+            return {
+                "operating_status": "ACTIONABLE",
+                "operating_note": "Pilot-capital mode allows guardrailed action when the setup is earned.",
+            }
+    elif operating_mode == "LIVE_MANAGED":
+        if is_new_capital or is_manage:
+            return {
+                "operating_status": "ACTIONABLE",
+                "operating_note": "Live-managed mode allows execution, still subject to lane authority and allocator policy.",
+            }
+
+    if blockers:
+        return {
+            "operating_status": "BLOCKED",
+            "operating_note": "Current blockers outweigh what policy would otherwise allow.",
+        }
+
+    return {
+        "operating_status": "MONITOR",
+        "operating_note": "This item is currently best treated as monitor-only.",
+    }
+
+
+def _build_lane_policy_snapshot(
+    operating_mode_summary: dict | None,
+    memecoins: dict | None = None,
+    perps: dict | None = None,
+    spot: dict | None = None,
+    whale: dict | None = None,
+) -> dict:
+    """Lane-by-lane policy readout anchored to the current operating mode."""
+    operating_mode_summary = dict(operating_mode_summary or {})
+    memecoins = dict(memecoins or {})
+    perps = dict(perps or {})
+    spot = dict(spot or {})
+    whale = dict(whale or {})
+
+    operating_mode = str(operating_mode_summary.get("operating_mode") or "OBSERVATION").strip().upper() or "OBSERVATION"
+    route_bucket = str(operating_mode_summary.get("route_bucket") or "UNKNOWN").strip().upper() or "UNKNOWN"
+    allocator_posture = str(operating_mode_summary.get("allocator_posture") or "UNKNOWN").strip().upper() or "UNKNOWN"
+    any_live = bool(operating_mode_summary.get("any_live"))
+    any_armed = bool(operating_mode_summary.get("any_armed"))
+
+    def _lane(policy_state: str, note: str, source_posture: str | None = None) -> dict:
+        return {
+            "policy_state": policy_state,
+            "policy_note": note,
+            "source_posture": source_posture,
+        }
+
+    meme_posture = str(memecoins.get("posture") or "UNKNOWN").strip().upper() or "UNKNOWN"
+    perp_posture = str(perps.get("posture") or "UNKNOWN").strip().upper() or "UNKNOWN"
+    spot_posture = str(spot.get("posture") or "UNKNOWN").strip().upper() or "UNKNOWN"
+    whale_posture = str(whale.get("posture") or "UNKNOWN").strip().upper() or "UNKNOWN"
+
+    if operating_mode == "OBSERVATION":
+        meme_lane = _lane("PLANNING_ONLY", "Memecoin lane is observation/planning-only under current system mode.", meme_posture)
+        perp_lane = _lane("MONITOR_ONLY", "Perp lane is monitor-only in observation mode.", perp_posture)
+        spot_lane = _lane("RESEARCH_ONLY", "Spot lane is research-only in observation mode.", spot_posture)
+    elif operating_mode == "PAPER_EXECUTION":
+        meme_lane = _lane("PLANNING_ONLY", "Memecoin lane stays paper/planning-only until policy upgrades.", meme_posture)
+        if perp_posture in ("POSITIONS_ACTIVE", "POSITIONS_MONITORING", "COLLATERAL_CONSTRAINED"):
+            perp_lane = _lane("MANAGE_ONLY", "Perp lane may manage existing exposure, but not add unrestricted fresh capital.", perp_posture)
+        else:
+            perp_lane = _lane("MONITOR_ONLY", "Perp lane is monitor-only while the system remains in paper execution.", perp_posture)
+        if spot_posture in ("ACCUMULATING", "AT_CAPACITY", "ADDS_PAUSED", "ENTRY_WATCHING"):
+            spot_lane = _lane("MANUAL_ONLY", "Spot lane remains operator-managed/manual under paper execution.", spot_posture)
+        else:
+            spot_lane = _lane("RESEARCH_ONLY", "Spot lane is research-only until stronger posture returns.", spot_posture)
+    elif operating_mode == "PILOT_CAPITAL":
+        if route_bucket in ("DISCIPLINED_PROBE", "SCALE_READY"):
+            meme_lane = _lane("GUARDRAILED_EXECUTION", "Memecoin lane can deploy guarded pilot capital when authority is earned.", meme_posture)
+        else:
+            meme_lane = _lane("PLANNING_ONLY", "Memecoin lane is armed in principle, but current route policy still blocks deployment.", meme_posture)
+        perp_lane = _lane("GUARDRAILED_EXECUTION" if any_armed else "MONITOR_ONLY", "Perp lane can act with pilot-capital discipline when setups are earned.", perp_posture)
+        spot_lane = _lane("MANUAL_ONLY", "Spot lane remains manual/operator-driven even in pilot-capital mode.", spot_posture)
+    else:
+        meme_lane = _lane("EXECUTION_CAPABLE" if route_bucket != "LOCKED" else "PLANNING_ONLY", "Memecoin lane can execute live when authority and route policy align.", meme_posture)
+        perp_lane = _lane("EXECUTION_CAPABLE" if any_live else "MANAGE_ONLY", "Perp lane can execute under live-managed policy.", perp_posture)
+        spot_lane = _lane("MANUAL_ONLY", "Spot lane remains manual/operator-managed under current product design.", spot_posture)
+
+    if whale_posture == "SIGNAL_ACTIVE":
+        whale_lane = _lane("REINFORCEMENT_ACTIVE", "Whale lane is active as a reinforcement/confirmation layer.", whale_posture)
+    elif whale_posture == "TRACKING":
+        whale_lane = _lane("MONITOR_ONLY", "Whale lane is tracking flows but has not earned stronger reinforcement status yet.", whale_posture)
+    else:
+        whale_lane = _lane("QUIET", "Whale lane is quiet and not driving action right now.", whale_posture)
+
+    if meme_lane["policy_state"] in ("EXECUTION_CAPABLE", "GUARDRAILED_EXECUTION"):
+        primary_focus = "MEMECOINS"
+    elif perp_lane["policy_state"] in ("EXECUTION_CAPABLE", "GUARDRAILED_EXECUTION", "MANAGE_ONLY"):
+        primary_focus = "PERP"
+    elif spot_lane["policy_state"] in ("MANUAL_ONLY", "RESEARCH_ONLY"):
+        primary_focus = "SPOT"
+    else:
+        primary_focus = "HOLD_CASH"
+
+    return {
+        "primary_focus_lane": primary_focus,
+        "allocator_posture": allocator_posture,
+        "memecoins": meme_lane,
+        "perps": perp_lane,
+        "spot": spot_lane,
+        "whale": whale_lane,
+    }
+
+
+def _build_lane_authority_summary(
+    operating_mode_summary: dict | None,
+    memecoins: dict | None = None,
+    perps: dict | None = None,
+    spot: dict | None = None,
+    whale: dict | None = None,
+) -> dict:
+    """Shared authority snapshot across the main lanes for Roadmap 2."""
+    operating_mode_summary = dict(operating_mode_summary or {})
+    memecoins = dict(memecoins or {})
+    perps = dict(perps or {})
+    spot = dict(spot or {})
+    whale = dict(whale or {})
+
+    validation = _build_validation_registry()
+    validation_summary = dict(validation.get("summary") or {})
+    proof_stack_authority = str(validation_summary.get("proof_stack_authority") or "TENTATIVE").strip().upper() or "TENTATIVE"
+
+    tier_summary = _tiers_summary(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..")))
+    spot_summary = _spot_summary()
+    whale_summary = _whale_summary()
+
+    meme_posture = str(memecoins.get("posture") or "UNKNOWN").strip().upper() or "UNKNOWN"
+    perp_posture = str(perps.get("posture") or "UNKNOWN").strip().upper() or "UNKNOWN"
+    spot_posture = str(spot.get("posture") or "UNKNOWN").strip().upper() or "UNKNOWN"
+    whale_posture = str(whale.get("posture") or "UNKNOWN").strip().upper() or "UNKNOWN"
+    route_bucket = str(operating_mode_summary.get("route_bucket") or "UNKNOWN").strip().upper() or "UNKNOWN"
+
+    def _lane(authority: str, note: str, driver: str) -> dict:
+        return {
+            "authority": authority,
+            "authority_note": note,
+            "primary_driver": driver,
+        }
+
+    if proof_stack_authority == "FORCEFUL" and route_bucket in ("DISCIPLINED_PROBE", "SCALE_READY") and meme_posture in ("TRANSITION_FORMING", "ACTIVE"):
+        memecoin_lane = _lane("STACKED", "Memecoin lane has proof, posture, and route alignment.", "proof+route+continuation")
+    elif proof_stack_authority in ("FORCEFUL", "BACKED") and meme_posture in ("TRANSITION_FORMING", "MONITOR_ONLY"):
+        memecoin_lane = _lane("BACKED", "Memecoin lane has meaningful proof support but execution is still policy-constrained.", "proof_stack_authority")
+    elif meme_posture == "DEGRADED":
+        memecoin_lane = _lane("ADVERSE", "Memecoin scanner posture is degraded.", "scanner_health")
+    else:
+        memecoin_lane = _lane("TENTATIVE", "Memecoin lane is still accumulating enough authority to upgrade.", "continuation_build")
+
+    buffer_usd = float(tier_summary.get("buffer_usd") or 0.0)
+    worst_liq = tier_summary.get("worst_liq_pct")
+    if perp_posture == "POSITIONS_ACTIVE" and buffer_usd > 50 and (worst_liq is None or float(worst_liq) >= 25.0):
+        perp_lane = _lane("STACKED", "Perp lane has active positions with constructive buffer support.", "positions+buffer")
+    elif perp_posture in ("POSITIONS_ACTIVE", "POSITIONS_MONITORING"):
+        perp_lane = _lane("BACKED", "Perp lane has live exposure and enough structure for active management.", "live_positions")
+    elif perp_posture == "COLLATERAL_CONSTRAINED":
+        perp_lane = _lane("ADVERSE", "Perp lane is constrained by weak collateral/buffer posture.", "collateral_constraint")
+    else:
+        perp_lane = _lane("TENTATIVE", "Perp lane is idle and waiting for stronger setup authority.", "idle")
+
+    spot_conf = str(spot_summary.get("signal_confidence") or "pending").strip().lower()
+    actionable = int(spot.get("actionable_setups") or 0)
+    if spot_posture == "ACCUMULATING" and actionable > 0 and spot_conf in ("high", "medium"):
+        spot_lane = _lane("BACKED", "Spot lane has add-ready setups with constructive confidence.", "spot_posture")
+    elif spot_posture in ("ENTRY_WATCHING", "ADDS_PAUSED", "AT_CAPACITY"):
+        spot_lane = _lane("TENTATIVE", "Spot lane has structure, but not enough authority for stronger classification.", "spot_posture")
+    else:
+        spot_lane = _lane("TENTATIVE", "Spot lane is still waiting for stronger accumulation authority.", "signal_confidence")
+
+    recent_pass = int(whale_summary.get("recent_pass_2h") or 0)
+    if whale_posture == "SIGNAL_ACTIVE" and recent_pass >= 2:
+        whale_lane = _lane("BACKED", "Whale lane is actively reinforcing with fresh scanner-pass flow.", "recent_pass")
+    elif whale_posture == "TRACKING" or recent_pass > 0:
+        whale_lane = _lane("TENTATIVE", "Whale lane is contributing signal context, but not enough for stronger authority.", "tracking_flow")
+    else:
+        whale_lane = _lane("QUIET", "Whale lane is quiet and not adding meaningful authority right now.", "quiet")
+
+    authority_rank = {
+        "STACKED": 4,
+        "BACKED": 3,
+        "TENTATIVE": 2,
+        "QUIET": 1,
+        "ADVERSE": 0,
+    }
+    lane_ranks = {
+        "MEMECOINS": authority_rank.get(memecoin_lane["authority"], 0),
+        "PERP": authority_rank.get(perp_lane["authority"], 0),
+        "SPOT": authority_rank.get(spot_lane["authority"], 0),
+        "WHALE": authority_rank.get(whale_lane["authority"], 0),
+    }
+    top_lane = max(lane_ranks, key=lane_ranks.get) if lane_ranks else "HOLD_CASH"
+    if lane_ranks.get(top_lane, 0) <= 1:
+        top_lane = "HOLD_CASH"
+
+    return {
+        "top_authority_lane": top_lane,
+        "proof_stack_authority": proof_stack_authority,
+        "memecoins": memecoin_lane,
+        "perps": perp_lane,
+        "spot": spot_lane,
+        "whale": whale_lane,
+    }
+
+
+def _build_lane_unlock_summary(
+    operating_mode_summary: dict | None,
+    lane_policy_summary: dict | None,
+    lane_authority_summary: dict | None,
+    memecoins: dict | None = None,
+    perps: dict | None = None,
+    spot: dict | None = None,
+    whale: dict | None = None,
+) -> dict:
+    """What each lane needs next before it can graduate into a stronger state."""
+    operating_mode_summary = dict(operating_mode_summary or {})
+    lane_policy_summary = dict(lane_policy_summary or {})
+    lane_authority_summary = dict(lane_authority_summary or {})
+    memecoins = dict(memecoins or {})
+    perps = dict(perps or {})
+    spot = dict(spot or {})
+    whale = dict(whale or {})
+
+    validation = _build_validation_registry()
+    validation_summary = dict(validation.get("summary") or {})
+    proof_stack_authority = str(lane_authority_summary.get("proof_stack_authority") or validation_summary.get("proof_stack_authority") or "TENTATIVE").strip().upper() or "TENTATIVE"
+    route_bucket = str(operating_mode_summary.get("route_bucket") or "UNKNOWN").strip().upper() or "UNKNOWN"
+    headroom_bucket = str(operating_mode_summary.get("headroom_bucket") or "UNKNOWN").strip().upper() or "UNKNOWN"
+    window_bucket = str(operating_mode_summary.get("window_bucket") or "UNKNOWN").strip().upper() or "UNKNOWN"
+
+    tier_summary = _tiers_summary(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..")))
+    spot_summary = _spot_summary()
+    whale_summary = _whale_summary()
+
+    def _check(name: str, passed: bool, note: str) -> dict:
+        return {
+            "name": name,
+            "passed": bool(passed),
+            "note": note,
+        }
+
+    def _lane(current_state: str, unlock_state: str, unlock_note: str, checklist: list[dict] | None = None) -> dict:
+        checklist = list(checklist or [])
+        return {
+            "current_state": current_state,
+            "next_unlock_state": unlock_state,
+            "next_unlock_note": unlock_note,
+            "checklist": checklist,
+            "passed_checks": sum(1 for item in checklist if item.get("passed")),
+            "total_checks": len(checklist),
+        }
+
+    meme_policy = dict(lane_policy_summary.get("memecoins") or {})
+    meme_auth = dict(lane_authority_summary.get("memecoins") or {})
+    meme_checklist = [
+        _check(
+            "proof_stack_backed",
+            proof_stack_authority in ("BACKED", "FORCEFUL", "STACKED"),
+            f"Proof stack authority is {proof_stack_authority}.",
+        ),
+        _check(
+            "route_window_open",
+            route_bucket not in ("LOCKED",) and window_bucket != "CLOSED",
+            f"Route bucket is {route_bucket} and window bucket is {window_bucket}.",
+        ),
+        _check(
+            "headroom_available",
+            headroom_bucket not in ("THIN", "EXHAUSTED"),
+            f"Headroom bucket is {headroom_bucket}.",
+        ),
+        _check(
+            "lane_authority_constructive",
+            str(meme_auth.get("authority") or "").strip().upper() in ("BACKED", "STACKED"),
+            f"Lane authority is {str(meme_auth.get('authority') or 'UNKNOWN').strip().upper() or 'UNKNOWN'}.",
+        ),
+    ]
+    if str(meme_policy.get("policy_state") or "") == "PLANNING_ONLY":
+        if proof_stack_authority not in ("BACKED", "FORCEFUL", "STACKED"):
+            memecoin_unlock = _lane("PLANNING_ONLY", "BACKED_PROOF", "Memecoin lane needs stronger proof-stack authority before policy can loosen.", meme_checklist)
+        elif route_bucket == "LOCKED" or window_bucket == "CLOSED":
+            memecoin_unlock = _lane("PLANNING_ONLY", "ROUTE_OPEN", "Memecoin lane needs a non-locked route/window before deployment can graduate.", meme_checklist)
+        elif headroom_bucket in ("THIN", "EXHAUSTED"):
+            memecoin_unlock = _lane("PLANNING_ONLY", "HEADROOM_RECOVERY", "Memecoin lane needs more effective headroom before it can unlock.", meme_checklist)
+        else:
+            memecoin_unlock = _lane("PLANNING_ONLY", "GUARDRAILED_EXECUTION", "Memecoin lane is close, but still needs cleaner continuation authority.", meme_checklist)
+    elif str(meme_auth.get("authority") or "") == "TENTATIVE":
+        memecoin_unlock = _lane("TENTATIVE", "BACKED", "Memecoin lane needs stronger continuation/proof alignment.", meme_checklist)
+    else:
+        memecoin_unlock = _lane(str(meme_auth.get("authority") or "UNKNOWN"), "MAINTAIN", "Memecoin lane should maintain current authority quality.", meme_checklist)
+
+    perp_policy = dict(lane_policy_summary.get("perps") or {})
+    perp_auth = dict(lane_authority_summary.get("perps") or {})
+    buffer_usd = float(tier_summary.get("buffer_usd") or 0.0)
+    worst_liq = tier_summary.get("worst_liq_pct")
+    perp_checklist = [
+        _check(
+            "profit_buffer_strong",
+            buffer_usd > 50,
+            f"Profit buffer is ${buffer_usd:,.0f}.",
+        ),
+        _check(
+            "liquidation_distance_safe",
+            worst_liq is None or float(worst_liq) >= 25.0,
+            f"Worst liquidation distance is {float(worst_liq):.1f}%." if worst_liq is not None else "No liquidation pressure detected.",
+        ),
+        _check(
+            "lane_authority_constructive",
+            str(perp_auth.get("authority") or "").strip().upper() in ("BACKED", "STACKED"),
+            f"Lane authority is {str(perp_auth.get('authority') or 'UNKNOWN').strip().upper() or 'UNKNOWN'}.",
+        ),
+    ]
+    if str(perp_policy.get("policy_state") or "") == "MANAGE_ONLY":
+        if buffer_usd <= 50:
+            perp_unlock = _lane("MANAGE_ONLY", "BUFFER_STRENGTH", "Perp lane needs stronger profit-buffer support before it can earn broader authority.", perp_checklist)
+        elif worst_liq is not None and float(worst_liq) < 25.0:
+            perp_unlock = _lane("MANAGE_ONLY", "SAFER_LIQUIDATION_DISTANCE", "Perp lane needs more liquidation distance before it can upgrade.", perp_checklist)
+        else:
+            perp_unlock = _lane("MANAGE_ONLY", "EXECUTION_CAPABLE", "Perp lane is structurally close; stronger live support would unlock a higher state.", perp_checklist)
+    elif str(perp_auth.get("authority") or "") == "TENTATIVE":
+        perp_unlock = _lane("TENTATIVE", "BACKED", "Perp lane needs either live positions or stronger buffer support.", perp_checklist)
+    else:
+        perp_unlock = _lane(str(perp_auth.get("authority") or "UNKNOWN"), "MAINTAIN", "Perp lane should maintain buffer and position quality.", perp_checklist)
+
+    spot_policy = dict(lane_policy_summary.get("spot") or {})
+    spot_auth = dict(lane_authority_summary.get("spot") or {})
+    spot_conf = str(spot_summary.get("signal_confidence") or "pending").strip().lower()
+    spot_actionable = int(spot.get("actionable_setups") or 0)
+    spot_checklist = [
+        _check(
+            "signal_confidence_ready",
+            spot_conf in ("high", "medium"),
+            f"Spot signal confidence is {spot_conf}.",
+        ),
+        _check(
+            "add_ready_setup_present",
+            spot_actionable > 0,
+            f"Spot actionable setups = {spot_actionable}.",
+        ),
+        _check(
+            "lane_authority_constructive",
+            str(spot_auth.get("authority") or "").strip().upper() in ("BACKED", "STACKED"),
+            f"Lane authority is {str(spot_auth.get('authority') or 'UNKNOWN').strip().upper() or 'UNKNOWN'}.",
+        ),
+    ]
+    if str(spot_policy.get("policy_state") or "") == "MANUAL_ONLY":
+        if spot_conf not in ("high", "medium"):
+            spot_unlock = _lane("MANUAL_ONLY", "HIGHER_CONFIDENCE", "Spot lane needs stronger signal confidence before it can earn a better unlock state.", spot_checklist)
+        elif spot_actionable <= 0:
+            spot_unlock = _lane("MANUAL_ONLY", "ADD_READY_SETUP", "Spot lane needs at least one add-ready setup to strengthen its authority.", spot_checklist)
+        else:
+            spot_unlock = _lane("MANUAL_ONLY", "BACKED_MANUAL", "Spot lane is close; cleaner add-ready posture would strengthen it.", spot_checklist)
+    else:
+        spot_unlock = _lane(str(spot_auth.get("authority") or "UNKNOWN"), "MAINTAIN", "Spot lane should maintain constructive add-ready posture.", spot_checklist)
+
+    whale_policy = dict(lane_policy_summary.get("whale") or {})
+    whale_auth = dict(lane_authority_summary.get("whale") or {})
+    recent_pass = int(whale_summary.get("recent_pass_2h") or 0)
+    whale_checklist = [
+        _check(
+            "fresh_pass_flow",
+            recent_pass >= 2,
+            f"Recent whale pass count is {recent_pass}.",
+        ),
+        _check(
+            "lane_authority_constructive",
+            str(whale_auth.get("authority") or "").strip().upper() in ("BACKED", "STACKED"),
+            f"Lane authority is {str(whale_auth.get('authority') or 'UNKNOWN').strip().upper() or 'UNKNOWN'}.",
+        ),
+    ]
+    if str(whale_policy.get("policy_state") or "") == "QUIET":
+        whale_unlock = _lane("QUIET", "FRESH_REINFORCEMENT", "Whale lane needs fresh scanner-pass flow to become an active reinforcement lane.", whale_checklist)
+    elif str(whale_auth.get("authority") or "") == "TENTATIVE" and recent_pass < 2:
+        whale_unlock = _lane("TENTATIVE", "BACKED", "Whale lane needs more fresh pass activity before its reinforcement authority upgrades.", whale_checklist)
+    else:
+        whale_unlock = _lane(str(whale_auth.get("authority") or "UNKNOWN"), "MAINTAIN", "Whale lane should maintain reinforcement quality.", whale_checklist)
+
+    return {
+        "memecoins": memecoin_unlock,
+        "perps": perp_unlock,
+        "spot": spot_unlock,
+        "whale": whale_unlock,
+    }
+
+
+def _build_operating_agenda_summary(
+    operating_mode_summary: dict | None,
+    lane_policy_summary: dict | None,
+    lane_authority_summary: dict | None,
+    lane_unlock_summary: dict | None,
+    allocator_summary: dict | None = None,
+    top_action: dict | None = None,
+) -> dict:
+    """Compact operator agenda synthesized from mode, lane state, and queue truth."""
+    operating_mode_summary = dict(operating_mode_summary or {})
+    lane_policy_summary = dict(lane_policy_summary or {})
+    lane_authority_summary = dict(lane_authority_summary or {})
+    lane_unlock_summary = dict(lane_unlock_summary or {})
+    allocator_summary = dict(allocator_summary or {})
+    top_action = dict(top_action or {})
+
+    operating_mode = str(operating_mode_summary.get("operating_mode") or "UNKNOWN").strip().upper() or "UNKNOWN"
+    primary_focus_lane = str(lane_policy_summary.get("primary_focus_lane") or "HOLD_CASH").strip().upper() or "HOLD_CASH"
+    top_authority_lane = str(lane_authority_summary.get("top_authority_lane") or "HOLD_CASH").strip().upper() or "HOLD_CASH"
+    marginal_route = str(allocator_summary.get("marginal_route") or "HOLD_CASH").strip().upper() or "HOLD_CASH"
+    marginal_route_authority = str(allocator_summary.get("marginal_route_authority") or "UNPROVEN").strip().upper() or "UNPROVEN"
+
+    lane_unlock_rank = {
+        "BACKED_PROOF": 5,
+        "ROUTE_OPEN": 4,
+        "BUFFER_STRENGTH": 4,
+        "HIGHER_CONFIDENCE": 3,
+        "FRESH_REINFORCEMENT": 3,
+        "HEADROOM_RECOVERY": 3,
+        "ADD_READY_SETUP": 2,
+        "SAFER_LIQUIDATION_DISTANCE": 2,
+        "GUARDRAILED_EXECUTION": 2,
+        "EXECUTION_CAPABLE": 2,
+        "BACKED_MANUAL": 1,
+        "BACKED": 1,
+        "MAINTAIN": 0,
+    }
+    top_unlock_lane = "NONE"
+    top_unlock_note = "No urgent unlock pressure right now."
+    top_unlock_state = "MAINTAIN"
+    best_rank = -1
+    for lane_name in ("memecoins", "perps", "spot", "whale"):
+        lane = dict(lane_unlock_summary.get(lane_name) or {})
+        state = str(lane.get("next_unlock_state") or "MAINTAIN").strip().upper() or "MAINTAIN"
+        rank = lane_unlock_rank.get(state, 0)
+        if rank > best_rank:
+            best_rank = rank
+            top_unlock_lane = lane_name.upper()
+            top_unlock_state = state
+            top_unlock_note = str(lane.get("next_unlock_note") or top_unlock_note)
+
+    top_action_system = str(top_action.get("system") or "NONE").strip().upper() or "NONE"
+    top_action_status = str(top_action.get("operating_status") or "UNKNOWN").strip().upper() or "UNKNOWN"
+    top_action_label = str(top_action.get("action") or "NONE").strip().upper() or "NONE"
+
+    if top_action_status == "ACTIONABLE":
+        agenda_state = "EXECUTE_FOCUS"
+        agenda_note = f"Highest-quality attention belongs on {top_action_system} / {top_action_label}."
+    elif top_action_status in ("MONITOR", "RESEARCH", "PLANNING_ONLY", "GATED"):
+        agenda_state = "DISCIPLINED_WAIT"
+        agenda_note = f"Stay disciplined in {operating_mode}; current best queue item is {top_action_status.lower().replace('_', '-')}."
+    elif marginal_route == "HOLD_CASH":
+        agenda_state = "HOLD_CASH"
+        agenda_note = "No lane has earned fresh marginal capital right now. Hold cash and wait."
+    else:
+        agenda_state = "LANE_PREP"
+        agenda_note = f"Prepare around {primary_focus_lane}, but keep fresh capital discipline intact."
+
+    return {
+        "agenda_state": agenda_state,
+        "agenda_note": agenda_note,
+        "primary_focus_lane": primary_focus_lane,
+        "top_authority_lane": top_authority_lane,
+        "top_unlock_lane": top_unlock_lane,
+        "top_unlock_state": top_unlock_state,
+        "top_unlock_note": top_unlock_note,
+        "marginal_route": marginal_route,
+        "marginal_route_authority": marginal_route_authority,
+        "top_action_system": top_action_system,
+        "top_action_status": top_action_status,
+        "top_action_label": top_action_label,
+    }
+
+
+# ── Roadmap 2: shared lane-signal constants and pure helpers ─────────────────
+#
+# Single source of truth for authority ranking and the two directional
+# signals (lane_momentum, unlock_horizon).  All Roadmap-2 summary builders
+# that previously defined _AUTH_RANK locally should use _LANE_AUTH_RANK
+# instead, and call _lane_signals() rather than re-deriving inline.
+
+_LANE_AUTH_RANK: dict[str, int] = {
+    "STACKED": 6, "FORCEFUL": 5, "BACKED": 4,
+    "TENTATIVE": 3, "QUIET": 2, "ADVERSE": 1, "BLOCKED": 0,
+}
+
+
+def _lane_signals(
+    authority: str,
+    passed: int,
+    total: int,
+    operating_state: str,
+    next_unlock: str,
+) -> dict:
     """
-    Single endpoint for the HOME tab.
-    Returns compact status for: Perp Tiers, Memecoins, Spot, Whale Watch.
+    Derive lane_momentum and unlock_horizon from core lane data.
+
+    lane_momentum  — directional signal: ADVANCING / BUILDING / STALLING / BLOCKED
+    unlock_horizon — effort estimate to next unlock: NONE / NEAR / MEDIUM / FAR
+
+    Pure function — no I/O, no side effects.  Consumed by every Roadmap-2
+    summary that needs directional context without creating a duplicate truth path.
+
+    Rules
+    ─────
+    BLOCKED   — operating_state is BLOCKED/PAUSED or authority is ADVERSE/BLOCKED
+    ADVANCING — authority ≥ BACKED (rank 4) and ≥ 50 % checks passing and
+                lane is not BLOCKED/PAUSED
+    STALLING  — zero checks passing AND authority rank ≤ QUIET (2)
+    BUILDING  — everything else; lane is working but not yet firing on all cylinders
+
+    NONE   — next_unlock == MAINTAIN or all checks passed (outstanding == 0)
+    NEAR   — exactly 1 check outstanding
+    MEDIUM — 2–3 checks outstanding
+    FAR    — 4+ checks outstanding
     """
+    auth_rank   = _LANE_AUTH_RANK.get(authority, 0)
+    total_      = max(total, 1)
+    check_ratio = passed / total_
+    outstanding = total - passed
+
+    # ── lane_momentum ──────────────────────────────────────────────────────────
+    op_upper = operating_state.upper()
+    if op_upper in ("BLOCKED", "PAUSED") or authority in ("ADVERSE", "BLOCKED"):
+        lane_momentum = "BLOCKED"
+    elif auth_rank >= 4 and check_ratio >= 0.5 and op_upper not in ("BLOCKED", "PAUSED"):
+        lane_momentum = "ADVANCING"
+    elif check_ratio <= 0.0 and auth_rank <= 2:
+        lane_momentum = "STALLING"
+    else:
+        lane_momentum = "BUILDING"
+
+    # ── unlock_horizon ─────────────────────────────────────────────────────────
+    if next_unlock == "MAINTAIN" or outstanding <= 0:
+        unlock_horizon = "NONE"
+    elif outstanding == 1:
+        unlock_horizon = "NEAR"
+    elif outstanding <= 3:
+        unlock_horizon = "MEDIUM"
+    else:
+        unlock_horizon = "FAR"
+
+    return {"lane_momentum": lane_momentum, "unlock_horizon": unlock_horizon}
+
+
+def _build_operating_constraints_summary(
+    operating_mode_summary: dict | None,
+    lane_policy_summary: dict | None,
+    lane_authority_summary: dict | None,
+    lane_unlock_summary: dict | None,
+    allocator_summary: dict | None = None,
+) -> dict:
+    """Compact view of the main constraints currently holding the system back."""
+    operating_mode_summary = dict(operating_mode_summary or {})
+    lane_policy_summary = dict(lane_policy_summary or {})
+    lane_authority_summary = dict(lane_authority_summary or {})
+    lane_unlock_summary = dict(lane_unlock_summary or {})
+    allocator_summary = dict(allocator_summary or {})
+
+    operating_mode = str(operating_mode_summary.get("operating_mode") or "UNKNOWN").strip().upper() or "UNKNOWN"
+    route_bucket = str(operating_mode_summary.get("route_bucket") or "UNKNOWN").strip().upper() or "UNKNOWN"
+    headroom_bucket = str(operating_mode_summary.get("headroom_bucket") or "UNKNOWN").strip().upper() or "UNKNOWN"
+    window_bucket = str(operating_mode_summary.get("window_bucket") or "UNKNOWN").strip().upper() or "UNKNOWN"
+    allocator_posture = str(allocator_summary.get("allocator_posture") or "UNKNOWN").strip().upper() or "UNKNOWN"
+    marginal_route_authority = str(allocator_summary.get("marginal_route_authority") or "UNPROVEN").strip().upper() or "UNPROVEN"
+    proof_stack_authority = str(lane_authority_summary.get("proof_stack_authority") or "TENTATIVE").strip().upper() or "TENTATIVE"
+
+    def _constraint(key: str, severity: int, note: str, source: str) -> dict:
+        return {
+            "key": key,
+            "severity": severity,
+            "note": note,
+            "source": source,
+        }
+
+    constraints: list[dict] = []
+
+    if operating_mode in ("OBSERVATION", "PAPER_EXECUTION"):
+        constraints.append(_constraint(
+            "MODE_POLICY",
+            5,
+            "Current operating mode still blocks fresh real-capital deployment.",
+            "operating_mode",
+        ))
+
+    if proof_stack_authority not in ("BACKED", "FORCEFUL", "STACKED"):
+        constraints.append(_constraint(
+            "PROOF_STACK",
+            5,
+            "Proof stack authority is still too thin for broader policy loosening.",
+            "proof_stack_authority",
+        ))
+
+    if route_bucket in ("LOCKED", "MICRO_PROBE_ONLY") or window_bucket == "CLOSED":
+        constraints.append(_constraint(
+            "MEME_ROUTE",
+            4,
+            "Memecoin route/window is still too restricted for stronger deployment.",
+            "route_bucket",
+        ))
+
+    if headroom_bucket in ("THIN", "EXHAUSTED"):
+        constraints.append(_constraint(
+            "HEADROOM",
+            3,
+            "Effective memecoin headroom is too thin for broader deployment.",
+            "headroom_bucket",
+        ))
+
+    if marginal_route_authority in ("UNPROVEN", "FRAGILE"):
+        constraints.append(_constraint(
+            "ROUTE_AUTHORITY",
+            4,
+            "Cross-system marginal routing has not earned enough authority yet.",
+            "marginal_route_authority",
+        ))
+
+    for lane_name in ("memecoins", "perps", "spot", "whale"):
+        lane = dict(lane_unlock_summary.get(lane_name) or {})
+        state = str(lane.get("next_unlock_state") or "MAINTAIN").strip().upper() or "MAINTAIN"
+        if state == "MAINTAIN":
+            continue
+        severity = {
+            "BACKED_PROOF": 5,
+            "BUFFER_STRENGTH": 4,
+            "ROUTE_OPEN": 4,
+            "HIGHER_CONFIDENCE": 3,
+            "FRESH_REINFORCEMENT": 3,
+            "HEADROOM_RECOVERY": 3,
+            "ADD_READY_SETUP": 2,
+            "SAFER_LIQUIDATION_DISTANCE": 2,
+            "GUARDRAILED_EXECUTION": 2,
+            "EXECUTION_CAPABLE": 2,
+            "BACKED_MANUAL": 1,
+            "BACKED": 1,
+        }.get(state, 1)
+        constraints.append(_constraint(
+            f"{lane_name.upper()}_{state}",
+            severity,
+            str(lane.get("next_unlock_note") or ""),
+            lane_name,
+        ))
+
+    constraints = sorted(constraints, key=lambda c: (-int(c.get("severity") or 0), str(c.get("key") or "")))
+    top_constraints = constraints[:5]
+    posture_note = {
+        "DEFENSIVE": "System posture is defensive.",
+        "TIGHT": "Allocator posture is tight.",
+        "DISCIPLINED": "Allocator posture is disciplined.",
+        "OPEN": "Allocator posture is open.",
+    }.get(allocator_posture, "Allocator posture is still forming.")
+
+    return {
+        "count": len(constraints),
+        "posture_note": posture_note,
+        "top_constraints": top_constraints,
+        "primary_constraint": top_constraints[0] if top_constraints else None,
+    }
+
+
+def _build_operating_transition_summary(
+    operating_mode_summary: dict | None,
+    lane_policy_summary: dict | None,
+    lane_authority_summary: dict | None,
+    lane_unlock_summary: dict | None,
+    operating_constraints_summary: dict | None,
+    allocator_summary: dict | None = None,
+) -> dict:
+    """Describe the next system-wide operating transition and what blocks it."""
+    operating_mode_summary = dict(operating_mode_summary or {})
+    lane_policy_summary = dict(lane_policy_summary or {})
+    lane_authority_summary = dict(lane_authority_summary or {})
+    lane_unlock_summary = dict(lane_unlock_summary or {})
+    operating_constraints_summary = dict(operating_constraints_summary or {})
+    allocator_summary = dict(allocator_summary or {})
+
+    operating_mode = str(operating_mode_summary.get("operating_mode") or "OBSERVATION").strip().upper() or "OBSERVATION"
+    top_authority_lane = str(lane_authority_summary.get("top_authority_lane") or "NONE").strip().upper() or "NONE"
+    proof_stack_authority = str(lane_authority_summary.get("proof_stack_authority") or "TENTATIVE").strip().upper() or "TENTATIVE"
+    marginal_route_authority = str(allocator_summary.get("marginal_route_authority") or "UNPROVEN").strip().upper() or "UNPROVEN"
+    route_bucket = str(operating_mode_summary.get("route_bucket") or "UNKNOWN").strip().upper() or "UNKNOWN"
+    headroom_bucket = str(operating_mode_summary.get("headroom_bucket") or "UNKNOWN").strip().upper() or "UNKNOWN"
+
+    transition_order = {
+        "OBSERVATION": "PAPER_EXECUTION",
+        "PAPER_EXECUTION": "PILOT_CAPITAL",
+        "PILOT_CAPITAL": "LIVE_MANAGED",
+        "LIVE_MANAGED": "LIVE_MANAGED",
+    }
+    next_mode = transition_order.get(operating_mode, operating_mode)
+
+    top_constraints = list(operating_constraints_summary.get("top_constraints") or [])
+    transition_blockers = top_constraints[:3]
+
+    def _check(name: str, passed: bool, note: str) -> dict:
+        return {
+            "name": name,
+            "passed": bool(passed),
+            "note": note,
+        }
+
+    checklist: list[dict] = []
+
+    if operating_mode == "OBSERVATION":
+        readiness = "BUILDING"
+        next_mode_note = "Paper execution is the next graduation step once the system is used actively for monitoring and journaling."
+        checklist = [
+            _check("paper_workflow_active", True, "Paper workflow is already available for monitoring and journaling."),
+            _check("lane_summaries_ready", True, "Lane policy, authority, and unlock summaries are already live."),
+        ]
+    elif operating_mode == "PAPER_EXECUTION":
+        checklist = [
+            _check(
+                "proof_stack_backed",
+                proof_stack_authority in ("BACKED", "FORCEFUL", "STACKED"),
+                f"Proof stack authority is {proof_stack_authority}.",
+            ),
+            _check(
+                "route_authority_context_backed",
+                marginal_route_authority in ("CONTEXT_BACKED", "STACKED"),
+                f"Marginal route authority is {marginal_route_authority}.",
+            ),
+            _check(
+                "memecoin_unlock_progress",
+                str((lane_unlock_summary.get('memecoins') or {}).get('next_unlock_state') or 'MAINTAIN').strip().upper() in ("MAINTAIN", "BACKED", "GUARDRAILED_EXECUTION", "EXECUTION_CAPABLE"),
+                str((lane_unlock_summary.get("memecoins") or {}).get("next_unlock_note") or "Memecoin lane still needs a stronger unlock."),
+            ),
+            _check(
+                "perp_lane_stable",
+                str((lane_unlock_summary.get('perps') or {}).get('next_unlock_state') or 'MAINTAIN').strip().upper() not in ("BUFFER_STRENGTH", "SAFER_LIQUIDATION_DISTANCE"),
+                str((lane_unlock_summary.get("perps") or {}).get("next_unlock_note") or "Perp lane still needs stronger buffer support."),
+            ),
+        ]
+        if proof_stack_authority in ("BACKED", "FORCEFUL", "STACKED") and marginal_route_authority in ("CONTEXT_BACKED", "STACKED"):
+            readiness = "NEAR_READY"
+        elif top_constraints:
+            readiness = "BLOCKED"
+        else:
+            readiness = "BUILDING"
+        next_mode_note = (
+            "Pilot capital is the next graduation step once proof authority, route authority, and lane unlocks are stronger."
+        )
+    elif operating_mode == "PILOT_CAPITAL":
+        checklist = [
+            _check(
+                "proof_stack_forceful",
+                proof_stack_authority in ("FORCEFUL", "STACKED"),
+                f"Proof stack authority is {proof_stack_authority}.",
+            ),
+            _check(
+                "route_authority_stacked",
+                marginal_route_authority == "STACKED",
+                f"Marginal route authority is {marginal_route_authority}.",
+            ),
+            _check(
+                "route_window_open",
+                route_bucket in ("DISCIPLINED_PROBE", "SCALE_READY"),
+                f"Current route bucket is {route_bucket}.",
+            ),
+            _check(
+                "headroom_workable",
+                headroom_bucket in ("WORKABLE", "AMPLE"),
+                f"Current headroom bucket is {headroom_bucket}.",
+            ),
+        ]
+        if proof_stack_authority in ("FORCEFUL", "STACKED") and marginal_route_authority == "STACKED" and route_bucket in ("DISCIPLINED_PROBE", "SCALE_READY"):
+            readiness = "NEAR_READY"
+        elif top_constraints:
+            readiness = "BLOCKED"
+        else:
+            readiness = "BUILDING"
+        next_mode_note = "Live managed is the next step once pilot capital proves durable and allocator routing earns stronger authority."
+    else:
+        readiness = "ACTIVE"
+        next_mode_note = "System is already in the highest operating mode."
+        checklist = [
+            _check("highest_mode_active", True, "System is already operating in the highest managed mode."),
+        ]
+
+    if top_constraints:
+        primary_blocker = dict(top_constraints[0] or {})
+        transition_note = (
+            f"Next operating transition points toward {next_mode}, but {str(primary_blocker.get('note') or '').strip()}"
+        )
+    elif operating_mode == "LIVE_MANAGED":
+        transition_note = "System is already operating at the highest managed mode."
+    else:
+        transition_note = f"Next operating transition points toward {next_mode}."
+
+    total_checks = len(checklist)
+    passed_checks = sum(1 for item in checklist if item.get("passed"))
+
+    # ── momentum_note — describes partial progress even when checks fail ──────
+    # Helps operator see that the system IS moving even when passed_checks=0.
+    partially_met = []
+    for item in checklist:
+        if item.get("passed"):
+            continue
+        note = str(item.get("note") or "")
+        # Detect "soft" progress signals in the check note
+        name = str(item.get("name") or "")
+        if name == "proof_stack_backed" and proof_stack_authority == "TENTATIVE":
+            partially_met.append("proof stack at TENTATIVE (needs BACKED)")
+        elif name == "route_authority_context_backed" and marginal_route_authority not in ("UNPROVEN",):
+            partially_met.append(f"route authority at {marginal_route_authority} (needs CONTEXT_BACKED)")
+        elif name == "perp_lane_stable" and top_authority_lane == "PERP":
+            partially_met.append("perp lane has BACKED authority (buffer gate outstanding)")
+
+    if passed_checks > 0:
+        momentum_note = f"{passed_checks}/{total_checks} transition checks passing — progress underway."
+    elif partially_met:
+        momentum_note = f"0/{total_checks} checks passing, but partial progress: {'; '.join(partially_met)}."
+    else:
+        momentum_note = f"0/{total_checks} transition checks passing — all gates outstanding."
+
+    return {
+        "current_mode": operating_mode,
+        "next_mode": next_mode,
+        "readiness": readiness,
+        "transition_note": transition_note,
+        "next_mode_note": next_mode_note,
+        "top_authority_lane": top_authority_lane,
+        "proof_stack_authority": proof_stack_authority,
+        "marginal_route_authority": marginal_route_authority,
+        "transition_blockers": transition_blockers,
+        "primary_transition_blocker": transition_blockers[0] if transition_blockers else None,
+        "checklist": checklist,
+        "passed_checks": passed_checks,
+        "total_checks": total_checks,
+        "momentum_note": momentum_note,
+    }
+
+
+def _build_lane_graduation_rank(
+    lane_unlock_summary: dict | None,
+    lane_authority_summary: dict | None,
+    lane_policy_summary: dict | None,
+) -> dict:
+    """
+    Graduation-rank layer: score each lane by how close it is to upgrading.
+    Synthesizes unlock checklist progress and next-unlock-state proximity
+    into a 0-100 graduation score, then ranks lanes 1-4 (1 = closest).
+    """
+    lane_unlock_summary  = dict(lane_unlock_summary  or {})
+    lane_authority_summary = dict(lane_authority_summary or {})
+    lane_policy_summary  = dict(lane_policy_summary  or {})
+
+    # How many meaningful steps away from MAINTAIN is each next_unlock_state?
+    # Higher score = already at target or very close.
+    _proximity: dict[str, int] = {
+        "MAINTAIN":                   100,
+        "BACKED":                      72,
+        "BACKED_MANUAL":               72,
+        "EXECUTION_CAPABLE":           68,
+        "GUARDRAILED_EXECUTION":       65,
+        "BUFFER_STRENGTH":             45,
+        "ROUTE_OPEN":                  45,
+        "HIGHER_CONFIDENCE":           40,
+        "FRESH_REINFORCEMENT":         40,
+        "ADD_READY_SETUP":             38,
+        "HEADROOM_RECOVERY":           25,
+        "SAFER_LIQUIDATION_DISTANCE":  22,
+        "BACKED_PROOF":                18,
+    }
+
+    lanes: dict[str, dict] = {}
+    for lane_name in ("memecoins", "perps", "spot", "whale"):
+        lane_unlock  = dict(lane_unlock_summary.get(lane_name)  or {})
+        lane_auth    = dict(lane_authority_summary.get(lane_name) or {})
+
+        passed = int(lane_unlock.get("passed_checks") or 0)
+        total  = int(lane_unlock.get("total_checks")  or 1)
+        next_state   = str(lane_unlock.get("next_unlock_state") or "MAINTAIN").strip().upper() or "MAINTAIN"
+        current_state = str(lane_unlock.get("current_state") or "UNKNOWN").strip().upper() or "UNKNOWN"
+        unlock_note  = str(lane_unlock.get("next_unlock_note") or "")
+        authority    = str(lane_auth.get("authority") or "TENTATIVE").strip().upper() or "TENTATIVE"
+
+        check_score = round((passed / max(total, 1)) * 100)
+        proximity   = _proximity.get(next_state, 15)
+
+        # 60% checklist completion + 40% proximity to target state
+        grad_score = round(check_score * 0.6 + proximity * 0.4)
+
+        # Small authority bonus — doesn't dominate, just breaks ties
+        if authority == "STACKED":
+            grad_score = min(100, grad_score + 8)
+        elif authority == "BACKED":
+            grad_score = min(100, grad_score + 4)
+
+        lanes[lane_name] = {
+            "graduation_score":  grad_score,
+            "unlock_progress":   f"{passed}/{total}",
+            "passed_checks":     passed,
+            "total_checks":      total,
+            "current_state":     current_state,
+            "next_unlock_state": next_state,
+            "authority":         authority,
+            "graduation_note":   unlock_note,
+            "graduation_rank":   0,  # filled below
+        }
+
+    ranked = sorted(lanes.keys(), key=lambda k: -lanes[k]["graduation_score"])
+    for i, name in enumerate(ranked):
+        lanes[name]["graduation_rank"] = i + 1
+
+    fastest = ranked[0] if ranked else "NONE"
+    fastest_score  = lanes[fastest]["graduation_score"]  if fastest != "NONE" else 0
+    fastest_unlock = lanes[fastest]["next_unlock_state"] if fastest != "NONE" else "MAINTAIN"
+
+    if fastest_score >= 80:
+        summary = (
+            f"{fastest.upper()} lane is closest to graduating — "
+            f"{fastest_unlock.replace('_', ' ').lower()} is within reach."
+        )
+    elif fastest_score >= 50:
+        summary = (
+            f"{fastest.upper()} lane has the most graduation momentum "
+            f"({fastest_score}/100); {fastest_unlock.replace('_', ' ').lower()} is the target."
+        )
+    else:
+        summary = (
+            "No lane is close to graduating right now. "
+            "Focus on building unlock checklist progress across the board."
+        )
+
+    return {
+        "fastest_graduation_lane":   fastest.upper(),
+        "fastest_graduation_score":  fastest_score,
+        "fastest_graduation_unlock": fastest_unlock,
+        "graduation_summary":        summary,
+        "lanes":                     lanes,
+    }
+
+
+def _build_operating_recommendation(
+    operating_mode_summary: dict | None,
+    lane_policy_summary: dict | None,
+    lane_authority_summary: dict | None,
+    lane_unlock_summary: dict | None,
+    lane_graduation_rank: dict | None,
+    operating_constraints_summary: dict | None,
+    operating_transition_summary: dict | None,
+    operating_agenda_summary: dict | None,
+) -> dict:
+    """
+    Session-level operator recommendation: what to emphasize for the next session/day.
+    More actionable than agenda — tells the operator what to do, not just what the system is doing.
+    Synthesizes mode, authority, graduation rank, constraints, and transition readiness.
+    """
+    operating_mode_summary       = dict(operating_mode_summary       or {})
+    lane_authority_summary       = dict(lane_authority_summary       or {})
+    lane_graduation_rank         = dict(lane_graduation_rank         or {})
+    operating_constraints_summary = dict(operating_constraints_summary or {})
+    operating_transition_summary  = dict(operating_transition_summary  or {})
+    operating_agenda_summary      = dict(operating_agenda_summary      or {})
+
+    operating_mode       = str(operating_mode_summary.get("operating_mode")     or "PAPER_EXECUTION").strip().upper() or "PAPER_EXECUTION"
+    transition_readiness = str(operating_transition_summary.get("readiness")    or "BUILDING").strip().upper() or "BUILDING"
+    agenda_state         = str(operating_agenda_summary.get("agenda_state")     or "DISCIPLINED_WAIT").strip().upper() or "DISCIPLINED_WAIT"
+    top_authority_lane   = str(lane_authority_summary.get("top_authority_lane") or "NONE").strip().upper() or "NONE"
+    proof_stack_authority = str(lane_authority_summary.get("proof_stack_authority") or "TENTATIVE").strip().upper() or "TENTATIVE"
+
+    primary_constraint     = dict(operating_constraints_summary.get("primary_constraint") or {})
+    primary_constraint_key = str(primary_constraint.get("key") or "NONE").strip().upper() or "NONE"
+
+    fastest_lane   = str(lane_graduation_rank.get("fastest_graduation_lane")   or "NONE").strip().upper() or "NONE"
+    fastest_score  = int(lane_graduation_rank.get("fastest_graduation_score")  or 0)
+    fastest_unlock = str(lane_graduation_rank.get("fastest_graduation_unlock") or "MAINTAIN").strip().upper() or "MAINTAIN"
+    grad_lanes     = dict(lane_graduation_rank.get("lanes") or {})
+
+    # lane name → authority-summary key (PERP ↔ perps)
+    _auth_key = {"MEMECOINS": "memecoins", "PERP": "perps", "SPOT": "spot", "WHALE": "whale"}
+    top_auth_key = _auth_key.get(top_authority_lane, top_authority_lane.lower())
+    top_authority_state = str(
+        (dict(lane_authority_summary.get(top_auth_key) or {})).get("authority") or "TENTATIVE"
+    ).strip().upper() or "TENTATIVE"
+
+    _constraint_to_emphasis = {
+        "MODE_POLICY":     "BUILD_PROOF",
+        "PROOF_STACK":     "BUILD_PROOF",
+        "MEME_ROUTE":      "BUILD_ROUTE",
+        "HEADROOM":        "BUILD_ROUTE",
+        "ROUTE_AUTHORITY": "BUILD_ROUTE",
+    }
+
+    # Determine session emphasis (priority order)
+    if (
+        agenda_state == "EXECUTE_FOCUS"
+        and transition_readiness not in ("BLOCKED", "BUILDING")
+        and top_authority_state in ("BACKED", "FORCEFUL")
+    ):
+        session_emphasis = "EXECUTE"
+        session_emphasis_note = (
+            f"Focus on executing the top {top_authority_lane.lower().replace('_', '-')} action; "
+            "it has earned the authority."
+        )
+    elif agenda_state == "EXECUTE_FOCUS":
+        session_emphasis = "ADVANCE_UNLOCK"
+        session_emphasis_note = (
+            f"{top_authority_lane.title()} is the main lane to work, but authority is still "
+            f"{top_authority_state.lower()}; advance the unlock checklist before treating it as deployable."
+        )
+    elif transition_readiness == "NEAR_READY":
+        session_emphasis = "TRANSITION_PREP"
+        session_emphasis_note = (
+            "System is near mode transition. "
+            "Verify proof authority and route alignment before any capital move."
+        )
+    elif primary_constraint_key in _constraint_to_emphasis:
+        session_emphasis = _constraint_to_emphasis[primary_constraint_key]
+        c_note = str(primary_constraint.get("note") or "").strip()
+        session_emphasis_note = c_note or f"Primary constraint ({primary_constraint_key}) is holding the system back."
+    elif fastest_score >= 65 and fastest_unlock not in ("MAINTAIN",):
+        session_emphasis = f"LANE_UNLOCK_{fastest_lane}"
+        session_emphasis_note = (
+            f"{fastest_lane.title()} lane is closest to graduating. "
+            f"Work the {fastest_unlock.replace('_', ' ').lower()} checklist."
+        )
+    elif proof_stack_authority == "TENTATIVE" and operating_mode == "PAPER_EXECUTION":
+        session_emphasis = "BUILD_PROOF"
+        session_emphasis_note = (
+            "Proof stack authority is thin. "
+            "Build paper execution evidence through disciplined setup evaluation."
+        )
+    else:
+        session_emphasis = "MONITOR"
+        session_emphasis_note = (
+            "No high-leverage unlock available. "
+            "Monitor lanes, observe conditions, and journal any setups."
+        )
+
+    # Build up to 3 ordered session actions
+    def _action(label: str, lane: str, urgency: str, note: str) -> dict:
+        return {"label": label, "lane": lane, "urgency": urgency, "note": note}
+
+    raw_actions: list[dict] = []
+
+    # 1. Fastest lane graduation advance (if meaningful)
+    if fastest_score >= 45 and fastest_unlock not in ("MAINTAIN",):
+        lane_grad = dict(grad_lanes.get(fastest_lane.lower(), {}))
+        raw_actions.append(_action(
+            f"Advance {fastest_lane.title()} unlock",
+            fastest_lane,
+            "HIGH" if fastest_score >= 65 else "MEDIUM",
+            str(lane_grad.get("graduation_note") or f"Work toward {fastest_unlock.replace('_', ' ').lower()}."),
+        ))
+
+    # 2. Proof stack if still TENTATIVE in paper mode
+    if operating_mode == "PAPER_EXECUTION" and proof_stack_authority == "TENTATIVE":
+        raw_actions.append(_action(
+            "Build proof-stack authority",
+            "MEMECOINS",
+            "HIGH",
+            "Paper-execute evaluated setups to grow proof stack evidence.",
+        ))
+
+    # 3. Maintain top authority lane
+    if top_authority_lane not in ("NONE", "HOLD_CASH"):
+        auth_key = _auth_key.get(top_authority_lane, top_authority_lane.lower())
+        top_auth = dict(lane_authority_summary.get(auth_key) or {})
+        raw_actions.append(_action(
+            f"Maintain {top_authority_lane.title()} authority",
+            top_authority_lane,
+            "MEDIUM",
+            str(top_auth.get("authority_note") or f"{top_authority_lane} lane has the strongest authority — protect it."),
+        ))
+
+    # Deduplicate by label, cap at 3
+    seen: set[str] = set()
+    session_actions: list[dict] = []
+    for a in raw_actions:
+        lbl = a["label"]
+        if lbl not in seen:
+            seen.add(lbl)
+            session_actions.append(a)
+        if len(session_actions) >= 3:
+            break
+
+    return {
+        "session_emphasis":       session_emphasis,
+        "session_emphasis_note":  session_emphasis_note,
+        "top_session_action":     session_actions[0] if session_actions else None,
+        "session_actions":        session_actions,
+        "transition_readiness":   transition_readiness,
+        "fastest_graduation_lane":  fastest_lane,
+        "fastest_graduation_score": fastest_score,
+    }
+
+
+def _build_cross_lane_operating_matrix(
+    lane_graduation_rank: "dict | None",
+    lane_authority_summary: "dict | None",
+    lane_policy_summary: "dict | None",
+    lane_unlock_summary: "dict | None",
+    operating_mode_summary: "dict | None",
+) -> dict:
+    """
+    Roadmap 2: Cross-lane operating matrix.
+
+    Builds a unified per-lane comparison from the four existing Home lane
+    summaries — no external calls, no duplicate truth.
+
+    Per-lane entry
+    ──────────────
+      operating_state       — derived from policy_state + authority
+      policy_state          — from lane_policy_summary
+      authority             — from lane_authority_summary
+      next_unlock_state     — from lane_unlock_summary
+      primary_constraint_key — derived from next_unlock_state
+      passed_checks / total_checks — from lane_graduation_rank (or unlock)
+      graduation_score      — 0-100 from lane_graduation_rank
+      graduation_rank       — 1-4 (1 = closest to graduating)
+      operating_alignment   — mirrors authority scale
+
+    Top-level synthesised
+    ──────────────────────
+      strongest_lane         — highest authority
+      weakest_lane           — lowest graduation score
+      closest_to_graduation  — same as fastest_graduation_lane
+      most_blocked_lane      — most failing checks (lowest passed/total ratio)
+      best_mode_alignment_lane — highest-authority lane with productive policy
+    """
+    lgr  = dict(lane_graduation_rank  or {})
+    las  = dict(lane_authority_summary or {})
+    lps  = dict(lane_policy_summary   or {})
+    lus  = dict(lane_unlock_summary   or {})
+    oms  = dict(operating_mode_summary or {})
+
+    _POLICY_TO_OPSTATE: dict[str, str] = {
+        "UNRESTRICTED":   "ACTIVE",
+        "MANAGE_ONLY":    "MANAGING",
+        "PLANNING_ONLY":  "PLANNING",
+        "MANUAL_ONLY":    "MANUAL_ONLY",
+        "OBSERVE_ONLY":   "OBSERVING",
+        "QUIET":          "OBSERVING",
+        "LOCKED":         "BLOCKED",
+        "PAUSED":         "PAUSED",
+    }
+
+    _UNLOCK_TO_CONSTRAINT: dict[str, str] = {
+        "MAINTAIN":                   "NONE",
+        "BACKED":                     "AUTHORITY_BUILDING",
+        "BACKED_MANUAL":              "AUTHORITY_BUILDING",
+        "BACKED_PROOF":               "PROOF_STACK_THIN",
+        "EXECUTION_CAPABLE":          "EXECUTION_PROOF_PENDING",
+        "GUARDRAILED_EXECUTION":      "GUARDRAIL_PENDING",
+        "BUFFER_STRENGTH":            "BUFFER_WEAK",
+        "ROUTE_OPEN":                 "ROUTE_LOCKED",
+        "HIGHER_CONFIDENCE":          "SIGNAL_CONFIDENCE_LOW",
+        "FRESH_REINFORCEMENT":        "REINFORCEMENT_STALE",
+        "ADD_READY_SETUP":            "NO_ADD_SETUP",
+        "HEADROOM_RECOVERY":          "HEADROOM_LOW",
+        "SAFER_LIQUIDATION_DISTANCE": "LIQ_DISTANCE_TIGHT",
+        "SIGNAL_PROOF_10":            "SIGNAL_PROOF_PENDING",
+        "TUNER_CALIBRATION":          "CONFIDENCE_PENDING",
+        "LIVE_CAPITAL_DEPLOY":        "PAPER_MODE_ONLY",
+        "PROOF_20_TRADES":            "PROOF_BUILDING",
+        "WIN_RATE_50_PCT":            "WIN_RATE_BELOW_THRESHOLD",
+        "LIQ_IMPROVEMENT":            "LIQ_DISTANCE_TIGHT",
+    }
+
+    # Policy states considered "productive" (lane is doing something useful)
+    _PRODUCTIVE_POLICIES = {"UNRESTRICTED", "MANAGE_ONLY", "PLANNING_ONLY", "MANUAL_ONLY"}
+
+    grad_lanes = dict(lgr.get("lanes") or {})
+
+    matrix: dict[str, dict] = {}
+    for lane in ("memecoins", "perps", "spot", "whale"):
+        lane_auth   = dict(las.get(lane) or {})
+        lane_pol    = dict(lps.get(lane) or {})
+        lane_unlock = dict(lus.get(lane) or {})
+        lane_grad   = dict(grad_lanes.get(lane) or {})
+
+        authority    = str(lane_auth.get("authority")    or "QUIET").strip().upper() or "QUIET"
+        auth_note    = str(lane_auth.get("authority_note") or "")
+        policy_state = str(lane_pol.get("policy_state") or "QUIET").strip().upper() or "QUIET"
+        policy_note  = str(lane_pol.get("policy_note")  or "")
+
+        next_unlock   = str(lane_unlock.get("next_unlock_state") or lane_grad.get("next_unlock_state") or "MAINTAIN").strip().upper() or "MAINTAIN"
+        unlock_note   = str(lane_unlock.get("next_unlock_note")  or lane_grad.get("graduation_note") or "")
+        current_state = str(lane_unlock.get("current_state")     or "UNKNOWN").strip().upper() or "UNKNOWN"
+
+        passed = int(lane_grad.get("passed_checks") or lane_unlock.get("passed_checks") or 0)
+        total  = int(lane_grad.get("total_checks")  or lane_unlock.get("total_checks")  or 1)
+        grad_score = int(lane_grad.get("graduation_score") or 0)
+        grad_rank  = int(lane_grad.get("graduation_rank")  or 4)
+
+        operating_state     = _POLICY_TO_OPSTATE.get(policy_state, "LIMITED")
+        primary_constraint  = _UNLOCK_TO_CONSTRAINT.get(next_unlock, "UNLOCK_PENDING")
+        operating_alignment = authority  # authority scale = alignment scale
+
+        # One-line operating note
+        if operating_state == "ACTIVE":
+            op_note = f"Lane active — {authority.lower()} authority, {passed}/{total} checks."
+        elif operating_state == "MANAGING":
+            op_note = f"Managing existing exposure — {authority.lower()} authority."
+        elif operating_state == "PLANNING":
+            op_note = f"Planning-only mode — {passed}/{total} checks to unlock execution."
+        elif operating_state == "MANUAL_ONLY":
+            op_note = f"Manual ops only — {passed}/{total} checks to earn auto-execution."
+        elif operating_state == "BLOCKED":
+            op_note = f"Lane locked. Unlock: {next_unlock.replace('_', ' ').lower()}."
+        elif operating_state == "OBSERVING":
+            op_note = f"Observing — {passed}/{total} checks. Unlock: {next_unlock.replace('_', ' ').lower()}."
+        else:
+            op_note = f"{passed}/{total} checks. Unlock: {next_unlock.replace('_', ' ').lower()}."
+
+        # ── lane_momentum + unlock_horizon — via shared helper ─────────────────
+        _signals       = _lane_signals(authority, passed, total, operating_state, next_unlock)
+        lane_momentum  = _signals["lane_momentum"]
+        unlock_horizon = _signals["unlock_horizon"]
+
+        matrix[lane] = {
+            "lane":                  lane,
+            "operating_state":       operating_state,
+            "operating_note":        op_note,
+            "policy_state":          policy_state,
+            "policy_note":           policy_note,
+            "authority":             authority,
+            "authority_note":        auth_note,
+            "current_state":         current_state,
+            "next_unlock_state":     next_unlock,
+            "next_unlock_note":      unlock_note,
+            "primary_constraint_key": primary_constraint,
+            "passed_checks":         passed,
+            "total_checks":          total,
+            "graduation_score":      grad_score,
+            "graduation_rank":       grad_rank,
+            "operating_alignment":   operating_alignment,
+            "lane_momentum":         lane_momentum,
+            "unlock_horizon":        unlock_horizon,
+        }
+
+    # ── synthesised top-level fields ──────────────────────────────────────────
+
+    def _auth_rank(lane: str) -> int:
+        return _LANE_AUTH_RANK.get(matrix[lane]["authority"], 0)
+
+    def _block_ratio(lane: str) -> float:
+        t = matrix[lane]["total_checks"]
+        p = matrix[lane]["passed_checks"]
+        return (t - p) / max(t, 1)  # fraction of checks failing
+
+    lanes_list = list(matrix.keys())
+
+    strongest_lane = max(lanes_list, key=_auth_rank)
+    weakest_lane   = min(lanes_list, key=lambda l: matrix[l]["graduation_score"])
+    closest_lane   = str(lgr.get("fastest_graduation_lane") or "NONE").upper()
+    most_blocked   = max(lanes_list, key=_block_ratio)
+
+    # best_mode_alignment = highest-authority lane with productive policy
+    productive = [l for l in lanes_list if matrix[l]["policy_state"] in _PRODUCTIVE_POLICIES]
+    best_aligned = max(productive, key=_auth_rank) if productive else strongest_lane
+
+    # ── momentum distribution — synthesised from per-lane lane_momentum ────────
+    _MOM_RANK = {"ADVANCING": 3, "BUILDING": 2, "STALLING": 1, "BLOCKED": 0}
+    momentum_distribution = {
+        "ADVANCING": sum(1 for l in lanes_list if matrix[l]["lane_momentum"] == "ADVANCING"),
+        "BUILDING":  sum(1 for l in lanes_list if matrix[l]["lane_momentum"] == "BUILDING"),
+        "STALLING":  sum(1 for l in lanes_list if matrix[l]["lane_momentum"] == "STALLING"),
+        "BLOCKED":   sum(1 for l in lanes_list if matrix[l]["lane_momentum"] == "BLOCKED"),
+    }
+    # Momentum leader = highest momentum rank; auth_rank breaks ties within same state
+    momentum_leader_lane = max(
+        lanes_list,
+        key=lambda l: (_MOM_RANK.get(matrix[l]["lane_momentum"], 0), _auth_rank(l)),
+    ).upper()
+
+    # Matrix health summary
+    avg_score = round(sum(matrix[l]["graduation_score"] for l in lanes_list) / max(len(lanes_list), 1))
+    backed_lanes = [l for l in lanes_list if _LANE_AUTH_RANK.get(matrix[l]["authority"], 0) >= 4]
+    _adv_n = momentum_distribution["ADVANCING"]
+    _stall_n = momentum_distribution["STALLING"] + momentum_distribution["BLOCKED"]
+    _mom_ctx = (
+        f" {_adv_n} lane(s) advancing, {_stall_n} stalling/blocked."
+        if (_adv_n > 0 or _stall_n > 0)
+        else ""
+    )
+    if len(backed_lanes) >= 2:
+        health_note = (
+            f"{len(backed_lanes)} lane(s) at BACKED+ authority. "
+            f"Average graduation score {avg_score}/100.{_mom_ctx}"
+        )
+    elif len(backed_lanes) == 1:
+        health_note = (
+            f"One lane at BACKED+ authority ({backed_lanes[0]}). "
+            f"Average graduation score {avg_score}/100.{_mom_ctx}"
+        )
+    else:
+        health_note = (
+            f"No lane at BACKED+ authority yet. "
+            f"Average graduation score {avg_score}/100.{_mom_ctx}"
+        )
+
+    return {
+        "lanes":                    matrix,
+        "strongest_lane":           strongest_lane.upper(),
+        "weakest_lane":             weakest_lane.upper(),
+        "closest_to_graduation":    closest_lane,
+        "most_blocked_lane":        most_blocked.upper(),
+        "best_mode_alignment_lane": best_aligned.upper(),
+        "average_graduation_score": avg_score,
+        "health_note":              health_note,
+        "momentum_distribution":    momentum_distribution,
+        "momentum_leader_lane":     momentum_leader_lane,
+    }
+
+
+def _build_portfolio_operating_directive(
+    operating_mode_summary: "dict | None",
+    operating_transition_summary: "dict | None",
+    operating_recommendation: "dict | None",
+    cross_lane_operating_matrix: "dict | None",
+    allocator_summary: "dict | None",
+    operating_constraints_summary: "dict | None",
+) -> dict:
+    """
+    Roadmap 2: Portfolio-level operating directive.
+
+    Synthesises one compact instruction for the portfolio from existing
+    Home summaries only — no new truth paths.
+
+    Directive vocabulary
+    ─────────────────────
+    DEFEND_AND_WAIT    — posture defensive, route locked, no clear near-term unlock
+    BUILD_PROOF        — proof-stack authority is the binding constraint
+    PREPARE_TRANSITION — system is near mode transition, verify readiness
+    GRADUATE_PERPS     — perps lane is closest to graduating; work the unlock
+    PREPARE_MEMECOINS  — memecoins lane is closest; build deployment readiness
+    ROTATE_TO_SPOT     — spot lane unlock is the best near-term opportunity
+    MULTI_LANE_BUILD   — multiple lanes at BACKED+ authority; build across lanes
+    HOLD_CASH          — no productive lane available; preserve capital
+    MONITOR_AND_LEARN  — early-stage, accumulate signal, no urgent action
+
+    Output fields
+    ─────────────
+    directive             — compact keyword (see above)
+    directive_note        — 1-2 sentence operator explanation
+    portfolio_posture     — DEFENSIVE / BUILDING / ROTATING / SCALING / EXECUTING
+    dominant_lane         — lane that deserves the most operator attention now
+    capital_bias          — HOLD / ADD / REDUCE / NEUTRAL
+    risk_posture          — REDUCE / NEUTRAL / ADD_RISK
+    top_portfolio_actions — up to 3 compact actions (reused from session_actions)
+    """
+    oms  = dict(operating_mode_summary        or {})
+    ots  = dict(operating_transition_summary  or {})
+    orec = dict(operating_recommendation      or {})
+    clom = dict(cross_lane_operating_matrix   or {})
+    als  = dict(allocator_summary             or {})
+    ocs  = dict(operating_constraints_summary or {})
+
+    # ── pull key fields ────────────────────────────────────────────────────────
+    operating_mode       = str(oms.get("operating_mode")  or "PAPER_EXECUTION").strip().upper()
+    allocator_posture    = str(oms.get("allocator_posture") or als.get("allocator_posture") or "DEFENSIVE").strip().upper()
+    route_bucket         = str(oms.get("route_bucket")    or als.get("route_bucket")    or "LOCKED").strip().upper()
+    window_bucket        = str(oms.get("window_bucket")   or als.get("window_bucket")   or "CLOSED").strip().upper()
+    headroom_bucket      = str(oms.get("headroom_bucket") or als.get("headroom_bucket") or "LOW").strip().upper()
+    any_live             = bool(oms.get("any_live") or False)
+    any_armed            = bool(oms.get("any_armed") or False)
+
+    marginal_route       = str(als.get("marginal_route")      or "HOLD_CASH").strip().upper()
+    marginal_authority   = str(als.get("marginal_route_authority") or "UNPROVEN").strip().upper()
+
+    current_mode         = str(ots.get("current_mode")       or operating_mode).strip().upper()
+    next_mode            = str(ots.get("next_mode")           or "PILOT_CAPITAL").strip().upper()
+    transition_readiness = str(ots.get("readiness")           or orec.get("transition_readiness") or "BLOCKED").strip().upper()
+    proof_stack_auth     = str(ots.get("proof_stack_authority") or "TENTATIVE").strip().upper()
+    top_authority_lane   = str(ots.get("top_authority_lane")  or "NONE").strip().upper()
+
+    session_emphasis     = str(orec.get("session_emphasis")   or "MONITOR").strip().upper()
+    fastest_lane         = str(orec.get("fastest_graduation_lane")  or clom.get("closest_to_graduation") or "NONE").strip().upper()
+    fastest_score        = int(orec.get("fastest_graduation_score") or 0)
+    session_actions      = list(orec.get("session_actions") or [])
+    top_session_action   = orec.get("top_session_action")
+
+    strongest_lane       = str(clom.get("strongest_lane") or "NONE").strip().upper()
+    matrix_lanes         = dict(clom.get("lanes") or {})
+
+    primary_constraint   = dict(ocs.get("primary_constraint") or {})
+    primary_key          = str(primary_constraint.get("key") or "NONE").strip().upper()
+
+    backed_lanes = [
+        l for l in matrix_lanes
+        if _LANE_AUTH_RANK.get(str(matrix_lanes[l].get("authority") or "QUIET").upper(), 0) >= 4
+    ]
+
+    # ── directive decision tree ────────────────────────────────────────────────
+    #
+    # Priority:
+    #  1. Near transition → PREPARE_TRANSITION
+    #  2. Proof is the binding constraint → BUILD_PROOF
+    #  3. Fastest lane has high graduation score → GRADUATE_* / ROTATE_*
+    #  4. Multiple BACKED+ lanes → MULTI_LANE_BUILD
+    #  5. Defensive / locked → DEFEND_AND_WAIT or HOLD_CASH
+    #  6. Default → MONITOR_AND_LEARN
+
+    if transition_readiness == "NEAR_READY":
+        directive = "PREPARE_TRANSITION"
+        directive_note = (
+            f"System is near transition to {next_mode}. "
+            "Verify proof authority and route alignment before any capital move."
+        )
+
+    elif session_emphasis == "BUILD_PROOF" or "PROOF" in primary_key:
+        directive = "BUILD_PROOF"
+        p_note = str(primary_constraint.get("note") or "").strip()
+        # Enrich note with advancing-lane context when available
+        _adv_lanes = [
+            l for l, v in matrix_lanes.items()
+            if str(v.get("lane_momentum") or "").upper() == "ADVANCING"
+        ]
+        _near_lanes = [
+            l for l, v in matrix_lanes.items()
+            if str(v.get("unlock_horizon") or "").upper() == "NEAR"
+        ]
+        _adv_ctx = ""
+        if _adv_lanes:
+            _adv_names = ", ".join(l.title() for l in _adv_lanes)
+            _adv_ctx = f" {_adv_names} lane advancing"
+            if _near_lanes:
+                _near_names = ", ".join(l.title() for l in _near_lanes)
+                _adv_ctx += f" ({_near_names} at NEAR unlock horizon)"
+            _adv_ctx += " — work that gate alongside proof-stack growth."
+        _base_note = (
+            p_note
+            or (
+                f"Proof-stack authority is {proof_stack_auth.lower()}. "
+                f"Build paper execution evidence to unlock {next_mode.replace('_',' ').lower()}."
+            )
+        )
+        directive_note = f"{_base_note.rstrip('.')}.{_adv_ctx}" if _adv_ctx else _base_note
+
+    elif session_emphasis.startswith("LANE_UNLOCK_") and fastest_score >= 55:
+        raw_lane = session_emphasis.replace("LANE_UNLOCK_", "")
+        _LANE_DIRECTIVE = {
+            "PERPS":     "GRADUATE_PERPS",
+            "MEMECOINS": "PREPARE_MEMECOINS",
+            "SPOT":      "ROTATE_TO_SPOT",
+            "WHALE":     "ADVANCE_WHALE",
+        }
+        directive = _LANE_DIRECTIVE.get(raw_lane, f"ADVANCE_{raw_lane}")
+        lane_entry = dict(matrix_lanes.get(raw_lane.lower()) or {})
+        next_unlock = str(lane_entry.get("next_unlock_state") or "").replace("_", " ").lower()
+        directive_note = (
+            f"{raw_lane.title()} lane (score {fastest_score}/100) is closest to graduating. "
+            f"Work the {next_unlock} checklist to unlock the next authority tier."
+        )
+
+    elif len(backed_lanes) >= 2:
+        directive = "MULTI_LANE_BUILD"
+        directive_note = (
+            f"{len(backed_lanes)} lane(s) at BACKED+ authority "
+            f"({', '.join(l.title() for l in backed_lanes)}). "
+            "Maintain and grow all productive lanes simultaneously."
+        )
+
+    elif route_bucket == "LOCKED" and window_bucket == "CLOSED" and allocator_posture == "DEFENSIVE":
+        directive = "DEFEND_AND_WAIT"
+        directive_note = (
+            f"Route locked, deployment window closed, posture defensive. "
+            f"Protect existing {str(oms.get('dominant_book') or 'SPOT').title()} exposure "
+            f"and wait for conditions to improve."
+        )
+
+    elif marginal_route == "HOLD_CASH" or route_bucket == "LOCKED":
+        directive = "HOLD_CASH"
+        directive_note = (
+            "No lane has earned fresh marginal capital. "
+            "Hold cash and wait for a cleaner entry signal."
+        )
+
+    else:
+        directive = "MONITOR_AND_LEARN"
+        directive_note = (
+            "No high-leverage action available right now. "
+            "Monitor lanes, observe conditions, and journal any setups."
+        )
+
+    # ── portfolio posture ──────────────────────────────────────────────────────
+    if directive in ("DEFEND_AND_WAIT", "HOLD_CASH"):
+        portfolio_posture = "DEFENSIVE"
+    elif directive == "PREPARE_TRANSITION":
+        portfolio_posture = "BUILDING"
+    elif directive in ("GRADUATE_PERPS", "ROTATE_TO_SPOT"):
+        portfolio_posture = "ROTATING"
+    elif directive == "MULTI_LANE_BUILD":
+        portfolio_posture = "SCALING"
+    elif directive == "BUILD_PROOF":
+        portfolio_posture = "BUILDING"
+    elif any_live and session_emphasis == "EXECUTE":
+        portfolio_posture = "EXECUTING"
+    else:
+        portfolio_posture = "BUILDING"
+
+    # ── dominant lane ──────────────────────────────────────────────────────────
+    # The lane the operator should focus on most. Use top_session_action.lane if
+    # set and non-trivial; fall back to fastest graduation lane; then strongest.
+    _top_action_lane = str((top_session_action or {}).get("lane") or "").strip().upper()
+    if _top_action_lane and _top_action_lane not in ("NONE", ""):
+        dominant_lane = _top_action_lane
+    elif fastest_lane and fastest_lane != "NONE":
+        dominant_lane = fastest_lane
+    else:
+        dominant_lane = strongest_lane if strongest_lane != "NONE" else "NONE"
+
+    # ── capital bias ───────────────────────────────────────────────────────────
+    if marginal_route == "HOLD_CASH" or route_bucket == "LOCKED":
+        capital_bias = "HOLD"
+    elif allocator_posture == "DEFENSIVE":
+        capital_bias = "HOLD"
+    elif marginal_route in ("MEMECOINS_NBM", "SPOT_ADD", "PERP_ENTRY"):
+        capital_bias = "ADD"
+    elif headroom_bucket in ("FULL", "ABUNDANT"):
+        capital_bias = "ADD"
+    else:
+        capital_bias = "NEUTRAL"
+
+    # ── risk posture ───────────────────────────────────────────────────────────
+    if not any_live and not any_armed:
+        # Paper-only — no real capital at risk
+        risk_posture = "NEUTRAL"
+    elif allocator_posture == "DEFENSIVE" and route_bucket == "LOCKED":
+        risk_posture = "REDUCE"
+    elif any_live and marginal_authority in ("STACKED", "FORCEFUL", "BACKED"):
+        risk_posture = "ADD_RISK"
+    else:
+        risk_posture = "NEUTRAL"
+
+    # ── top_portfolio_actions ──────────────────────────────────────────────────
+    # Reuse session_actions from operating_recommendation — no duplication.
+    top_portfolio_actions = session_actions[:3]
+
+    return {
+        "directive":             directive,
+        "directive_note":        directive_note,
+        "portfolio_posture":     portfolio_posture,
+        "dominant_lane":         dominant_lane,
+        "capital_bias":          capital_bias,
+        "risk_posture":          risk_posture,
+        "top_portfolio_actions": top_portfolio_actions,
+        # supporting context
+        "current_mode":          current_mode,
+        "next_mode":             next_mode,
+        "transition_readiness":  transition_readiness,
+        "marginal_route":        marginal_route,
+        "allocator_posture":     allocator_posture,
+    }
+
+
+def _build_portfolio_progression_summary(
+    portfolio_operating_directive: "dict | None",
+    operating_transition_summary: "dict | None",
+    cross_lane_operating_matrix: "dict | None",
+    operating_recommendation: "dict | None",
+    operating_constraints_summary: "dict | None",
+    allocator_summary: "dict | None",
+) -> dict:
+    """
+    Roadmap 2: Portfolio progression summary.
+
+    Explains how the current portfolio directive itself improves — what
+    checks must pass for it to rotate to the next, stronger directive.
+    Synthesised from existing summaries only; no new truth paths.
+
+    Progression states
+    ──────────────────
+    BLOCKED        — hard blockers in place; no near-term progress path
+    BUILDING       — working toward next directive; multiple checks outstanding
+    NEAR_READY     — within reach; 1–2 checks from advancing
+    READY_TO_ROTATE  — lane-specific unlock complete; ready to shift focus
+    READY_TO_EXECUTE — all checks green; ready to execute / deploy capital
+
+    Output fields
+    ─────────────
+    current_directive       — mirrors portfolio_operating_directive.directive
+    next_directive          — what the directive upgrades to when checks pass
+    progression_state       — see above
+    progression_note        — concise operator-facing explanation
+    primary_progress_blocker — key + note for the single binding constraint
+    progress_checks         — list of {name, passed, note} from transition checklist
+    passed_checks           — count of passing checks
+    total_checks            — count of all checks
+    """
+    pod  = dict(portfolio_operating_directive or {})
+    ots  = dict(operating_transition_summary  or {})
+    clom = dict(cross_lane_operating_matrix   or {})
+    orec = dict(operating_recommendation      or {})
+    ocs  = dict(operating_constraints_summary or {})
+    als  = dict(allocator_summary             or {})
+
+    # ── pull key fields ────────────────────────────────────────────────────────
+    current_directive    = str(pod.get("directive")           or "MONITOR_AND_LEARN").strip().upper()
+    transition_readiness = str(pod.get("transition_readiness") or ots.get("readiness") or "BLOCKED").strip().upper()
+    current_mode         = str(pod.get("current_mode")         or ots.get("current_mode") or "PAPER_EXECUTION").strip().upper()
+    next_mode            = str(pod.get("next_mode")            or ots.get("next_mode")    or "PILOT_CAPITAL").strip().upper()
+    proof_stack_auth     = str(ots.get("proof_stack_authority") or "TENTATIVE").strip().upper()
+    marginal_auth        = str(ots.get("marginal_route_authority") or als.get("marginal_route_authority") or "UNPROVEN").strip().upper()
+    fastest_lane         = str(orec.get("fastest_graduation_lane") or clom.get("closest_to_graduation") or "NONE").strip().upper()
+    fastest_score        = int(orec.get("fastest_graduation_score") or 0)
+
+    # Transition checklist — primary source of progress_checks
+    trans_checklist = list(ots.get("checklist") or [])
+    trans_passed    = int(ots.get("passed_checks") or 0)
+    trans_total     = int(ots.get("total_checks")  or max(len(trans_checklist), 1))
+
+    primary_blocker_dict = dict(ots.get("primary_transition_blocker") or ocs.get("primary_constraint") or {})
+    primary_blocker_key  = str(primary_blocker_dict.get("key")  or "NONE").strip().upper()
+    primary_blocker_note = str(primary_blocker_dict.get("note") or "").strip()
+
+    # Authority rank for "near ready" detection
+    _proof_rank = _LANE_AUTH_RANK.get(proof_stack_auth, 0)
+
+    # ── next directive mapping ─────────────────────────────────────────────────
+    # Each directive has a natural successor once its primary checks clear.
+    _DIRECTIVE_NEXT: dict[str, str] = {
+        "MONITOR_AND_LEARN":  "BUILD_PROOF",
+        "HOLD_CASH":          "DEFEND_AND_WAIT",
+        "DEFEND_AND_WAIT":    "BUILD_PROOF",
+        "BUILD_PROOF":        "PREPARE_TRANSITION",
+        "PREPARE_TRANSITION": (
+            f"GRADUATE_{fastest_lane}"
+            if fastest_lane not in ("NONE", "")
+            else "MULTI_LANE_BUILD"
+        ),
+        "GRADUATE_PERPS":     "MULTI_LANE_BUILD",
+        "PREPARE_MEMECOINS":  "MULTI_LANE_BUILD",
+        "ROTATE_TO_SPOT":     "MULTI_LANE_BUILD",
+        "ADVANCE_WHALE":      "MULTI_LANE_BUILD",
+        "MULTI_LANE_BUILD":   "EXECUTE",
+        "EXECUTE":            "MAINTAIN",
+    }
+    next_directive = _DIRECTIVE_NEXT.get(current_directive, "ADVANCE")
+
+    # ── progress_checks — pick the most relevant checklist ────────────────────
+    # For lane-specific directives, augment with that lane's matrix entry.
+    # For mode-level directives, use the transition checklist.
+    lane_for_checks: str | None = None
+    if current_directive.startswith("GRADUATE_"):
+        lane_for_checks = current_directive.replace("GRADUATE_", "").lower()
+    elif current_directive == "PREPARE_MEMECOINS":
+        lane_for_checks = "memecoins"
+    elif current_directive == "ROTATE_TO_SPOT":
+        lane_for_checks = "spot"
+
+    if lane_for_checks and lane_for_checks in (clom.get("lanes") or {}):
+        lane_entry    = dict((clom.get("lanes") or {}).get(lane_for_checks) or {})
+        lane_passed   = int(lane_entry.get("passed_checks") or 0)
+        lane_total    = int(lane_entry.get("total_checks")  or 1)
+        lane_unlock   = str(lane_entry.get("next_unlock_state") or "MAINTAIN")
+        lane_constraint = str(lane_entry.get("primary_constraint_key") or "NONE")
+
+        # Build synthetic progress checks for lane-specific directive
+        progress_checks = trans_checklist + [
+            {
+                "name":   f"{lane_for_checks}_unlock_progress",
+                "passed": lane_entry.get("graduation_score", 0) >= 75,
+                "note":   (
+                    f"{lane_for_checks.title()} graduation score "
+                    f"{lane_entry.get('graduation_score',0)}/100 — "
+                    f"unlock: {lane_unlock.replace('_',' ').lower()}"
+                ),
+            }
+        ]
+        passed_checks = trans_passed + (1 if lane_entry.get("graduation_score", 0) >= 75 else 0)
+        total_checks  = trans_total + 1
+    else:
+        # Mode-level directives: use transition checklist directly
+        progress_checks = trans_checklist
+        passed_checks   = trans_passed
+        total_checks    = trans_total
+
+    # Ensure total_checks is at least 1
+    total_checks = max(total_checks, 1)
+
+    # ── progression state ──────────────────────────────────────────────────────
+    ratio = passed_checks / total_checks
+
+    if transition_readiness == "NEAR_READY" or ratio >= 0.75:
+        progression_state = "NEAR_READY"
+    elif current_directive in ("EXECUTE", "MAINTAIN"):
+        progression_state = "READY_TO_EXECUTE"
+    elif (
+        current_directive.startswith("GRADUATE_")
+        or current_directive == "ROTATE_TO_SPOT"
+    ) and ratio >= 0.5:
+        progression_state = "READY_TO_ROTATE"
+    elif passed_checks == 0 and transition_readiness == "BLOCKED":
+        progression_state = "BLOCKED"
+    elif ratio < 0.5:
+        progression_state = "BUILDING"
+    else:
+        progression_state = "BUILDING"
+
+    # ── progression note ───────────────────────────────────────────────────────
+    _MODE_LABEL: dict[str, str] = {
+        "PAPER_EXECUTION": "paper execution",
+        "PILOT_CAPITAL":   "pilot capital",
+        "LIVE_MANAGED":    "live managed",
+        "OBSERVATION":     "observation",
+    }
+
+    if progression_state == "BLOCKED":
+        progression_note = (
+            f"Directive is {current_directive.replace('_',' ').title()} "
+            f"({current_mode.replace('_',' ').lower()}). "
+            f"Hard blockers prevent advancing to "
+            f"{next_directive.replace('_',' ').title()}. "
+            f"Primary: {primary_blocker_note}"
+            if primary_blocker_note
+            else (
+                f"Hard blockers prevent advancing to "
+                f"{next_directive.replace('_',' ').title()}."
+            )
+        )
+    elif progression_state == "NEAR_READY":
+        progression_note = (
+            f"Portfolio is {current_directive.replace('_',' ').lower()} "
+            f"and approaching {next_directive.replace('_',' ').title()}. "
+            f"{passed_checks}/{total_checks} checks passing — "
+            "one more push completes the advance."
+        )
+    elif progression_state in ("READY_TO_ROTATE", "READY_TO_EXECUTE"):
+        progression_note = (
+            f"All {total_checks} progression checks passed. "
+            f"Portfolio is ready to rotate to "
+            f"{next_directive.replace('_',' ').title()}."
+        )
+    else:  # BUILDING
+        remaining = total_checks - passed_checks
+        progression_note = (
+            f"Building toward {next_directive.replace('_',' ').title()}. "
+            f"{passed_checks}/{total_checks} checks passing — "
+            f"{remaining} outstanding. "
+            f"Primary blocker: {primary_blocker_key.replace('_',' ').lower()}."
+        )
+
+    # ── portfolio velocity — derived from lane_momentum distribution ──────────
+    # Summarises whether the portfolio as a whole is gaining or losing ground.
+    # Consumes already-computed clom.lanes — no new truth path.
+    _clom_lanes = dict(clom.get("lanes") or {})
+    _advancing = sum(1 for v in _clom_lanes.values() if v.get("lane_momentum") == "ADVANCING")
+    _building  = sum(1 for v in _clom_lanes.values() if v.get("lane_momentum") == "BUILDING")
+    _stalling  = sum(1 for v in _clom_lanes.values() if v.get("lane_momentum") == "STALLING")
+    _blocked   = sum(1 for v in _clom_lanes.values() if v.get("lane_momentum") == "BLOCKED")
+    _total_lanes = max(len(_clom_lanes), 1)
+    _positive  = _advancing + _building
+    _negative  = _stalling + _blocked
+
+    if _advancing >= 1 and _negative == 0:
+        portfolio_velocity = "ACCELERATING"
+    elif _advancing >= 1 and _negative <= 1:
+        portfolio_velocity = "GAINING"
+    elif _positive > _negative:
+        portfolio_velocity = "STABLE"
+    elif _stalling >= 2 or _blocked >= 1:
+        portfolio_velocity = "DECELERATING"
+    else:
+        portfolio_velocity = "STALLED"
+
+    # ── primary_progress_blocker output ───────────────────────────────────────
+    primary_progress_blocker = {
+        "key":  primary_blocker_key,
+        "note": primary_blocker_note or "No binding blocker identified.",
+    }
+
+    return {
+        "current_directive":        current_directive,
+        "next_directive":           next_directive,
+        "progression_state":        progression_state,
+        "progression_note":         progression_note,
+        "primary_progress_blocker": primary_progress_blocker,
+        "progress_checks":          progress_checks,
+        "passed_checks":            passed_checks,
+        "total_checks":             total_checks,
+        "portfolio_velocity":       portfolio_velocity,
+        "velocity_detail": {
+            "advancing": _advancing,
+            "building":  _building,
+            "stalling":  _stalling,
+            "blocked":   _blocked,
+        },
+        # supporting context
+        "current_mode":             current_mode,
+        "next_mode":                next_mode,
+        "proof_stack_authority":    proof_stack_auth,
+    }
+
+
+def _build_cross_lane_promotion_summary(
+    cross_lane_operating_matrix: "dict | None",
+    lane_authority_summary: "dict | None",
+    lane_unlock_summary: "dict | None",
+    portfolio_operating_directive: "dict | None",
+    operating_transition_summary: "dict | None",
+    operating_constraints_summary: "dict | None",
+) -> dict:
+    """
+    Roadmap 2: Cross-lane promotion summary.
+
+    Synthesises from the cross-lane matrix, authority, and unlock summaries to
+    classify each lane as PROMOTING / STABLE / BUILDING / DEGRADING / SUSPENDED
+    and surfaces a compact top-level view for the operator.
+
+    Promotion states
+    ────────────────
+    PROMOTING   — lane is actively gaining authority; checks improving; unlock
+                  approaching MAINTAIN; authority is BACKED+
+    STABLE      — lane is holding a productive level; no clear forward movement
+                  but no deterioration either
+    BUILDING    — lane is in early accumulation; checks partially met; authority
+                  is TENTATIVE or below but operating state is not blocked
+    DEGRADING   — lane authority is ADVERSE or graduation score is falling to
+                  near-zero while not in BLOCKED state
+    SUSPENDED   — lane is locked or in a BLOCKED operating state; no near-term
+                  path to advance without external change
+
+    Output fields
+    ─────────────
+    lanes                — per-lane dict: promotion_state, promotion_note
+    promoting_lane       — first lane in PROMOTING state (or strongest STABLE)
+    degrading_lane       — first lane in DEGRADING state (or None)
+    stable_lanes         — list of lanes in STABLE state
+    suspended_lanes      — list of lanes in SUSPENDED state
+    system_promotion_state — ADVANCING / STABLE / MIXED / DEGRADING
+    system_promotion_note  — operator-facing one-liner
+    """
+    clom = dict(cross_lane_operating_matrix   or {})
+    las  = dict(lane_authority_summary        or {})
+    lus  = dict(lane_unlock_summary           or {})
+    pod  = dict(portfolio_operating_directive or {})
+    ots  = dict(operating_transition_summary  or {})
+    ocs  = dict(operating_constraints_summary or {})
+
+    matrix_lanes = dict(clom.get("lanes") or {})
+
+    # Unlock states that indicate a lane is within reach of MAINTAIN
+    _NEAR_MAINTAIN = {
+        "MAINTAIN", "GUARDRAILED_EXECUTION", "EXECUTION_CAPABLE",
+        "BACKED", "BACKED_MANUAL",
+    }
+
+    # Unlock states that indicate the lane is still far from graduation
+    _FAR_STATES = {
+        "BACKED_PROOF", "PROOF_20_TRADES", "LIVE_CAPITAL_DEPLOY",
+        "WIN_RATE_50_PCT", "LIQ_IMPROVEMENT",
+    }
+
+    # ── per-lane classification ────────────────────────────────────────────────
+    lane_results: dict[str, dict] = {}
+    for lane in ("memecoins", "perps", "spot", "whale"):
+        ml    = dict(matrix_lanes.get(lane) or {})
+        la    = dict(las.get(lane) or {})
+        lu    = dict(lus.get(lane) or {})
+
+        authority       = str(ml.get("authority")       or la.get("authority")       or "QUIET").strip().upper() or "QUIET"
+        operating_state = str(ml.get("operating_state") or "LIMITED").strip().upper() or "LIMITED"
+        grad_score      = int(ml.get("graduation_score") or 0)
+        passed          = int(ml.get("passed_checks")   or lu.get("passed_checks")   or 0)
+        total           = int(ml.get("total_checks")    or lu.get("total_checks")    or 1)
+        next_unlock     = str(ml.get("next_unlock_state") or lu.get("next_unlock_state") or "MAINTAIN").strip().upper() or "MAINTAIN"
+        auth_note       = str(la.get("authority_note")  or ml.get("authority_note")  or "")
+        auth_rank       = _LANE_AUTH_RANK.get(authority, 0)
+        check_ratio     = passed / max(total, 1)
+
+        # ── momentum + horizon — read from clom (single source) or derive ──────
+        # Prefer the already-computed values from cross_lane_operating_matrix.
+        # Fall back to _lane_signals() in case clom.lanes is not yet populated.
+        if ml.get("lane_momentum"):
+            lane_momentum  = str(ml["lane_momentum"]).upper()
+            unlock_horizon = str(ml.get("unlock_horizon") or "MEDIUM").upper()
+        else:
+            _sig           = _lane_signals(authority, passed, total, operating_state, next_unlock)
+            lane_momentum  = _sig["lane_momentum"]
+            unlock_horizon = _sig["unlock_horizon"]
+
+        # ── classify ──────────────────────────────────────────────────────────
+        if operating_state in ("BLOCKED", "PAUSED") or authority == "BLOCKED":
+            promo_state = "SUSPENDED"
+            promo_note  = (
+                f"{lane.title()} lane is locked. "
+                f"Unlock: {next_unlock.replace('_', ' ').lower()}."
+            )
+        elif authority == "ADVERSE":
+            promo_state = "DEGRADING"
+            promo_note  = (
+                f"{lane.title()} lane authority is ADVERSE — "
+                f"{auth_note.rstrip('.')}."
+                if auth_note
+                else f"{lane.title()} lane authority has deteriorated to ADVERSE."
+            )
+        elif grad_score < 10 and auth_rank <= 2 and next_unlock in _FAR_STATES:
+            promo_state = "DEGRADING"
+            promo_note  = (
+                f"{lane.title()} lane has low graduation score ({grad_score}/100) "
+                f"and is far from its next unlock ({next_unlock.replace('_', ' ').lower()})."
+            )
+        elif auth_rank >= 4 and next_unlock in _NEAR_MAINTAIN:
+            # BACKED or above AND within reach of MAINTAIN → PROMOTING
+            promo_state = "PROMOTING"
+            promo_note  = (
+                f"{lane.title()} lane is promoting — {authority.lower()} authority, "
+                f"{passed}/{total} checks, "
+                f"unlock: {next_unlock.replace('_', ' ').lower()}."
+            )
+        elif auth_rank >= 3 and check_ratio >= 0.5:
+            # TENTATIVE or above with majority checks met → STABLE
+            promo_state = "STABLE"
+            _ml_lane    = dict(matrix_lanes.get(lane) or {})
+            _momentum   = str(_ml_lane.get("lane_momentum") or "").upper()
+            _horizon    = str(_ml_lane.get("unlock_horizon") or "").upper()
+            if _momentum == "ADVANCING" and _horizon in ("NEAR", "NONE"):
+                promo_note = (
+                    f"{lane.title()} lane stable and advancing — {authority.lower()} authority, "
+                    f"{passed}/{total} checks; {_horizon.lower()} unlock horizon."
+                )
+            else:
+                promo_note = (
+                    f"{lane.title()} lane is stable — {authority.lower()} authority, "
+                    f"{passed}/{total} checks passing."
+                )
+        else:
+            # Default: working through early checks
+            promo_state = "BUILDING"
+            promo_note  = (
+                f"{lane.title()} lane is building — {authority.lower()} authority, "
+                f"{passed}/{total} checks, "
+                f"needs: {next_unlock.replace('_', ' ').lower()}."
+            )
+
+        lane_results[lane] = {
+            "promotion_state": promo_state,
+            "promotion_note":  promo_note,
+            "authority":       authority,
+            "graduation_score": grad_score,
+            "passed_checks":   passed,
+            "total_checks":    total,
+            # Directional signals — passed through from clom (single source)
+            "lane_momentum":   lane_momentum,
+            "unlock_horizon":  unlock_horizon,
+        }
+
+    # ── top-level synthesis ────────────────────────────────────────────────────
+    promoting_lanes  = [l for l in lane_results if lane_results[l]["promotion_state"] == "PROMOTING"]
+    degrading_lanes  = [l for l in lane_results if lane_results[l]["promotion_state"] == "DEGRADING"]
+    stable_lanes     = [l for l in lane_results if lane_results[l]["promotion_state"] == "STABLE"]
+    building_lanes   = [l for l in lane_results if lane_results[l]["promotion_state"] == "BUILDING"]
+    suspended_lanes  = [l for l in lane_results if lane_results[l]["promotion_state"] == "SUSPENDED"]
+
+    # If no PROMOTING lane, surface the strongest STABLE or BUILDING lane as primary forward lane
+    if promoting_lanes:
+        promoting_lane = promoting_lanes[0]
+    elif stable_lanes:
+        promoting_lane = max(stable_lanes, key=lambda l: lane_results[l]["graduation_score"])
+    elif building_lanes:
+        promoting_lane = max(building_lanes, key=lambda l: lane_results[l]["graduation_score"])
+    else:
+        promoting_lane = None
+
+    degrading_lane = degrading_lanes[0] if degrading_lanes else None
+
+    # ── system_promotion_state ────────────────────────────────────────────────
+    if promoting_lanes and not degrading_lanes:
+        system_promotion_state = "ADVANCING"
+    elif promoting_lanes and degrading_lanes:
+        system_promotion_state = "MIXED"
+    elif degrading_lanes and not promoting_lanes and not stable_lanes:
+        system_promotion_state = "DEGRADING"
+    elif all(lane_results[l]["promotion_state"] in ("STABLE", "BUILDING") for l in lane_results):
+        system_promotion_state = "STABLE"
+    else:
+        system_promotion_state = "MIXED"
+
+    # ── system promotion note ─────────────────────────────────────────────────
+    directive   = str(pod.get("directive")   or "MONITOR_AND_LEARN").strip().upper()
+    readiness   = str(ots.get("readiness")   or "BUILDING").strip().upper()
+    n_promoting = len(promoting_lanes)
+    n_degrading = len(degrading_lanes)
+    n_suspended = len(suspended_lanes)
+
+    if system_promotion_state == "ADVANCING":
+        system_promotion_note = (
+            f"{n_promoting} lane(s) promoting ({', '.join(promoting_lanes)}). "
+            f"Portfolio directive: {directive.replace('_', ' ').lower()}."
+        )
+    elif system_promotion_state == "MIXED":
+        system_promotion_note = (
+            f"Mixed signals — {n_promoting} promoting, {n_degrading} degrading, "
+            f"{len(stable_lanes)} stable, {n_suspended} suspended. "
+            f"Directive: {directive.replace('_', ' ').lower()}."
+        )
+    elif system_promotion_state == "DEGRADING":
+        system_promotion_note = (
+            f"{n_degrading} lane(s) degrading ({', '.join(degrading_lanes)}). "
+            f"System needs repair before advancing."
+        )
+    else:  # STABLE
+        # Enrich with lane_momentum summary from clom
+        _adv_lanes = [
+            l for l, v in matrix_lanes.items()
+            if str(v.get("lane_momentum") or "").upper() == "ADVANCING"
+        ]
+        _stall_lanes = [
+            l for l, v in matrix_lanes.items()
+            if str(v.get("lane_momentum") or "").upper() in ("STALLING", "BLOCKED")
+        ]
+        _mom_ctx = ""
+        if _adv_lanes:
+            _mom_ctx += f" {', '.join(l.title() for l in _adv_lanes)} advancing."
+        if _stall_lanes:
+            _mom_ctx += f" {', '.join(l.title() for l in _stall_lanes)} stalling — watch."
+        system_promotion_note = (
+            f"All lanes stable or building.{_mom_ctx} "
+            f"Directive: {directive.replace('_', ' ').lower()}."
+        )
+
+    return {
+        "lanes":                  lane_results,
+        "promoting_lane":         promoting_lane,
+        "degrading_lane":         degrading_lane,
+        "stable_lanes":           stable_lanes,
+        "building_lanes":         building_lanes,
+        "suspended_lanes":        suspended_lanes,
+        "system_promotion_state": system_promotion_state,
+        "system_promotion_note":  system_promotion_note,
+    }
+
+
+def _build_cross_lane_routing_readiness(
+    cross_lane_operating_matrix: "dict | None",
+    cross_lane_promotion_summary: "dict | None",
+    portfolio_operating_directive: "dict | None",
+    portfolio_progression_summary: "dict | None",
+    allocator_summary: "dict | None",
+    lane_authority_summary: "dict | None",
+    lane_unlock_summary: "dict | None",
+) -> dict:
+    """
+    Roadmap 2: Cross-lane capital routing readiness.
+
+    Answers: which lanes are actually closest to deserving fresh capital right
+    now?  Synthesised entirely from existing summaries — no new truth paths.
+
+    Routing states (per lane)
+    ─────────────────────────
+    READY          — authority ≥ BACKED, near-MAINTAIN unlock, mode/route allow
+                     deployment, not DEGRADING/SUSPENDED.  Route fresh capital here.
+    WATCH          — one condition short of READY; authority or checks almost there.
+                     Worth active attention; not yet fresh-capital eligible.
+    HOLD           — lane has something to build but conditions are not right for
+                     fresh capital; keep managing existing exposure only.
+    BLOCKED        — hard block: authority ADVERSE/BLOCKED, lane SUSPENDED/DEGRADING,
+                     or global route locked against this lane.
+    DEFENSIVE_ONLY — system-level defensive condition; manage existing only, no new
+                     capital anywhere.
+
+    System routing states
+    ──────────────────────
+    OPEN       — at least one READY lane; mode allows deployment.
+    CAUTIOUS   — no READY lanes but ≥1 WATCH; or mode is PAPER_EXECUTION.
+    DEFENSIVE  — allocator defensive; manage only; lanes may still build.
+    LOCKED     — route locked or window closed; no fresh capital system-wide.
+
+    Output fields
+    ─────────────
+    lanes               — per-lane: routing_state, routing_note, routing_rank,
+                          authority, graduation_score, routing_score
+    best_routing_lane   — lane ranked #1 in READY/WATCH (None if all HOLD/BLOCKED)
+    routing_ready_lanes — list of READY lanes
+    routing_watch_lanes — list of WATCH lanes
+    blocked_routing_lanes — list of BLOCKED/DEFENSIVE_ONLY lanes
+    system_routing_state — OPEN / CAUTIOUS / DEFENSIVE / LOCKED
+    system_routing_note — operator-facing one-liner
+    """
+    clom = dict(cross_lane_operating_matrix  or {})
+    clps = dict(cross_lane_promotion_summary or {})
+    pod  = dict(portfolio_operating_directive or {})
+    pps  = dict(portfolio_progression_summary or {})
+    als  = dict(allocator_summary            or {})
+    las  = dict(lane_authority_summary       or {})
+    lus  = dict(lane_unlock_summary          or {})
+
+    matrix_lanes    = dict(clom.get("lanes") or {})
+    promotion_lanes = dict(clps.get("lanes") or {})
+
+    # ── global routing conditions ──────────────────────────────────────────────
+    allocator_posture = str(pod.get("allocator_posture") or als.get("allocator_posture") or "DEFENSIVE").strip().upper()
+    route_bucket      = str(als.get("route_bucket")  or "LOCKED").strip().upper()
+    window_bucket     = str(als.get("window_bucket") or "CLOSED").strip().upper()
+    capital_bias      = str(pod.get("capital_bias")  or "HOLD").strip().upper()
+    directive         = str(pod.get("directive")     or "MONITOR_AND_LEARN").strip().upper()
+    dominant_lane     = str(pod.get("dominant_lane") or "NONE").strip().upper()
+    progression_state = str(pps.get("progression_state") or "BUILDING").strip().upper()
+
+    # System-level hard gates
+    global_defensive = (
+        allocator_posture == "DEFENSIVE"
+        and route_bucket in ("LOCKED", "UNKNOWN")
+    )
+    global_locked = route_bucket == "LOCKED" and window_bucket == "CLOSED"
+
+    # Unlock states that put a lane within reach of fresh capital
+    _NEAR_MAINTAIN = {
+        "MAINTAIN", "GUARDRAILED_EXECUTION", "EXECUTION_CAPABLE",
+        "BACKED", "BACKED_MANUAL",
+    }
+
+    # ── per-lane classification ────────────────────────────────────────────────
+    lane_results: dict[str, dict] = {}
+    routing_scores: dict[str, int] = {}
+
+    for lane in ("memecoins", "perps", "spot", "whale"):
+        ml    = dict(matrix_lanes.get(lane)    or {})
+        pl    = dict(promotion_lanes.get(lane) or {})
+        la    = dict(las.get(lane)             or {})
+        lu    = dict(lus.get(lane)             or {})
+
+        authority       = str(ml.get("authority")    or la.get("authority")    or "QUIET").strip().upper() or "QUIET"
+        operating_state = str(ml.get("operating_state") or "LIMITED").strip().upper()
+        grad_score      = int(ml.get("graduation_score") or 0)
+        passed          = int(ml.get("passed_checks") or lu.get("passed_checks") or 0)
+        total           = int(ml.get("total_checks")  or lu.get("total_checks")  or 1)
+        next_unlock     = str(ml.get("next_unlock_state") or lu.get("next_unlock_state") or "MAINTAIN").strip().upper() or "MAINTAIN"
+        promotion_state = str(pl.get("promotion_state") or "BUILDING").strip().upper()
+        auth_rank       = _LANE_AUTH_RANK.get(authority, 0)
+        check_ratio     = passed / max(total, 1)
+
+        # ── momentum + horizon — read from clom (single source) or derive ──────
+        if ml.get("lane_momentum"):
+            lane_momentum  = str(ml["lane_momentum"]).upper()
+            unlock_horizon = str(ml.get("unlock_horizon") or "MEDIUM").upper()
+        else:
+            _sig           = _lane_signals(authority, passed, total, operating_state, next_unlock)
+            lane_momentum  = _sig["lane_momentum"]
+            unlock_horizon = _sig["unlock_horizon"]
+
+        # ── routing score (0–100) for ranking ─────────────────────────────────
+        score = grad_score
+        if auth_rank >= 4:
+            score += 15
+        elif auth_rank >= 3:
+            score += 8
+        if promotion_state == "PROMOTING":
+            score += 10
+        elif promotion_state == "STABLE":
+            score += 5
+        elif promotion_state == "DEGRADING":
+            score -= 20
+        elif promotion_state == "SUSPENDED":
+            score -= 30
+        if check_ratio < 0.25:
+            score -= 10
+        if lane.upper() == dominant_lane:
+            score += 10
+        if lane.upper() == str(clom.get("closest_to_graduation") or "").upper():
+            score += 5
+        score = max(0, min(score, 100))
+        routing_scores[lane] = score
+
+        # ── routing state ──────────────────────────────────────────────────────
+        if global_defensive or global_locked:
+            routing_state = "DEFENSIVE_ONLY"
+            routing_note  = (
+                f"{lane.title()} lane: system is defensive/locked — manage existing exposure only."
+            )
+
+        elif promotion_state in ("SUSPENDED", "DEGRADING") or auth_rank == 0:
+            routing_state = "BLOCKED"
+            routing_note  = (
+                f"{lane.title()} lane: {promotion_state.lower()} — "
+                f"no fresh capital until authority recovers."
+            )
+
+        elif auth_rank >= 4 and next_unlock in _NEAR_MAINTAIN and promotion_state in ("PROMOTING", "STABLE"):
+            routing_state = "READY"
+            routing_note  = (
+                f"{lane.title()} lane: {authority.lower()} authority, "
+                f"unlock {next_unlock.replace('_', ' ').lower()} — "
+                f"route fresh capital here first."
+            )
+
+        elif (auth_rank >= 3 and check_ratio >= 0.35) or (auth_rank >= 4 and check_ratio >= 0.25):
+            routing_state = "WATCH"
+            routing_note  = (
+                f"{lane.title()} lane: {authority.lower()} authority, "
+                f"{passed}/{total} checks — approaching routing readiness."
+            )
+
+        elif auth_rank <= 2 or check_ratio < 0.25:
+            routing_state = "HOLD"
+            routing_note  = (
+                f"{lane.title()} lane: {authority.lower()} authority, "
+                f"{passed}/{total} checks — hold; needs: "
+                f"{next_unlock.replace('_', ' ').lower()}."
+            )
+
+        else:
+            routing_state = "HOLD"
+            routing_note  = (
+                f"{lane.title()} lane: {passed}/{total} checks — "
+                f"hold pending stronger authority."
+            )
+
+        # ── conditional routing state (without global gates) ──────────────────
+        # Shows what routing state this lane WOULD have if the system-level
+        # defensive/locked condition were lifted.  Lets the operator see the
+        # queue order for when conditions improve, even while LOCKED.
+        if promotion_state in ("SUSPENDED", "DEGRADING") or auth_rank == 0:
+            cond_state = "BLOCKED"
+            cond_note  = (
+                f"{lane.title()} lane: {promotion_state.lower()} — "
+                "no fresh capital until authority recovers."
+            )
+        elif auth_rank >= 4 and next_unlock in _NEAR_MAINTAIN and promotion_state in ("PROMOTING", "STABLE"):
+            cond_state = "READY"
+            cond_note  = (
+                f"{lane.title()} lane: would be routing-ready — "
+                f"{authority.lower()} authority, unlock at near-maintain threshold."
+            )
+        elif (auth_rank >= 3 and check_ratio >= 0.35) or (auth_rank >= 4 and check_ratio >= 0.25):
+            cond_state = "WATCH"
+            cond_note  = (
+                f"{lane.title()} lane: would be on watch — "
+                f"{authority.lower()} authority, {passed}/{total} checks passing."
+            )
+        else:
+            cond_state = "HOLD"
+            cond_note  = (
+                f"{lane.title()} lane: would hold — "
+                f"{passed}/{total} checks, needs: "
+                f"{next_unlock.replace('_', ' ').lower()}."
+            )
+
+        lane_results[lane] = {
+            "routing_state":              routing_state,
+            "routing_note":               routing_note,
+            "conditional_routing_state":  cond_state,
+            "conditional_routing_note":   cond_note,
+            "routing_score":              score,
+            "authority":                  authority,
+            "graduation_score":           grad_score,
+            "passed_checks":              passed,
+            "total_checks":               total,
+            # Directional signals — passed through from clom (single source)
+            "lane_momentum":              lane_momentum,
+            "unlock_horizon":             unlock_horizon,
+        }
+
+    # ── routing rank (1 = most ready) ─────────────────────────────────────────
+    sorted_lanes = sorted(routing_scores, key=lambda l: routing_scores[l], reverse=True)
+    for rank, lane in enumerate(sorted_lanes, start=1):
+        lane_results[lane]["routing_rank"] = rank
+
+    # ── top-level synthesis ────────────────────────────────────────────────────
+    ready_lanes    = [l for l in lane_results if lane_results[l]["routing_state"] == "READY"]
+    watch_lanes    = [l for l in lane_results if lane_results[l]["routing_state"] == "WATCH"]
+    hold_lanes     = [l for l in lane_results if lane_results[l]["routing_state"] == "HOLD"]
+    blocked_lanes  = [l for l in lane_results if lane_results[l]["routing_state"] in ("BLOCKED", "DEFENSIVE_ONLY")]
+
+    # best_routing_lane = READY first; fall back to highest-scored WATCH, then HOLD
+    if ready_lanes:
+        best_routing_lane = max(ready_lanes, key=lambda l: routing_scores[l])
+    elif watch_lanes:
+        best_routing_lane = max(watch_lanes, key=lambda l: routing_scores[l])
+    elif hold_lanes:
+        best_routing_lane = max(hold_lanes, key=lambda l: routing_scores[l])
+    else:
+        best_routing_lane = None
+
+    # ── system_routing_state ──────────────────────────────────────────────────
+    if global_locked:
+        system_routing_state = "LOCKED"
+    elif global_defensive:
+        system_routing_state = "DEFENSIVE"
+    elif ready_lanes:
+        system_routing_state = "OPEN"
+    elif watch_lanes:
+        system_routing_state = "CAUTIOUS"
+    else:
+        system_routing_state = "DEFENSIVE"
+
+    # ── system routing note ───────────────────────────────────────────────────
+    n_ready   = len(ready_lanes)
+    n_watch   = len(watch_lanes)
+    n_blocked = len(blocked_lanes)
+
+    if system_routing_state == "LOCKED":
+        # Find which lane would be closest if lock lifted
+        _cond_ready = [
+            l for l, v in lane_results.items()
+            if str(v.get("conditional_routing_state") or "").upper() in ("READY", "WATCH")
+        ]
+        _cond_ctx = ""
+        if _cond_ready:
+            _cond_best = sorted(
+                _cond_ready,
+                key=lambda l: lane_results[l].get("routing_score", 0),
+                reverse=True,
+            )
+            _cond_ctx = (
+                f" If lock lifts: {', '.join(l.title() for l in _cond_best[:2])} "
+                "would be routing-eligible first."
+            )
+        system_routing_note = (
+            "Route locked and deployment window closed — no fresh capital system-wide. "
+            f"Manage existing exposure only.{_cond_ctx}"
+        )
+    elif system_routing_state == "DEFENSIVE":
+        system_routing_note = (
+            "Allocator posture is defensive — manage existing exposure only. "
+            f"{n_watch} lane(s) approaching readiness: {', '.join(watch_lanes) or 'none'}."
+        )
+    elif system_routing_state == "OPEN":
+        lanes_str = ", ".join(ready_lanes)
+        system_routing_note = (
+            f"{n_ready} lane(s) routing-ready: {lanes_str}. "
+            f"Directive: {directive.replace('_', ' ').lower()}."
+        )
+    else:  # CAUTIOUS
+        lanes_str = ", ".join(watch_lanes)
+        system_routing_note = (
+            f"No lane fully routing-ready yet. {n_watch} on watch: {lanes_str}. "
+            f"Directive: {directive.replace('_', ' ').lower()}."
+        )
+
+    return {
+        "lanes":                  lane_results,
+        "best_routing_lane":      best_routing_lane,
+        "routing_ready_lanes":    ready_lanes,
+        "routing_watch_lanes":    watch_lanes,
+        "routing_hold_lanes":     hold_lanes,
+        "blocked_routing_lanes":  blocked_lanes,
+        "system_routing_state":   system_routing_state,
+        "system_routing_note":    system_routing_note,
+    }
+
+
+def _build_operator_briefing_summary(
+    operating_mode_summary: "dict | None",
+    operating_transition_summary: "dict | None",
+    operating_recommendation: "dict | None",
+    cross_lane_operating_matrix: "dict | None",
+    portfolio_operating_directive: "dict | None",
+    portfolio_progression_summary: "dict | None",
+    cross_lane_promotion_summary: "dict | None",
+    cross_lane_routing_readiness: "dict | None",
+    operating_constraints_summary: "dict | None",
+) -> dict:
+    """
+    Roadmap 2: Operator briefing summary.
+
+    Single high-signal object synthesising the current system state for the
+    operator.  Every field is a direct read or simple derivation from the nine
+    existing summaries passed in — no new truth paths, no DB calls.
+
+    Output fields
+    ─────────────
+    mode               — current operating mode (PAPER_EXECUTION / PILOT_CAPITAL / …)
+    directive          — portfolio directive (BUILD_PROOF / PREPARE_TRANSITION / …)
+    transition_state   — readiness toward next mode (BLOCKED / BUILDING / NEAR_READY / …)
+    dominant_lane      — lane with the most operator-relevant action right now
+    closest_capital_lane — lane closest to deserving fresh capital (from routing readiness)
+    main_blocker       — {key, note} — the single binding constraint holding the system back
+    session_emphasis   — what the operator should focus on this session
+    top_actions        — up to 3 compact action items (label, lane, urgency, note)
+    briefing_note      — 2-3 sentence operator-grade summary of the full picture
+    promotion_state    — system-wide promotion state (ADVANCING / STABLE / MIXED / DEGRADING)
+    routing_state      — system-wide routing state (OPEN / CAUTIOUS / DEFENSIVE / LOCKED)
+    progression_state  — how close the directive itself is to advancing (BLOCKED / BUILDING / …)
+    """
+    oms  = dict(operating_mode_summary        or {})
+    ots  = dict(operating_transition_summary  or {})
+    orec = dict(operating_recommendation      or {})
+    clom = dict(cross_lane_operating_matrix   or {})
+    pod  = dict(portfolio_operating_directive or {})
+    pps  = dict(portfolio_progression_summary or {})
+    clps = dict(cross_lane_promotion_summary  or {})
+    clrr = dict(cross_lane_routing_readiness  or {})
+    ocs  = dict(operating_constraints_summary or {})
+
+    # ── pull directly from existing summaries ─────────────────────────────────
+    mode               = str(oms.get("operating_mode")   or "PAPER_EXECUTION").strip().upper()
+    directive          = str(pod.get("directive")        or "MONITOR_AND_LEARN").strip().upper()
+    directive_note     = str(pod.get("directive_note")   or "").strip()
+    transition_state   = str(ots.get("readiness")        or pps.get("progression_state") or "BUILDING").strip().upper()
+    dominant_lane      = str(pod.get("dominant_lane")    or clom.get("strongest_lane") or "NONE").strip().upper()
+    session_emphasis   = str(orec.get("session_emphasis") or "MONITOR").strip().upper()
+    promotion_state    = str(clps.get("system_promotion_state") or "STABLE").strip().upper()
+    routing_state      = str(clrr.get("system_routing_state")   or "DEFENSIVE").strip().upper()
+    progression_state  = str(pps.get("progression_state") or "BUILDING").strip().upper()
+    portfolio_velocity = str(pps.get("portfolio_velocity") or "STABLE").strip().upper()
+
+    # closest capital lane — READY first, then WATCH, else dominant_lane
+    _rr_ready  = list(clrr.get("routing_ready_lanes") or [])
+    _rr_watch  = list(clrr.get("routing_watch_lanes")  or [])
+    _rr_best   = clrr.get("best_routing_lane")
+    if _rr_ready:
+        closest_capital_lane = _rr_ready[0].upper()
+    elif _rr_watch:
+        closest_capital_lane = (_rr_best or _rr_watch[0]).upper()
+    elif _rr_best:
+        closest_capital_lane = str(_rr_best).upper()
+    else:
+        closest_capital_lane = dominant_lane
+
+    # main blocker — from constraints summary, then transition summary
+    _pc  = dict(ocs.get("primary_constraint") or {})
+    _ptb = dict(ots.get("primary_transition_blocker") or {})
+    _ppb = dict(pps.get("primary_progress_blocker") or {})
+    if _pc.get("key") and str(_pc.get("key") or "").upper() != "NONE":
+        main_blocker = {"key": str(_pc["key"]).upper(), "note": str(_pc.get("note") or "").strip()}
+    elif _ptb.get("key") and str(_ptb.get("key") or "").upper() not in ("NONE", ""):
+        main_blocker = {"key": str(_ptb.get("name") or _ptb.get("key") or "").upper(), "note": str(_ptb.get("note") or "").strip()}
+    elif _ppb.get("key") and str(_ppb.get("key") or "").upper() != "NONE":
+        main_blocker = {"key": str(_ppb["key"]).upper(), "note": str(_ppb.get("note") or "").strip()}
+    else:
+        main_blocker = {"key": "NONE", "note": "No binding blocker identified."}
+
+    # top actions — pull from operating_recommendation, fall back to portfolio directive
+    top_actions = list(orec.get("session_actions") or pod.get("top_portfolio_actions") or [])[:3]
+
+    # ── session_verdict — compact operational posture for this session ─────────
+    # Single word capturing what kind of session this is for the operator.
+    # ADVANCE  — routing open, promotion advancing: push capital
+    # PREPARE  — system near a meaningful state transition: final checks
+    # PUSH     — routing locked but portfolio is GAINING velocity: work the near unlocks
+    # BUILD    — paper mode or locked routing, productive work to do
+    # WATCH    — defensive with watch lanes; monitor closely, no execution
+    # HOLD     — fully locked, nothing productive to do right now
+    if routing_state == "OPEN" and promotion_state == "ADVANCING":
+        session_verdict = "ADVANCE"
+    elif progression_state in ("NEAR_READY", "READY_TO_ROTATE", "READY_TO_EXECUTE"):
+        session_verdict = "PREPARE"
+    elif routing_state in ("DEFENSIVE", "LOCKED") and portfolio_velocity in ("GAINING", "ACCELERATING"):
+        session_verdict = "PUSH"
+    elif routing_state in ("DEFENSIVE", "LOCKED") and progression_state in ("BUILDING", "BLOCKED"):
+        session_verdict = "BUILD"
+    elif routing_state == "CAUTIOUS":
+        session_verdict = "WATCH"
+    elif routing_state == "LOCKED" and progression_state == "BLOCKED" and promotion_state not in ("ADVANCING", "STABLE"):
+        session_verdict = "HOLD"
+    else:
+        session_verdict = "BUILD"
+
+    # ── next_gate — the single most actionable gate to advance system state ───
+    # Maps the first failing transition checklist item to an operator action.
+    _GATE_MAP: dict[str, tuple[str, str, str]] = {
+        # key → (action, lane, what_it_unlocks)
+        "proof_stack_backed":            (
+            "Paper-execute evaluated setups to grow proof-stack evidence",
+            "MEMECOINS",
+            "Proof stack reaches BACKED — transition readiness improves",
+        ),
+        "route_authority_context_backed": (
+            "Grow route memory through consistent disciplined routing sessions",
+            "SYSTEM",
+            "Route authority reaches CONTEXT_BACKED — capital routing unblocks",
+        ),
+        "memecoin_unlock_progress":      (
+            "Advance memecoin lane: paper-execute evaluated setups",
+            "MEMECOINS",
+            "Memecoin lane reaches BACKED_PROOF unlock — top constraint removed",
+        ),
+        "perp_lane_stable":              (
+            "Build perp profit buffer through TP cycles or collateral addition",
+            "PERPS",
+            "Perp BUFFER_STRENGTH gate clears — perp transition check passes",
+        ),
+        "proof_stack_forceful":          (
+            "Demonstrate consistent execution proof across multiple sessions",
+            "SYSTEM",
+            "Proof stack reaches FORCEFUL — accelerates PILOT → LIVE transition",
+        ),
+        "route_authority_stacked":       (
+            "Build compounding route memory through disciplined multi-session routing",
+            "SYSTEM",
+            "Route authority reaches STACKED — enables live scaling",
+        ),
+        "route_window_open":             (
+            "Improve capital mix and reduce RISK_OFF conditions",
+            "SYSTEM",
+            "Route window opens — fresh capital becomes eligible",
+        ),
+        "headroom_workable":             (
+            "Reduce position concentration to free up capital headroom",
+            "SYSTEM",
+            "Headroom bucket improves — capital deployment becomes eligible",
+        ),
+        "profit_buffer_strong":          (
+            "Add to perp profit buffer through TP cycles",
+            "PERPS",
+            "Profit buffer gate passes — perp lane earns broader authority",
+        ),
+        "lane_authority_constructive":   (
+            "Paper-execute with discipline to build lane authority",
+            "MEMECOINS",
+            "Lane authority reaches BACKED — memecoins lane advances",
+        ),
+    }
+
+    _transition_checklist = list(ots.get("checklist") or [])
+    next_gate: dict = {}
+    for _chk in _transition_checklist:
+        if _chk.get("passed"):
+            continue
+        _chk_key = str(_chk.get("name") or "").strip()
+        if _chk_key in _GATE_MAP:
+            _action, _gate_lane, _unlocks = _GATE_MAP[_chk_key]
+            next_gate = {
+                "key":     _chk_key,
+                "lane":    _gate_lane,
+                "action":  _action,
+                "unlocks": _unlocks,
+                "note":    str(_chk.get("note") or "").strip(),
+            }
+            break
+    if not next_gate and main_blocker.get("key") and main_blocker["key"] != "NONE":
+        next_gate = {
+            "key":     main_blocker["key"],
+            "lane":    dominant_lane,
+            "action":  f"Address: {main_blocker['key'].replace('_', ' ').lower()}",
+            "unlocks": str(main_blocker.get("note") or "").strip(),
+            "note":    str(main_blocker.get("note") or "").strip(),
+        }
+
+    # ── briefing note ──────────────────────────────────────────────────────────
+    # Compose 2-3 sentences: mode/directive state, dominant lane + blocker,
+    # what to do next.
+
+    _mode_label = {
+        "PAPER_EXECUTION": "paper execution",
+        "PILOT_CAPITAL":   "pilot capital",
+        "LIVE_MANAGED":    "live managed",
+        "OBSERVATION":     "observation",
+    }
+    _transition_label = {
+        "BLOCKED":         "blocked",
+        "BUILDING":        "building",
+        "NEAR_READY":      "near transition",
+        "READY_TO_ROTATE": "ready to rotate",
+        "READY_TO_EXECUTE":"ready to execute",
+        "ACTIVE":          "active",
+    }
+    _routing_label = {
+        "OPEN":      "routing open",
+        "CAUTIOUS":  "cautious routing",
+        "DEFENSIVE": "defensive",
+        "LOCKED":    "routing locked",
+    }
+
+    mode_str       = _mode_label.get(mode, mode.replace("_", " ").lower())
+    trans_str      = _transition_label.get(transition_state, transition_state.replace("_", " ").lower())
+    routing_str    = _routing_label.get(routing_state, routing_state.replace("_", " ").lower())
+    directive_str  = directive.replace("_", " ").lower()
+    dom_str        = dominant_lane.replace("_", " ").title() if dominant_lane != "NONE" else "no clear dominant lane"
+    cap_str        = closest_capital_lane.replace("_", " ").title() if closest_capital_lane not in ("NONE", "") else "none"
+    blocker_note   = str(main_blocker.get("note") or "").strip()
+    emphasis_str   = session_emphasis.replace("_", " ").lower()
+
+    # Sentence 1: current state
+    sent1 = (
+        f"System is in {mode_str} mode — directive is {directive_str}, "
+        f"transition {trans_str}, {routing_str}."
+    )
+
+    # Sentence 2: dominant lane + blocker (append momentum leader if different)
+    _mom_leader = str(clom.get("momentum_leader_lane") or "").strip().upper()
+    _mom_leader_str = _mom_leader.replace("_", " ").title() if _mom_leader else ""
+    _mom_suffix = (
+        f" Momentum leader: {_mom_leader_str}."
+        if _mom_leader_str and _mom_leader != dominant_lane and _mom_leader not in ("NONE", "")
+        else ""
+    )
+    if blocker_note and main_blocker.get("key") != "NONE":
+        sent2 = (
+            f"Dominant lane is {dom_str}; closest capital lane is {cap_str}. "
+            f"Primary blocker: {blocker_note.rstrip('.')}.{_mom_suffix}"
+        )
+    else:
+        sent2 = (
+            f"Dominant lane is {dom_str}; closest capital lane is {cap_str}. "
+            f"No hard blockers identified.{_mom_suffix}"
+        )
+
+    # Sentence 3: momentum note > directive note > generic emphasis
+    # momentum_note explains partial progress (e.g. "0/4 checks but perp has BACKED auth")
+    _momentum_note   = str(ots.get("momentum_note") or "").strip()
+    _blocker_note_clean   = blocker_note.rstrip(".").strip().lower()
+    _directive_note_clean = directive_note.rstrip(".").strip().lower()
+    _directive_repeats_blocker = (
+        _directive_note_clean != ""
+        and _blocker_note_clean != ""
+        and _directive_note_clean == _blocker_note_clean
+    )
+    if _momentum_note:
+        sent3 = f"{_momentum_note.rstrip('.')}."
+    elif directive_note == "" or _directive_repeats_blocker:
+        sent3 = f"Session emphasis: {emphasis_str}."
+    else:
+        sent3 = f"{directive_note.rstrip('.')}."
+
+    briefing_note = f"{sent1} {sent2} {sent3}"
+
+    return {
+        "mode":                  mode,
+        "directive":             directive,
+        "transition_state":      transition_state,
+        "dominant_lane":         dominant_lane,
+        "closest_capital_lane":  closest_capital_lane,
+        "momentum_leader_lane":  _mom_leader or dominant_lane,
+        "main_blocker":          main_blocker,
+        "session_emphasis":      session_emphasis,
+        "session_verdict":       session_verdict,
+        "next_gate":             next_gate,
+        "top_actions":           top_actions,
+        "briefing_note":         briefing_note,
+        # supporting context (compact, no duplication of full sub-objects)
+        "promotion_state":       promotion_state,
+        "routing_state":         routing_state,
+        "progression_state":     progression_state,
+        "portfolio_velocity":    portfolio_velocity,
+    }
+
+
+def _build_lane_rotation_summary(
+    cross_lane_operating_matrix: "dict | None",
+    cross_lane_promotion_summary: "dict | None",
+    cross_lane_routing_readiness: "dict | None",
+    portfolio_operating_directive: "dict | None",
+    portfolio_progression_summary: "dict | None",
+    operator_briefing_summary: "dict | None",
+    allocator_summary: "dict | None",
+) -> dict:
+    """
+    Roadmap 2: Lane rotation summary.
+
+    Synthesises existing Home summaries into a compact operator signal that
+    describes whether the system is preparing to rotate attention or capital
+    between lanes, and if so, from which lane to which.
+
+    No new truth paths — pure synthesis from the seven summaries passed in.
+
+    rotation_state values:
+      NONE       — system stable, no rotation signal detected
+      CANDIDATE  — partial rotation signal: one lane rising, another fading
+      PREPARING  — strong signal: clear source + target with near unlock
+      BLOCKED    — rotation desired but prevented by a binding constraint
+
+    rotation_trigger values:
+      PROGRESSION_ROTATE  — progression_state is READY_TO_ROTATE
+      NEAR_UNLOCK         — target has NEAR/NONE horizon and ADVANCING momentum
+      ROUTING_OPEN        — target is in routing_ready_lanes
+      MOMENTUM_SHIFT      — momentum leader moved away from source
+      PROMOTION_ADVANCING — target is the actively promoting lane
+      VELOCITY_GAINING    — portfolio velocity GAINING/ACCELERATING toward target
+
+    rotation_blocker values:
+      ROUTE_LOCKED    — system routing is LOCKED
+      TARGET_STALLING — intended target has STALLING/BLOCKED momentum
+      PROOF_THIN      — target authority below TENTATIVE
+      NO_TARGET       — no viable target lane identified
+      NONE            — no blocker
+    """
+    clom = dict(cross_lane_operating_matrix   or {})
+    clps = dict(cross_lane_promotion_summary  or {})
+    clrr = dict(cross_lane_routing_readiness  or {})
+    pod  = dict(portfolio_operating_directive or {})
+    pps  = dict(portfolio_progression_summary or {})
+    obs  = dict(operator_briefing_summary     or {})
+    aloc = dict(allocator_summary             or {})
+
+    matrix_lanes   = dict(clom.get("lanes") or {})
+    mom_leader     = str(clom.get("momentum_leader_lane") or "").strip().upper()
+    strongest      = str(clom.get("strongest_lane") or "").strip().upper()
+
+    promoting_lane  = str(clps.get("promoting_lane") or "").strip().upper()
+    degrading_lane  = str(clps.get("degrading_lane") or "").strip().upper()
+    promotion_state = str(clps.get("system_promotion_state") or "STABLE").strip().upper()
+
+    routing_ready  = [str(l).upper() for l in (clrr.get("routing_ready_lanes") or [])]
+    routing_watch  = [str(l).upper() for l in (clrr.get("routing_watch_lanes")  or [])]
+    best_routing   = str(clrr.get("best_routing_lane") or "").strip().upper()
+    system_routing = str(clrr.get("system_routing_state") or "DEFENSIVE").strip().upper()
+
+    directive       = str(pod.get("directive")     or "MONITOR_AND_LEARN").strip().upper()
+    dominant_lane   = str(pod.get("dominant_lane") or obs.get("dominant_lane") or "").strip().upper()
+
+    velocity        = str(pps.get("portfolio_velocity") or "STABLE").strip().upper()
+    progression     = str(pps.get("progression_state")  or "BUILDING").strip().upper()
+
+    closest_capital = str(obs.get("closest_capital_lane") or "").strip().upper()
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+    def _momentum(lane_key: str) -> str:
+        return str((matrix_lanes.get(lane_key.lower()) or {}).get("lane_momentum") or "").upper()
+
+    def _horizon(lane_key: str) -> str:
+        return str((matrix_lanes.get(lane_key.lower()) or {}).get("unlock_horizon") or "FAR").upper()
+
+    def _auth_rank(lane_key: str) -> int:
+        auth = str((matrix_lanes.get(lane_key.lower()) or {}).get("authority") or "QUIET").upper()
+        return _LANE_AUTH_RANK.get(auth, 0)
+
+    # ── source lane — current capital / attention focus ───────────────────────
+    source_lane = dominant_lane or strongest or None
+
+    # ── target lane — where momentum / routing readiness is pulling ───────────
+    # Priority: (1) ADVANCING momentum leader ≠ source
+    #           (2) routing-eligible closest capital lane ≠ source
+    #           (3) promoting lane that is not also degrading
+    #           (4) best routing lane ≠ source
+    target_lane: "str | None" = None
+
+    if mom_leader and mom_leader not in ("NONE", "") and mom_leader != source_lane:
+        if _momentum(mom_leader) == "ADVANCING":
+            target_lane = mom_leader
+
+    if not target_lane and closest_capital and closest_capital not in ("NONE", "") and closest_capital != source_lane:
+        if closest_capital in routing_ready or closest_capital in routing_watch:
+            target_lane = closest_capital
+
+    if not target_lane and promoting_lane and promoting_lane not in ("NONE", "") and promoting_lane != source_lane:
+        if promoting_lane != degrading_lane:
+            target_lane = promoting_lane
+
+    if not target_lane and best_routing and best_routing not in ("NONE", "") and best_routing != source_lane:
+        target_lane = best_routing
+
+    # ── rotation_blocker ─────────────────────────────────────────────────────
+    if not target_lane:
+        rotation_blocker = "NO_TARGET"
+    elif system_routing == "LOCKED":
+        rotation_blocker = "ROUTE_LOCKED"
+    elif _momentum(target_lane) in ("STALLING", "BLOCKED"):
+        rotation_blocker = "TARGET_STALLING"
+    elif _auth_rank(target_lane) < 3:
+        rotation_blocker = "PROOF_THIN"
+    else:
+        rotation_blocker = "NONE"
+
+    # ── rotation_trigger ─────────────────────────────────────────────────────
+    rotation_trigger: "str | None" = None
+    if progression == "READY_TO_ROTATE":
+        rotation_trigger = "PROGRESSION_ROTATE"
+    elif target_lane and _momentum(target_lane) == "ADVANCING" and _horizon(target_lane) in ("NONE", "NEAR"):
+        rotation_trigger = "NEAR_UNLOCK"
+    elif target_lane and target_lane in routing_ready:
+        rotation_trigger = "ROUTING_OPEN"
+    elif mom_leader and mom_leader != source_lane and mom_leader not in ("NONE", ""):
+        rotation_trigger = "MOMENTUM_SHIFT"
+    elif target_lane and target_lane == promoting_lane and promotion_state == "ADVANCING":
+        rotation_trigger = "PROMOTION_ADVANCING"
+    elif velocity in ("GAINING", "ACCELERATING") and target_lane:
+        rotation_trigger = "VELOCITY_GAINING"
+
+    # ── rotation_state ───────────────────────────────────────────────────────
+    if not source_lane or not target_lane or source_lane == target_lane:
+        rotation_state = "NONE"
+    elif progression == "READY_TO_ROTATE":
+        rotation_state = "PREPARING"
+    elif rotation_blocker in ("ROUTE_LOCKED", "TARGET_STALLING") and rotation_trigger is not None:
+        rotation_state = "BLOCKED"
+    elif (
+        target_lane in routing_ready
+        and _momentum(target_lane) in ("ADVANCING", "BUILDING")
+        and velocity in ("GAINING", "ACCELERATING", "STABLE")
+        and rotation_blocker == "NONE"
+    ):
+        rotation_state = "PREPARING"
+    elif (
+        target_lane in routing_watch
+        and _momentum(target_lane) == "ADVANCING"
+        and rotation_blocker == "NONE"
+    ):
+        rotation_state = "PREPARING"
+    elif rotation_blocker == "NONE" and rotation_trigger is not None:
+        rotation_state = "CANDIDATE"
+    elif rotation_blocker not in ("NONE", "NO_TARGET") and rotation_trigger is not None:
+        rotation_state = "BLOCKED"
+    else:
+        rotation_state = "NONE"
+
+    # ── rotation_note ─────────────────────────────────────────────────────────
+    _src = source_lane.replace("_", " ").title() if source_lane else "unknown"
+    _tgt = target_lane.replace("_", " ").title() if target_lane else "none"
+    _trg = (rotation_trigger or "").replace("_", " ").lower()
+    _blk = (rotation_blocker or "NONE").replace("_", " ").lower()
+
+    if rotation_state == "NONE":
+        if not target_lane:
+            rotation_note = (
+                f"No rotation signal. System focused on {_src}. "
+                "No lane showing sufficient momentum to warrant a rotation."
+            )
+        else:
+            rotation_note = (
+                f"System stable on {_src}. "
+                f"{_tgt} is a future candidate but rotation conditions not met."
+            )
+    elif rotation_state == "PREPARING":
+        rotation_note = (
+            f"Preparing rotation toward {_tgt} from {_src}. "
+            f"Trigger: {_trg}. "
+            f"Velocity {velocity.lower()} — directive: {directive.replace('_', ' ').lower()}."
+        )
+    elif rotation_state == "CANDIDATE":
+        rotation_note = (
+            f"{_tgt} is a rotation candidate from {_src}. "
+            f"Signal: {_trg}. Partial rotation conditions — not yet confirmed."
+        )
+    else:  # BLOCKED
+        rotation_note = (
+            f"Rotation toward {_tgt} from {_src} is blocked. "
+            f"Blocker: {_blk}. Resolve before capital can rotate."
+        )
+
+    return {
+        "rotation_state":   rotation_state,
+        "rotation_note":    rotation_note,
+        "source_lane":      source_lane or None,
+        "target_lane":      target_lane or None,
+        "rotation_trigger": rotation_trigger,
+        "rotation_blocker": rotation_blocker,
+    }
+
+
+def _build_lane_suspension_summary(
+    cross_lane_operating_matrix: "dict | None",
+    cross_lane_promotion_summary: "dict | None",
+    cross_lane_routing_readiness: "dict | None",
+    lane_unlock_summary: "dict | None",
+    portfolio_progression_summary: "dict | None",
+    lane_rotation_summary: "dict | None",
+    operator_briefing_summary: "dict | None",
+) -> dict:
+    """
+    Roadmap 2: Lane suspension / reactivation summary.
+
+    Synthesises existing Home summaries into a compact operator signal that
+    classifies each lane as active, watching, suspended, reactivating, or
+    hard-blocked.  No new truth paths — pure synthesis from the seven
+    summaries passed in.
+
+    Per-lane suspension_state values:
+      ACTIVE       — lane is operating productively; BACKED+ authority,
+                     ADVANCING/BUILDING momentum, productive operating state
+      WATCHING     — lane is present but passive; building checks; no block
+                     signal but not yet ready for capital deployment
+      SUSPENDED    — lane effectively sidelined: DEGRADING/SUSPENDED promotion,
+                     ADVERSE authority, BLOCKED/PAUSED operating state, or
+                     STALLING momentum with blocked routing
+      REACTIVATING — lane was or is sidelined but showing clear upward signal:
+                     near unlock + BUILDING momentum + WATCH/READY routing, or
+                     named as rotation target, or BUILDING with TENTATIVE+ auth
+                     and routing entry point opening
+      HARD_BLOCKED — absolute block: authority BLOCKED, policy LOCKED, or
+                     SUSPENDED promotion locked against BLOCKED routing
+
+    Top-level fields:
+      suspended_lanes         — lanes in SUSPENDED state
+      hard_blocked_lanes      — lanes in HARD_BLOCKED state
+      reactivating_lanes      — lanes in REACTIVATING state
+      system_suspension_state — ALL_ACTIVE / OPERATING / PARTIAL_SUSPENSION /
+                                CRITICAL_SUSPENSION / FULL_SUSPENSION
+      system_suspension_note  — operator-facing one-liner
+    """
+    clom = dict(cross_lane_operating_matrix  or {})
+    clps = dict(cross_lane_promotion_summary or {})
+    clrr = dict(cross_lane_routing_readiness or {})
+    lus  = dict(lane_unlock_summary          or {})
+    pps  = dict(portfolio_progression_summary or {})
+    lrs  = dict(lane_rotation_summary        or {})
+    obs  = dict(operator_briefing_summary    or {})
+
+    matrix_lanes    = dict(clom.get("lanes")  or {})
+    promo_lanes     = dict(clps.get("lanes")  or {})
+    routing_lanes   = dict(clrr.get("lanes")  or {})
+
+    rotation_target = str(lrs.get("target_lane") or "").strip().upper()
+    velocity        = str(pps.get("portfolio_velocity") or "STABLE").strip().upper()
+    dominant_lane   = str(obs.get("dominant_lane") or "").strip().upper()
+
+    lane_results: dict[str, dict] = {}
+
+    for lane in ("memecoins", "perps", "spot", "whale"):
+        ml = dict(matrix_lanes.get(lane)  or {})
+        pl = dict(promo_lanes.get(lane)   or {})
+        rl = dict(routing_lanes.get(lane) or {})
+        lu = dict(lus.get(lane)           or {})
+
+        authority       = str(ml.get("authority")       or "QUIET").strip().upper() or "QUIET"
+        op_state        = str(ml.get("operating_state") or "LIMITED").strip().upper() or "LIMITED"
+        policy_state    = str(ml.get("policy_state")    or "QUIET").strip().upper() or "QUIET"
+        momentum        = str(ml.get("lane_momentum")   or "BUILDING").strip().upper() or "BUILDING"
+        horizon         = str(ml.get("unlock_horizon")  or "FAR").strip().upper() or "FAR"
+        passed          = int(ml.get("passed_checks")   or lu.get("passed_checks") or 0)
+        total           = int(ml.get("total_checks")    or lu.get("total_checks")  or 1)
+        grad_score      = int(ml.get("graduation_score") or 0)
+
+        promo_state     = str(pl.get("promotion_state") or "BUILDING").strip().upper() or "BUILDING"
+        routing_state   = str(rl.get("routing_state")   or "HOLD").strip().upper() or "HOLD"
+
+        auth_rank       = _LANE_AUTH_RANK.get(authority, 0)
+        is_rot_target   = (rotation_target == lane.upper() or rotation_target == "PERPS" and lane == "perps")
+
+        # ── classify ───────────────────────────────────────────────────────────
+
+        # HARD_BLOCKED — absolute block; no near-term path without external change
+        if authority == "BLOCKED" or policy_state == "LOCKED":
+            suspension_state = "HARD_BLOCKED"
+            suspension_note = (
+                f"{lane.title()} hard-blocked: "
+                f"{'authority blocked' if authority == 'BLOCKED' else 'policy locked'}. "
+                "No path to advance without external change."
+            )
+
+        elif promo_state == "SUSPENDED" and routing_state == "BLOCKED":
+            suspension_state = "HARD_BLOCKED"
+            suspension_note = (
+                f"{lane.title()} hard-blocked: suspended promotion + blocked routing. "
+                "System has no entry point for this lane."
+            )
+
+        # SUSPENDED — effectively sidelined
+        elif promo_state in ("SUSPENDED", "DEGRADING") or authority == "ADVERSE":
+            suspension_state = "SUSPENDED"
+            _why = (
+                "authority adverse" if authority == "ADVERSE"
+                else f"promotion {promo_state.lower()}"
+            )
+            suspension_note = (
+                f"{lane.title()} suspended: {_why}. "
+                f"Routing is {routing_state.lower()}. Rebuild required before reactivation."
+            )
+
+        elif op_state in ("BLOCKED", "PAUSED"):
+            suspension_state = "SUSPENDED"
+            suspension_note = (
+                f"{lane.title()} suspended: operating state {op_state.lower()}. "
+                f"Policy: {policy_state.lower()}. Awaiting unlock."
+            )
+
+        elif momentum in ("STALLING", "BLOCKED") and routing_state in ("BLOCKED", "DEFENSIVE_ONLY"):
+            suspension_state = "SUSPENDED"
+            suspension_note = (
+                f"{lane.title()} suspended: {momentum.lower()} momentum + "
+                f"{routing_state.lower()} routing. No capital path open."
+            )
+
+        # REACTIVATING — sidelined but showing clear upward signal
+        elif (
+            momentum == "BUILDING"
+            and horizon in ("NEAR", "NONE")
+            and routing_state in ("WATCH", "READY")
+        ):
+            suspension_state = "REACTIVATING"
+            suspension_note = (
+                f"{lane.title()} reactivating: {passed}/{total} checks, "
+                f"{horizon.lower()} unlock horizon, routing {routing_state.lower()}. "
+                "Lane approaching active contention."
+            )
+
+        elif is_rot_target and momentum in ("ADVANCING", "BUILDING"):
+            suspension_state = "REACTIVATING"
+            suspension_note = (
+                f"{lane.title()} reactivating: named rotation target with "
+                f"{momentum.lower()} momentum. System attention shifting here."
+            )
+
+        elif (
+            promo_state == "BUILDING"
+            and auth_rank >= 3  # TENTATIVE+
+            and routing_state in ("WATCH", "READY")
+        ):
+            suspension_state = "REACTIVATING"
+            suspension_note = (
+                f"{lane.title()} reactivating: promotion building, {authority.lower()} "
+                f"authority, routing {routing_state.lower()}. "
+                f"{passed}/{total} checks passed."
+            )
+
+        # ACTIVE — operating productively with deployment authority
+        elif (
+            auth_rank >= 4  # BACKED+
+            and momentum in ("ADVANCING", "BUILDING")
+            and op_state not in ("BLOCKED", "PAUSED", "OBSERVING")
+        ):
+            suspension_state = "ACTIVE"
+            suspension_note = (
+                f"{lane.title()} active: {authority.lower()} authority, "
+                f"{momentum.lower()} momentum, routing {routing_state.lower()}. "
+                f"Score {grad_score}/100."
+            )
+
+        # WATCHING — present but passive
+        else:
+            suspension_state = "WATCHING"
+            _watch_why = (
+                f"{passed}/{total} checks, {horizon.lower()} horizon"
+                if total > 0
+                else f"authority {authority.lower()}"
+            )
+            suspension_note = (
+                f"{lane.title()} watching: {_watch_why}. "
+                f"Routing {routing_state.lower()}. Building toward contention."
+            )
+
+        lane_results[lane] = {
+            "suspension_state": suspension_state,
+            "suspension_note":  suspension_note,
+        }
+
+    # ── top-level aggregation ─────────────────────────────────────────────────
+    suspended_lanes      = [l for l in lane_results if lane_results[l]["suspension_state"] == "SUSPENDED"]
+    hard_blocked_lanes   = [l for l in lane_results if lane_results[l]["suspension_state"] == "HARD_BLOCKED"]
+    reactivating_lanes   = [l for l in lane_results if lane_results[l]["suspension_state"] == "REACTIVATING"]
+    active_lanes         = [l for l in lane_results if lane_results[l]["suspension_state"] == "ACTIVE"]
+    watching_lanes       = [l for l in lane_results if lane_results[l]["suspension_state"] == "WATCHING"]
+
+    _sidelined_n = len(suspended_lanes) + len(hard_blocked_lanes)
+    _total_lanes = len(lane_results)
+
+    if _sidelined_n == 0 and len(reactivating_lanes) == 0 and len(active_lanes) == _total_lanes:
+        system_suspension_state = "ALL_ACTIVE"
+    elif _sidelined_n == 0:
+        system_suspension_state = "OPERATING"
+    elif len(hard_blocked_lanes) >= 2 or _sidelined_n >= (_total_lanes // 2 + 1):
+        system_suspension_state = "CRITICAL_SUSPENSION"
+    elif _sidelined_n == _total_lanes:
+        system_suspension_state = "FULL_SUSPENSION"
+    else:
+        system_suspension_state = "PARTIAL_SUSPENSION"
+
+    # ── system note ───────────────────────────────────────────────────────────
+    _act_str  = ", ".join(t.title() for t in active_lanes)       or "none"
+    _react_str = ", ".join(t.title() for t in reactivating_lanes) or "none"
+    _susp_str = ", ".join(t.title() for t in suspended_lanes + hard_blocked_lanes) or "none"
+
+    if system_suspension_state == "ALL_ACTIVE":
+        system_suspension_note = (
+            f"All lanes active. System operating at full capacity. "
+            f"Velocity: {velocity.lower()}."
+        )
+    elif system_suspension_state == "OPERATING":
+        system_suspension_note = (
+            f"System operating normally. Active: {_act_str}. "
+            f"Reactivating: {_react_str}. "
+            f"No lanes suspended."
+        )
+    elif system_suspension_state == "PARTIAL_SUSPENSION":
+        system_suspension_note = (
+            f"Partial suspension: {_susp_str} sidelined. "
+            f"Active: {_act_str}. "
+            f"Reactivating: {_react_str}."
+        )
+    elif system_suspension_state == "CRITICAL_SUSPENSION":
+        system_suspension_note = (
+            f"Critical suspension: {_susp_str} sidelined or hard-blocked. "
+            f"System capacity constrained. Active: {_act_str}."
+        )
+    else:  # FULL_SUSPENSION
+        system_suspension_note = (
+            "Full suspension: no lanes active. "
+            f"All sidelined — {_susp_str}. System in recovery mode."
+        )
+
+    return {
+        "lanes":                  lane_results,
+        "suspended_lanes":        suspended_lanes,
+        "hard_blocked_lanes":     hard_blocked_lanes,
+        "reactivating_lanes":     reactivating_lanes,
+        "active_lanes":           active_lanes,
+        "watching_lanes":         watching_lanes,
+        "system_suspension_state": system_suspension_state,
+        "system_suspension_note":  system_suspension_note,
+    }
+
+
+def _build_portfolio_policy_summary(
+    operating_mode_summary: "dict | None",
+    portfolio_operating_directive: "dict | None",
+    portfolio_progression_summary: "dict | None",
+    cross_lane_routing_readiness: "dict | None",
+    cross_lane_promotion_summary: "dict | None",
+    lane_suspension_summary: "dict | None",
+    operating_constraints_summary: "dict | None",
+    operator_briefing_summary: "dict | None",
+    outcome_attribution: "dict | None" = None,
+) -> dict:
+    """
+    Roadmap 2: Portfolio policy summary.
+
+    Synthesises the portfolio-level policy laws currently governing the system
+    into a compact, operator-grade object.  No new truth paths — pure synthesis
+    from the eight summaries passed in.
+
+    policy_state values:
+      CONSTRAINED       — hard mode/route/proof locks all active; no deployment path
+      DEFENSIVE         — protecting existing exposure; posture-driven no-deploy
+      BUILDING          — paper mode or soft-locked but productive; velocity rising
+      TRANSITION_READY  — within reach of a meaningful state upgrade
+      EXECUTION_READY   — routing open, authority sufficient, ready to deploy
+
+    fresh_capital_policy values:
+      BLOCKED      — mode + route + window locks prevent all fresh deployment
+      CONDITIONAL  — fresh capital possible if specific near-term conditions clear
+      SELECTIVE    — specific lanes cleared; not system-wide
+      OPEN         — system-wide fresh capital allowed
+
+    rotation_policy values:
+      LOCKED          — routing locked; no reallocation possible
+      MONITOR_ONLY    — watching for signals; nothing actionable yet
+      CANDIDATE_READY — partial rotation signal present
+      ROTATION_ARMED  — clear source + target + trigger; ready to act
+
+    lane_activation_policy values:
+      NONE_ELIGIBLE      — no lanes on a reactivation path
+      BUILDING           — lanes accumulating checks; not near threshold
+      NEAR_REACTIVATION  — one or more lanes approaching reactivation threshold
+      REACTIVATION_READY — lane cleared to shift from watching/suspended to active
+
+    risk_policy values:
+      REDUCE              — reduce risk exposure
+      NEUTRAL             — hold steady; no directional risk change
+      ADD_RISK_CONDITIONAL — conditional risk add; specific gates must clear first
+      ADD_RISK            — clear to add risk
+
+    policy_confidence values:
+      LOW    — conflicting or soft signals; picture unclear
+      MEDIUM — core signals aligned; some uncertainty remains
+      HIGH   — hard deterministic locks in place; picture fully clear
+    """
+    oms  = dict(operating_mode_summary        or {})
+    pod  = dict(portfolio_operating_directive or {})
+    pps  = dict(portfolio_progression_summary or {})
+    clrr = dict(cross_lane_routing_readiness  or {})
+    clps = dict(cross_lane_promotion_summary  or {})
+    lss  = dict(lane_suspension_summary       or {})
+    ocs  = dict(operating_constraints_summary or {})
+    obs  = dict(operator_briefing_summary     or {})
+
+    # ── unpack key fields ─────────────────────────────────────────────────────
+    operating_mode    = str(oms.get("operating_mode")    or "PAPER_EXECUTION").strip().upper()
+    allocator_posture = str(oms.get("allocator_posture") or "DEFENSIVE").strip().upper()
+    route_bucket      = str(oms.get("route_bucket")      or "LOCKED").strip().upper()
+    window_bucket     = str(oms.get("window_bucket")     or "CLOSED").strip().upper()
+    headroom_bucket   = str(oms.get("headroom_bucket")   or "LOW").strip().upper()
+    any_live          = bool(oms.get("any_live") or False)
+
+    directive         = str(pod.get("directive")            or "MONITOR_AND_LEARN").strip().upper()
+    portfolio_posture = str(pod.get("portfolio_posture")    or "BUILDING").strip().upper()
+    capital_bias      = str(pod.get("capital_bias")         or "HOLD").strip().upper()
+    risk_posture      = str(pod.get("risk_posture")         or "NEUTRAL").strip().upper()
+    transition_ready  = str(pod.get("transition_readiness") or "BLOCKED").strip().upper()
+    current_mode      = str(pod.get("current_mode")         or operating_mode).strip().upper()
+    next_mode         = str(pod.get("next_mode")            or "PILOT_CAPITAL").strip().upper()
+
+    progression_state = str(pps.get("progression_state")   or "BUILDING").strip().upper()
+    portfolio_velocity = str(pps.get("portfolio_velocity")  or "STABLE").strip().upper()
+    prog_passed       = int(pps.get("passed_checks") or 0)
+    prog_total        = int(pps.get("total_checks")  or 1)
+
+    routing_state     = str(clrr.get("system_routing_state")  or "LOCKED").strip().upper()
+    routing_ready     = list(clrr.get("routing_ready_lanes")   or [])
+    routing_watch     = list(clrr.get("routing_watch_lanes")   or [])
+
+    promo_state       = str(clps.get("system_promotion_state") or "STABLE").strip().upper()
+
+    susp_state        = str(lss.get("system_suspension_state") or "OPERATING").strip().upper()
+    active_lanes      = list(lss.get("active_lanes")       or [])
+    reactivating_lanes = list(lss.get("reactivating_lanes") or [])
+    hard_blocked_lanes = list(lss.get("hard_blocked_lanes") or [])
+    suspended_lanes   = list(lss.get("suspended_lanes")    or [])
+    watching_lanes    = list(lss.get("watching_lanes")     or [])
+
+    top_constraints   = list(ocs.get("top_constraints")   or [])
+    primary_c         = dict(ocs.get("primary_constraint") or {})
+    primary_key       = str(primary_c.get("key")      or "NONE").strip().upper()
+    primary_severity  = int(primary_c.get("severity") or 0)
+
+    session_verdict   = str(obs.get("session_verdict")  or "BUILD").strip().upper()
+    main_blocker_key  = str((obs.get("main_blocker") or {}).get("key") or "NONE").strip().upper()
+
+    hard_mode_lock = operating_mode in ("OBSERVATION", "PAPER_EXECUTION")
+    hard_route_lock = route_bucket in ("LOCKED", "MICRO_PROBE_ONLY") and window_bucket == "CLOSED"
+
+    # ── policy_state ──────────────────────────────────────────────────────────
+    # CONSTRAINED: mode locked + route locked + proof deficit or progression blocked
+    if (
+        hard_mode_lock
+        and hard_route_lock
+        and progression_state in ("BLOCKED", "BUILDING")
+        and primary_severity >= 4
+    ):
+        policy_state = "CONSTRAINED"
+
+    # EXECUTION_READY: routing open + sufficient authority
+    elif routing_state == "OPEN" and routing_ready:
+        policy_state = "EXECUTION_READY"
+
+    # TRANSITION_READY: within reach of next mode or directive
+    elif (
+        transition_ready == "NEAR_READY"
+        or progression_state in ("NEAR_READY", "READY_TO_ROTATE", "READY_TO_EXECUTE")
+        or session_verdict == "PREPARE"
+    ):
+        policy_state = "TRANSITION_READY"
+
+    # DEFENSIVE: posture-driven, protecting existing only, no upward velocity
+    elif (
+        allocator_posture == "DEFENSIVE"
+        and portfolio_velocity in ("DECELERATING", "STALLED")
+        and not active_lanes
+    ):
+        policy_state = "DEFENSIVE"
+
+    # BUILDING: paper or soft-locked but productive
+    else:
+        policy_state = "BUILDING"
+
+    # ── fresh_capital_policy ──────────────────────────────────────────────────
+    if hard_mode_lock or hard_route_lock:
+        fresh_capital_policy = "BLOCKED"
+    elif routing_ready:
+        fresh_capital_policy = "SELECTIVE"
+    elif routing_watch or routing_state == "CAUTIOUS":
+        fresh_capital_policy = "CONDITIONAL"
+    else:
+        fresh_capital_policy = "OPEN"
+
+    # ── Phase 4 Step 3: outcome-informed FCP downgrade ────────────────────
+    # If structural logic would loosen FCP, poor outcome evidence can hold it back.
+    # Only fires when outcome data is sufficient. Never tightens beyond BLOCKED.
+    _fcp_outcome_downgrade = None
+    _oa = dict(outcome_attribution or {})
+    _oa_agg = _oa.get("aggregate", {})
+    if _oa_agg.get("sufficient") and fresh_capital_policy in ("SELECTIVE", "OPEN"):
+        _oa_wr = _oa_agg.get("wr_4h")
+        if _oa_wr is not None and _oa_wr < 40.0:
+            _fcp_outcome_downgrade = (
+                f"outcome_quality_hold — aggregate wr_4h={_oa_wr}% < 40% "
+                f"over {_oa_agg.get('n_total', 0)} outcomes; "
+                f"holding FCP at CONDITIONAL until performance improves"
+            )
+            fresh_capital_policy = "CONDITIONAL"
+    elif _oa_agg.get("sufficient") and fresh_capital_policy == "CONDITIONAL":
+        _oa_wr = _oa_agg.get("wr_4h")
+        if _oa_wr is not None and _oa_wr < 35.0:
+            _fcp_outcome_downgrade = (
+                f"outcome_quality_hold — aggregate wr_4h={_oa_wr}% < 35% "
+                f"over {_oa_agg.get('n_total', 0)} outcomes; "
+                f"holding FCP at BLOCKED until performance improves"
+            )
+            fresh_capital_policy = "BLOCKED"
+
+    # ── rotation_policy ───────────────────────────────────────────────────────
+    _lrs_state = str(obs.get("rotation_state") or "").strip().upper()
+    if not _lrs_state:
+        # Derive from routing state
+        _lrs_state = "NONE"
+    if routing_state == "LOCKED" and not routing_ready:
+        rotation_policy = "LOCKED"
+    elif _lrs_state == "PREPARING":
+        rotation_policy = "ROTATION_ARMED"
+    elif _lrs_state == "CANDIDATE":
+        rotation_policy = "CANDIDATE_READY"
+    else:
+        rotation_policy = "MONITOR_ONLY"
+
+    # ── lane_activation_policy ────────────────────────────────────────────────
+    if hard_blocked_lanes and not active_lanes and not reactivating_lanes:
+        lane_activation_policy = "NONE_ELIGIBLE"
+    elif reactivating_lanes:
+        # Check if any are near-threshold (routing WATCH or READY exists)
+        if routing_watch or routing_ready:
+            lane_activation_policy = "REACTIVATION_READY"
+        else:
+            lane_activation_policy = "NEAR_REACTIVATION"
+    elif watching_lanes and not suspended_lanes and not hard_blocked_lanes:
+        lane_activation_policy = "BUILDING"
+    elif watching_lanes:
+        lane_activation_policy = "BUILDING"
+    else:
+        lane_activation_policy = "NONE_ELIGIBLE"
+
+    # ── risk_policy ───────────────────────────────────────────────────────────
+    if susp_state in ("CRITICAL_SUSPENSION", "FULL_SUSPENSION") or hard_blocked_lanes:
+        risk_policy = "REDUCE"
+    elif risk_posture == "REDUCE" or capital_bias == "REDUCE":
+        risk_policy = "REDUCE"
+    elif policy_state == "EXECUTION_READY" and capital_bias == "ADD":
+        risk_policy = "ADD_RISK"
+    elif (
+        policy_state in ("BUILDING", "TRANSITION_READY")
+        and portfolio_velocity in ("GAINING", "ACCELERATING")
+        and not hard_route_lock
+    ):
+        risk_policy = "ADD_RISK_CONDITIONAL"
+    elif risk_posture == "ADD_RISK" or capital_bias == "ADD":
+        risk_policy = "ADD_RISK_CONDITIONAL"
+    else:
+        risk_policy = "NEUTRAL"
+
+    # ── override_blockers — constraints sev >= 4 holding policy back ──────────
+    override_blockers = [
+        str(c.get("key") or "").upper()
+        for c in top_constraints
+        if int(c.get("severity") or 0) >= 4 and str(c.get("key") or "").upper() not in ("NONE", "")
+    ][:5]
+
+    # ── policy_confidence ─────────────────────────────────────────────────────
+    _hard_count = sum([
+        1 if hard_mode_lock else 0,
+        1 if hard_route_lock else 0,
+        1 if primary_severity >= 5 else 0,
+    ])
+    if _hard_count >= 2:
+        policy_confidence = "HIGH"
+    elif _hard_count == 1 or len(override_blockers) >= 2:
+        policy_confidence = "MEDIUM"
+    else:
+        policy_confidence = "LOW"
+
+    # ── policy_note ───────────────────────────────────────────────────────────
+    _mode_str  = current_mode.replace("_", " ").lower()
+    _next_str  = next_mode.replace("_", " ").lower()
+    _dir_str   = directive.replace("_", " ").lower()
+    _vel_str   = portfolio_velocity.lower()
+    _prog_chks = f"{prog_passed}/{prog_total} checks"
+
+    if policy_state == "CONSTRAINED":
+        policy_note = (
+            f"Portfolio fully constrained: {_mode_str} mode, route locked, "
+            f"proof deficit active. Directive is {_dir_str}. "
+            f"Velocity {_vel_str} — {_prog_chks} toward {_next_str}."
+        )
+    elif policy_state == "EXECUTION_READY":
+        _rr_str = ", ".join(l.title() for l in routing_ready)
+        policy_note = (
+            f"Portfolio ready for execution: routing open on {_rr_str}. "
+            f"Directive is {_dir_str}. Deploy capital with active risk controls."
+        )
+    elif policy_state == "TRANSITION_READY":
+        policy_note = (
+            f"Portfolio approaching transition from {_mode_str} to {_next_str}. "
+            f"{_prog_chks} passed — {_dir_str}. "
+            "Final checks required before mode upgrade."
+        )
+    elif policy_state == "DEFENSIVE":
+        policy_note = (
+            f"Portfolio in defensive posture: protecting existing exposure only. "
+            f"Velocity {_vel_str}. No fresh capital until posture improves."
+        )
+    else:  # BUILDING
+        policy_note = (
+            f"Portfolio building: {_mode_str} mode, {_dir_str} directive. "
+            f"Velocity {_vel_str}, {_prog_chks} toward {_next_str}. "
+            f"Routing {routing_state.lower()} — work the near unlocks."
+        )
+
+    return {
+        "policy_state":              policy_state,
+        "policy_note":               policy_note,
+        "fresh_capital_policy":      fresh_capital_policy,
+        "fcp_outcome_downgrade":     _fcp_outcome_downgrade,  # Phase 4 Step 3
+        "rotation_policy":           rotation_policy,
+        "lane_activation_policy":    lane_activation_policy,
+        "risk_policy":               risk_policy,
+        "override_blockers":         override_blockers,
+        "policy_confidence":         policy_confidence,
+    }
+
+
+def _build_action_law_summary(
+    portfolio_policy_summary: "dict | None",
+    portfolio_operating_directive: "dict | None",
+    portfolio_progression_summary: "dict | None",
+    cross_lane_routing_readiness: "dict | None",
+    lane_suspension_summary: "dict | None",
+    operator_briefing_summary: "dict | None",
+    operating_mode_summary: "dict | None",
+) -> dict:
+    """
+    Roadmap 2: Action law summary.
+
+    Synthesises from existing Home summaries into a compact operator object
+    that classifies every meaningful portfolio action as currently allowed,
+    conditional, or disallowed.  No new truth paths — pure synthesis.
+
+    action_law_state values:
+      RESTRICTED         — hard mode/route/proof locks block most action classes;
+                           only management and planning permitted
+      CONDITIONAL        — some deployment/rotation/activation possible if near-term
+                           conditions clear; nothing fully open
+      PERMISSIVE         — watch lanes approaching, near-unlock conditions met, or
+                           mode transition within reach; broader action set opening
+      EXECUTION_ENABLED  — routing open + sufficient authority; deployment lawful
+
+    highest_permitted_action values (ordered, least → most permissive):
+      PAPER_EXECUTION_ONLY   — no live action possible; paper/plan only
+      MANAGE_AND_PLAN        — manage active exposure + plan; no new deployment
+      CONDITIONAL_ROUTING    — conditional watch-lane entry approaching
+      SELECTIVE_DEPLOYMENT   — specific READY lanes cleared for capital
+      FULL_DEPLOYMENT        — system-wide capital deployment allowed
+
+    law_confidence values:
+      HIGH   — hard deterministic locks define the law clearly
+      MEDIUM — mixed signals; some uncertainty in classification
+      LOW    — few signals; soft constraints only
+    """
+    pps  = dict(portfolio_policy_summary      or {})
+    pod  = dict(portfolio_operating_directive or {})
+    ppro = dict(portfolio_progression_summary or {})
+    clrr = dict(cross_lane_routing_readiness  or {})
+    lss  = dict(lane_suspension_summary       or {})
+    obs  = dict(operator_briefing_summary     or {})
+    oms  = dict(operating_mode_summary        or {})
+
+    # ── unpack ────────────────────────────────────────────────────────────────
+    policy_state        = str(pps.get("policy_state")          or "BUILDING").strip().upper()
+    fresh_capital       = str(pps.get("fresh_capital_policy")  or "BLOCKED").strip().upper()
+    rotation_pol        = str(pps.get("rotation_policy")       or "LOCKED").strip().upper()
+    activation_pol      = str(pps.get("lane_activation_policy") or "BUILDING").strip().upper()
+    risk_pol            = str(pps.get("risk_policy")           or "NEUTRAL").strip().upper()
+    policy_confidence   = str(pps.get("policy_confidence")     or "MEDIUM").strip().upper()
+
+    directive           = str(pod.get("directive")             or "MONITOR_AND_LEARN").strip().upper()
+    capital_bias        = str(pod.get("capital_bias")          or "HOLD").strip().upper()
+    dominant_lane       = str(pod.get("dominant_lane")         or "").strip().upper()
+
+    progression_state   = str(ppro.get("progression_state")   or "BUILDING").strip().upper()
+    portfolio_velocity  = str(ppro.get("portfolio_velocity")   or "STABLE").strip().upper()
+
+    routing_state       = str(clrr.get("system_routing_state") or "LOCKED").strip().upper()
+    routing_ready       = list(clrr.get("routing_ready_lanes") or [])
+    routing_watch       = list(clrr.get("routing_watch_lanes") or [])
+
+    active_lanes        = list(lss.get("active_lanes")        or [])
+    reactivating_lanes  = list(lss.get("reactivating_lanes")  or [])
+    suspended_lanes     = list(lss.get("suspended_lanes")     or [])
+    hard_blocked_lanes  = list(lss.get("hard_blocked_lanes")  or [])
+    watching_lanes      = list(lss.get("watching_lanes")      or [])
+
+    session_verdict     = str(obs.get("session_verdict")      or "BUILD").strip().upper()
+    main_blocker_key    = str((obs.get("main_blocker") or {}).get("key") or "NONE").strip().upper()
+
+    operating_mode      = str(oms.get("operating_mode")       or "PAPER_EXECUTION").strip().upper()
+    oms_allowed_now     = list(oms.get("allowed_now")         or [])
+    oms_planning_only   = list(oms.get("planning_only")       or [])
+    oms_blocked_policy  = list(oms.get("blocked_by_policy")   or [])
+    any_live            = bool(oms.get("any_live") or False)
+    any_armed           = bool(oms.get("any_armed") or False)
+
+    hard_mode_lock  = operating_mode in ("OBSERVATION", "PAPER_EXECUTION")
+    hard_route_lock = routing_state == "LOCKED" and not routing_ready
+
+    # ── allowed_actions ───────────────────────────────────────────────────────
+    # Start from mode-level allowances, then add lane-driven permissions.
+    _allowed: list[str] = []
+
+    # Base: what the operating mode always permits
+    for a in oms_allowed_now:
+        if a not in _allowed:
+            _allowed.append(a)
+
+    # Active lane management — always lawful when a lane is active
+    for lane in active_lanes:
+        action = f"manage_{lane}_exposure"
+        if action not in _allowed:
+            _allowed.append(action)
+
+    # Plan next directive step — lawful unless fully blocked with no velocity
+    if progression_state != "BLOCKED" or portfolio_velocity in ("GAINING", "ACCELERATING"):
+        if "plan_next_move" not in _allowed:
+            _allowed.append("plan_next_move")
+
+    # Dominant-lane attention — always lawful to work the dominant lane's gate
+    if dominant_lane and dominant_lane not in ("NONE", ""):
+        gate_action = f"advance_{dominant_lane.lower()}_gate"
+        if gate_action not in _allowed:
+            _allowed.append(gate_action)
+
+    # ── conditional_actions ───────────────────────────────────────────────────
+    # Actions that are lawful only once a specific near-term condition clears.
+    _conditional: list[dict] = []
+
+    # Mode-level planning-only actions
+    _cond_conditions = {
+        "memecoin_deployment":    "proof_stack reaches BACKED + route/window open",
+        "perp_live_scaling":      "perp buffer gate passes + mode upgrades to PILOT_CAPITAL",
+        "cross_system_routing":   "routing state opens + mode allows capital flow",
+    }
+    for a in oms_planning_only:
+        cond = _cond_conditions.get(a, "policy gates clear")
+        _conditional.append({"action": a, "condition": cond})
+
+    # Watch lanes approaching — conditional routing entry
+    if routing_watch:
+        _watch_str = ", ".join(l.title() for l in routing_watch)
+        _conditional.append({
+            "action": "deploy_to_watch_lane",
+            "condition": f"routing entry clears for {_watch_str}",
+        })
+
+    # Lane reactivation — conditional if near threshold
+    if activation_pol in ("NEAR_REACTIVATION", "REACTIVATION_READY") and reactivating_lanes:
+        _react_str = ", ".join(l.title() for l in reactivating_lanes)
+        _conditional.append({
+            "action": "activate_reactivating_lane",
+            "condition": f"unlock horizon clears for {_react_str}",
+        })
+
+    # Rotation — conditional if candidate ready
+    if rotation_pol == "CANDIDATE_READY":
+        _conditional.append({
+            "action": "initiate_rotation",
+            "condition": "rotation signal confirmed — source/target pair established",
+        })
+
+    # Mode transition — conditional if near ready
+    if progression_state in ("NEAR_READY", "READY_TO_ROTATE", "READY_TO_EXECUTE"):
+        _conditional.append({
+            "action": "trigger_mode_transition",
+            "condition": "remaining progression checks pass",
+        })
+
+    # Risk add — conditional if policy allows it conditionally
+    if risk_pol == "ADD_RISK_CONDITIONAL":
+        _conditional.append({
+            "action": "add_risk_exposure",
+            "condition": f"velocity maintained {portfolio_velocity.lower()} + routing opens",
+        })
+
+    # ── disallowed_actions ────────────────────────────────────────────────────
+    _disallowed: list[str] = []
+
+    # Mode-level hard blocks
+    for a in oms_blocked_policy:
+        if a not in _disallowed:
+            _disallowed.append(a)
+
+    # Fresh capital — disallowed when policy blocks it
+    if fresh_capital == "BLOCKED":
+        if "deploy_fresh_capital" not in _disallowed:
+            _disallowed.append("deploy_fresh_capital")
+
+    # Lane rotation execution — disallowed when routing locked
+    if rotation_pol == "LOCKED":
+        _disallowed.append("execute_lane_rotation")
+
+    # Deployment to suspended/hard-blocked lanes
+    if suspended_lanes:
+        _disallowed.append(f"deploy_to_suspended_lanes")
+    if hard_blocked_lanes:
+        _disallowed.append(f"activate_hard_blocked_lanes")
+
+    # Risk reduction note — not an action block, but directional
+    if risk_pol == "REDUCE":
+        _disallowed.append("add_risk_exposure")
+
+    # Deduplicate
+    _disallowed = list(dict.fromkeys(_disallowed))
+
+    # ── highest_permitted_action ──────────────────────────────────────────────
+    if routing_ready and fresh_capital in ("OPEN",):
+        highest_permitted_action = "FULL_DEPLOYMENT"
+    elif routing_ready and fresh_capital == "SELECTIVE":
+        highest_permitted_action = "SELECTIVE_DEPLOYMENT"
+    elif routing_watch or activation_pol in ("NEAR_REACTIVATION", "REACTIVATION_READY"):
+        highest_permitted_action = "CONDITIONAL_ROUTING"
+    elif active_lanes or any_live or any_armed:
+        highest_permitted_action = "MANAGE_AND_PLAN"
+    else:
+        highest_permitted_action = "PAPER_EXECUTION_ONLY"
+
+    # ── action_law_state ──────────────────────────────────────────────────────
+    if routing_ready and fresh_capital in ("OPEN", "SELECTIVE"):
+        action_law_state = "EXECUTION_ENABLED"
+    elif (
+        routing_watch
+        or activation_pol in ("NEAR_REACTIVATION", "REACTIVATION_READY")
+        or progression_state in ("NEAR_READY", "READY_TO_ROTATE", "READY_TO_EXECUTE")
+        or rotation_pol in ("CANDIDATE_READY", "ROTATION_ARMED")
+    ):
+        action_law_state = "PERMISSIVE" if routing_watch else "CONDITIONAL"
+    elif hard_mode_lock and hard_route_lock and fresh_capital == "BLOCKED":
+        action_law_state = "RESTRICTED"
+    else:
+        action_law_state = "CONDITIONAL"
+
+    # ── action_law_note ───────────────────────────────────────────────────────
+    _dir_str  = directive.replace("_", " ").lower()
+    _mode_str = operating_mode.replace("_", " ").lower()
+    _vel_str  = portfolio_velocity.lower()
+
+    if action_law_state == "RESTRICTED":
+        _active_str = (
+            f" Active: {', '.join(l.title() for l in active_lanes)}."
+            if active_lanes else " No active lanes."
+        )
+        action_law_note = (
+            f"Action law restricted: {_mode_str} mode, route locked, fresh capital blocked. "
+            f"Permitted: manage existing exposure + paper execution + planning.{_active_str}"
+        )
+    elif action_law_state == "EXECUTION_ENABLED":
+        _rr_str = ", ".join(l.title() for l in routing_ready)
+        action_law_note = (
+            f"Execution enabled: routing open on {_rr_str}. "
+            f"Fresh capital deployment lawful within active policy guardrails."
+        )
+    elif action_law_state == "PERMISSIVE":
+        _watch_str = ", ".join(l.title() for l in routing_watch) if routing_watch else "none"
+        action_law_note = (
+            f"Permissive: watch lanes opening ({_watch_str}). "
+            f"Conditional deployment approaching — {_dir_str} directive, velocity {_vel_str}."
+        )
+    else:  # CONDITIONAL
+        _cond_count = len(_conditional)
+        action_law_note = (
+            f"Action law conditional: {_cond_count} action class(es) gated on near-term conditions. "
+            f"Directive is {_dir_str}. Work the gates to advance law state."
+        )
+
+    return {
+        "action_law_state":        action_law_state,
+        "action_law_note":         action_law_note,
+        "allowed_actions":         _allowed,
+        "conditional_actions":     _conditional,
+        "disallowed_actions":      _disallowed,
+        "highest_permitted_action": highest_permitted_action,
+        "law_confidence":          policy_confidence,
+    }
+
+
+def _build_home_operating_stack(
+    operating_mode_summary: dict | None,
+    lane_policy_summary: dict | None,
+    lane_authority_summary: dict | None,
+    lane_unlock_summary: dict | None,
+    allocator_summary: dict | None = None,
+    top_action: dict | None = None,
+    rotation_allocator_summary: dict | None = None,
+) -> dict:
+    """Build the shared Home Roadmap 2 summary stack from common mode/lane truth."""
+    operating_mode_summary = dict(operating_mode_summary or {})
+    lane_policy_summary = dict(lane_policy_summary or {})
+    lane_authority_summary = dict(lane_authority_summary or {})
+    lane_unlock_summary = dict(lane_unlock_summary or {})
+    allocator_summary = dict(allocator_summary or {})
+    top_action = dict(top_action or {})
+
+    operating_agenda_summary = _build_operating_agenda_summary(
+        operating_mode_summary,
+        lane_policy_summary,
+        lane_authority_summary,
+        lane_unlock_summary,
+        allocator_summary,
+        top_action,
+    )
+    operating_constraints_summary = _build_operating_constraints_summary(
+        operating_mode_summary,
+        lane_policy_summary,
+        lane_authority_summary,
+        lane_unlock_summary,
+        allocator_summary,
+    )
+    operating_transition_summary = _build_operating_transition_summary(
+        operating_mode_summary,
+        lane_policy_summary,
+        lane_authority_summary,
+        lane_unlock_summary,
+        operating_constraints_summary,
+        allocator_summary,
+    )
+    lane_graduation_rank = _build_lane_graduation_rank(
+        lane_unlock_summary,
+        lane_authority_summary,
+        lane_policy_summary,
+    )
+    operating_recommendation = _build_operating_recommendation(
+        operating_mode_summary,
+        lane_policy_summary,
+        lane_authority_summary,
+        lane_unlock_summary,
+        lane_graduation_rank,
+        operating_constraints_summary,
+        operating_transition_summary,
+        operating_agenda_summary,
+    )
+    cross_lane_operating_matrix = _build_cross_lane_operating_matrix(
+        lane_graduation_rank,
+        lane_authority_summary,
+        lane_policy_summary,
+        lane_unlock_summary,
+        operating_mode_summary,
+    )
+    portfolio_operating_directive = _build_portfolio_operating_directive(
+        operating_mode_summary,
+        operating_transition_summary,
+        operating_recommendation,
+        cross_lane_operating_matrix,
+        allocator_summary,
+        operating_constraints_summary,
+    )
+    portfolio_progression_summary = _build_portfolio_progression_summary(
+        portfolio_operating_directive,
+        operating_transition_summary,
+        cross_lane_operating_matrix,
+        operating_recommendation,
+        operating_constraints_summary,
+        allocator_summary,
+    )
+    cross_lane_promotion_summary = _build_cross_lane_promotion_summary(
+        cross_lane_operating_matrix,
+        lane_authority_summary,
+        lane_unlock_summary,
+        portfolio_operating_directive,
+        operating_transition_summary,
+        operating_constraints_summary,
+    )
+    cross_lane_routing_readiness = _build_cross_lane_routing_readiness(
+        cross_lane_operating_matrix,
+        cross_lane_promotion_summary,
+        portfolio_operating_directive,
+        portfolio_progression_summary,
+        allocator_summary,
+        lane_authority_summary,
+        lane_unlock_summary,
+    )
+    operator_briefing_summary = _build_operator_briefing_summary(
+        operating_mode_summary,
+        operating_transition_summary,
+        operating_recommendation,
+        cross_lane_operating_matrix,
+        portfolio_operating_directive,
+        portfolio_progression_summary,
+        cross_lane_promotion_summary,
+        cross_lane_routing_readiness,
+        operating_constraints_summary,
+    )
+    lane_rotation_summary = _build_lane_rotation_summary(
+        cross_lane_operating_matrix,
+        cross_lane_promotion_summary,
+        cross_lane_routing_readiness,
+        portfolio_operating_directive,
+        portfolio_progression_summary,
+        operator_briefing_summary,
+        dict(rotation_allocator_summary or {}) or None,
+    )
+    lane_suspension_summary = _build_lane_suspension_summary(
+        cross_lane_operating_matrix,
+        cross_lane_promotion_summary,
+        cross_lane_routing_readiness,
+        lane_unlock_summary,
+        portfolio_progression_summary,
+        lane_rotation_summary,
+        operator_briefing_summary,
+    )
+    # Phase 4 Step 3: compute outcome attribution for policy downgrade
+    _outcome_attr = None
+    try:
+        _utils_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))), "utils")
+        if _utils_path not in sys.path:
+            sys.path.insert(0, _utils_path)
+        from outcome_attribution import build_outcome_attribution  # type: ignore[import]
+        _outcome_attr = build_outcome_attribution(lookback_days=30)
+    except Exception:
+        pass
+    portfolio_policy_summary = _build_portfolio_policy_summary(
+        operating_mode_summary,
+        portfolio_operating_directive,
+        portfolio_progression_summary,
+        cross_lane_routing_readiness,
+        cross_lane_promotion_summary,
+        lane_suspension_summary,
+        operating_constraints_summary,
+        operator_briefing_summary,
+        outcome_attribution=_outcome_attr,
+    )
+    action_law_summary = _build_action_law_summary(
+        portfolio_policy_summary,
+        portfolio_operating_directive,
+        portfolio_progression_summary,
+        cross_lane_routing_readiness,
+        lane_suspension_summary,
+        operator_briefing_summary,
+        operating_mode_summary,
+    )
+
+    stack = {
+        "operating_agenda_summary": operating_agenda_summary,
+        "operating_constraints_summary": operating_constraints_summary,
+        "operating_transition_summary": operating_transition_summary,
+        "lane_graduation_rank": lane_graduation_rank,
+        "operating_recommendation": operating_recommendation,
+        "cross_lane_operating_matrix": cross_lane_operating_matrix,
+        "portfolio_operating_directive": portfolio_operating_directive,
+        "portfolio_progression_summary": portfolio_progression_summary,
+        "cross_lane_promotion_summary": cross_lane_promotion_summary,
+        "cross_lane_routing_readiness": cross_lane_routing_readiness,
+        "operator_briefing_summary": operator_briefing_summary,
+        "lane_rotation_summary": lane_rotation_summary,
+        "lane_suspension_summary": lane_suspension_summary,
+        "portfolio_policy_summary": portfolio_policy_summary,
+        "action_law_summary": action_law_summary,
+    }
+
+    # ── Roadmap 3: write authority snapshot for engine authority bridge ────────
+    try:
+        _utils_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))), "utils")
+        if _utils_path not in sys.path:
+            sys.path.insert(0, _utils_path)
+        from authority import write_snapshot  # type: ignore[import]
+        _lss   = lane_suspension_summary.get("lanes", {})
+        _pol   = portfolio_policy_summary
+        _law   = action_law_summary
+        _rr    = cross_lane_routing_readiness
+        # Phase 4 Step 2: compute outcome attribution for snapshot
+        _oa = {}
+        try:
+            from outcome_attribution import build_outcome_attribution  # type: ignore[import]
+            _oa = build_outcome_attribution(lookback_days=30)
+        except Exception:
+            pass
+
+        write_snapshot({
+            "computed_at":                  datetime.now(tz=timezone.utc).isoformat(),
+            "action_law_state":             _law.get("action_law_state"),
+            "highest_permitted_action":     _law.get("highest_permitted_action"),
+            "law_confidence":               _law.get("law_confidence"),
+            "fresh_capital_policy":         _pol.get("fresh_capital_policy"),
+            "rotation_policy":              _pol.get("rotation_policy"),
+            "policy_state":                 _pol.get("policy_state"),
+            "memecoins_suspension_state":   _lss.get("memecoins", {}).get("suspension_state", "ACTIVE"),
+            "spot_suspension_state":        _lss.get("spot", {}).get("suspension_state", "ACTIVE"),
+            "perps_suspension_state":       _lss.get("perps", {}).get("suspension_state", "ACTIVE"),
+            "whale_suspension_state":       _lss.get("whale", {}).get("suspension_state", "ACTIVE"),
+            # Phase B: routing data for rank progression evaluation
+            "system_routing_state":         _rr.get("system_routing_state"),
+            "routing_ready_lanes":          _rr.get("ready_lanes", []),
+            "routing_watch_lanes":          _rr.get("watch_lanes", []),
+            # Phase 4 Step 2: outcome attribution for evidence-gated rank advancement
+            "outcome_aggregate_wr_4h":      _oa.get("aggregate", {}).get("wr_4h"),
+            "outcome_aggregate_n":          _oa.get("aggregate", {}).get("n_total", 0),
+            "outcome_aggregate_sufficient": _oa.get("aggregate", {}).get("sufficient", False),
+            "outcome_best_lane_wr_4h":      max(
+                [_oa.get(l, {}).get("wr_4h") or 0
+                 for l in ("perps", "memecoins", "spot")
+                 if _oa.get(l, {}).get("sufficient", False)]
+                or [0]
+            ) if _oa else None,
+            "outcome_best_lane_sufficient": any(
+                _oa.get(l, {}).get("sufficient", False)
+                for l in ("perps", "memecoins", "spot")
+            ) if _oa else False,
+        })
+    except Exception as _auth_exc:
+        log.warning("authority.write_snapshot failed: %s", _auth_exc)
+
+    return stack
+
+
+def refresh_authority_snapshot() -> bool:
+    """
+    Standalone snapshot refresh — called from a background loop in main.py
+    so the authority snapshot stays fresh even when no dashboard page is open.
+
+    Returns True on success, False on failure.
+    """
+    try:
+        mc    = _posture_memecoins()
+        perps = _posture_perps()
+        spot  = _posture_spot()
+        whale = _posture_whale()
+        capital = {
+            **_home_portfolio_pressure_context(),
+            "perps_collateral_usd": perps.get("collateral_usd"),
+            "spot_invested_usd":    spot.get("invested_usd"),
+        }
+        capital["total_deployed_usd"] = round(
+            float(capital.get("perps_collateral_usd") or 0.0)
+            + float(capital.get("spot_invested_usd") or 0.0),
+            0,
+        )
+        allocator_summary = _build_cross_system_allocator_summary(capital)
+        operating_mode_summary = _build_operating_mode_snapshot(capital, allocator_summary)
+        lane_policy_summary = _build_lane_policy_snapshot(
+            operating_mode_summary,
+            memecoins=mc, perps=perps, spot=spot, whale=whale,
+        )
+        lane_authority_summary = _build_lane_authority_summary(
+            operating_mode_summary,
+            memecoins=mc, perps=perps, spot=spot, whale=whale,
+        )
+        lane_unlock_summary = _build_lane_unlock_summary(
+            operating_mode_summary,
+            lane_policy_summary,
+            lane_authority_summary,
+            memecoins=mc, perps=perps, spot=spot, whale=whale,
+        )
+        # Call the full stack builder — this writes the snapshot as a side effect
+        _build_home_operating_stack(
+            operating_mode_summary,
+            lane_policy_summary,
+            lane_authority_summary,
+            lane_unlock_summary,
+            allocator_summary,
+            None,
+            None,
+        )
+        return True
+    except Exception as exc:
+        log.warning("refresh_authority_snapshot failed: %s", exc)
+        return False
+
+
+def _home_item_lane_context(
+    item: dict | None,
+    lane_policy_summary: dict | None,
+    lane_authority_summary: dict | None,
+    lane_unlock_summary: dict | None,
+) -> dict:
+    """Attach lane-level policy/authority/unlock context to a Home item."""
+    item = dict(item or {})
+    lane_policy_summary = dict(lane_policy_summary or {})
+    lane_authority_summary = dict(lane_authority_summary or {})
+    lane_unlock_summary = dict(lane_unlock_summary or {})
+
+    system = str(item.get("system") or "").strip().upper()
+    lane_key = {
+        "MEMECOINS": "memecoins",
+        "PERP": "perps",
+        "SPOT": "spot",
+        "WHALE": "whale",
+        "WHALE_WATCH": "whale",
+    }.get(system)
+
+    if not lane_key:
+        return {}
+
+    lane_policy = dict(lane_policy_summary.get(lane_key) or {})
+    lane_authority = dict(lane_authority_summary.get(lane_key) or {})
+    lane_unlock = dict(lane_unlock_summary.get(lane_key) or {})
+    return {
+        "lane_policy_state": lane_policy.get("policy_state"),
+        "lane_policy_note": lane_policy.get("policy_note"),
+        "lane_authority": lane_authority.get("authority"),
+        "lane_authority_note": lane_authority.get("authority_note"),
+        "lane_authority_driver": lane_authority.get("primary_driver"),
+        "lane_next_unlock_state": lane_unlock.get("next_unlock_state"),
+        "lane_next_unlock_note": lane_unlock.get("next_unlock_note"),
+    }
+
+
+def _home_item_constraint_context(
+    item: dict | None,
+    operating_mode_summary: dict | None,
+    lane_policy_summary: dict | None,
+    lane_authority_summary: dict | None,
+    lane_unlock_summary: dict | None,
+    operating_constraints_summary: dict | None,
+) -> dict:
+    """Attach the most relevant operating constraint to a Home item."""
+    item = dict(item or {})
+    lane_context = _home_item_lane_context(item, lane_policy_summary, lane_authority_summary, lane_unlock_summary)
+    operating_mode_summary = dict(operating_mode_summary or {})
+    operating_constraints_summary = dict(operating_constraints_summary or {})
+
+    system = str(item.get("system") or "").strip().upper()
+    lane_key = {
+        "MEMECOINS": "memecoins",
+        "PERP": "perps",
+        "SPOT": "spot",
+        "WHALE": "whale",
+        "WHALE_WATCH": "whale",
+    }.get(system)
+    unlock_state = str(lane_context.get("lane_next_unlock_state") or "MAINTAIN").strip().upper() or "MAINTAIN"
+    if lane_key and unlock_state != "MAINTAIN":
+        return {
+            "primary_constraint_key": f"{lane_key.upper()}_{unlock_state}",
+            "primary_constraint_note": lane_context.get("lane_next_unlock_note"),
+            "primary_constraint_source": lane_key,
+        }
+
+    operating_status = str(item.get("operating_status") or "").strip().upper()
+    if operating_status in ("PLANNING_ONLY", "GATED", "BLOCKED"):
+        operating_mode = str(operating_mode_summary.get("operating_mode") or "UNKNOWN").strip().upper() or "UNKNOWN"
+        return {
+            "primary_constraint_key": "MODE_POLICY",
+            "primary_constraint_note": f"Current operating mode ({operating_mode}) still caps this row.",
+            "primary_constraint_source": "operating_mode",
+        }
+
+    route_bucket = str(operating_mode_summary.get("route_bucket") or "UNKNOWN").strip().upper() or "UNKNOWN"
+    window_bucket = str(operating_mode_summary.get("window_bucket") or "UNKNOWN").strip().upper() or "UNKNOWN"
+    if system == "MEMECOINS" and (route_bucket in ("LOCKED", "MICRO_PROBE_ONLY") or window_bucket == "CLOSED"):
+        return {
+            "primary_constraint_key": "MEME_ROUTE",
+            "primary_constraint_note": "Memecoin route/window is still too restricted for stronger deployment.",
+            "primary_constraint_source": "route_bucket",
+        }
+
+    top_constraints = list(operating_constraints_summary.get("top_constraints") or [])
+    if top_constraints:
+        primary = dict(top_constraints[0] or {})
+        return {
+            "primary_constraint_key": primary.get("key"),
+            "primary_constraint_note": primary.get("note"),
+            "primary_constraint_source": primary.get("source"),
+        }
+
+    return {}
+
+
+def _home_marginal_route_memory() -> dict:
+    """Outcome memory for Home allocator marginal-route choices."""
+    import sqlite3 as _sqlite3
+
+    def _snapshot(pnls: list[float]) -> dict:
+        if not pnls:
+            return {
+                "state": "THIN",
+                "confidence": "LOW",
+                "trailing_n": 0,
+                "trailing_weighted_n": 0.0,
+                "wr_delta": 0.0,
+                "avg_delta": 0.0,
+            }
+        trailing = pnls[-10:]
+        tn = len(trailing)
+        tw = sum(1 for p in trailing if p > 0)
+        trailing_wr = (tw / tn * 100.0) if tn else 0.0
+        trailing_avg = (sum(trailing) / tn) if tn else 0.0
+        ln = len(pnls)
+        lw = sum(1 for p in pnls if p > 0)
+        lifetime_wr = (lw / ln * 100.0) if ln else 0.0
+        lifetime_avg = (sum(pnls) / ln) if ln else 0.0
+        if tn >= 5 and trailing_wr >= 58.0 and trailing_avg >= 4.0:
+            state = "COMPOUNDING"
+        elif tn >= 5 and trailing_wr < 38.0:
+            state = "FRAGILE"
+        elif tn >= 3:
+            state = "MIXED"
+        else:
+            state = "THIN"
+        confidence = "HIGH" if ln >= 8 else "MEDIUM" if ln >= 4 else "LOW"
+        return {
+            "state": state,
+            "confidence": confidence,
+            "trailing_n": tn,
+            "trailing_weighted_n": float(tn),
+            "wr_delta": round(trailing_wr - lifetime_wr, 1),
+            "avg_delta": round(trailing_avg - lifetime_avg, 2),
+        }
+
+    def _allocator_posture(value: str | None) -> str:
+        posture = str(value or "UNKNOWN").strip().upper()
+        if posture in ("DEFENSIVE", "TIGHT", "DISCIPLINED", "OPEN"):
+            return posture
+        return "UNKNOWN"
+
+    def _dominant_book(value: str | None) -> str:
+        book = str(value or "UNKNOWN").strip().upper()
+        if book in ("UNDEPLOYED", "SPOT", "PERP", "BALANCED"):
+            return book
+        return "UNKNOWN"
+
+    def _marginal_route(value: str | None) -> str:
+        route = str(value or "UNKNOWN").strip().upper()
+        if route in ("PERP_DEFENSE", "SPOT_DCA", "MEMECOIN_PROBE", "MEMECOIN_SCALE", "HOLD_CASH"):
+            return route
+        return "UNKNOWN"
+
+    def _queue_system(value: str | None) -> str:
+        system = str(value or "UNKNOWN").strip().upper()
+        if system in ("MEMECOINS", "SPOT", "PERP", "WHALE", "CONFLUENCE", "RESEARCH"):
+            return system
+        return "UNKNOWN"
+
+    def _marginal_route_family(posture: str | None, dominant: str | None, route: str | None) -> str:
+        return f"{_allocator_posture(posture)}|{_dominant_book(dominant)}|{_marginal_route(route)}"
+
+    def _marginal_route_lane_family(posture: str | None, system: str | None, route: str | None) -> str:
+        return f"{_allocator_posture(posture)}|{_queue_system(system)}|{_marginal_route(route)}"
+
+    def _marginal_route_action_family(posture: str | None, system: str | None, action: str | None, route: str | None) -> str:
+        return (
+            f"{_allocator_posture(posture)}|{_queue_system(system)}|"
+            f"{str(action or 'UNKNOWN').strip().upper() or 'UNKNOWN'}|{_marginal_route(route)}"
+        )
+
+    def _queue_priority_bucket(value: str | None) -> str:
+        priority = str(value or "UNKNOWN").strip().upper()
+        if priority in ("URGENT", "NORMAL", "LOW", "BACKGROUND", "INFO"):
+            return priority
+        return "UNKNOWN"
+
+    def _marginal_route_priority_family(posture: str | None, system: str | None, priority: str | None, route: str | None) -> str:
+        return (
+            f"{_allocator_posture(posture)}|{_queue_system(system)}|"
+            f"{_queue_priority_bucket(priority)}|{_marginal_route(route)}"
+        )
+
+    try:
+        db_path = os.path.join(os.path.dirname(__file__), "..", "..", "..", "data_storage", "engine.db")
+        conn = _sqlite3.connect(os.path.abspath(db_path))
+        conn.row_factory = _sqlite3.Row
+        rows = conn.execute("""
+            SELECT marginal_route, allocator_posture, dominant_book, queue_system, queue_priority_bucket, action, return_24h_pct
+            FROM research_surface_log
+            WHERE source = 'HOME_QUEUE'
+              AND outcome_status = 'RESOLVED'
+              AND return_24h_pct IS NOT NULL
+              AND marginal_route IS NOT NULL
+            ORDER BY surfaced_at ASC
+        """).fetchall()
+        conn.close()
+        route_buckets: dict[str, list[float]] = {}
+        family_buckets: dict[str, list[float]] = {}
+        lane_family_buckets: dict[str, list[float]] = {}
+        action_family_buckets: dict[str, list[float]] = {}
+        priority_family_buckets: dict[str, list[float]] = {}
+        for r in rows:
+            route = _marginal_route(r["marginal_route"])
+            family = _marginal_route_family(r["allocator_posture"], r["dominant_book"], r["marginal_route"])
+            lane_family = _marginal_route_lane_family(r["allocator_posture"], r["queue_system"], r["marginal_route"])
+            action_family = _marginal_route_action_family(r["allocator_posture"], r["queue_system"], r["action"], r["marginal_route"])
+            priority_family = _marginal_route_priority_family(r["allocator_posture"], r["queue_system"], r["queue_priority_bucket"], r["marginal_route"])
+            pnl = float(r["return_24h_pct"])
+            route_buckets.setdefault(route, []).append(pnl)
+            family_buckets.setdefault(family, []).append(pnl)
+            lane_family_buckets.setdefault(lane_family, []).append(pnl)
+            action_family_buckets.setdefault(action_family, []).append(pnl)
+            priority_family_buckets.setdefault(priority_family, []).append(pnl)
+        return {
+            "route_memory": {k: _snapshot(v) for k, v in route_buckets.items()},
+            "family_memory": {k: _snapshot(v) for k, v in family_buckets.items()},
+            "lane_family_memory": {k: _snapshot(v) for k, v in lane_family_buckets.items()},
+            "action_family_memory": {k: _snapshot(v) for k, v in action_family_buckets.items()},
+            "priority_family_memory": {k: _snapshot(v) for k, v in priority_family_buckets.items()},
+        }
+    except Exception:
+        return {"route_memory": {}, "family_memory": {}, "lane_family_memory": {}, "action_family_memory": {}, "priority_family_memory": {}}
+
+
+def _build_marginal_capital_route(
+    top_action: dict | None,
+    secondary_actions: list[dict] | None,
+    capital: dict,
+    allocator_summary: dict,
+) -> dict:
+    """Cross-system answer to: if new capital moved now, where should it go?"""
+    top = top_action or {}
+    secondary = list(secondary_actions or [])
+    route_bucket = str(allocator_summary.get("route_bucket") or "UNKNOWN")
+    route_memory_ctx = _home_marginal_route_memory()
+    route_memory = dict(route_memory_ctx.get("route_memory") or {})
+    family_memory = dict(route_memory_ctx.get("family_memory") or {})
+    lane_family_memory = dict(route_memory_ctx.get("lane_family_memory") or {})
+    action_family_memory = dict(route_memory_ctx.get("action_family_memory") or {})
+    priority_family_memory = dict(route_memory_ctx.get("priority_family_memory") or {})
+    allocator_posture = str(allocator_summary.get("allocator_posture") or "UNKNOWN").strip().upper() or "UNKNOWN"
+    dominant_book = str(allocator_summary.get("dominant_book") or "UNKNOWN").strip().upper() or "UNKNOWN"
+
+    def _route_family_name(route_name: str) -> str:
+        return f"{allocator_posture}|{dominant_book}|{str(route_name or 'UNKNOWN').strip().upper() or 'UNKNOWN'}"
+
+    def _route_lane_family_name(system_name: str, route_name: str) -> str:
+        return f"{allocator_posture}|{str(system_name or 'UNKNOWN').strip().upper() or 'UNKNOWN'}|{str(route_name or 'UNKNOWN').strip().upper() or 'UNKNOWN'}"
+
+    def _route_action_family_name(system_name: str, action_name: str, route_name: str) -> str:
+        return (
+            f"{allocator_posture}|{str(system_name or 'UNKNOWN').strip().upper() or 'UNKNOWN'}|"
+            f"{str(action_name or 'UNKNOWN').strip().upper() or 'UNKNOWN'}|"
+            f"{str(route_name or 'UNKNOWN').strip().upper() or 'UNKNOWN'}"
+        )
+
+    def _queue_priority_bucket(value: str | None) -> str:
+        priority = str(value or "UNKNOWN").strip().upper()
+        if priority in ("URGENT", "NORMAL", "LOW", "BACKGROUND", "INFO"):
+            return priority
+        return "UNKNOWN"
+
+    def _route_priority_family_name(system_name: str, priority_name: str, route_name: str) -> str:
+        return (
+            f"{allocator_posture}|{str(system_name or 'UNKNOWN').strip().upper() or 'UNKNOWN'}|"
+            f"{_queue_priority_bucket(priority_name)}|"
+            f"{str(route_name or 'UNKNOWN').strip().upper() or 'UNKNOWN'}"
+        )
+
+    def _route_authority(
+        route_name: str,
+        system_name: str,
+        action_name: str,
+        priority_name: str,
+        mem: dict,
+        family: dict,
+        lane_family: dict,
+        action_family: dict,
+        priority_family: dict,
+    ) -> tuple[str, str]:
+        route_state = str(mem.get("state") or "THIN")
+        route_conf = str(mem.get("confidence") or "LOW")
+        route_weighted_n = float(mem.get("trailing_weighted_n") or mem.get("trailing_n") or 0.0)
+        family_state = str(family.get("state") or "THIN")
+        family_conf = str(family.get("confidence") or "LOW")
+        family_weighted_n = float(family.get("trailing_weighted_n") or family.get("trailing_n") or 0.0)
+        lane_state = str(lane_family.get("state") or "THIN")
+        lane_conf = str(lane_family.get("confidence") or "LOW")
+        lane_weighted_n = float(lane_family.get("trailing_weighted_n") or lane_family.get("trailing_n") or 0.0)
+        action_state = str(action_family.get("state") or "THIN")
+        action_conf = str(action_family.get("confidence") or "LOW")
+        action_weighted_n = float(action_family.get("trailing_weighted_n") or action_family.get("trailing_n") or 0.0)
+        priority_state = str(priority_family.get("state") or "THIN")
+        priority_conf = str(priority_family.get("confidence") or "LOW")
+        priority_weighted_n = float(priority_family.get("trailing_weighted_n") or priority_family.get("trailing_n") or 0.0)
+
+        if _route_is_fragile(route_name, system_name, action_name, priority_name):
+            return "FRAGILE", "Route memory stack is fragile lately."
+
+        compound_count = sum(
+            1
+            for state in (route_state, family_state, lane_state, action_state, priority_state)
+            if state == "COMPOUNDING"
+        )
+        stable_context_count = sum(
+            1
+            for state, conf, n in (
+                (family_state, family_conf, family_weighted_n),
+                (lane_state, lane_conf, lane_weighted_n),
+                (action_state, action_conf, action_weighted_n),
+                (priority_state, priority_conf, priority_weighted_n),
+            )
+            if state == "COMPOUNDING" or (state == "MIXED" and conf in ("MEDIUM", "HIGH") and n >= 3.0)
+        )
+        if compound_count >= 2 or (
+            route_state == "COMPOUNDING"
+            and route_conf in ("MEDIUM", "HIGH")
+            and stable_context_count >= 2
+        ):
+            return "STACKED", "Route memory is stacked across multiple context layers."
+        if (
+            route_state == "COMPOUNDING"
+            or stable_context_count >= 2
+            or (
+                family_state == "COMPOUNDING"
+                and family_conf in ("MEDIUM", "HIGH")
+            )
+            or (
+                lane_state == "COMPOUNDING"
+                and lane_conf in ("MEDIUM", "HIGH")
+            )
+        ):
+            return "CONTEXT_BACKED", "Route memory is context-backed enough for disciplined routing."
+        if (
+            route_weighted_n >= 4.0
+            or family_weighted_n >= 4.0
+            or lane_weighted_n >= 4.0
+            or action_weighted_n >= 4.0
+            or priority_weighted_n >= 4.0
+        ):
+            return "UNPROVEN", "Route memory has sample, but not enough constructive authority yet."
+        return "UNPROVEN", "Route memory is still thin and unproven."
+
+    def _fallback_lane_system() -> str:
+        if _spot_dca:
+            return "SPOT"
+        if _perp_defense:
+            return "PERP"
+        if _meme:
+            return "MEMECOINS"
+        if dominant_book in ("SPOT", "PERP"):
+            return dominant_book
+        return "UNKNOWN"
+
+    def _route_is_fragile(route_name: str, system_name: str, action_name: str, priority_name: str) -> bool:
+        mem = route_memory.get(route_name) or {}
+        family = family_memory.get(_route_family_name(route_name)) or {}
+        lane_family = lane_family_memory.get(_route_lane_family_name(system_name, route_name)) or {}
+        action_family = action_family_memory.get(_route_action_family_name(system_name, action_name, route_name)) or {}
+        priority_family = priority_family_memory.get(_route_priority_family_name(system_name, priority_name, route_name)) or {}
+        state = str(mem.get("state") or "THIN")
+        weighted_n = float(mem.get("trailing_weighted_n") or mem.get("trailing_n") or 0.0)
+        confidence = str(mem.get("confidence") or "LOW")
+        family_state = str(family.get("state") or "THIN")
+        family_weighted_n = float(family.get("trailing_weighted_n") or family.get("trailing_n") or 0.0)
+        family_confidence = str(family.get("confidence") or "LOW")
+        lane_family_state = str(lane_family.get("state") or "THIN")
+        lane_family_weighted_n = float((lane_family.get("trailing_weighted_n") or lane_family.get("trailing_n") or 0.0))
+        lane_family_confidence = str(lane_family.get("confidence") or "LOW")
+        action_family_state = str(action_family.get("state") or "THIN")
+        action_family_weighted_n = float((action_family.get("trailing_weighted_n") or action_family.get("trailing_n") or 0.0))
+        action_family_confidence = str(action_family.get("confidence") or "LOW")
+        priority_family_state = str(priority_family.get("state") or "THIN")
+        priority_family_weighted_n = float((priority_family.get("trailing_weighted_n") or priority_family.get("trailing_n") or 0.0))
+        priority_family_confidence = str(priority_family.get("confidence") or "LOW")
+        if priority_family_state == "FRAGILE" and priority_family_weighted_n >= 3.0:
+            return True
+        if action_family_state == "FRAGILE" and action_family_weighted_n >= 3.0:
+            return True
+        if lane_family_state == "FRAGILE" and lane_family_weighted_n >= 3.0:
+            return True
+        if family_state == "FRAGILE" and family_weighted_n >= 3.0:
+            return True
+        return state == "FRAGILE" or (weighted_n >= 4.0 and confidence == "LOW") or (
+            family_weighted_n >= 4.0 and family_confidence == "LOW"
+        ) or (lane_family_weighted_n >= 4.0 and lane_family_confidence == "LOW") or (
+            action_family_weighted_n >= 4.0 and action_family_confidence == "LOW"
+        ) or (
+            priority_family_weighted_n >= 4.0 and priority_family_confidence == "LOW"
+        )
+
+    def _route_memory_score(route_name: str, system_name: str, action_name: str, priority_name: str) -> tuple[int, dict, dict, dict, dict, dict]:
+        mem = route_memory.get(route_name) or {}
+        family = family_memory.get(_route_family_name(route_name)) or {}
+        lane_family = lane_family_memory.get(_route_lane_family_name(system_name, route_name)) or {}
+        action_family = action_family_memory.get(_route_action_family_name(system_name, action_name, route_name)) or {}
+        priority_family = priority_family_memory.get(_route_priority_family_name(system_name, priority_name, route_name)) or {}
+        state = str(mem.get("state") or "THIN")
+        confidence = str(mem.get("confidence") or "LOW")
+        weighted_n = float(mem.get("trailing_weighted_n") or mem.get("trailing_n") or 0.0)
+        score = {
+            "COMPOUNDING": 4,
+            "MIXED": 1,
+            "THIN": -1,
+            "FRAGILE": -5,
+        }.get(state, 0)
+        score += {
+            "HIGH": 1,
+            "MEDIUM": 0,
+            "LOW": -1 if weighted_n >= 4.0 else 0,
+        }.get(confidence, 0)
+        family_state = str(family.get("state") or "THIN")
+        family_confidence = str(family.get("confidence") or "LOW")
+        family_weighted_n = float(family.get("trailing_weighted_n") or family.get("trailing_n") or 0.0)
+        score += {
+            "COMPOUNDING": 2,
+            "MIXED": 0,
+            "THIN": 0,
+            "FRAGILE": -3,
+        }.get(family_state, 0)
+        score += {
+            "HIGH": 1,
+            "MEDIUM": 0,
+            "LOW": -1 if family_weighted_n >= 4.0 else 0,
+        }.get(family_confidence, 0)
+        lane_family_state = str(lane_family.get("state") or "THIN")
+        lane_family_confidence = str(lane_family.get("confidence") or "LOW")
+        lane_family_weighted_n = float((lane_family.get("trailing_weighted_n") or lane_family.get("trailing_n") or 0.0))
+        score += {
+            "COMPOUNDING": 2,
+            "MIXED": 0,
+            "THIN": 0,
+            "FRAGILE": -3,
+        }.get(lane_family_state, 0)
+        score += {
+            "HIGH": 1,
+            "MEDIUM": 0,
+            "LOW": -1 if lane_family_weighted_n >= 4.0 else 0,
+        }.get(lane_family_confidence, 0)
+        action_family_state = str(action_family.get("state") or "THIN")
+        action_family_confidence = str(action_family.get("confidence") or "LOW")
+        action_family_weighted_n = float((action_family.get("trailing_weighted_n") or action_family.get("trailing_n") or 0.0))
+        score += {
+            "COMPOUNDING": 2,
+            "MIXED": 0,
+            "THIN": 0,
+            "FRAGILE": -3,
+        }.get(action_family_state, 0)
+        score += {
+            "HIGH": 1,
+            "MEDIUM": 0,
+            "LOW": -1 if action_family_weighted_n >= 4.0 else 0,
+        }.get(action_family_confidence, 0)
+        priority_family_state = str(priority_family.get("state") or "THIN")
+        priority_family_confidence = str(priority_family.get("confidence") or "LOW")
+        priority_family_weighted_n = float((priority_family.get("trailing_weighted_n") or priority_family.get("trailing_n") or 0.0))
+        score += {
+            "COMPOUNDING": 2,
+            "MIXED": 0,
+            "THIN": 0,
+            "FRAGILE": -3,
+        }.get(priority_family_state, 0)
+        score += {
+            "HIGH": 1,
+            "MEDIUM": 0,
+            "LOW": -1 if priority_family_weighted_n >= 4.0 else 0,
+        }.get(priority_family_confidence, 0)
+        return score, mem, family, lane_family, action_family, priority_family
+
+    all_rows = [top, *secondary]
+
+    def _first_match(fn):
+        for row in all_rows:
+            if isinstance(row, dict) and fn(row):
+                return row
+        return None
+
+    _perp_defense = _first_match(
+        lambda r: str(r.get("system") or "") == "PERP"
+        and str(r.get("action") or "") in ("WATCH", "MANAGE")
+        and str(r.get("priority") or "") in ("URGENT", "NORMAL")
+    )
+
+    _spot_dca = _first_match(
+        lambda r: str(r.get("system") or "") == "SPOT"
+        and str(r.get("action") or "") == "DCA"
+    )
+
+    _meme = _first_match(
+        lambda r: str(r.get("system") or "") == "MEMECOINS"
+        and str(r.get("action") or "") in ("ACT", "RESEARCH", "WATCH")
+        and str(r.get("block_state") or "") in ("CLEAR", "CONSTRAINED", "")
+    )
+
+    options: list[dict] = []
+    if _perp_defense:
+        _perp_action = str(_perp_defense.get("action") or "HOLD")
+        _perp_priority = str(_perp_defense.get("priority") or "NORMAL")
+        _mem_score, _mem, _family, _lane_family, _action_family, _priority_family = _route_memory_score("PERP_DEFENSE", "PERP", _perp_action, _perp_priority)
+        options.append({
+            "route": "PERP_DEFENSE",
+            "system": "PERP",
+            "action": _perp_action,
+            "priority": _perp_priority,
+            "score": 9 + _mem_score,
+            "note": "Marginal capital should stay focused on perp risk defense before new deployments elsewhere.",
+            "memory": _mem,
+            "family_memory": _family,
+            "lane_family_memory": _lane_family,
+            "action_family_memory": _action_family,
+            "priority_family_memory": _priority_family,
+        })
+    if _spot_dca:
+        _spot_action = str(_spot_dca.get("action") or "DCA")
+        _spot_priority = str(_spot_dca.get("priority") or "NORMAL")
+        _mem_score, _mem, _family, _lane_family, _action_family, _priority_family = _route_memory_score("SPOT_DCA", "SPOT", _spot_action, _spot_priority)
+        options.append({
+            "route": "SPOT_DCA",
+            "system": "SPOT",
+            "action": _spot_action,
+            "priority": _spot_priority,
+            "score": 7 + _mem_score,
+            "note": "Spot is the cleaner marginal destination right now.",
+            "memory": _mem,
+            "family_memory": _family,
+            "lane_family_memory": _lane_family,
+            "action_family_memory": _action_family,
+            "priority_family_memory": _priority_family,
+        })
+    if _meme and route_bucket == "SCALE_READY":
+        _meme_action = str(_meme.get("action") or "ACT")
+        _meme_priority = str(_meme.get("priority") or "NORMAL")
+        _mem_score, _mem, _family, _lane_family, _action_family, _priority_family = _route_memory_score("MEMECOIN_SCALE", "MEMECOINS", _meme_action, _meme_priority)
+        options.append({
+            "route": "MEMECOIN_SCALE",
+            "system": "MEMECOINS",
+            "action": _meme_action,
+            "priority": _meme_priority,
+            "score": 6 + _mem_score,
+            "note": "Memecoin lane is the best marginal destination for added capital if a qualified continuation candidate appears.",
+            "memory": _mem,
+            "family_memory": _family,
+            "lane_family_memory": _lane_family,
+            "action_family_memory": _action_family,
+            "priority_family_memory": _priority_family,
+        })
+    if _meme and route_bucket in ("DISCIPLINED_PROBE", "MICRO_PROBE_ONLY"):
+        _meme_action = str(_meme.get("action") or "RESEARCH")
+        _meme_priority = str(_meme.get("priority") or "NORMAL")
+        _mem_score, _mem, _family, _lane_family, _action_family, _priority_family = _route_memory_score("MEMECOIN_PROBE", "MEMECOINS", _meme_action, _meme_priority)
+        options.append({
+            "route": "MEMECOIN_PROBE",
+            "system": "MEMECOINS",
+            "action": _meme_action,
+            "priority": _meme_priority,
+            "score": 4 + _mem_score,
+            "note": "Memecoin lane is open only for disciplined probe-sized capital, not full-size deployment.",
+            "memory": _mem,
+            "family_memory": _family,
+            "lane_family_memory": _lane_family,
+            "action_family_memory": _action_family,
+            "priority_family_memory": _priority_family,
+        })
+
+    if options:
+        options.sort(key=lambda o: o["score"], reverse=True)
+        best = options[0]
+        best_mem = dict(best.get("memory") or {})
+        best_family_mem = dict(best.get("family_memory") or {})
+        best_lane_family_mem = dict(best.get("lane_family_memory") or {})
+        best_action_family_mem = dict(best.get("action_family_memory") or {})
+        best_priority_family_mem = dict(best.get("priority_family_memory") or {})
+        best_state = str(best_mem.get("state") or "THIN")
+        best_conf = str(best_mem.get("confidence") or "LOW")
+        best_family = _route_family_name(str(best["route"]))
+        best_lane_family = _route_lane_family_name(str(best.get("system") or "UNKNOWN"), str(best["route"]))
+        best_action_family = _route_action_family_name(str(best.get("system") or "UNKNOWN"), str(best.get("action") or "UNKNOWN"), str(best["route"]))
+        best_priority_family = _route_priority_family_name(str(best.get("system") or "UNKNOWN"), str(best.get("priority") or "UNKNOWN"), str(best["route"]))
+        best_family_state = str(best_family_mem.get("state") or "THIN")
+        best_family_conf = str(best_family_mem.get("confidence") or "LOW")
+        best_lane_family_state = str(best_lane_family_mem.get("state") or "THIN")
+        best_lane_family_conf = str(best_lane_family_mem.get("confidence") or "LOW")
+        best_action_family_state = str(best_action_family_mem.get("state") or "THIN")
+        best_action_family_conf = str(best_action_family_mem.get("confidence") or "LOW")
+        best_priority_family_state = str(best_priority_family_mem.get("state") or "THIN")
+        best_priority_family_conf = str(best_priority_family_mem.get("confidence") or "LOW")
+        best_authority, best_authority_note = _route_authority(
+            str(best["route"]),
+            str(best.get("system") or "UNKNOWN"),
+            str(best.get("action") or "UNKNOWN"),
+            str(best.get("priority") or "UNKNOWN"),
+            best_mem,
+            best_family_mem,
+            best_lane_family_mem,
+            best_action_family_mem,
+            best_priority_family_mem,
+        )
+        authority_ok = False
+        if best["route"] == "MEMECOIN_SCALE":
+            authority_ok = best_authority == "STACKED"
+        elif best["route"] in ("MEMECOIN_PROBE", "SPOT_DCA", "PERP_DEFENSE"):
+            authority_ok = best_authority in ("CONTEXT_BACKED", "STACKED")
+
+        if best["score"] > 0 and authority_ok and not _route_is_fragile(str(best["route"]), str(best.get("system") or "UNKNOWN"), str(best.get("action") or "UNKNOWN"), str(best.get("priority") or "UNKNOWN")):
+            note = str(best["note"])
+            if best_state == "COMPOUNDING":
+                note += " Recent route memory is compounding."
+            elif best_state == "MIXED" and best_conf in ("MEDIUM", "HIGH"):
+                note += " Route memory is mixed but stable enough to allow disciplined routing."
+            if best_family_state == "COMPOUNDING":
+                note += " This allocator-posture route family is also compounding."
+            if best_lane_family_state == "COMPOUNDING":
+                note += " This lane-specific route family is also compounding."
+            if best_action_family_state == "COMPOUNDING":
+                note += " This lane-action route family is also compounding."
+            if best_priority_family_state == "COMPOUNDING":
+                note += " This lane-priority route family is also compounding."
+            return {
+                "marginal_route": best["route"],
+                "marginal_route_note": note,
+                "marginal_route_memory_state": best_state,
+                "marginal_route_memory_confidence": best_conf,
+                "marginal_route_family": best_family,
+                "marginal_route_family_memory_state": best_family_state,
+                "marginal_route_family_memory_confidence": best_family_conf,
+                "marginal_route_lane_family": best_lane_family,
+                "marginal_route_lane_family_memory_state": best_lane_family_state,
+                "marginal_route_lane_family_memory_confidence": best_lane_family_conf,
+                "marginal_route_action_family": best_action_family,
+                "marginal_route_action_family_memory_state": best_action_family_state,
+                "marginal_route_action_family_memory_confidence": best_action_family_conf,
+                "marginal_route_priority_family": best_priority_family,
+                "marginal_route_priority_family_memory_state": best_priority_family_state,
+                "marginal_route_priority_family_memory_confidence": best_priority_family_conf,
+                "marginal_route_authority": best_authority,
+                "marginal_route_authority_note": best_authority_note,
+            }
+        if best["route"] == "PERP_DEFENSE":
+            hold_note = "Perp-defense route memory is fragile lately. Hold cash until conditions stabilize."
+        elif best["route"] == "SPOT_DCA":
+            hold_note = "Spot-DCA route memory is fragile lately. Hold cash until cleaner adds appear."
+        elif str(best["route"]).startswith("MEMECOIN"):
+            hold_note = "Memecoin route memory is fragile lately. Hold cash until cleaner continuation conditions return."
+        else:
+            hold_note = "Recent route memory is too weak to earn fresh capital right now. Hold cash."
+        if best_family_state == "FRAGILE":
+            hold_note = "Allocator-posture route-family memory is fragile lately. Hold cash until cleaner conditions return."
+        elif best_authority == "UNPROVEN":
+            hold_note = f"{best_authority_note} Hold cash until a route earns clearer authority."
+        return {
+            "marginal_route": "HOLD_CASH",
+            "marginal_route_note": hold_note,
+            "marginal_route_memory_state": best_state,
+            "marginal_route_memory_confidence": best_conf,
+            "marginal_route_family": best_family,
+            "marginal_route_family_memory_state": best_family_state,
+            "marginal_route_family_memory_confidence": best_family_conf,
+            "marginal_route_lane_family": best_lane_family,
+            "marginal_route_lane_family_memory_state": best_lane_family_state,
+            "marginal_route_lane_family_memory_confidence": best_lane_family_conf,
+            "marginal_route_action_family": best_action_family,
+            "marginal_route_action_family_memory_state": best_action_family_state,
+            "marginal_route_action_family_memory_confidence": best_action_family_conf,
+            "marginal_route_priority_family": best_priority_family,
+            "marginal_route_priority_family_memory_state": best_priority_family_state,
+            "marginal_route_priority_family_memory_confidence": best_priority_family_conf,
+            "marginal_route_authority": best_authority,
+            "marginal_route_authority_note": best_authority_note,
+        }
+
+    return {
+        "marginal_route": "HOLD_CASH",
+        "marginal_route_note": "No lane has earned fresh marginal capital right now. Hold cash and wait for cleaner conditions.",
+        "marginal_route_memory_state": "THIN",
+        "marginal_route_memory_confidence": "LOW",
+        "marginal_route_family": _route_family_name("HOLD_CASH"),
+        "marginal_route_family_memory_state": "THIN",
+        "marginal_route_family_memory_confidence": "LOW",
+        "marginal_route_lane_family": _route_lane_family_name(_fallback_lane_system(), "HOLD_CASH"),
+        "marginal_route_lane_family_memory_state": "THIN",
+        "marginal_route_lane_family_memory_confidence": "LOW",
+        "marginal_route_action_family": _route_action_family_name(_fallback_lane_system(), "HOLD", "HOLD_CASH"),
+        "marginal_route_action_family_memory_state": "THIN",
+        "marginal_route_action_family_memory_confidence": "LOW",
+        "marginal_route_priority_family": _route_priority_family_name(_fallback_lane_system(), "NORMAL", "HOLD_CASH"),
+        "marginal_route_priority_family_memory_state": "THIN",
+        "marginal_route_priority_family_memory_confidence": "LOW",
+        "marginal_route_authority": "UNPROVEN",
+        "marginal_route_authority_note": "No route has earned authority yet.",
+    }
+
+
+# ── Patch 260: Home v3 — state-change annotation helpers ─────────────────────
+
+_HOME_QUEUE_SNAPSHOT_KEY = "home_queue_snapshot"
+
+
+def _home_item_key(item: dict) -> str:
+    """Stable identity key for a queue item across generations.
+
+    Key = system:action:symbol — e.g. "MEMECOINS:ACT:WRT", "WHALE:RESEARCH:TESTICLE".
+    Symbol is normalised to '' for lane-level rows (PERP WAIT, MEMECOINS WAIT, etc.)
+    so their identity is stable even when the reason string changes.
+    """
+    return f"{item.get('system', '')}:{item.get('action', '')}:{item.get('symbol') or ''}"
+
+
+def _home_item_tier(item: dict) -> int:
+    """Numeric tier for UPGRADED / DEGRADED comparison.  Higher = better."""
+    return {"ACT": 3, "RESEARCH": 2, "MONITOR": 1}.get(item.get("action", ""), 0)
+
+
+def _home_snapshot_load() -> dict | None:
+    """Load the previous Home queue snapshot from kv_store.  Returns None on miss."""
+    try:
+        from utils.db import get_conn  # type: ignore
+        with get_conn() as _c:
+            _r = _c.execute(
+                "SELECT value FROM kv_store WHERE key=?",
+                (_HOME_QUEUE_SNAPSHOT_KEY,)
+            ).fetchone()
+            return json.loads(_r[0]) if _r else None
+    except Exception:
+        return None
+
+
+def _home_snapshot_save(items: list, ts: str) -> None:
+    """Persist current Home queue snapshot to kv_store for next-generation diffing."""
+    try:
+        from utils.db import get_conn  # type: ignore
+        payload = json.dumps({"_ts": ts, "items": items})
+        with get_conn() as _c:
+            _c.execute(
+                "INSERT INTO kv_store (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (_HOME_QUEUE_SNAPSHOT_KEY, payload),
+            )
+    except Exception:
+        pass
+
+
+def _fetch_jupiter_summary() -> tuple:
+    """
+    Returns (collateral_usd, net_pnl_usd, worst_liq_pct) from Jupiter live API.
+    collateralUsd is stored in micro-units (÷ 1 000 000); pnl and prices are USD.
+    Raises on failure — caller falls back to DB values.
+    """
+    import requests as _req
+    wallet = _resolve_jup_wallet()
+    if not wallet:
+        raise RuntimeError("Jupiter wallet not configured")
+    r = _req.get(_JUP_V1_POS, params={"walletAddress": wallet}, timeout=5)
+    if r.status_code != 200:
+        raise RuntimeError(f"Jupiter HTTP {r.status_code}")
+    raw = r.json().get("dataList") or r.json().get("positions") or []
+    total_col: float       = 0.0
+    net_pnl:   float       = 0.0
+    worst_liq: float | None = None
+    for p in raw:
+        total_col += _fl(p.get("collateralUsd"), 1_000_000)
+        net_pnl   += _fl(p.get("pnlAfterFeesUsd"))
+        mark = _fl(p.get("markPrice"))
+        liq  = _fl(p.get("liquidationPrice"))
+        if mark > 0 and liq > 0:
+            dist = abs(mark - liq) / mark * 100
+            if worst_liq is None or dist < worst_liq:
+                worst_liq = dist
+    return (
+        round(total_col, 2),
+        round(net_pnl, 2),
+        round(worst_liq, 1) if worst_liq is not None else None,
+    )
+
+
+def _build_home_summary_payload() -> dict:
     import sys
     root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
     if root not in sys.path:
         sys.path.insert(0, root)
 
-    from utils.db import get_conn
-
-    result = {
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
         "tiers":       _tiers_summary(root),
         "memecoins":   _memecoins_summary(),
         "spot":        _spot_summary(),
         "whale_watch": _whale_summary(),
+        "priority_engine": {
+            "mode": "ACTION_BOARD_OWNS_PRIORITY",
+            "detail": "Home summary stays lightweight; buy/watch reasoning is served by the action board.",
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        },
     }
-    return result
+
+
+@router.get("/summary")
+async def get_home_summary(_user=Depends(get_current_user)):
+    """
+    Single endpoint for the HOME tab.
+    Returns compact status for: Perp Tiers, Memecoins, Spot, Whale Watch.
+    """
+
+    try:
+        return await snapshot_or_build("home:summary", _build_home_summary_payload, fresh_s=180, stale_s=600, wait_timeout_s=6)
+    except Exception as exc:
+        raise HTTPException(status_code=504, detail=str(exc))
+
+
+def _build_home_speculation_heat_payload(history_limit: int = 12) -> dict:
+    """Compact speculation heat snapshot for Home."""
+    from utils.db import (
+        get_latest_speculation_heat_snapshot,
+        get_recent_speculation_heat_snapshots,
+        record_speculation_heat_snapshot,
+    )
+    from utils.speculation_heat import build_speculation_heat_snapshot
+
+    latest = get_latest_speculation_heat_snapshot()
+    fresh_enough = False
+    if latest:
+        try:
+            ts = datetime.fromisoformat(str(latest.get("ts_utc") or "").replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            fresh_enough = (datetime.now(timezone.utc) - ts.astimezone(timezone.utc)).total_seconds() < 20 * 60
+        except Exception:
+            fresh_enough = False
+
+    payload = latest if (latest and fresh_enough) else build_speculation_heat_snapshot()
+    if not (latest and fresh_enough):
+        try:
+            record_speculation_heat_snapshot(payload, min_interval_minutes=30)
+        except Exception:
+            pass
+    history = get_recent_speculation_heat_snapshots(limit=max(1, min(int(history_limit), 48)))
+    generated_at = payload.get("generated_at") or payload.get("ts_utc") or datetime.now(timezone.utc).isoformat()
+    return {
+        **payload,
+        "generated_at": generated_at,
+        "history": [
+            {
+                "ts_utc": item.get("ts_utc") or item.get("generated_at"),
+                "heat_state": item.get("heat_state"),
+                "heat_score": item.get("heat_score"),
+                "momentum": item.get("momentum"),
+            }
+            for item in history
+        ],
+    }
+
+
+def _warming_snapshot(name: str) -> dict:
+    return {
+        "_snapshot": {
+            "name": name,
+            "updated_at": None,
+            "age_seconds": None,
+            "status": "WARMING",
+            "source": "fallback",
+        }
+    }
+
+
+@router.get("/speculation-heat")
+async def get_home_speculation_heat(_user=Depends(get_current_user), history_limit: int = 12):
+    """Compact speculation heat snapshot for Home."""
+    key = f"home:speculation-heat:{max(1, min(int(history_limit), 48))}"
+    try:
+        return await snapshot_or_build(
+            key,
+            lambda: _build_home_speculation_heat_payload(history_limit),
+            fresh_s=120,
+            stale_s=900,
+            wait_timeout_s=4,
+        )
+    except Exception:
+        return {
+            **_warming_snapshot(key),
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "heat_state": "WARMING",
+            "heat_score": None,
+            "momentum": "UNKNOWN",
+            "history": [],
+        }
+
+
+@router.get("/memecoin-outcome-insights")
+def get_home_memecoin_outcome_insights(
+    _user=Depends(get_current_user),
+    window_days: int = 90,
+    min_trades: int = 5,
+):
+    """Compact outcome-learning summary for Home."""
+    from utils.db import get_memecoin_outcome_insights
+
+    return get_memecoin_outcome_insights(
+        window_days=max(7, int(window_days)),
+        min_trades=max(3, int(min_trades)),
+    )
+
+
+@router.get("/ai-analyst")
+async def get_home_ai_analyst(
+    _user=Depends(get_current_user),
+    max_age_minutes: int = 60,
+    window_days: int = 90,
+):
+    """Latest advisory memo from the runtime-owned AI analyst service."""
+    from utils.ai_analyst import get_or_refresh_ai_analyst_snapshot
+
+    return await get_or_refresh_ai_analyst_snapshot(
+        max_age_minutes=max(30, int(max_age_minutes)),
+        window_days=max(7, int(window_days)),
+    )
 
 
 def _tiers_summary(root: str) -> dict:
     try:
         from utils.db import get_conn
         from utils.tier_manager import get_profit_buffer  # type: ignore
+        from utils.perp_executor import get_perp_status  # type: ignore
         import sqlite3
 
         db_path = os.path.join(root, "data_storage", "engine.db")
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
 
-        positions = conn.execute("""
-            SELECT symbol, collateral_usd, notes
-            FROM perp_positions
-            WHERE status='OPEN' AND notes LIKE '%TIER%'
-        """).fetchall()
+        # Use the canonical perp status snapshot so Home matches /api/perps/status.
+        # The older notes LIKE '%TIER%' filter missed active scalp positions and
+        # made Home incorrectly report the perp lane as idle.
+        real_positions = 0
+        collateral     = 0.0
+        ledger_entries = 0
+        try:
+            perp_status = get_perp_status() or {}
+            positions_list = perp_status.get("positions") or []
+            real_positions = int(perp_status.get("open_positions") or len(positions_list) or 0)
+            collateral = round(sum(float((p or {}).get("collateral_usd") or 0.0) for p in positions_list), 2)
+            ledger_entries = real_positions
+        except Exception as pex:
+            log.debug("tiers_summary canonical perps snapshot failed: %s", pex)
+            by_symbol = conn.execute("""
+                SELECT symbol,
+                       SUM(collateral_usd) AS collateral_usd,
+                       COUNT(*)            AS entry_count
+                FROM perp_positions
+                WHERE status='OPEN'
+                GROUP BY symbol
+            """).fetchall()
+            real_positions = len(by_symbol)
+            collateral     = sum(float(p["collateral_usd"] or 0) for p in by_symbol)
+            ledger_entries = sum(int(p["entry_count"]) for p in by_symbol)
 
-        collateral = sum(float(p["collateral_usd"] or 0) for p in positions)
         buffer_usd = get_profit_buffer(conn)
 
         # Count TP cycles from kv_store
@@ -66,16 +5451,38 @@ def _tiers_summary(root: str) -> dict:
         tp_cycles = int(row["value"]) if row else 0
 
         conn.close()
+
+        # ── Enrich with Jupiter live data (collateral, PnL, worst liq distance) ─
+        live_col      = collateral   # fallback: DB ledger total
+        net_pnl_usd   = None
+        worst_liq_pct = None
+        data_source   = "db_fallback"
+        try:
+            live_col, net_pnl_usd, worst_liq_pct = _fetch_jupiter_summary()
+            data_source = "jupiter"
+        except Exception as jex:
+            log.debug("tiers_summary jupiter: %s", jex)
+
         return {
-            "mode":          "LIVE" if os.getenv("PERP_DRY_RUN", "true").lower() == "false" else "SIM",
-            "positions":     len(positions),
-            "collateral_usd": round(collateral, 2),
-            "buffer_usd":    round(buffer_usd, 2),
-            "tp_cycles":     tp_cycles,
+            "mode":           "LIVE" if os.getenv("PERP_DRY_RUN", "true").lower() == "false" else "SIM",
+            "positions":      real_positions,    # real on-chain Jupiter positions (e.g. 3)
+            "ledger_entries": ledger_entries,    # internal stacking rows (e.g. 60)
+            "collateral_usd": live_col,
+            "net_pnl_usd":    net_pnl_usd,
+            "worst_liq_pct":  worst_liq_pct,
+            "buffer_usd":     round(buffer_usd, 2),
+            "tp_cycles":      tp_cycles,
+            "data_source":    data_source,
+            "fetched_at":     datetime.now(timezone.utc).isoformat(),
         }
     except Exception as e:
         log.debug("tiers_summary error: %s", e)
-        return {"mode": "?", "positions": 0, "collateral_usd": 0, "buffer_usd": 0, "tp_cycles": 0}
+        return {
+            "mode": "?", "positions": 0, "ledger_entries": 0,
+            "collateral_usd": 0, "net_pnl_usd": None, "worst_liq_pct": None,
+            "buffer_usd": 0, "tp_cycles": 0, "data_source": "db_fallback",
+            "fetched_at": None,
+        }
 
 
 def _memecoins_summary() -> dict:
@@ -95,38 +5502,41 @@ def _memecoins_summary() -> dict:
             """).fetchone()
             wr = wr_row[0] if wr_row and wr_row[0] is not None else None
 
-            # F&G from kv_store
-            fg_row = conn.execute(
-                "SELECT value FROM kv_store WHERE key='shared_fear_greed'"
-            ).fetchone()
-            fg_val = None
-            if fg_row:
-                try:
-                    fg_val = json.loads(fg_row["value"]).get("value")
-                except Exception:
-                    pass
+        # F&G via shared cache — use get_fear_greed() NOT a raw kv_store read.
+        # Raw kv_store reads bypass the 15-min TTL and can return a value that is
+        # days stale, causing Home MEMECOIN card to disagree with MarketOverviewBar.
+        fg_val = None
+        try:
+            from utils.agent_coordinator import get_fear_greed  # type: ignore
+            fg_val = get_fear_greed().get("value")
+        except Exception:
+            pass
 
-            # Next milestone (same ladder as memecoins router)
-            if complete >= 1000:
-                next_ms = ((complete // 500) + 1) * 500
-            elif complete >= 500:
-                next_ms = 1000
-            elif complete >= 200:
-                next_ms = 500
-            elif complete >= 50:
-                next_ms = 200
-            elif complete >= 20:
-                next_ms = 50
-            else:
-                next_ms = 20
+        # Next milestone (same ladder as memecoins router)
+        if complete >= 1000:
+            next_ms = ((complete // 500) + 1) * 500
+        elif complete >= 500:
+            next_ms = 1000
+        elif complete >= 200:
+            next_ms = 500
+        elif complete >= 50:
+            next_ms = 200
+        elif complete >= 20:
+            next_ms = 50
+        else:
+            next_ms = 20
 
+        # Mode reflects the pilot framework: PAPER | PILOT | LIVE
+        _dry  = os.getenv("MEMECOIN_DRY_RUN",   "true").lower()  == "true"
+        _plot = os.getenv("MEMECOIN_PILOT_MODE", "false").lower() == "true"
+        _mode = "PAPER" if _dry else ("PILOT" if _plot else "LIVE")
         return {
-            "mode":          "PAPER" if os.getenv("MEMECOIN_DRY_RUN", "true").lower() != "false" else "LIVE",
-            "outcomes":      complete,
+            "mode":           _mode,
+            "outcomes":       complete,
             "next_milestone": next_ms,
-            "wr_pct":        wr,
-            "fg_value":      fg_val,
-            "fg_ok":         fg_val is not None and fg_val > 25,
+            "wr_pct":         wr,
+            "fg_value":       fg_val,
+            "fg_ok":          fg_val is not None and fg_val > 25,
         }
     except Exception as e:
         log.debug("memecoins_summary error: %s", e)
@@ -134,83 +5544,1067 @@ def _memecoins_summary() -> dict:
 
 
 def _spot_summary() -> dict:
+    holdings_count    = 0
+    basket_size       = 0
+    signal_confidence = "pending"
+    win_rate_7d: float | None = None
+    outcomes_complete = 0
+    holdings_source   = "ledger"
+    wallet_address    = None
+
     try:
         from utils.db import get_conn
+        from utils.spot_accumulator import get_portfolio_state  # type: ignore
+
+        try:
+            _spot_state = get_portfolio_state() or {}
+            holdings_count = int(_spot_state.get("holdings_count") or 0)
+            holdings_source = str(_spot_state.get("holdings_source") or holdings_source)
+            wallet_address = _spot_state.get("wallet_address")
+            basket_size = len(_spot_state.get("holdings") or []) or basket_size
+        except Exception:
+            pass
+
         with get_conn() as conn:
-            # Count spot signal outcomes
-            outcomes = conn.execute(
-                "SELECT COUNT(*) FROM spot_signal_outcomes WHERE status='COMPLETE'"
-            ).fetchone()
-            outcome_count = outcomes[0] if outcomes else 0
+            # Basket size — count tokens in kv_store signals (not hardcoded)
+            try:
+                sr = conn.execute(
+                    "SELECT value FROM kv_store WHERE key='spot_current_signals'"
+                ).fetchone()
+                if sr:
+                    raw      = json.loads(sr[0])
+                    spot_map = raw.get("data", raw) if isinstance(raw, dict) else {}
+                    basket_size = len(spot_map)
+            except Exception:
+                pass
 
-            # Live buys
-            live_row = conn.execute(
-                "SELECT COUNT(*) FROM spot_buys WHERE status='ACTIVE'"
-            ).fetchone()
-            live_buys = live_row[0] if live_row else 0
+            # 7d timing rate — from spot_signals (correct table)
+            try:
+                outcomes_complete = conn.execute(
+                    "SELECT COUNT(*) FROM spot_signals WHERE status='COMPLETE'"
+                ).fetchone()[0]
+                wins = conn.execute(
+                    "SELECT COUNT(*) FROM spot_signals WHERE status='COMPLETE' AND return_7d_pct > 0"
+                ).fetchone()[0]
+                win_rate_7d = round(wins / outcomes_complete * 100, 1) if outcomes_complete else None
+            except Exception:
+                pass
 
-        return {
-            "mode":         "PAPER",  # spot live is manual — always shown as advisory
-            "outcomes":     outcome_count,
-            "live_buys":    live_buys,
-            "basket_size":  11,       # fixed basket of 11 tokens (WIF/BONK/etc.)
-        }
+            # Signal confidence from tuner
+            try:
+                tr = conn.execute(
+                    "SELECT value FROM kv_store WHERE key='spot_signal_thresholds'"
+                ).fetchone()
+                if tr:
+                    tuner             = json.loads(tr[0])
+                    signal_confidence = tuner.get("confidence", "pending")
+            except Exception:
+                pass
+
     except Exception as e:
         log.debug("spot_summary error: %s", e)
-        return {"mode": "PAPER", "outcomes": 0, "live_buys": 0, "basket_size": 11}
+
+    return {
+        "mode":               "LIVE",   # WIF is a real live position
+        "holdings_count":     holdings_count,
+        "basket_size":        basket_size,
+        "signal_confidence":  signal_confidence,
+        "win_rate_7d":        win_rate_7d,
+        "outcomes_complete":  outcomes_complete,
+        "holdings_source":    holdings_source,
+        "wallet_address":     wallet_address,
+    }
+
+
+def _spot_posture_snapshot() -> dict:
+    """Shared Home-side spot posture truth used by posture, NBM, and action queue."""
+    try:
+        import sqlite3 as _sqlite3
+        from collections import defaultdict as _dd
+        from utils.db import get_conn
+        from utils.spot_accumulator import BASKET  # type: ignore
+
+        def _fg_bucket(fg: int | None) -> str:
+            if fg is None:
+                return "UNKNOWN"
+            if fg < 15:
+                return "XFEAR"
+            if fg < 25:
+                return "FEAR"
+            if fg < 40:
+                return "CAUTIOUS"
+            return "NEUTRAL+"
+
+        current_signals: dict = {}
+        bucket_perf: dict = {}
+        with get_conn() as conn:
+            conn.row_factory = _sqlite3.Row
+            sr = conn.execute(
+                "SELECT value FROM kv_store WHERE key='spot_current_signals'"
+            ).fetchone()
+            if sr:
+                raw = json.loads(sr[0])
+                current_signals = raw.get("data", raw) if isinstance(raw, dict) else {}
+
+            rows = conn.execute("""
+                SELECT signal_type, fg_at_signal, return_7d_pct
+                FROM spot_signals
+                WHERE status = 'COMPLETE' AND return_7d_pct IS NOT NULL
+            """).fetchall()
+
+        stats: dict = _dd(lambda: {"n": 0, "wins": 0, "sum_ret": 0.0})
+        for r in rows:
+            key = (r["signal_type"], _fg_bucket(r["fg_at_signal"]))
+            stats[key]["n"] += 1
+            stats[key]["wins"] += 1 if (r["return_7d_pct"] or 0) > 0 else 0
+            stats[key]["sum_ret"] += r["return_7d_pct"] or 0.0
+        for key, s in stats.items():
+            n = s["n"]
+            bucket_perf[key] = {
+                "n": n,
+                "win_rate": round(s["wins"] / n * 100, 1) if n else None,
+                "avg_return": round(s["sum_ret"] / n, 2) if n else None,
+            }
+
+        rows_out: list[dict] = []
+        by_symbol: dict = {}
+        actionable: list[str] = []
+        poor: list[str] = []
+        for token in BASKET:
+            sym = token["symbol"]
+            sig = current_signals.get(sym) or {}
+            stype = str(sig.get("signal_type") or "HOLD")
+            try:
+                fg = int(sig["fg"]) if sig.get("fg") is not None else None
+            except Exception:
+                fg = None
+
+            if fg is None:
+                posture = "F&G_FEED_DOWN"
+            elif stype in ("HOLD", "AVOID"):
+                posture = "HOLD"
+            else:
+                perf = bucket_perf.get((stype, _fg_bucket(fg)))
+                if perf is None or (perf.get("n") or 0) < 10:
+                    posture = "INSUFFICIENT_DATA"
+                else:
+                    wr = float(perf.get("win_rate") or 0)
+                    if wr >= 65:
+                        posture = "PRIME_ENTRY"
+                    elif wr >= 50:
+                        posture = "ACCUMULATE"
+                    elif wr >= 35:
+                        posture = "HOLD"
+                    else:
+                        posture = "POOR_CONDITIONS"
+
+            row = {
+                "symbol": sym,
+                "token_address": token.get("mint"),
+                "signal_type": stype,
+                "gap": float(sig.get("gap") or 0),
+                "score": float(sig.get("score") or 0),
+                "fg": fg,
+                "posture": posture,
+            }
+            rows_out.append(row)
+            by_symbol[sym] = row
+            if posture in ("PRIME_ENTRY", "ACCUMULATE"):
+                actionable.append(sym)
+            elif posture == "POOR_CONDITIONS":
+                poor.append(sym)
+
+        return {
+            "rows": rows_out,
+            "by_symbol": by_symbol,
+            "actionable": actionable,
+            "poor": poor,
+        }
+    except Exception:
+        return {"rows": [], "by_symbol": {}, "actionable": [], "poor": []}
 
 
 def _whale_summary() -> dict:
     try:
-        from utils.db import get_conn
-        with get_conn() as conn:
-            # Check table exists first
-            tbl = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='whale_watch_alerts'"
-            ).fetchone()
-            if not tbl:
-                return {"total": 0, "in_range": 0, "scanner_pass": 0, "alerts_sent": 0, "last_ts": None}
-
-            total    = conn.execute("SELECT COUNT(*) FROM whale_watch_alerts").fetchone()[0]
-            in_range = conn.execute("SELECT COUNT(*) FROM whale_watch_alerts WHERE mc_in_range=1").fetchone()[0]
-            passed   = conn.execute("SELECT COUNT(*) FROM whale_watch_alerts WHERE scanner_pass=1").fetchone()[0]
-            sent     = conn.execute("SELECT COUNT(*) FROM whale_watch_alerts WHERE alert_sent=1").fetchone()[0]
-            last_row = conn.execute("SELECT ts_utc FROM whale_watch_alerts ORDER BY id DESC LIMIT 1").fetchone()
-            last_ts  = last_row[0] if last_row else None
-
-        return {
-            "total":        total,
-            "in_range":     in_range,
-            "scanner_pass": passed,
-            "alerts_sent":  sent,
-            "last_ts":      last_ts,
-        }
+        try:
+            from routers.whale_watch import get_whale_summary_data
+        except Exception:
+            from whale_watch import get_whale_summary_data
+        return dict(get_whale_summary_data())
     except Exception as e:
         log.debug("whale_summary error: %s", e)
-        return {"total": 0, "in_range": 0, "scanner_pass": 0, "alerts_sent": 0, "last_ts": None}
+        return {
+            "total": 0,
+            "in_range": 0,
+            "scanner_pass": 0,
+            "alerts_sent": 0,
+            "last_ts": None,
+            "recent_alerts_6h": 0,
+            "recent_pass_2h": 0,
+            "posture": "QUIET",
+            "detail": "no data",
+        }
 
 
-# ── Patch 190: Next Best Move — unified cross-system recommendation ────────────
+# ── Patch 256: Whale lifecycle-enriched Home action builder ───────────────────
 
-@router.get("/next-best-move")
-def get_next_best_move(_user=Depends(get_current_user)):
+def _build_whale_lifecycle_actions(db_path: str, limit: int = 3) -> list:
     """
-    Cross-system 'what to do next' recommendation. P190.
-    Aggregates PERP buffer health, MEMECOIN gate state, and SPOT portfolio gap
-    into a single ranked action + 2 alternatives.
-    Decision support only — no auto-trading changes.
+    Patch 256 — Pull recent scanner-pass sweet-spot whale alerts, enrich with
+    current symbol_lifecycle state via mint-first JOIN, and rank into structured
+    Home action items.
 
-    Actions: MANAGE (urgent) > BUY (meme signal) > DCA (spot gap) >
-             WATCH (gates open, no signal) > WAIT (gate closed) > HOLD (nothing to do)
+    Enrichment strategy: query-time JOIN on symbol_lifecycle.mint = whale_watch_alerts.token_mint.
+    Keeping enrichment at read-time (not stored in whale_watch_alerts) means the
+    lifecycle context is always current — lifecycle recomputes every 5 min.
+
+    Lookup is mint-ONLY.  No symbol-string fallback: memecoins share symbol
+    strings across hundreds of different tokens.  Matching on symbol alone would
+    return lifecycle context for the wrong asset.  Alerts whose mint has no
+    lifecycle entry are still surfaced — freshness + scanner_pass + buy size alone
+    are enough to qualify them.
+
+    Classification (deterministic, no ML):
+      ACT      (rank 70): age ≤ 60m  AND lifecycle entry_window=OPEN
+                          AND fuel_quality = STRONG
+      RESEARCH (rank 44): age ≤ 60m  AND lifecycle entry_window in (OPEN, CLOSING)
+                          AND fuel_quality in (STRONG, MODERATE)
+      RESEARCH (rank 34): age ≤ 60m  AND no lifecycle match
+                          AND buy_amount_usd >= $10k AND scanner_score >= 70
+      RESEARCH (rank 30): age ≤ 240m AND lifecycle entry_window=OPEN
+                          AND fuel_quality = STRONG
+      MONITOR  (rank 12): age ≤ 360m AND scanner_pass=1 (all remaining)
+      SKIP:               age > 360m OR non-sweet_spot OR scanner_pass != 1
+
+    Returns list of action dicts compatible with both NBM and action-queue consumers.
     """
-    import sys
+    import sqlite3 as _sq
+    from datetime import datetime, timezone as _tz
+
+    results = []
+    try:
+        _c = _sq.connect(db_path)
+        _c.row_factory = _sq.Row
+        rows = _c.execute("""
+            SELECT
+                wa.id,
+                wa.ts_utc,
+                wa.token_symbol,
+                wa.token_mint,
+                wa.buy_amount_usd,
+                wa.market_cap_usd,
+                wa.scanner_score,
+                wa.alert_type,
+                lc.lifecycle_state,
+                lc.entry_window,
+                lc.fuel_quality,
+                lc.move_phase,
+                lc.vol_acc_current
+            FROM whale_watch_alerts wa
+            LEFT JOIN symbol_lifecycle lc ON lc.mint = wa.token_mint
+            WHERE wa.scanner_pass = 1
+              AND wa.mc_tier = 'sweet_spot'
+              AND wa.ts_utc >= datetime('now', '-6 hours')
+            ORDER BY wa.id DESC
+            LIMIT 20
+        """).fetchall()
+        _c.close()
+    except Exception:
+        return results
+
+    now_utc  = datetime.now(_tz.utc)
+    seen_mints: set = set()   # de-duplicate: use most-recent alert per mint
+
+    for r in rows:
+        mint = r["token_mint"] or ""
+        # Keep only the newest alert per mint (rows are ordered newest-first)
+        if mint and mint in seen_mints:
+            continue
+        if mint:
+            seen_mints.add(mint)
+
+        # Freshness
+        try:
+            alert_dt = datetime.fromisoformat(r["ts_utc"].replace("Z", "+00:00"))
+            if alert_dt.tzinfo is None:
+                alert_dt = alert_dt.replace(tzinfo=_tz.utc)
+            age_min = (now_utc - alert_dt).total_seconds() / 60
+        except Exception:
+            age_min = 999
+
+        if age_min > 360:
+            continue
+
+        lc_state = r["lifecycle_state"]
+        ew       = r["entry_window"]
+        fq       = r["fuel_quality"]
+        mp       = r["move_phase"]
+        vacc     = r["vol_acc_current"]
+        has_lc   = lc_state is not None
+        buy_usd  = float(r["buy_amount_usd"] or 0)
+        is_fresh = age_min <= 60
+        is_warm  = age_min <= 240
+
+        # Classify
+        _sc_val = float(r["scanner_score"] or 0)
+
+        if is_fresh and has_lc and ew == "OPEN" and fq == "STRONG":
+            action_type, priority, rank = "ACT",      "HIGH",   70
+        elif is_fresh and has_lc and ew in ("OPEN", "CLOSING") and fq in ("STRONG", "MODERATE"):
+            action_type, priority, rank = "RESEARCH",  "NORMAL", 44
+        elif is_fresh and not has_lc and buy_usd >= 10_000 and _sc_val >= 70:
+            action_type, priority, rank = "RESEARCH",  "NORMAL", 34
+        elif is_warm and has_lc and ew == "OPEN" and fq == "STRONG":
+            action_type, priority, rank = "RESEARCH",  "NORMAL", 30
+        elif is_warm:
+            action_type, priority, rank = "MONITOR",   "LOW",    12
+        else:
+            action_type, priority, rank = "MONITOR",   "LOW",    8
+
+        # Why-now string — derived from real field values
+        age_str  = f"{int(age_min)}m ago" if age_min < 60 else f"{age_min / 60:.1f}h ago"
+        buy_str  = (f"${buy_usd / 1_000:.0f}k" if buy_usd >= 1_000 else f"${buy_usd:.0f}")
+        atype    = r["alert_type"] or "WHALE"
+        parts    = [f"{atype} {buy_str}", age_str, "sweet_spot"]
+        if has_lc:
+            if mp:   parts.append(f"{mp} phase")
+            if ew:   parts.append(f"window {ew}")
+            if fq:   parts.append(f"{fq} fuel")
+            if vacc and float(vacc) > 2.0:
+                parts.append(f"vacc={float(vacc):.1f}x")
+        else:
+            parts.append("no lifecycle match")
+        sc = r["scanner_score"]
+        if sc:
+            parts.append(f"sc={sc:.0f}")
+
+        blockers: list[str] = []
+        if not has_lc:
+            blockers.append("NO_LIFECYCLE_MATCH")
+        if action_type == "MONITOR" and _sc_val < 70:
+            blockers.append(f"sc={_sc_val:.0f}<70")
+
+        results.append({
+            "_score":       -age_min,   # tiebreak: fresher first within same rank
+            "_rank":        rank,
+            "action":       action_type,
+            "system":       "WHALE",
+            "symbol":       r["token_symbol"] or "?",
+            "token_address": mint or None,
+            "priority":     priority,
+            "reason":       " · ".join(parts),
+            "confidence":   "high" if (has_lc and fq == "STRONG") else "medium",
+            "blockers":     blockers,
+            "size_guidance": f"Whale {action_type} — verify alert before any manual action.",
+        })
+
+    results.sort(key=lambda x: (-x["_rank"], x["_score"]))
+    for r in results:
+        r.pop("_score", None)
+    return results[:limit]
+
+
+# ── Patch 255: Memecoin lifecycle action builder ──────────────────────────────
+
+# ── Patch 261: Move-type classifier (Home v3 / interpretation layer) ─────────
+
+_RESEARCH_BUDGET = {"HIGH": "15m", "MEDIUM": "5m", "QUICK_GLANCE": "30s"}
+
+
+def _classify_move_type(
+    mp: str,   ls: str,   flc: int,  mlc: int,  surv: int,
+    nw: int,   hrslw: float,  bp: float,  pd: float,
+    liq_floor: float, liq_current: float, vacc: float,
+) -> tuple:
+    """
+    Deterministic move-type classifier for memecoin lifecycle candidates.
+
+    Returns (move_type: str, research_priority: str, triage_tags: list[str])
+
+    Classification rules (ordered, first match wins):
+
+    RELOAD_CONTINUATION — already-real name resetting for another leg
+    REVIVAL_CONTINUATION — revival state with proof of prior structure
+    DORMANT_SECOND_LEG  — DORMANT state, first leg confirmed, ≥3 windows, liq ≥2x floor
+    DEEP_PULLBACK       — best_return ≥50%, pullback ≥25%, first leg confirmed
+    STALE_MOMENTUM      — single window, no legs, >200h since last window
+    STRUCTURAL_PASS     — everything else that passed the score gate
+    """
+    liq_ratio = round(liq_current / liq_floor, 2) if liq_floor > 0 else 1.0
+    tags: list = []
+
+    # ── Rule 1: RELOAD_CONTINUATION ──────────────────────────────────────────
+    if mp == "RELOAD" and flc and nw >= 2 and hrslw < 96.0:
+        tags = [
+            f"{nw}w",
+            "first+multi leg" if mlc else "first leg",
+            f"{hrslw:.0f}h ago",
+        ]
+        return "RELOAD_CONTINUATION", "MEDIUM", tags
+
+    # ── Rule 2: REVIVAL_CONTINUATION ─────────────────────────────────────────
+    if ls == "REVIVAL" and flc and nw >= 2 and hrslw < 120.0:
+        tags = [
+            f"{nw}w",
+            "revival",
+            "first+multi leg" if mlc else "first leg",
+        ]
+        return "REVIVAL_CONTINUATION", "MEDIUM", tags
+
+    # ── Rule 3: DORMANT_SECOND_LEG ───────────────────────────────────────────
+    if ls == "DORMANT" and flc and nw >= 3 and liq_ratio >= 2.0:
+        tags = [
+            f"{nw}w",
+            "first+multi leg" if mlc else "first leg",
+            f"{liq_ratio:.1f}x liq expansion",
+            f"{hrslw:.0f}h dormant",
+        ]
+        return "DORMANT_SECOND_LEG", "MEDIUM", tags
+
+    # ── Rule 4: DEEP_PULLBACK ────────────────────────────────────────────────
+    if bp >= 50.0 and pd >= 25.0 and flc:
+        tags = [
+            f"{bp:.0f}% peak return",
+            f"{pd:.0f}% pullback",
+            f"{nw}w",
+        ]
+        return "DEEP_PULLBACK", "MEDIUM", tags
+
+    # ── Rule 5: STALE_MOMENTUM ───────────────────────────────────────────────
+    if nw <= 1 and not flc and hrslw > 200.0:
+        tags = [
+            "1 window",
+            "no legs confirmed",
+            f"{hrslw:.0f}h stale",
+        ]
+        return "STALE_MOMENTUM", "QUICK_GLANCE", tags
+
+    # ── Rule 6: STRUCTURAL_PASS (default) ────────────────────────────────────
+    if nw > 1:
+        tags.append(f"{nw}w")
+    if flc:
+        tags.append("first leg" + (" + multi" if mlc else ""))
+    if liq_ratio > 1.3:
+        tags.append(f"{liq_ratio:.1f}x liq")
+    if vacc > 2.0:
+        tags.append(f"vacc {vacc:.1f}x")
+    if not tags:
+        tags = ["gate pass"]
+    return "STRUCTURAL_PASS", "QUICK_GLANCE", tags
+
+
+def _home_continuation_archetype(
+    entry_window: str | None,
+    fuel_quality: str | None,
+    move_phase: str | None,
+) -> str:
+    """Match memecoin continuation-family semantics inside Home."""
+    ew = str(entry_window or "").upper()
+    fq = str(fuel_quality or "").upper()
+    mp = str(move_phase or "").upper()
+
+    if mp == "REVIVAL":
+        return "REVIVAL_CONTINUATION"
+    if mp == "RELOAD" and ew == "OPEN" and fq in ("STRONG", "MODERATE"):
+        return "DORMANT_SECOND_LEG"
+    if mp == "RELOAD":
+        return "RELOAD_CONTINUATION"
+    if ew == "CLOSING" and mp in ("EARLY", "MID", "RELOAD"):
+        return "DEEP_PULLBACK"
+    if ew == "OPEN" and fq in ("STRONG", "MODERATE") and mp in ("EARLY", "MID"):
+        return "STRUCTURAL_PASS"
+    return "PHASE_CONTINUATION"
+
+
+def _build_memecoin_lifecycle_actions(db_path: str, limit: int = 5) -> list:
+    """
+    Patch 255 — Rank symbol_lifecycle candidates into structured Home action items.
+
+    Scoring (deterministic, no ML):
+      fuel_quality:    STRONG=100  MODERATE=60  WEAK=20  TRAP=-999
+      entry_window:    OPEN=+30    CLOSING=+15  CLOSED=-50
+      move_phase:      RELOAD=+34 MID=+18 EARLY=+6 IGNITION=0
+                       EXTENDED=-20 CHURN=-40
+      lifecycle_state: REVIVAL=+14 RELOAD=+10 ACTIVE=+2 COOLING=-4 DORMANT=-10
+      attention_quality: STRONG=+20 MODERATE=+10 WEAK=+5
+      first_leg_confirmed: +10
+      boost_active: +5
+
+    Action classification:
+      score >= 150  → ACT    / HIGH
+      score >= 100  → RESEARCH / NORMAL
+      score >= 60   → MONITOR / LOW
+      below 60      → skipped
+
+    Returns list of action dicts compatible with both NBM and action-queue consumers.
+    """
+    import sqlite3 as _sq
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+
+    _FQ = {"STRONG": 100, "MODERATE": 60, "WEAK": 20, "TRAP": -999}
+    _EW = {"OPEN": 30, "CLOSING": 15, "CLOSED": -50}
+    _MP = {"RELOAD": 34, "MID": 18, "EARLY": 6, "IGNITION": 0, "EXTENDED": -20, "CHURN": -40}
+    _LS = {"REVIVAL": 14, "RELOAD": 10, "ACTIVE": 2, "COOLING": -4, "DORMANT": -10}
+    _AQ = {"STRONG": 20, "MODERATE": 10, "WEAK": 5, "NONE": 0}
+
+    results = []
+    try:
+        _now = _dt.now(_tz.utc)
+        _cutoff_30d = (_now - _td(days=30)).strftime("%Y-%m-%d %H:%M:%S")
+        _cutoff_14d = (_now - _td(days=14)).strftime("%Y-%m-%d %H:%M:%S")
+        _corr_start = (_now - _td(days=14)).strftime("%Y-%m-%d")
+        _meme_dry = os.getenv("MEMECOIN_DRY_RUN", "true").lower() == "true"
+        _meme_pilot = os.getenv("MEMECOIN_PILOT_MODE", "false").lower() == "true"
+        _meme_auto = os.getenv("MEMECOIN_AUTO_BUY", "false").lower() == "true"
+        _meme_max_open = int(os.getenv("MEMECOIN_MAX_OPEN", "3"))
+        _meme_mode = "PAPER" if _meme_dry else ("PILOT" if _meme_pilot else "LIVE")
+        _pressure_ctx = _home_portfolio_pressure_context()
+        _pressure_bucket = str(_pressure_ctx.get("capital_pressure_bucket") or "LOW")
+        _pressure_note = str(_pressure_ctx.get("capital_pressure_note") or "")
+        _c = _sq.connect(db_path)
+        _c.row_factory = _sq.Row
+        rows = _c.execute("""
+            SELECT
+                lc.symbol,
+                lc.mint,
+                lc.entry_window,
+                lc.fuel_quality,
+                lc.move_phase,
+                lc.lifecycle_state,
+                lc.vol_acc_current,
+                lc.liq_current,
+                lc.liq_floor,
+                lc.first_leg_confirmed,
+                lc.multi_leg_confirmed,
+                lc.survivor_confirmed,
+                lc.n_windows,
+                lc.best_return_pct,
+                lc.pullback_depth_pct,
+                lc.hours_since_last_window,
+                mso.attention_quality,
+                mso.boost_active,
+                perf.perf_n,
+                perf.perf_avg,
+                perf.perf_wr,
+                lmcap.last_mcap
+            FROM symbol_lifecycle lc
+            LEFT JOIN (
+                SELECT symbol, attention_quality, boost_active
+                FROM memecoin_signal_outcomes
+                WHERE source = 'DISCOVERY'
+                GROUP BY symbol
+                HAVING MAX(scanned_at)
+            ) mso ON mso.symbol = lc.symbol
+            LEFT JOIN (
+                SELECT symbol,
+                       COUNT(*) AS perf_n,
+                       AVG(return_24h_pct) AS perf_avg,
+                       SUM(CASE WHEN return_24h_pct >= 10 THEN 1.0 ELSE 0.0 END)
+                           * 100.0 / COUNT(*) AS perf_wr
+                FROM memecoin_signal_outcomes
+                WHERE status = 'COMPLETE' AND return_24h_pct IS NOT NULL
+                GROUP BY symbol
+            ) perf ON perf.symbol = lc.symbol
+            LEFT JOIN (
+                SELECT symbol, mcap_at_scan AS last_mcap
+                FROM memecoin_signal_outcomes
+                WHERE source = 'SCANNER'
+                GROUP BY symbol
+                HAVING MAX(scanned_at)
+            ) lmcap ON lmcap.symbol = lc.symbol
+            WHERE lc.entry_window IN ('OPEN', 'CLOSING')
+              AND lc.fuel_quality IN ('STRONG', 'MODERATE')
+              AND lc.move_phase NOT IN ('CHURN', 'EXTENDED')
+        """).fetchall()
+        _scan_rows = _c.execute("""
+            SELECT symbol,
+                   COUNT(*)        AS cnt_30d,
+                   MAX(scanned_at) AS last_scan
+            FROM memecoin_signal_outcomes
+            WHERE scanned_at >= ?
+            GROUP BY symbol
+        """, (_cutoff_30d,)).fetchall()
+        _last_scan_rows = _c.execute("""
+            SELECT symbol, mcap_at_scan, liquidity_usd, rug_label,
+                   top_holder_pct, top5_holder_pct,
+                   volume_24h, token_age_days, holder_quality_level, scanned_at
+            FROM memecoin_signal_outcomes
+            WHERE source = 'SCANNER'
+              AND scanned_at = (
+                  SELECT MAX(scanned_at) FROM memecoin_signal_outcomes m2
+                  WHERE m2.symbol = memecoin_signal_outcomes.symbol
+                    AND m2.source = 'SCANNER'
+              )
+        """).fetchall()
+        _corr_rows = _c.execute("""
+            SELECT symbol, return_24h_pct
+            FROM memecoin_signal_outcomes
+            WHERE status = 'COMPLETE'
+              AND return_24h_pct IS NOT NULL
+              AND scanned_at >= ?
+        """, (_corr_start,)).fetchall()
+        _label_rows = _c.execute("""
+            SELECT symbol, trust_label, triage_state
+            FROM memecoin_signal_outcomes
+            WHERE id IN (
+                SELECT MAX(id)
+                FROM memecoin_signal_outcomes
+                WHERE trust_label IS NOT NULL OR triage_state IS NOT NULL
+                GROUP BY symbol
+            )
+        """).fetchall()
+        _open_cnt_row = _c.execute("""
+            SELECT COUNT(DISTINCT mint) AS open_cnt
+            FROM memecoin_signal_outcomes
+            WHERE status = 'OPEN'
+        """).fetchone()
+        _c.close()
+    except Exception:
+        return results
+
+    _scan_stats = {
+        r["symbol"]: {"cnt": int(r["cnt_30d"] or 0), "last": r["last_scan"]}
+        for r in _scan_rows
+    }
+    _last_scan_sig = {
+        r["symbol"]: {
+            "mcap_usd":             float(r["mcap_at_scan"] or 0),
+            "liquidity_usd":        float(r["liquidity_usd"] or 0),
+            "rug_label":            r["rug_label"],
+            "top_holder_pct":       float(r["top_holder_pct"] or 0),
+            "top5_holder_pct":      float(r["top5_holder_pct"] or 0),
+            "volume_24h":           float(r["volume_24h"] or 0),
+            "token_age_days":       float(r["token_age_days"] or 0),
+            "holder_quality_level": r["holder_quality_level"],
+            "scanned_at":           r["scanned_at"],
+        }
+        for r in _last_scan_rows
+    }
+    _corr_by_sym: dict = {}
+    for _cr in _corr_rows:
+        _corr_by_sym.setdefault(_cr["symbol"], []).append(float(_cr["return_24h_pct"]))
+    _corr_tier: dict = {}
+    for _sym, _rets in _corr_by_sym.items():
+        _cn = len(_rets)
+        _avg = round(sum(_rets) / _cn, 1)
+        if _cn >= 2 and _avg < -30.0:
+            _corr_tier[_sym] = "CASUALTY"
+        elif _cn >= 2 and _avg > -5.0 and (sum(1 for _r in _rets if _r > -20.0) / _cn) >= 0.70:
+            _corr_tier[_sym] = "SURVIVOR"
+        elif _cn >= 2:
+            _corr_tier[_sym] = "TRACKER"
+        else:
+            _corr_tier[_sym] = "UNRATED"
+    _latest_labels = {
+        r["symbol"]: {
+            "trust_label": str(r["trust_label"] or "").strip() or None,
+            "triage_state": str(r["triage_state"] or "").strip() or None,
+        }
+        for r in _label_rows
+        if r["symbol"]
+    }
+    _meme_open_cnt = int((_open_cnt_row["open_cnt"] if _open_cnt_row else 0) or 0)
+    _alloc_ctx = _home_memecoin_allocator_context()
+
+    def _coin_quality(sig: dict) -> str:
+        _rug   = str(sig.get("rug_label") or "").upper()
+        _top1  = float(sig.get("top_holder_pct") or 0)
+        _top5  = float(sig.get("top5_holder_pct") or 0)
+        _liq   = float(sig.get("liquidity_usd") or 0)
+        _vol24 = float(sig.get("volume_24h") or 0)
+        _age   = float(sig.get("token_age_days") or 0)
+        _hq    = str(sig.get("holder_quality_level") or "").upper()
+        _vl    = (_vol24 / _liq) if _liq > 1000 else 0.0
+        if _rug == "DANGER" or _top1 >= 80 or _top5 >= 90 or (0 < _liq < 30_000) or _vl > 25:
+            return "WEAK"
+        if _rug in ("WARN", "UNKNOWN") or (50 <= _top1 < 80) or (70 <= _top5 < 90) or (0 < _liq < 75_000) or (0 < _age < 7) or (10 < _vl <= 25) or _hq == "RISKY":
+            return "QUESTIONABLE"
+        return "CLEAR"
+
+    scored = []
+    for r in rows:
+        _sym = r["symbol"]
+        _stat = _scan_stats.get(_sym, {})
+        _last = (_stat.get("last") or "")
+        _sig = _last_scan_sig.get(_sym)
+        if int(_stat.get("cnt", 0) or 0) < 3:
+            continue
+        if not _last or _last < _cutoff_14d:
+            continue
+        if not _sig:
+            continue
+        if float(_sig.get("mcap_usd") or 0) < 1_500_000:
+            continue
+        if float(_sig.get("liquidity_usd") or 0) < 50_000:
+            continue
+        if _coin_quality(_sig) == "WEAK":
+            continue
+        if _corr_tier.get(_sym) == "CASUALTY":
+            continue
+
+        fq    = r["fuel_quality"]    or "WEAK"
+        ew    = r["entry_window"]    or "CLOSED"
+        mp    = r["move_phase"]      or "RELOAD"
+        ls    = r["lifecycle_state"] or "COOLING"
+        aq    = r["attention_quality"] or "NONE"
+        flc   = int(r["first_leg_confirmed"]  or 0)
+        mlc   = int(r["multi_leg_confirmed"]  or 0)
+        surv  = int(r["survivor_confirmed"]   or 0)
+        nw    = int(r["n_windows"]            or 0)
+        boost = int(r["boost_active"]         or 0)
+        vacc  = r["vol_acc_current"]
+        hrslw = float(r["hours_since_last_window"] if r["hours_since_last_window"] is not None else 9999)
+        bp    = float(r["best_return_pct"]    or 0)
+        pd    = float(r["pullback_depth_pct"] or 0)
+        liq_f = float(r["liq_floor"]          or 0)
+        liq_c = float(r["liq_current"]        or 0)
+        _scanned_at = _sig.get("scanned_at")
+        _hours_since_scan = 9999.0
+        try:
+            if _scanned_at:
+                _sd = _dt.fromisoformat(str(_scanned_at).replace("Z", "+00:00"))
+                if _sd.tzinfo is None:
+                    _sd = _sd.replace(tzinfo=_tz.utc)
+                _hours_since_scan = max(0.0, (_now - _sd).total_seconds() / 3600.0)
+        except Exception:
+            _hours_since_scan = 9999.0
+
+        # Patch 258: vacc momentum boost — capped at +15 (max at vacc >= 10x).
+        # Breaks ties among structurally similar RESEARCH items without overriding
+        # fuel/phase/window hierarchy.  Formula: min(vacc, 10) * 1.5 → 0–15 pts.
+        _vacc_boost = round(min(float(vacc or 0), 10.0) * 1.5) if vacc else 0
+
+        score = (
+            _FQ.get(fq, 0)
+            + _EW.get(ew, 0)
+            + _MP.get(mp, 0)
+            + _LS.get(ls, 0)
+            + _AQ.get(aq, 0)
+            + (10 if flc else 0)
+            + (5  if boost else 0)
+            + _vacc_boost
+        )
+
+        if score < 60 or fq == "TRAP":
+            continue
+
+        # Patch 303: veto PROVEN_NEGATIVE symbols — historical memory overrides
+        # structural score.  Tier thresholds match NBA path (Patch 289).
+        _pn  = int(r["perf_n"]  or 0)
+        _avg = float(r["perf_avg"] or 0) if r["perf_avg"] is not None else 0.0
+        if _pn >= 15 and _avg < -10:
+            continue  # PROVEN_NEGATIVE — do not surface as action candidate
+
+        # Patch 303b: veto sub-floor tokens — last known scanner mcap below $1.5M.
+        # Only applied when scanner mcap data exists; lifecycle-only tokens (NULL)
+        # are allowed through since their mcap is unknown.
+        _last_mcap = r["last_mcap"]
+        if _last_mcap is not None and float(_last_mcap) < 1_500_000:
+            continue  # sub-floor at last scan — do not surface as action candidate
+
+        # Continuation-first roadmap: do not surface same-day/lightly-formed
+        # ignition names just because they have strong fuel and an open window.
+        if (
+            _hours_since_scan < 48.0
+            and flc == 0
+            and nw < 2
+            and mp in ("IGNITION", "EARLY")
+            and ls not in ("RELOAD", "REVIVAL")
+        ):
+            continue
+
+        if score >= 150:
+            action_type, priority = "ACT",      "HIGH"
+        elif score >= 100:
+            action_type, priority = "RESEARCH",  "NORMAL"
+        else:
+            action_type, priority = "MONITOR",   "LOW"
+
+        # Patch 261: classify move type and research priority
+        move_type, rp, triage_tags = _classify_move_type(
+            mp, ls, flc, mlc, surv, nw, hrslw, bp, pd, liq_f, liq_c, float(vacc or 0)
+        )
+        continuation_archetype = _home_continuation_archetype(ew, fq, mp)
+        budget = _RESEARCH_BUDGET[rp]
+        _label_ctx = _latest_labels.get(_sym, {})
+        _trust_label = str(_label_ctx.get("trust_label") or "LOW_TRUST")
+        _triage_state = str(_label_ctx.get("triage_state") or ("INVESTIGATE_NOW" if action_type == "ACT" else "MONITOR"))
+
+        if _trust_label == "DISTRUST" or _triage_state == "DO_NOT_TOUCH":
+            _capital_posture = "NO_DEPLOY"
+            _capital_band = "ZERO"
+            _capital_ready_state = "RESEARCH_ONLY"
+            _capital_guidance = "Do not deploy capital. Keep this continuation out of the active book."
+            _capital_rationale = "persisted trust/triage labels are explicitly adverse"
+        elif (
+            _trust_label == "HIGH_TRUST"
+            and _triage_state == "INVESTIGATE_NOW"
+            and action_type in ("ACT", "RESEARCH")
+            and ew == "OPEN"
+            and continuation_archetype in ("DORMANT_SECOND_LEG", "REVIVAL_CONTINUATION", "RELOAD_CONTINUATION")
+        ):
+            _capital_posture = "PROBE_ONLY"
+            _capital_band = "SMALL"
+            _capital_ready_state = "READY" if _meme_mode in ("PILOT", "LIVE") and _meme_auto and _meme_open_cnt < _meme_max_open else "PLANNING_ONLY"
+            _capital_guidance = "Small probe only. Continuation structure is constructive, but fuller sizing still belongs in the main memecoin engine."
+            _capital_rationale = "persisted trust/triage labels support a continuation probe, but Home lifecycle actions stay conservative"
+        else:
+            _capital_posture = "RESEARCH_ONLY"
+            _capital_band = "ZERO"
+            _capital_ready_state = "PLANNING_ONLY" if _meme_mode == "PAPER" else "RESEARCH_ONLY"
+            _capital_guidance = "Research and monitor only. Let the main memecoin engine earn deployment posture first."
+            _capital_rationale = "Home lifecycle lane is informative, but not the final capital authority"
+
+        if _capital_ready_state == "READY" and _pressure_bucket == "HIGH":
+            _capital_ready_state = "PLANNING_ONLY"
+            _capital_guidance = "Small probe idea only, but broader portfolio exposure is already elevated. Keep this in planning until pressure eases."
+            _capital_rationale = "portfolio pressure is high, so Home keeps lifecycle continuation out of ready state"
+        _capital_allocator_stance = str(_alloc_ctx.get("memecoin_allocator_stance") or "UNKNOWN")
+        _capital_allocator_note = str(_alloc_ctx.get("memecoin_allocator_note") or "")
+        _capital_route_bucket = str(_alloc_ctx.get("memecoins_capital_route_bucket") or "LOCKED")
+        _capital_headroom_bucket = str(_alloc_ctx.get("memecoins_capital_headroom_bucket") or "UNKNOWN")
+        _capital_headroom_note = str(_alloc_ctx.get("memecoins_capital_headroom_note") or "")
+        _capital_window_bucket = str(_alloc_ctx.get("memecoins_capital_window_bucket") or "CLOSED")
+        _capital_window_note = str(_alloc_ctx.get("memecoins_capital_window_note") or "")
+        _deployment_authority = _home_deployment_authority({
+            "promotion_authority": "SUPPORTED" if _capital_posture == "PROBE_ONLY" else "TENTATIVE",
+            "reinforcement_authority": "BACKED" if _capital_posture == "PROBE_ONLY" else "ABSENT",
+            "capital_ready_state": _capital_ready_state,
+            "capital_route_bucket": _capital_route_bucket,
+            "capital_headroom_bucket": _capital_headroom_bucket,
+        })
+
+        # Reason: move_type first, then compact triage tags + fuel/window context
+        _ctx = f"{fq} fuel · {ew}"
+        if aq and aq not in ("NONE",):
+            _ctx += f" · attn {aq}"
+        if boost:
+            _ctx += " · boosted"
+        reason = f"{move_type} · {' · '.join(triage_tags)} [{_ctx}]"
+
+        scored.append({
+            "_score":           score,
+            "_rank":            75 if action_type == "ACT" else 45 if action_type == "RESEARCH" else 15,
+            "action":           action_type,
+            "system":           "MEMECOINS",
+            "symbol":           r["symbol"],
+            "token_address":    r["mint"] or None,
+            "priority":         priority,
+            "reason":           reason,
+            "confidence":       "high" if fq == "STRONG" else "medium",
+            "blockers":         [],
+            "size_guidance":    _capital_guidance,
+            # Patch 261: structured interpretation fields
+            "move_type":        move_type,
+            "continuation_archetype": continuation_archetype,
+            "research_priority": rp,
+            "research_budget":  budget,
+            "triage_tags":      triage_tags,
+            "trust_label":      _trust_label,
+            "triage_state":     _triage_state,
+            "capital_posture":  _capital_posture,
+            "capital_band":     _capital_band,
+            "capital_guidance": _capital_guidance,
+            "capital_rationale": _capital_rationale,
+            "capital_ready_state": _capital_ready_state,
+            "capital_pressure_bucket": _pressure_bucket,
+            "capital_pressure_note": _pressure_note,
+            "proof_stack_authority": _proof_stack_authority_from_registry(),
+            "capital_allocator_stance": _capital_allocator_stance,
+            "capital_allocator_note": _capital_allocator_note,
+            "capital_headroom_bucket": _capital_headroom_bucket,
+            "capital_headroom_note": _capital_headroom_note,
+            "deployment_authority": _deployment_authority,
+            "capital_route_bucket": _capital_route_bucket,
+            "capital_window_bucket": _capital_window_bucket,
+            "capital_window_note": _capital_window_note,
+        })
+
+    scored.sort(key=lambda x: x["_score"], reverse=True)
+    return scored[:limit]
+
+
+# ── Patch 257: Confluence — fresh whale × lifecycle Home action builder ──────
+
+def _build_confluence_actions(db_path: str, limit: int = 3) -> list:
+    """
+    Patch 257 — Detect fresh whale × memecoin lifecycle agreement on the same mint
+    and surface that two-lane consensus as a higher-priority Home action item.
+
+    Detection: whale alert (scanner_pass=1, sweet_spot, ts_utc <= 4h) INNER JOIN
+    symbol_lifecycle on mint, filtered to entry_window IN (OPEN, CLOSING) and
+    fuel_quality IN (STRONG, MODERATE).  INNER JOIN means BOTH systems independently
+    flagged the same token.  This is the core confluence signal.
+
+    Lookup is mint-ONLY.  No symbol fallback — see _build_whale_lifecycle_actions
+    for reasoning.  Tokens whose mints are not yet in lifecycle are handled by the
+    independent whale and lifecycle builders.
+
+    Rank ladder (all outrank equivalent single-lane signals):
+      ACT    rank 85: age ≤ 60m  AND OPEN   AND STRONG/MODERATE
+      RES    rank 65: age ≤ 240m AND OPEN   AND STRONG  (warm two-lane)
+      RES    rank 58: age ≤ 240m AND OPEN   AND MODERATE (warm two-lane)
+      RES    rank 52: age ≤ 60m  AND CLOSING AND STRONG
+      MON    rank 22: remaining qualifying pairs — still two-lane, just weaker
+    """
+    import sqlite3 as _sq
+    from datetime import datetime, timezone as _tz
+
+    results = []
+    try:
+        _c = _sq.connect(db_path)
+        _c.row_factory = _sq.Row
+        rows = _c.execute("""
+            SELECT
+                wa.id,
+                wa.ts_utc,
+                wa.token_symbol,
+                wa.token_mint,
+                wa.buy_amount_usd,
+                wa.scanner_score,
+                wa.alert_type,
+                lc.lifecycle_state,
+                lc.entry_window,
+                lc.fuel_quality,
+                lc.move_phase,
+                lc.vol_acc_current,
+                mso.attention_quality,
+                mso.boost_active
+            FROM whale_watch_alerts wa
+            INNER JOIN symbol_lifecycle lc ON lc.mint = wa.token_mint
+            LEFT JOIN (
+                SELECT symbol, attention_quality, boost_active
+                FROM memecoin_signal_outcomes
+                WHERE source = 'DISCOVERY'
+                GROUP BY symbol
+                HAVING MAX(scanned_at)
+            ) mso ON mso.symbol = lc.symbol
+            WHERE wa.scanner_pass = 1
+              AND wa.mc_tier = 'sweet_spot'
+              AND wa.ts_utc >= datetime('now', '-4 hours')
+              AND lc.entry_window IN ('OPEN', 'CLOSING')
+              AND lc.fuel_quality IN ('STRONG', 'MODERATE')
+              AND (lc.lifecycle_state IS NULL OR lc.lifecycle_state != 'DEAD')
+            ORDER BY wa.id DESC
+        """).fetchall()
+        _c.close()
+    except Exception:
+        return results
+
+    now_utc    = datetime.now(_tz.utc)
+    seen_mints: set = set()
+
+    for r in rows:
+        mint = r["token_mint"] or ""
+        if mint and mint in seen_mints:
+            continue
+        if mint:
+            seen_mints.add(mint)
+
+        try:
+            alert_dt = datetime.fromisoformat(r["ts_utc"].replace("Z", "+00:00"))
+            if alert_dt.tzinfo is None:
+                alert_dt = alert_dt.replace(tzinfo=_tz.utc)
+            age_min = (now_utc - alert_dt).total_seconds() / 60
+        except Exception:
+            age_min = 999
+
+        if age_min > 240:
+            continue
+
+        ew       = r["entry_window"]    or "CLOSED"
+        fq       = r["fuel_quality"]    or "WEAK"
+        mp       = r["move_phase"]      or ""
+        ls       = r["lifecycle_state"] or ""
+        vacc     = r["vol_acc_current"]
+        buy      = float(r["buy_amount_usd"] or 0)
+        aq       = r["attention_quality"] or ""
+        boost    = int(r["boost_active"] or 0)
+        sc       = r["scanner_score"]
+        is_fresh = age_min <= 60
+
+        # Two-lane rank — always above the equivalent single-lane rank
+        if   is_fresh and ew == "OPEN"    and fq in ("STRONG", "MODERATE"):
+            action, priority, rank = "ACT",     "HIGH",   85
+        elif              ew == "OPEN"    and fq == "STRONG":
+            action, priority, rank = "RESEARCH", "NORMAL", 65
+        elif              ew == "OPEN"    and fq == "MODERATE":
+            action, priority, rank = "RESEARCH", "NORMAL", 58
+        elif is_fresh and ew == "CLOSING" and fq == "STRONG":
+            action, priority, rank = "RESEARCH", "NORMAL", 52
+        else:
+            action, priority, rank = "MONITOR",  "LOW",    22
+
+        # Why-now — explicitly names both contributing systems
+        age_str = f"{int(age_min)}m ago" if age_min < 60 else f"{age_min / 60:.1f}h ago"
+        buy_str = f"${buy / 1_000:.0f}k" if buy >= 1_000 else f"${buy:.0f}"
+        parts   = [f"WHALE {buy_str} {age_str}"]
+        if mp:  parts.append(f"{mp} phase")
+        parts.append(f"{ew} window")
+        parts.append(f"{fq} fuel")
+        if ls and ls != "COOLING":
+            parts.append(f"lc={ls}")
+        if aq and aq not in ("NONE", ""):
+            parts.append(f"attn {aq}")
+        if vacc and float(vacc) > 2.0:
+            parts.append(f"vacc={float(vacc):.1f}x")
+        if boost:
+            parts.append("boosted")
+        if sc:
+            parts.append(f"sc={sc:.0f}")
+
+        sym = r["token_symbol"] or "?"
+        results.append({
+            "_score":        -age_min,
+            "_rank":         rank,
+            "action":        action,
+            "system":        "CONFLUENCE",
+            "symbol":        sym,
+            "token_address": mint or None,
+            "priority":      priority,
+            "reason":        " · ".join(parts),
+            "confidence":    "very high" if (fq == "STRONG" and ew == "OPEN") else "high",
+            "blockers":      [],
+            "size_guidance": (
+                f"Two-lane signal — WHALE + LIFECYCLE both flag {sym}. "
+                "Verify alert and lifecycle state before any action."
+            ),
+        })
+
+    results.sort(key=lambda x: (-x["_rank"], x["_score"]))
+    for r in results:
+        r.pop("_score", None)
+    return results[:limit]
+
+
+def _apply_gated_home_label(item: dict) -> dict:
+    """
+    Keep ranking based on structural importance, but make operator-facing action
+    labels honest when a named setup is still blocked by live gates.
+    """
+    if not item:
+        return item
+    gated = (
+        item.get("system") == "MEMECOINS"
+        and item.get("symbol")
+        and item.get("action") in ("ACT", "BUY")
+        and bool(item.get("blockers"))
+    )
+    if not gated:
+        return item
+
+    out = dict(item)
+    out["intended_action"] = item.get("action")
+    out["action_state"] = "GATED"
+    out["action"] = "WAIT"
+    reason = str(item.get("reason") or "")
+    if not reason.startswith("Best setup is gated"):
+        out["reason"] = f"Best setup is gated — {reason}"
+    return out
+
+
+def _build_next_best_move_candidates(root: str) -> list[dict]:
     import json as _j
-    from datetime import datetime, timezone
-
-    root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
-    if root not in sys.path:
-        sys.path.insert(0, root)
-
     from utils.db import get_conn  # type: ignore
 
     candidates = []
@@ -224,7 +6618,7 @@ def get_next_best_move(_user=Depends(get_current_user)):
         from utils.tier_manager import get_profit_buffer  # type: ignore
         _buf  = get_profit_buffer(_cp)
         _npos = _cp.execute(
-            "SELECT COUNT(*) FROM perp_positions WHERE status='OPEN' AND notes LIKE '%TIER%'"
+            "SELECT COUNT(DISTINCT symbol) FROM perp_positions WHERE status='OPEN' AND notes LIKE '%TIER%'"
         ).fetchone()[0]
         _col_row = _cp.execute(
             "SELECT SUM(collateral_usd) FROM perp_positions WHERE status='OPEN' AND notes LIKE '%TIER%'"
@@ -263,16 +6657,13 @@ def get_next_best_move(_user=Depends(get_current_user)):
         _bands     = []
         _multi     = False
 
-        with get_conn() as _cm:
-            _fg_row = _cm.execute(
-                "SELECT value FROM kv_store WHERE key='shared_fear_greed'"
-            ).fetchone()
-            if _fg_row:
-                try:
-                    _fg_val = _j.loads(_fg_row[0]).get("value")
-                except Exception:
-                    pass
+        try:
+            from utils.agent_coordinator import get_fear_greed as _gfg  # type: ignore
+            _fg_val = _gfg().get("value")
+        except Exception:
+            pass
 
+        with get_conn() as _cm:
             _open_cnt = _cm.execute(
                 "SELECT COUNT(DISTINCT mint) FROM memecoin_signal_outcomes WHERE status='OPEN'"
             ).fetchone()[0]
@@ -289,14 +6680,15 @@ def get_next_best_move(_user=Depends(get_current_user)):
                     pass
 
         _fg_thr = 35 if not _dry_run else 25
-        _fg_ok  = _fg_val is not None and _fg_val > _fg_thr
+        _fg_gate_active = not _dry_run
+        _fg_ok  = True if not _fg_gate_active else (_fg_val is not None and _fg_val > _fg_thr)
         _cap_ok = _open_cnt < _max_open
 
         _m_blk = []
         if not _auto_buy:
             _m_blk.append("AUTO_BUY=false")
-        if not _fg_ok:
-            _m_blk.append(f"F&G={_fg_val or '?'} (need >{_fg_thr})")
+        if _fg_gate_active and not _fg_ok:
+            _m_blk.append(f"F&G={_fg_val if _fg_val is not None else '?'} (need >{_fg_thr})")
         if not _cap_ok:
             _m_blk.append(f"CAPACITY {_open_cnt}/{_max_open}")
 
@@ -321,6 +6713,7 @@ def get_next_best_move(_user=Depends(get_current_user)):
         if not _m_blk and _best_sig:
             candidates.append({
                 "_rank": 60, "action": "BUY", "system": "MEMECOINS",
+                "token_address": _best_sig.get("mint"),
                 "symbol": _best_sig.get("symbol"), "priority": "NORMAL",
                 "reason": (
                     f"All gates pass — {_best_sig.get('symbol')} "
@@ -335,7 +6728,7 @@ def get_next_best_move(_user=Depends(get_current_user)):
                 "reason": "All system gates open — no signal in active band right now. Check at next scan.",
                 "blockers": [], "confidence": "medium",
             })
-        elif not _fg_ok:
+        elif _fg_gate_active and not _fg_ok:
             _bstr = ""
             if _bands:
                 _bstr = " Active bands: " + " + ".join(
@@ -345,7 +6738,7 @@ def get_next_best_move(_user=Depends(get_current_user)):
                 "_rank": 15, "action": "WAIT", "system": "MEMECOINS", "symbol": None,
                 "priority": "LOW",
                 "reason": (
-                    f"F&G={_fg_val or '?'} — below {'pilot' if not _dry_run else 'paper'} "
+                    f"F&G={_fg_val if _fg_val is not None else '?'} — below {'pilot' if not _dry_run else 'paper'} "
                     f"gate (>{_fg_thr}). Extreme fear — wait for recovery.{_bstr}"
                 ),
                 "blockers": _m_blk, "confidence": "high",
@@ -367,47 +6760,244 @@ def get_next_best_move(_user=Depends(get_current_user)):
     except Exception as exc:
         log.debug("next_best_move meme: %s", exc)
 
+    try:
+        _db_path = os.path.join(root, "data_storage", "engine.db")
+        _gate_blks = _m_blk if "_m_blk" in locals() else []
+        for _lca in _build_memecoin_lifecycle_actions(_db_path, limit=5):
+            _blks = list(_gate_blks) if _lca["action"] == "ACT" else []
+            candidates.append({
+                "_rank":             _lca["_rank"],
+                "action":            _lca["action"],
+                "system":            "MEMECOINS",
+                "symbol":            _lca["symbol"],
+                "token_address":     _lca.get("token_address"),
+                "priority":          _lca["priority"],
+                "reason":            _lca["reason"],
+                "blockers":          _blks,
+                "confidence":        _lca["confidence"],
+                "move_type":         _lca.get("move_type"),
+                "continuation_archetype": _lca.get("continuation_archetype"),
+                "research_priority": _lca.get("research_priority"),
+                "research_budget":   _lca.get("research_budget"),
+                "triage_tags":       _lca.get("triage_tags"),
+            })
+    except Exception as exc:
+        log.debug("next_best_move lifecycle: %s", exc)
+
     # ── 3. Spot — portfolio gap ────────────────────────────────────────────────
     try:
+        _spot_snap = _spot_posture_snapshot()
+        _spot_by_sym = _spot_snap.get("by_symbol", {})
         with get_conn() as _cs:
             _sr = _cs.execute(
                 "SELECT value FROM kv_store WHERE key='spot_current_signals'"
             ).fetchone()
         if _sr:
-            # spot_current_signals is stored as {"data": {SYM: {...}}, "updated_at": "..."}
             _raw2 = _j.loads(_sr[0])
             _spot_map = _raw2.get("data", _raw2) if isinstance(_raw2, dict) else {}
-            # gap key in spot signals is "gap", not "portfolio_gap"
             _dca = sorted(
                 [(sym, d) for sym, d in _spot_map.items()
-                 if isinstance(d, dict) and (d.get("gap") or 0) > 0],
-                key=lambda x: x[1].get("gap", 0), reverse=True,
+                 if isinstance(d, dict)
+                 and (d.get("gap") or 0) > 0
+                 and _spot_by_sym.get(sym, {}).get("posture") in ("PRIME_ENTRY", "ACCUMULATE")],
+                key=lambda x: (x[1].get("signal_type") == "DCA_NOW", x[1].get("gap", 0)), reverse=True,
             )
             if _dca:
                 _sym2, _d2 = _dca[0]
                 _gap2 = _d2.get("gap", 0)
                 _sig2 = _d2.get("signal_type", "WATCH")
+                _spot_row2 = _spot_by_sym.get(_sym2, {}) or {}
+                _pst2 = _spot_row2.get("posture")
                 candidates.append({
                     "_rank": 35 if _sig2 == "DCA_NOW" else 12,
                     "action": "DCA", "system": "SPOT", "symbol": _sym2,
+                    "token_address": _spot_row2.get("token_address"),
                     "priority": "NORMAL" if _sig2 == "DCA_NOW" else "LOW",
                     "reason": (
                         f"{_sym2} is {_gap2:+.1f}% under target allocation. "
-                        f"Signal: {_sig2}. Manual buy at discretion."
+                        f"Signal: {_sig2}. Posture: {_pst2}. Manual buy at discretion."
                     ),
                     "blockers": ["MANUAL_ONLY"], "confidence": "medium",
+                })
+            elif _spot_snap.get("poor"):
+                candidates.append({
+                    "_rank": 9, "action": "WAIT", "system": "SPOT", "symbol": None,
+                    "priority": "LOW",
+                    "reason": f"Spot underweight names exist, but conditions are poor on {len(_spot_snap.get('poor', []))} token(s).",
+                    "blockers": ["POOR_CONDITIONS"], "confidence": "high",
                 })
     except Exception as exc:
         log.debug("next_best_move spot: %s", exc)
 
-    # ── Rank + assemble ────────────────────────────────────────────────────────
+    try:
+        _db_path_w = os.path.join(root, "data_storage", "engine.db")
+        for _wa in _build_whale_lifecycle_actions(_db_path_w, limit=3):
+            candidates.append({
+                "_rank":      _wa["_rank"],
+                "action":     _wa["action"],
+                "system":     _wa["system"],
+                "symbol":     _wa["symbol"],
+                "token_address": _wa.get("token_address"),
+                "priority":   _wa["priority"],
+                "reason":     _wa["reason"],
+                "blockers":   _wa["blockers"],
+                "confidence": _wa["confidence"],
+            })
+    except Exception as exc:
+        log.debug("next_best_move whale: %s", exc)
+
+    try:
+        _db_path_c = os.path.join(root, "data_storage", "engine.db")
+        for _ca in _build_confluence_actions(_db_path_c, limit=3):
+            candidates.append({
+                "_rank":      _ca["_rank"],
+                "action":     _ca["action"],
+                "system":     _ca["system"],
+                "symbol":     _ca["symbol"],
+                "token_address": _ca.get("token_address"),
+                "priority":   _ca["priority"],
+                "reason":     _ca["reason"],
+                "blockers":   _ca["blockers"],
+                "confidence": _ca["confidence"],
+            })
+    except Exception as exc:
+        log.debug("next_best_move confluence: %s", exc)
+
     candidates.sort(key=lambda c: c["_rank"], reverse=True)
     for c in candidates:
         c.pop("_rank", None)
+    return [_apply_gated_home_label(c) for c in candidates]
 
-    # HOLD and WAIT both mean "stand by — no capital action needed right now"
-    no_action = not candidates or candidates[0]["action"] in ("HOLD", "WAIT")
 
+def _priority_candidate_to_home_move(item: dict | None) -> dict | None:
+    if not item:
+        return None
+    out = {
+        "action": item.get("action"),
+        "system": item.get("system"),
+        "symbol": item.get("symbol"),
+        "token_address": item.get("token_address"),
+        "priority": item.get("priority"),
+        "reason": item.get("reason"),
+        "blockers": item.get("blockers") or [],
+        "confidence": item.get("confidence"),
+    }
+    if item.get("action_state"):
+        out["action_state"] = item.get("action_state")
+    if item.get("operating_status"):
+        out["operating_status"] = item.get("operating_status")
+    if item.get("operating_note"):
+        out["operating_note"] = item.get("operating_note")
+    if item.get("lane_policy_state"):
+        out["lane_policy_state"] = item.get("lane_policy_state")
+    if item.get("lane_policy_note"):
+        out["lane_policy_note"] = item.get("lane_policy_note")
+    if item.get("lane_authority"):
+        out["lane_authority"] = item.get("lane_authority")
+    if item.get("lane_authority_note"):
+        out["lane_authority_note"] = item.get("lane_authority_note")
+    if item.get("lane_authority_driver"):
+        out["lane_authority_driver"] = item.get("lane_authority_driver")
+    if item.get("lane_next_unlock_state"):
+        out["lane_next_unlock_state"] = item.get("lane_next_unlock_state")
+    if item.get("lane_next_unlock_note"):
+        out["lane_next_unlock_note"] = item.get("lane_next_unlock_note")
+    if item.get("primary_constraint_key"):
+        out["primary_constraint_key"] = item.get("primary_constraint_key")
+    if item.get("primary_constraint_note"):
+        out["primary_constraint_note"] = item.get("primary_constraint_note")
+    if item.get("primary_constraint_source"):
+        out["primary_constraint_source"] = item.get("primary_constraint_source")
+    if item.get("intended_action"):
+        out["intended_action"] = item.get("intended_action")
+    if item.get("move_type"):
+        out["move_type"] = item.get("move_type")
+    if item.get("continuation_archetype"):
+        out["continuation_archetype"] = item.get("continuation_archetype")
+    if item.get("research_priority"):
+        out["research_priority"] = item.get("research_priority")
+    if item.get("research_budget"):
+        out["research_budget"] = item.get("research_budget")
+    if item.get("triage_tags"):
+        out["triage_tags"] = item.get("triage_tags")
+    if item.get("capital_posture"):
+        out["capital_posture"] = item.get("capital_posture")
+    if item.get("capital_band"):
+        out["capital_band"] = item.get("capital_band")
+    if item.get("capital_guidance"):
+        out["capital_guidance"] = item.get("capital_guidance")
+    if item.get("capital_rationale"):
+        out["capital_rationale"] = item.get("capital_rationale")
+    if item.get("capital_ready_state"):
+        out["capital_ready_state"] = item.get("capital_ready_state")
+    if item.get("capital_pressure_bucket"):
+        out["capital_pressure_bucket"] = item.get("capital_pressure_bucket")
+    if item.get("capital_pressure_note"):
+        out["capital_pressure_note"] = item.get("capital_pressure_note")
+    if item.get("capital_regime_bucket"):
+        out["capital_regime_bucket"] = item.get("capital_regime_bucket")
+    if item.get("capital_regime_note"):
+        out["capital_regime_note"] = item.get("capital_regime_note")
+    if item.get("capital_mix_bucket"):
+        out["capital_mix_bucket"] = item.get("capital_mix_bucket")
+    if item.get("capital_mix_note"):
+        out["capital_mix_note"] = item.get("capital_mix_note")
+    if item.get("capital_allocator_stance"):
+        out["capital_allocator_stance"] = item.get("capital_allocator_stance")
+    if item.get("capital_allocator_note"):
+        out["capital_allocator_note"] = item.get("capital_allocator_note")
+    if item.get("capital_headroom_bucket"):
+        out["capital_headroom_bucket"] = item.get("capital_headroom_bucket")
+    if item.get("capital_headroom_note"):
+        out["capital_headroom_note"] = item.get("capital_headroom_note")
+    if item.get("capital_route_bucket"):
+        out["capital_route_bucket"] = item.get("capital_route_bucket")
+    if item.get("capital_window_bucket"):
+        out["capital_window_bucket"] = item.get("capital_window_bucket")
+    if item.get("capital_window_note"):
+        out["capital_window_note"] = item.get("capital_window_note")
+    if item.get("marginal_route"):
+        out["marginal_route"] = item.get("marginal_route")
+    if item.get("marginal_route_authority"):
+        out["marginal_route_authority"] = item.get("marginal_route_authority")
+    if item.get("capital_routing_family"):
+        out["capital_routing_family"] = item.get("capital_routing_family")
+    if item.get("capital_intensity_bucket"):
+        out["capital_intensity_bucket"] = item.get("capital_intensity_bucket")
+    if item.get("capital_deployment_family"):
+        out["capital_deployment_family"] = item.get("capital_deployment_family")
+    if item.get("freshness_bucket"):
+        out["freshness_bucket"] = item.get("freshness_bucket")
+    if item.get("capital_suggested_entry_usd") is not None:
+        out["capital_suggested_entry_usd"] = item.get("capital_suggested_entry_usd")
+    if item.get("capital_max_entry_usd") is not None:
+        out["capital_max_entry_usd"] = item.get("capital_max_entry_usd")
+    if item.get("capital_staged_scale_usd") is not None:
+        out["capital_staged_scale_usd"] = item.get("capital_staged_scale_usd")
+    if item.get("capital_remaining_cap_usd") is not None:
+        out["capital_remaining_cap_usd"] = item.get("capital_remaining_cap_usd")
+    if item.get("capital_remaining_slots") is not None:
+        out["capital_remaining_slots"] = item.get("capital_remaining_slots")
+    if item.get("capital_effective_per_trade_usd") is not None:
+        out["capital_effective_per_trade_usd"] = item.get("capital_effective_per_trade_usd")
+    if item.get("capital_effective_total_cap_usd") is not None:
+        out["capital_effective_total_cap_usd"] = item.get("capital_effective_total_cap_usd")
+    if item.get("capital_effective_cap_multiplier") is not None:
+        out["capital_effective_cap_multiplier"] = item.get("capital_effective_cap_multiplier")
+    if item.get("capital_deployment_blockers"):
+        out["capital_deployment_blockers"] = item.get("capital_deployment_blockers")
+    reinforcement_score = float(item.get("support_overlap_score") or item.get("reinforcement_score") or 0.0)
+    reinforcement_tags = list(item.get("support_overlap_tags") or item.get("reinforcement_tags") or [])
+    if reinforcement_score > 0:
+        out["support_overlap_score"] = round(reinforcement_score, 2)
+    if reinforcement_tags:
+        out["support_overlap_tags"] = reinforcement_tags
+        out["reinforcement_bucket"] = _home_reinforcement_bucket(reinforcement_score, reinforcement_tags)
+    return out
+
+
+def _build_legacy_next_best_move_response(root: str) -> dict:
+    candidates = _build_next_best_move_candidates(root)
     if not candidates:
         best = {
             "action": "HOLD", "system": None, "symbol": None, "priority": "LOW",
@@ -417,7 +7007,481 @@ def get_next_best_move(_user=Depends(get_current_user)):
         alts = []
     else:
         best = candidates[0]
-        alts = candidates[1:3]
+        alts = candidates[1:8]
+    return {
+        "next_best_move": best,
+        "alternatives": alts,
+    }
+
+
+def _build_action_queue_state(root: str) -> dict:
+    import sqlite3, json as _j
+    from datetime import datetime, timezone
+
+    db_path = os.path.join(root, "data_storage", "engine.db")
+    now_utc = datetime.now(timezone.utc)
+
+    actions: list = []
+    blocked: list = []
+    capital = {
+        "perps_collateral_usd": 0.0,
+        "perps_positions": 0,
+        "spot_invested_usd": 0.0,
+        "memecoins_mode": "PAPER",
+        "total_deployed_usd": 0.0,
+        "memecoin_allocator_stance": "PAPER_ONLY",
+        "memecoin_allocator_note": "Allocator snapshot not built yet.",
+    }
+
+    try:
+        _perp_pressure_ctx = _home_portfolio_pressure_context()
+        n_pos = 0
+        live_col = 0.0
+        try:
+            from utils.perp_executor import get_perp_status  # type: ignore
+            perp_status = get_perp_status() or {}
+            positions = perp_status.get("positions") or []
+            live_col = round(sum(float((p or {}).get("collateral_usd") or 0.0) for p in positions), 2)
+        except Exception as pex:
+            log.debug("action_queue perp canonical snapshot failed: %s", pex)
+
+        _pc = sqlite3.connect(db_path)
+        _pc.row_factory = sqlite3.Row
+        try:
+            _tier_n_pos = int(_pc.execute(
+                "SELECT COUNT(DISTINCT symbol) FROM perp_positions "
+                "WHERE status='OPEN' AND notes LIKE '%TIER%'"
+            ).fetchone()[0] or 0)
+            n_pos = max(_tier_n_pos, int(_perp_pressure_ctx.get("perps_positions") or 0))
+        except Exception:
+            n_pos = int(_perp_pressure_ctx.get("perps_positions") or 0)
+
+        if live_col <= 0:
+            try:
+                live_col = float(_pc.execute(
+                    "SELECT COALESCE(SUM(collateral_usd), 0) FROM perp_positions "
+                    "WHERE status='OPEN' AND notes LIKE '%TIER%'"
+                ).fetchone()[0] or 0.0)
+            except Exception:
+                live_col = 0.0
+
+        if n_pos <= 0:
+            _pc = sqlite3.connect(db_path)
+            _pc.row_factory = sqlite3.Row
+            n_pos = int(_pc.execute(
+                "SELECT COUNT(DISTINCT symbol) FROM perp_positions "
+                "WHERE status='OPEN' AND notes LIKE '%TIER%'"
+            ).fetchone()[0] or 0)
+        _pc.close()
+
+        if live_col <= 0:
+            live_col = float(_perp_pressure_ctx.get("perps_collateral_usd") or 0.0)
+
+        capital["perps_positions"] = n_pos
+
+        worst_liq = None
+        try:
+            _jup_col, _, worst_liq = _fetch_jupiter_summary()
+            if live_col <= 0 and _jup_col > 0:
+                live_col = _jup_col
+        except Exception:
+            pass
+        capital["perps_collateral_usd"] = round(live_col, 0)
+
+        if worst_liq is not None and worst_liq < 15:
+            actions.append({
+                "_rank": 95, "system": "PERP", "action": "WATCH",
+                "symbol": None, "priority": "URGENT",
+                "reason": f"Liq distance {worst_liq:.1f}% — position near threshold. Reduce or add collateral.",
+                "size_guidance": "Do not add new capital. Consider reducing position.",
+                "blockers": [f"LIQ={worst_liq:.1f}%"],
+            })
+        elif worst_liq is not None and worst_liq < 25:
+            actions.append({
+                "_rank": 25, "system": "PERP", "action": "WATCH",
+                "symbol": None, "priority": "NORMAL",
+                "reason": f"{n_pos} positions · ${live_col:,.0f} collateral · worst liq {worst_liq:.1f}% — monitor.",
+                "size_guidance": "No new perp capital until liq distance improves (>25%).",
+                "blockers": [],
+            })
+        elif n_pos > 0:
+            liq_str = f" · liq {worst_liq:.1f}%" if worst_liq else ""
+            actions.append({
+                "_rank": 20, "system": "PERP", "action": "HOLD",
+                "symbol": None, "priority": "LOW",
+                "reason": f"{n_pos} positions healthy · ${live_col:,.0f} deployed{liq_str}.",
+                "size_guidance": "No new capital needed. Hold.",
+                "blockers": [],
+            })
+        else:
+            actions.append({
+                "_rank": 10, "system": "PERP", "action": "WAIT",
+                "symbol": None, "priority": "LOW",
+                "reason": "No open positions.",
+                "size_guidance": "Stand by for next tier entry signal.",
+                "blockers": [],
+            })
+    except Exception as exc:
+        log.debug("action_queue perp: %s", exc)
+
+    try:
+        _meme_alloc = _home_memecoin_allocator_context()
+        capital.update(_meme_alloc)
+        _dry     = os.getenv("MEMECOIN_DRY_RUN",    "true").lower()  == "true"
+        _pilot   = os.getenv("MEMECOIN_PILOT_MODE", "false").lower() == "true"
+        _auto    = os.getenv("MEMECOIN_AUTO_BUY",   "false").lower() == "true"
+        _max_pos = int(os.getenv("MEMECOIN_MAX_OPEN", "3"))
+        _buy_min = float(os.getenv("MEMECOIN_BUY_SCORE_MIN", "65"))
+        _mmode   = "PAPER" if _dry else ("PILOT" if _pilot else "LIVE")
+        capital["memecoins_mode"] = _mmode
+
+        fg_val = None
+        try:
+            from utils.agent_coordinator import get_fear_greed  # type: ignore
+            fg_val = get_fear_greed().get("value")
+        except Exception:
+            pass
+        _fg_thr = 35 if not _dry else 25
+        _fg_gate_active = not _dry
+        _fg_ok  = True if not _fg_gate_active else (fg_val is not None and fg_val > _fg_thr)
+
+        COOLDOWN = "2026-03-07T00:00:00"
+        _mc = sqlite3.connect(db_path)
+        _mc.row_factory = sqlite3.Row
+        n_pc = int(_mc.execute(
+            "SELECT COUNT(*) FROM alert_outcomes "
+            "WHERE created_ts_utc >= ? AND return_24h_pct IS NOT NULL",
+            (COOLDOWN,)
+        ).fetchone()[0] or 0)
+        open_cnt = int(_mc.execute(
+            "SELECT COUNT(DISTINCT mint) FROM memecoin_signal_outcomes WHERE status='OPEN'"
+        ).fetchone()[0] or 0)
+        _mc.close()
+
+        sample_ok = n_pc >= 20
+        blks = []
+        if not sample_ok: blks.append(f"SAMPLE={n_pc}/20")
+        if _fg_gate_active and not _fg_ok:
+            blks.append(f"F&G={fg_val if fg_val is not None else '?'}<{_fg_thr}")
+        if not _auto:     blks.append("AUTO_BUY=off")
+
+        best_sig = None
+        try:
+            from utils.memecoin_scanner import get_cached_signals  # type: ignore
+            _sigs = sorted(get_cached_signals(), key=lambda s: s.get("score", 0), reverse=True)
+            if _sigs and _sigs[0].get("score", 0) >= _buy_min:
+                best_sig = _sigs[0]
+        except Exception:
+            pass
+
+        if not sample_ok:
+            actions.append({
+                "_rank": 5, "system": "MEMECOINS", "action": "BLOCKED",
+                "symbol": None, "priority": "LOW",
+                "reason": f"Sample experiment: {n_pc}/20 evaluations post-cooldown. Unlocks at 20.",
+                "size_guidance": f"{_mmode} — no operator capital required. {capital.get('memecoin_allocator_note')}",
+                "blockers": blks,
+            })
+            if best_sig:
+                blocked.append({
+                    "system": "MEMECOINS",
+                    "symbol": best_sig.get("symbol"),
+                    "token_address": best_sig.get("mint"),
+                    "reason": f"Score {best_sig.get('score', 0):.0f} qualifies — held by sample gate",
+                    "blockers": [f"SAMPLE={n_pc}/20"],
+                })
+        elif _fg_gate_active and not _fg_ok:
+            actions.append({
+                "_rank": 12, "system": "MEMECOINS", "action": "WAIT",
+                "symbol": None, "priority": "LOW",
+                "reason": f"F&G {fg_val if fg_val is not None else '?'} — below gate (>{_fg_thr}). Extreme fear zone.",
+                "size_guidance": f"No capital until F&G recovers. {capital.get('memecoin_allocator_note')}",
+                "blockers": blks,
+            })
+            if best_sig:
+                blocked.append({
+                    "system": "MEMECOINS",
+                    "symbol": best_sig.get("symbol"),
+                    "token_address": best_sig.get("mint"),
+                    "reason": f"Score {best_sig.get('score', 0):.0f} qualifies — blocked by F&G gate (>{_fg_thr})",
+                    "blockers": [f"F&G={fg_val}"],
+                })
+        elif not _auto or open_cnt >= _max_pos:
+            actions.append({
+                "_rank": 8, "system": "MEMECOINS", "action": "BLOCKED",
+                "symbol": None, "priority": "LOW",
+                "reason": "Gate passes but execution blocked: " + ", ".join(blks),
+                "size_guidance": f"No capital deployment. {capital.get('memecoin_allocator_note')}",
+                "blockers": blks,
+            })
+        else:
+            actions.append({
+                "_rank": 40, "system": "MEMECOINS", "action": "WATCH",
+                "symbol": None, "priority": "NORMAL",
+                "reason": f"All gates open — {_mmode} auto-system active · {open_cnt}/{_max_pos} open.",
+                "size_guidance": (
+                    f"Allocator stance: {capital.get('memecoin_allocator_stance')} · "
+                    f"effective per-trade ${float(capital.get('memecoins_effective_per_trade_usd') or 0.0):.2f} · "
+                    f"effective cap ${float(capital.get('memecoins_effective_total_cap_usd') or 0.0):.2f}."
+                ),
+                "blockers": [],
+            })
+    except Exception as exc:
+        log.debug("action_queue meme: %s", exc)
+
+    try:
+        _gate_blks_aq = blks if "blks" in locals() else []
+        for _lca in _build_memecoin_lifecycle_actions(db_path, limit=5):
+            _blks_aq = list(_gate_blks_aq) if _lca["action"] == "ACT" else []
+            actions.append({
+                "_rank":             _lca["_rank"],
+                "system":            "MEMECOINS",
+                "action":            _lca["action"],
+                "symbol":            _lca["symbol"],
+                "token_address":     _lca.get("token_address"),
+                "priority":          _lca["priority"],
+                "reason":            _lca["reason"],
+                "size_guidance":     _lca["size_guidance"],
+                "blockers":          _blks_aq,
+                "move_type":         _lca.get("move_type"),
+                "continuation_archetype": _lca.get("continuation_archetype"),
+                "research_priority": _lca.get("research_priority"),
+                "research_budget":   _lca.get("research_budget"),
+                "triage_tags":       _lca.get("triage_tags"),
+            })
+    except Exception as exc:
+        log.debug("action_queue lifecycle: %s", exc)
+
+    try:
+        _spot_snap = _spot_posture_snapshot()
+        _spot_by_sym = _spot_snap.get("by_symbol", {})
+        _spot_state = {}
+        try:
+            from utils.spot_accumulator import get_portfolio_state  # type: ignore
+            _spot_state = get_portfolio_state() or {}
+            capital["spot_invested_usd"] = round(float(_spot_state.get("total_invested") or 0.0), 0)
+        except Exception:
+            _spot_state = {}
+
+        _sc = sqlite3.connect(db_path)
+        _sc.row_factory = sqlite3.Row
+        _sr = _sc.execute(
+            "SELECT value FROM kv_store WHERE key='spot_current_signals'"
+        ).fetchone()
+        _sc.close()
+
+        best_dca = None
+        if _sr:
+            _raw  = _j.loads(_sr[0])
+            _smap = _raw.get("data", _raw) if isinstance(_raw, dict) else {}
+            _dcas = sorted(
+                [(s, d) for s, d in _smap.items()
+                 if isinstance(d, dict) and (d.get("gap") or 0) > 0],
+                key=lambda x: (x[1].get("signal_type") == "DCA_NOW", x[1].get("gap", 0)), reverse=True,
+            )
+            if _dcas:
+                best_dca = _dcas[0]
+
+        if best_dca:
+            sym, d   = best_dca
+            gap      = d.get("gap", 0)
+            sig      = d.get("signal_type", "WATCH")
+            price    = d.get("price_usd") or d.get("current_price")
+            p_str    = f" @ ${price:.4f}" if price else ""
+            _spot_row = _spot_by_sym.get(sym, {}) or {}
+            posture = _spot_row.get("posture")
+            token_address = _spot_row.get("token_address")
+            if posture in ("PRIME_ENTRY", "ACCUMULATE"):
+                actions.append({
+                    "_rank": 35 if sig == "DCA_NOW" else 15,
+                    "system": "SPOT", "action": "DCA",
+                    "symbol": sym, "priority": "NORMAL" if sig == "DCA_NOW" else "LOW",
+                    "token_address": token_address,
+                    "reason": f"{sym} {gap:+.1f}% under target · signal: {sig} · posture: {posture}.",
+                    "size_guidance": f"Manual DCA{p_str}. No auto-execution.",
+                    "blockers": ["MANUAL_ONLY"],
+                })
+            else:
+                actions.append({
+                    "_rank": 12, "system": "SPOT", "action": "WAIT",
+                    "symbol": sym, "priority": "LOW",
+                    "token_address": token_address,
+                    "reason": f"{sym} {gap:+.1f}% under target but current posture is {posture or 'UNKNOWN'}.",
+                    "size_guidance": "Hold off until spot posture improves.",
+                    "blockers": [posture or "NOT_ACTIONABLE"],
+                })
+        else:
+            actions.append({
+                "_rank": 10, "system": "SPOT", "action": "WATCH",
+                "symbol": None, "priority": "LOW",
+                "reason": "Basket balanced — no significant allocation gap.",
+                "size_guidance": "No action needed.",
+                "blockers": [],
+            })
+    except Exception as exc:
+        log.debug("action_queue spot: %s", exc)
+
+    try:
+        for _wa in _build_whale_lifecycle_actions(db_path, limit=3):
+            actions.append({
+                "_rank":         _wa["_rank"],
+                "system":        _wa["system"],
+                "action":        _wa["action"],
+                "symbol":        _wa["symbol"],
+                "token_address": _wa.get("token_address"),
+                "priority":      _wa["priority"],
+                "reason":        _wa["reason"],
+                "size_guidance": _wa["size_guidance"],
+                "blockers":      _wa["blockers"],
+            })
+    except Exception as exc:
+        log.debug("action_queue whale: %s", exc)
+
+    try:
+        for _ca in _build_confluence_actions(db_path, limit=3):
+            actions.append({
+                "_rank":         _ca["_rank"],
+                "system":        "CONFLUENCE",
+                "action":        _ca["action"],
+                "symbol":        _ca["symbol"],
+                "token_address": _ca.get("token_address"),
+                "priority":      _ca["priority"],
+                "reason":        _ca["reason"],
+                "size_guidance": _ca["size_guidance"],
+                "blockers":      _ca["blockers"],
+            })
+    except Exception as exc:
+        log.debug("action_queue confluence: %s", exc)
+
+    actions.sort(key=lambda a: a["_rank"], reverse=True)
+    for a in actions:
+        a.pop("_rank", None)
+    actions = [_apply_gated_home_label(a) for a in actions]
+
+    capital["total_deployed_usd"] = round(
+        capital["perps_collateral_usd"] + capital["spot_invested_usd"], 0
+    )
+    allocator_summary = _build_cross_system_allocator_summary(capital)
+    operating_mode_summary = _build_operating_mode_snapshot(capital, allocator_summary)
+    lane_policy_summary = _build_lane_policy_snapshot(
+        operating_mode_summary,
+        memecoins=_posture_memecoins(),
+        perps=_posture_perps(),
+        spot=_posture_spot(),
+        whale=_posture_whale(),
+    )
+    lane_authority_summary = _build_lane_authority_summary(
+        operating_mode_summary,
+        memecoins=_posture_memecoins(),
+        perps=_posture_perps(),
+        spot=_posture_spot(),
+        whale=_posture_whale(),
+    )
+    lane_unlock_summary = _build_lane_unlock_summary(
+        operating_mode_summary,
+        lane_policy_summary,
+        lane_authority_summary,
+        memecoins=_posture_memecoins(),
+        perps=_posture_perps(),
+        spot=_posture_spot(),
+        whale=_posture_whale(),
+    )
+    operating_agenda_summary = _build_operating_agenda_summary(
+        operating_mode_summary,
+        lane_policy_summary,
+        lane_authority_summary,
+        lane_unlock_summary,
+        allocator_summary,
+        None,
+    )
+    operating_constraints_summary = _build_operating_constraints_summary(
+        operating_mode_summary,
+        lane_policy_summary,
+        lane_authority_summary,
+        lane_unlock_summary,
+        allocator_summary,
+    )
+    operating_transition_summary = _build_operating_transition_summary(
+        operating_mode_summary,
+        lane_policy_summary,
+        lane_authority_summary,
+        lane_unlock_summary,
+        operating_constraints_summary,
+        allocator_summary,
+    )
+
+    return {
+        "actions": actions,
+        "blocked": blocked,
+        "capital": capital,
+        "allocator_summary": allocator_summary,
+        "operating_mode_summary": operating_mode_summary,
+        "lane_policy_summary": lane_policy_summary,
+        "lane_authority_summary": lane_authority_summary,
+        "lane_unlock_summary": lane_unlock_summary,
+        "operating_agenda_summary": operating_agenda_summary,
+        "operating_constraints_summary": operating_constraints_summary,
+        "operating_transition_summary": operating_transition_summary,
+        "generated_at": now_utc.isoformat(),
+    }
+
+
+# ── Patch 190: Next Best Move — unified cross-system recommendation ────────────
+
+@router.get("/next-best-move")
+def get_next_best_move(_user=Depends(get_current_user)):
+    """
+    Cross-system 'what to do next' recommendation. P190.
+    Aggregates PERP buffer health, MEMECOIN gate state, and SPOT portfolio gap
+    into a single ranked action + 2 alternatives.
+    Decision support only — no auto-trading changes.
+
+    Actions: MANAGE (urgent) > BUY (meme signal) > DCA (spot gap) >
+             WATCH (gates open, no signal) > WAIT (gate closed) > HOLD (nothing to do)
+    """
+    import sys
+    from datetime import datetime, timezone
+
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    candidates = _build_next_best_move_candidates(root)
+    queue = get_action_queue(_user)
+
+    if not candidates:
+        best = {
+            "action": "HOLD", "system": None, "symbol": None, "priority": "LOW",
+            "reason": "All systems healthy — no immediate action required. Monitor positions.",
+            "blockers": [], "confidence": "medium",
+        }
+        alts = []
+    else:
+        legacy = {
+            "next_best_move": candidates[0],
+            "alternatives": candidates[1:8],
+        }
+        try:
+            priority = _build_priority_candidates_registry(nbm=legacy, queue=queue)
+            ranked = priority.get("candidates") or []
+            top = _priority_candidate_to_home_move(priority.get("top_candidate"))
+            best = top or candidates[0]
+            best_key = (priority.get("top_candidate") or {}).get("opportunity_key")
+            alt_items = []
+            for item in ranked:
+                if item.get("opportunity_key") == best_key:
+                    continue
+                mapped = _priority_candidate_to_home_move(item)
+                if mapped:
+                    alt_items.append(mapped)
+                if len(alt_items) >= 7:
+                    break
+            alts = alt_items if alt_items else candidates[1:8]
+        except Exception as exc:
+            log.debug("next_best_move priority selection fallback: %s", exc)
+            best = candidates[0]
+            alts = candidates[1:8]
+
+    no_action = not best or best["action"] in ("HOLD", "WAIT")
 
     return {
         "next_best_move":        best,
@@ -425,3 +7489,9311 @@ def get_next_best_move(_user=Depends(get_current_user)):
         "no_action_recommended": no_action,
         "generated_at":          datetime.now(timezone.utc).isoformat(),
     }
+
+
+# ── Patch 200: Runtime mode summary ──────────────────────────────────────────
+
+def _build_runtime_modes_payload() -> dict:
+    """
+    Lightweight runtime mode summary — reads env vars only, no I/O.
+    Returns the actual execution mode for each major system path.
+
+    Modes:
+      perp:      SIM   (PERP_DRY_RUN=true)    | LIVE (false)
+      memecoins: PAPER (MEMECOIN_DRY_RUN=true) | PILOT (dry=false, pilot=true) | LIVE (dry=false, pilot=false)
+      spot:      PAPER (always advisory — no auto-execution path exists)
+
+    any_live:  true when ANY path is armed for unrestricted live execution
+    any_armed: true when ANY path is executing with real capital (includes PILOT)
+    """
+    perp_dry   = os.getenv("PERP_DRY_RUN",       "true").lower()  == "true"
+    meme_dry   = os.getenv("MEMECOIN_DRY_RUN",    "true").lower()  == "true"
+    meme_pilot = os.getenv("MEMECOIN_PILOT_MODE", "false").lower() == "true"
+    meme_auto  = os.getenv("MEMECOIN_AUTO_BUY",   "false").lower() == "true"
+
+    perp_mode = "SIM"   if perp_dry  else "LIVE"
+    meme_mode = "PAPER" if meme_dry  else ("PILOT" if meme_pilot else "LIVE")
+    spot_mode = "PAPER"  # spot has no auto-execution path
+
+    # any_live:  unrestricted live (no guardrails)
+    # any_armed: any real-capital execution, including PILOT
+    any_live  = (not perp_dry) or (not meme_dry and not meme_pilot)
+    any_armed = (not perp_dry) or (not meme_dry)
+
+    capital = {
+        **_home_portfolio_pressure_context(),
+        **_home_memecoin_allocator_context(),
+    }
+    capital["total_deployed_usd"] = round(
+        float(capital.get("perps_collateral_usd") or 0.0)
+        + float(capital.get("spot_invested_usd") or 0.0),
+        0,
+    )
+    allocator_summary = _build_cross_system_allocator_summary(capital)
+    operating_mode_summary = _build_operating_mode_snapshot(capital, allocator_summary)
+    lane_policy_summary = _build_lane_policy_snapshot(
+        operating_mode_summary,
+        memecoins=_posture_memecoins(),
+        perps=_posture_perps(),
+        spot=_posture_spot(),
+        whale=_posture_whale(),
+    )
+    lane_authority_summary = _build_lane_authority_summary(
+        operating_mode_summary,
+        memecoins=_posture_memecoins(),
+        perps=_posture_perps(),
+        spot=_posture_spot(),
+        whale=_posture_whale(),
+    )
+    lane_unlock_summary = _build_lane_unlock_summary(
+        operating_mode_summary,
+        lane_policy_summary,
+        lane_authority_summary,
+        memecoins=_posture_memecoins(),
+        perps=_posture_perps(),
+        spot=_posture_spot(),
+        whale=_posture_whale(),
+    )
+    _home_stack = _build_home_operating_stack(
+        operating_mode_summary,
+        lane_policy_summary,
+        lane_authority_summary,
+        lane_unlock_summary,
+        allocator_summary,
+        None,
+        None,
+    )
+
+    return {
+        "perp":                   perp_mode,
+        "memecoins":              meme_mode,
+        "spot":                   spot_mode,
+        "any_live":               any_live,
+        "any_armed":              any_armed,
+        "meme_auto_buy":          meme_auto,
+        "operating_mode_summary":        operating_mode_summary,
+        "lane_policy_summary":           lane_policy_summary,
+        "lane_authority_summary":        lane_authority_summary,
+        "lane_unlock_summary":           lane_unlock_summary,
+        **_home_stack,
+    }
+
+
+def _build_runtime_modes_fallback() -> dict:
+    perp_dry = os.getenv("PERP_DRY_RUN", "true").lower() == "true"
+    meme_dry = os.getenv("MEMECOIN_DRY_RUN", "true").lower() == "true"
+    meme_pilot = os.getenv("MEMECOIN_PILOT_MODE", "false").lower() == "true"
+    return {
+        **_warming_snapshot("home:modes"),
+        "perp": "SIM" if perp_dry else "LIVE",
+        "memecoins": "PAPER" if meme_dry else ("PILOT" if meme_pilot else "LIVE"),
+        "spot": "PAPER",
+        "any_live": (not perp_dry) or (not meme_dry and not meme_pilot),
+        "any_armed": (not perp_dry) or (not meme_dry),
+        "meme_auto_buy": os.getenv("MEMECOIN_AUTO_BUY", "false").lower() == "true",
+    }
+
+
+@router.get("/modes")
+async def get_runtime_modes(_user=Depends(get_current_user)):
+    try:
+        return await snapshot_or_build(
+            "home:modes",
+            _build_runtime_modes_payload,
+            fresh_s=180,
+            stale_s=600,
+            wait_timeout_s=4,
+        )
+    except Exception:
+        return _build_runtime_modes_fallback()
+
+
+# ── Patch 202: Daily Brief ────────────────────────────────────────────────────
+
+def _build_home_brief_payload() -> dict:
+    """
+    Patch 202 — Daily Brief panel.
+    Returns: readiness checks, 24h perp stats, recent agent memory alerts.
+    """
+    import sys, sqlite3, re as _re202
+    from datetime import datetime, timezone, timedelta
+
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    if root not in sys.path:
+        sys.path.insert(0, root)
+
+    now_utc   = datetime.now(timezone.utc)
+    since_24h = (now_utc - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+    COOLDOWN  = "2026-03-07T00:00:00"
+
+    # Patch 203 — sample-build config (read env directly; engine not imported here)
+    _sb202_mode  = os.getenv("SAMPLE_BUILD_MODE", "false").lower() == "true"
+    _sb202_min   = int(os.getenv("SAMPLE_BUILD_SCORE_MIN", "65"))
+
+    result: dict = {
+        "checks":       [],
+        "today":        {"trades": 0, "pnl_sum": 0.0, "win_rate": None,
+                         "signals_24h": 0, "gate_acceptance_pct": None},
+        "alerts":       [],
+        "priority_snapshot": None,
+        "generated_at": now_utc.strftime("%Y-%m-%d %H:%M:%S"),
+        "pipeline_age_hours": None,
+        "pipeline_last_evaluated_utc": None,
+        "pipeline_health": "UNKNOWN",
+        "sample_build": {
+            "mode":      _sb202_mode,
+            "score_min": _sb202_min,
+            "label":     f"ON (min score {_sb202_min})" if _sb202_mode else "OFF",
+        },
+        "post_cooldown_n_sample_build": 0,
+    }
+
+    db_path = os.path.join(root, "data_storage", "engine.db")
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+
+        # ── Readiness checks (mirrors /trust logic) ───────────────────────────
+        # 1. Post-cooldown sample
+        try:
+            # Patch 220: switched from alert_outcomes to memecoin_signal_outcomes
+            n_pc = int(conn.execute(
+                "SELECT COUNT(*) FROM memecoin_signal_outcomes "
+                "WHERE scanned_at >= ? AND status = 'COMPLETE' AND return_24h_pct IS NOT NULL",
+                (COOLDOWN,)).fetchone()[0] or 0)
+            result["checks"].append({
+                "name": "post_cooldown_sample", "label": "sample",
+                "pass": n_pc >= 20, "value": f"{n_pc}/20",
+                "detail": "≥20 evals post-cooldown",
+            })
+        except Exception:
+            pass
+
+        # 2. Pipeline freshness
+        try:
+            # Patch 220: switched from alert_outcomes to memecoin_signal_outcomes
+            row = conn.execute(
+                "SELECT MAX(evaluated_24h_ts_utc) FROM memecoin_signal_outcomes "
+                "WHERE status = 'COMPLETE' AND return_24h_pct IS NOT NULL"
+            ).fetchone()
+            last_eval = row[0] if row else None
+            if last_eval:
+                age_h = (now_utc.replace(tzinfo=None) -
+                         datetime.fromisoformat(last_eval[:19])).total_seconds() / 3600
+                result["pipeline_age_hours"] = round(age_h, 2)
+                result["pipeline_last_evaluated_utc"] = last_eval
+                result["pipeline_health"] = (
+                    "FRESH" if age_h < 2 else
+                    "AGING" if age_h < 4 else
+                    "STALE"
+                )
+                result["checks"].append({
+                    "name": "pipeline_fresh", "label": "pipeline",
+                    "pass": age_h < 72,
+                    "value": f"{age_h:.0f}h ago", "detail": "eval pipeline <72h",
+                })
+            else:
+                result["pipeline_health"] = "NO_DATA"
+                result["checks"].append({
+                    "name": "pipeline_fresh", "label": "pipeline",
+                    "pass": False, "value": "no data", "detail": "no outcomes",
+                })
+        except Exception:
+            pass
+
+        # 3. WR gate — source: memecoin_signal_outcomes (Patch 237)
+        # Switched from alert_outcomes to MSO so the gate reflects live scanner quality.
+        # Patch 224: extended SELECT to capture symbol+score for sample quality context.
+        # Patch 235: added scanned_at for day-concentration fields.
+        # Patch 237 — symbol-capped gate sample (mirrors /trust block):
+        #   Pull LIMIT 200 by recency, accept at most _SYM_CAP rows per symbol,
+        #   stop when _CAP_N rows collected.  Threshold (55%) and min-n (5) unchanged.
+        _CAP_N   = 20   # target capped sample size
+        _SYM_CAP = 3    # max rows per symbol in gate sample
+        try:
+            from collections import Counter as _Ctr237b
+            _raw_rows_b = conn.execute(
+                "SELECT return_24h_pct, symbol, score, scanned_at FROM memecoin_signal_outcomes "
+                "WHERE status = 'COMPLETE' AND return_24h_pct IS NOT NULL "
+                "ORDER BY evaluated_24h_ts_utc DESC LIMIT 200"
+            ).fetchall()
+
+            # ── Raw window concentration (first 20 of raw batch, audit trail) ────
+            _raw20_b      = list(_raw_rows_b[:20])
+            _raw20_syms_b = [r[1] or "" for r in _raw20_b]
+            _raw20_ctr_b  = _Ctr237b(_raw20_syms_b)
+            _raw20_top_b  = _raw20_ctr_b.most_common(1)
+            _raw_top_sym_b = _raw20_top_b[0][0] if _raw20_top_b else None
+            _raw_top_pct_b = round(_raw20_top_b[0][1] / len(_raw20_b) * 100, 1) if _raw20_b else None
+
+            # ── Build symbol-capped gate sample ───────────────────────────────────
+            _sym_counts_b: dict = {}
+            rows = []
+            for _r in _raw_rows_b:
+                _sym = _r[1] or ""
+                if _sym_counts_b.get(_sym, 0) < _SYM_CAP:
+                    rows.append(_r)
+                    _sym_counts_b[_sym] = _sym_counts_b.get(_sym, 0) + 1
+                if len(rows) >= _CAP_N:
+                    break
+
+            n_wr = len(rows)
+            if n_wr >= 1:
+                wins  = sum(1 for r in rows if float(r[0]) > 0)
+                wr    = round(wins / n_wr * 100, 1)
+                pass_ = n_wr >= 5 and wr >= 55.0   # threshold UNCHANGED
+                # ── Capped sample concentration diagnostics ───────────────────────
+                _syms    = [r[1] for r in rows if r[1]]
+                _ctr     = _Ctr237b(_syms)
+                _top     = _ctr.most_common(1)
+                _top_sym = _top[0][0] if _top else None
+                _top_n   = _top[0][1] if _top else 0
+                _top_pct = round(_top_n / n_wr * 100, 1) if n_wr > 0 else None
+                _thresh  = int(os.getenv("ALERT_THRESHOLD", "90"))
+                _act     = [r for r in rows if r[2] is not None and float(r[2]) >= _thresh]
+                _act_n   = len(_act)
+                _act_wr  = round(sum(1 for r in _act if float(r[0]) > 0) / _act_n * 100, 1) if _act_n >= 3 else None
+                _days        = [str(r[3])[:10] for r in rows if r[3]]
+                _day_ctr     = _Ctr237b(_days)
+                _top_day_i   = _day_ctr.most_common(1)
+                _top_day     = _top_day_i[0][0] if _top_day_i else None
+                _top_day_n   = _top_day_i[0][1] if _top_day_i else 0
+                _top_day_pct = round(_top_day_n / n_wr * 100, 1) if n_wr > 0 else None
+                _unique_days = len(_day_ctr)
+                _nact_n      = n_wr - _act_n
+                _tok_v       = _top_pct or 0
+                _day_v       = _top_day_pct or 0
+                _conc = (
+                    "HIGHLY_CONCENTRATED" if _tok_v > 80 or _day_v > 80 else
+                    "NARROW"              if _tok_v > 60 or _day_v > 60 else
+                    "BROAD"
+                )
+                result["checks"].append({
+                    "name": "wr_gate", "label": "WR gate",
+                    "pass": pass_, "value": f"{wr}% n={n_wr}",
+                    "detail": f"capped-20 scan WR ≥55% (max {_SYM_CAP}/symbol)",
+                    "wr_sample_unique_tokens":        len(_ctr),
+                    "wr_sample_top_token_symbol":     _top_sym,
+                    "wr_sample_top_token_share_pct":  _top_pct,
+                    "wr_raw_top_token_share_pct":     _raw_top_pct_b,
+                    "wr_raw_top_token_symbol":        _raw_top_sym_b,
+                    "wr_sample_actionable_n":         _act_n,
+                    "wr_sample_actionable_wr":        _act_wr,
+                    "wr_sample_non_actionable_n":     _nact_n,
+                    "wr_sample_unique_days":          _unique_days,
+                    "wr_sample_top_day":              _top_day,
+                    "wr_sample_top_day_share_pct":    _top_day_pct,
+                    "wr_sample_concentration_status": _conc,
+                })
+            else:
+                result["checks"].append({
+                    "name": "wr_gate", "label": "WR gate",
+                    "pass": False, "value": "no data", "detail": "no MSO completions",
+                })
+        except Exception:
+            pass
+
+        # 5. Priority engine snapshot — compact cross-system brain check
+        try:
+            _pe = _home_priority_engine_summary()
+            _pe_sum = _pe.get("summary") or {}
+            _top_g = _pe.get("top_gated") or {}
+            _top_r = _pe.get("top_research") or {}
+            _top_m = _pe.get("top_monitor") or {}
+            result["priority_snapshot"] = {
+                "schema_version": _pe.get("schema_version"),
+                "candidate_count": int(_pe_sum.get("candidate_count") or 0),
+                "systems_present": _pe_sum.get("systems_present") or [],
+                "top_gated": {
+                    "system": _top_g.get("system"),
+                    "symbol": _top_g.get("symbol"),
+                    "action": _top_g.get("action"),
+                } if _top_g else None,
+                "top_research": {
+                    "system": _top_r.get("system"),
+                    "symbol": _top_r.get("symbol"),
+                    "action": _top_r.get("action"),
+                } if _top_r else None,
+                "top_monitor": {
+                    "system": _top_m.get("system"),
+                    "symbol": _top_m.get("symbol"),
+                    "action": _top_m.get("action"),
+                } if _top_m else None,
+            }
+            _val = f"{int(_pe_sum.get('candidate_count') or 0)} live"
+            _focus = []
+            if _top_g.get("symbol"):
+                _focus.append(f"G:{_top_g.get('symbol')}")
+            if _top_r.get("symbol"):
+                _focus.append(f"R:{_top_r.get('symbol')}")
+            elif _top_m.get("system"):
+                _focus.append(f"M:{_top_m.get('system')}")
+            result["checks"].append({
+                "name": "priority_engine", "label": "priority",
+                "pass": int(_pe_sum.get("candidate_count") or 0) > 0,
+                "value": _val,
+                "detail": " · ".join(_focus) if _focus else "cross-system priority registry ready",
+            })
+        except Exception:
+            pass
+
+        # 4. Open perp positions — use the same canonical status snapshot the
+        # rest of the system uses so readiness doesn't drift from the live lane.
+        try:
+            n_pos = 0
+            detail = "open perp positions"
+            try:
+                from utils.perp_executor import get_perp_status  # type: ignore
+                perp_status = get_perp_status() or {}
+                n_pos = int(perp_status.get("open_positions") or len(perp_status.get("positions") or []) or 0)
+            except Exception:
+                n_pos = int(conn.execute(
+                    "SELECT COUNT(DISTINCT symbol) FROM perp_positions WHERE status='OPEN'"
+                ).fetchone()[0] or 0)
+                detail = "open perp positions (db fallback)"
+
+            result["checks"].append({
+                "name": "perp_positions", "label": "positions",
+                "pass": n_pos > 0, "value": str(n_pos),
+                "detail": detail,
+            })
+        except Exception:
+            pass
+
+        # 5. F&G freshness
+        try:
+            import json as _j202
+            row5 = conn.execute(
+                "SELECT value FROM kv_store WHERE key='shared_fear_greed'"
+            ).fetchone()
+            if row5:
+                fg_data = _j202.loads(row5[0])
+                fg_val  = fg_data.get("value")
+                fg_ts   = float(fg_data.get("_ts", 0))
+                age_min = (now_utc.timestamp() - fg_ts) / 60
+                stale   = age_min > 120
+                result["checks"].append({
+                    "name": "fg_fresh", "label": "F&G",
+                    "pass": fg_val is not None and not stale,
+                    "value": f"{fg_val} ({age_min:.0f}m)" if fg_val is not None else "?",
+                    "detail": "F&G cache <2h",
+                })
+            else:
+                result["checks"].append({
+                    "name": "fg_fresh", "label": "F&G",
+                    "pass": False, "value": "missing", "detail": "not in kv_store",
+                })
+        except Exception:
+            pass
+
+        # ── 24h perp trading stats ─────────────────────────────────────────────
+        try:
+            pnl_rows = conn.execute(
+                "SELECT pnl_pct FROM perp_positions "
+                "WHERE status='CLOSED' AND closed_ts_utc >= ? AND pnl_pct IS NOT NULL",
+                (since_24h,)
+            ).fetchall()
+            if pnl_rows:
+                pnls = [float(r[0]) for r in pnl_rows]
+                wins = sum(1 for p in pnls if p > 0)
+                result["today"]["trades"]   = len(pnls)
+                result["today"]["pnl_sum"]  = round(sum(pnls), 2)
+                result["today"]["win_rate"] = round(wins / len(pnls) * 100, 1)
+        except Exception:
+            pass
+
+        # Gate acceptance (signals seen vs executed, last 24h)
+        try:
+            skipped = int(conn.execute(
+                "SELECT COUNT(*) FROM skipped_signals_log WHERE ts_utc >= ?",
+                (since_24h,)).fetchone()[0] or 0)
+            exec_ct = int(conn.execute(
+                "SELECT COUNT(*) FROM perp_positions WHERE opened_ts_utc >= ?",
+                (since_24h,)).fetchone()[0] or 0)
+            total_s = skipped + exec_ct
+            result["today"]["signals_24h"] = total_s
+            if total_s > 0:
+                result["today"]["gate_acceptance_pct"] = round(exec_ct / total_s * 100, 1)
+        except Exception:
+            pass
+
+        # ── Patch 203: post-cooldown sample-build count ─────────────────────
+        try:
+            result["post_cooldown_n_sample_build"] = int(conn.execute(
+                "SELECT COUNT(*) FROM alert_outcomes "
+                "WHERE created_ts_utc >= ? AND return_24h_pct IS NOT NULL AND is_sample_build=1",
+                (COOLDOWN,)
+            ).fetchone()[0] or 0)
+        except Exception:
+            pass
+
+        # ── Patch 209: sample runway / ETA ───────────────────────────────────
+        try:
+            TARGET = 20
+            cooldown_dt = datetime.fromisoformat(COOLDOWN)
+            elapsed_days = (now_utc.replace(tzinfo=None) - cooldown_dt).total_seconds() / 86400
+
+            # Entries created after COOLDOWN (regardless of evaluation status)
+            created_rows = conn.execute(
+                "SELECT created_ts_utc FROM alert_outcomes "
+                "WHERE created_ts_utc >= ? ORDER BY created_ts_utc",
+                (COOLDOWN,)
+            ).fetchall()
+            n_created_pc = len(created_rows)
+
+            # Evaluated count (same query used by gate check above)
+            n_evaluated_pc = int(conn.execute(
+                "SELECT COUNT(*) FROM alert_outcomes "
+                "WHERE created_ts_utc >= ? AND return_24h_pct IS NOT NULL",
+                (COOLDOWN,)
+            ).fetchone()[0] or 0)
+
+            # Latest entry and completion timestamps
+            latest_entry_ts = created_rows[-1][0] if created_rows else None
+            latest_eval_row = conn.execute(
+                "SELECT MAX(evaluated_24h_ts_utc) FROM alert_outcomes "
+                "WHERE created_ts_utc >= ? AND return_24h_pct IS NOT NULL",
+                (COOLDOWN,)
+            ).fetchone()
+            latest_eval_ts = latest_eval_row[0] if latest_eval_row else None
+
+            # Rate: entries created since COOLDOWN / days elapsed
+            # Require >=2 entries AND >=1 elapsed day for a meaningful rate
+            rate = None
+            proj_days = None
+            proj_date = None
+            if n_created_pc >= 2 and elapsed_days >= 1.0:
+                rate = round(n_created_pc / elapsed_days, 2)
+                remaining = max(0, TARGET - n_evaluated_pc)
+                if remaining == 0:
+                    proj_days = 0
+                    proj_date = "complete"
+                elif rate > 0:
+                    proj_days = round(remaining / rate, 1)
+                    proj_date = (now_utc + timedelta(days=proj_days)).strftime("%b %-d")
+
+            result["sample_runway"] = {
+                "post_cooldown_n":                     n_evaluated_pc,
+                "post_cooldown_target":                TARGET,
+                "recent_entry_rate_per_day":           rate,
+                "projected_days_to_target":            proj_days,
+                "projected_target_date":               proj_date,
+                "latest_post_cooldown_entry_ts":       latest_entry_ts,
+                "latest_post_cooldown_completed_24h_ts": latest_eval_ts,
+            }
+        except Exception:
+            pass
+
+        conn.close()
+    except Exception as e:
+        log.debug("brief db error: %s", e)
+
+    # ── Agent memory alerts ────────────────────────────────────────────────────
+    try:
+        sys.path.insert(0, root)
+        from utils import orchestrator as _o202  # type: ignore
+        mem_text = _o202.read_memory() if hasattr(_o202, "read_memory") else ""
+        if not mem_text:
+            mem_path = os.path.join(root, "memory", "MEMORY.md")
+            if os.path.exists(mem_path):
+                with open(mem_path) as _mf:
+                    mem_text = _mf.read()
+
+        ALERT_KW = [
+            "CONFIG_DRIFT", "SIGNAL_BLOCK", "OUTCOME_GAP", "PANEL_CHECK",
+            "AUTO_FIXED", "CIRCUIT_BREAKER", "STALE_TABLE", "LOW_ACCEPTANCE",
+            "FEED_FAILURE", "CRITICAL", "ERROR",
+        ]
+        alerts = []
+        for m202 in _re202.finditer(
+            r'^##\s+\[(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s*UTC\]\s+(\S+)\s*\n(.+)',
+            mem_text, _re202.MULTILINE
+        ):
+            ts_str  = m202.group(1)
+            agent_n = m202.group(2)
+            body    = m202.group(3).strip()
+            try:
+                entry_dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+                if (now_utc.replace(tzinfo=None) - entry_dt).total_seconds() > 86400:
+                    continue
+            except Exception:
+                pass
+            if any(kw in body.upper() for kw in ALERT_KW):
+                alerts.append({"ts": ts_str, "agent": agent_n, "msg": body[:120]})
+
+        result["alerts"] = list(reversed(alerts))[:6]
+    except Exception as e:
+        log.debug("brief memory error: %s", e)
+
+    return result
+
+
+@router.get("/brief")
+async def get_brief(_user=Depends(get_current_user)):
+    try:
+        return await snapshot_or_build(
+            "home:brief",
+            _build_home_brief_payload,
+            fresh_s=60,
+            stale_s=600,
+            wait_timeout_s=4,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=504, detail=str(exc))
+
+
+# ── Patch 206: Capital Action Queue ──────────────────────────────────────────
+
+@router.get("/action-queue")
+@_ttl_cached("action_queue")
+def get_action_queue(_user=Depends(get_current_user)):
+    """
+    Patch 206 — Cross-system capital allocation queue. Read-only.
+    Aggregates perp liq state, memecoin gate state, and spot portfolio gap into
+    a ranked action list + capital split + blocked opportunities.
+    No strategy logic changes — pulls from existing truth sources only.
+    """
+    import sys
+    from datetime import datetime, timezone
+
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    if root not in sys.path:
+        sys.path.insert(0, root)
+
+    now_utc = datetime.now(timezone.utc)
+    raw_state = _build_action_queue_state(root)
+    actions = list(raw_state.get("actions") or [])
+    blocked = list(raw_state.get("blocked") or [])
+    capital = dict(raw_state.get("capital") or {})
+    allocator_summary = dict(raw_state.get("allocator_summary") or {})
+    operating_mode_summary = dict(raw_state.get("operating_mode_summary") or {})
+    lane_policy_summary = dict(raw_state.get("lane_policy_summary") or {})
+    lane_authority_summary = dict(raw_state.get("lane_authority_summary") or {})
+    lane_unlock_summary = dict(raw_state.get("lane_unlock_summary") or {})
+    operating_agenda_summary = dict(raw_state.get("operating_agenda_summary") or {})
+    operating_constraints_summary = dict(raw_state.get("operating_constraints_summary") or {})
+
+    # ── Patch 260: state-change annotation (Home v3 step 1) ───────────────────
+    # Load previous snapshot, diff against current queue, annotate every item
+    # with change="NEW"|"UPGRADED"|"DEGRADED"|"STABLE", then persist snapshot.
+    _snap_ts   = now_utc.isoformat()
+    _prev_snap = _home_snapshot_load()
+    _prev_map: dict = {}          # key → {tier, pos}
+    _prev_snap_ts: str | None = None
+    if _prev_snap:
+        _prev_snap_ts = _prev_snap.get("_ts")
+        for _pi, _pitem in enumerate(_prev_snap.get("items", [])):
+            _prev_map[_pitem["key"]] = {"tier": _pitem["tier"], "pos": _pi}
+
+    _change_counts = {"new": 0, "upgraded": 0, "degraded": 0, "stable": 0}
+    _snap_items: list = []
+    for _pos, _a in enumerate(actions):
+        _key  = _home_item_key(_a)
+        _tier = _home_item_tier(_a)
+        _prev = _prev_map.get(_key)
+        if _prev is None:
+            _chg = "NEW"
+            _change_counts["new"] += 1
+        elif _tier > _prev["tier"]:
+            _chg = "UPGRADED"
+            _change_counts["upgraded"] += 1
+        elif _tier < _prev["tier"]:
+            _chg = "DEGRADED"
+            _change_counts["degraded"] += 1
+        else:
+            _chg = "STABLE"
+            _change_counts["stable"] += 1
+        _a["change"] = _chg
+        _snap_items.append({"key": _key, "tier": _tier, "pos": _pos})
+
+    _home_snapshot_save(_snap_items, _snap_ts)
+    _change_summary = {
+        **_change_counts,
+        "last_snapshot_at": _prev_snap_ts,
+    }
+    # ── End Patch 260 ──────────────────────────────────────────────────────────
+
+    legacy_nbm = _build_legacy_next_best_move_response(root)
+    priority = _build_priority_candidates_registry(nbm=legacy_nbm, queue={
+        "top_action": actions[0] if actions else None,
+        "secondary_actions": actions[1:8] if actions else [],
+        "blocked_opportunities": blocked,
+        "operating_mode_summary": operating_mode_summary,
+    }, root=root)
+
+    ranked = priority.get("candidates") or []
+    grouped = priority.get("grouped") or {}
+    top_priority_item = priority.get("top_candidate")
+    top = _priority_candidate_to_home_move(top_priority_item) if top_priority_item else None
+    if not top:
+        top = actions[0] if actions else {
+            "system": None, "action": "HOLD", "symbol": None, "priority": "LOW",
+            "reason": "All systems stable.", "size_guidance": "No action needed.", "blockers": [],
+        }
+    top_key = (top_priority_item or {}).get("opportunity_key")
+    secondary = []
+    seen_keys = {top_key} if top_key else set()
+    seen_memecoin_symbols = set()
+    if str((top or {}).get("system") or "") == "MEMECOINS" and (top or {}).get("symbol"):
+        seen_memecoin_symbols.add(str((top or {}).get("symbol") or "").upper())
+
+    def _append_secondary(item: dict | None) -> None:
+        if not item:
+            return
+        if _priority_is_internal_meta(item):
+            return
+        _key = item.get("opportunity_key")
+        if _key and _key in seen_keys:
+            return
+        _system = str(item.get("system") or "")
+        _symbol = str(item.get("symbol") or "").upper()
+        if _system == "MEMECOINS" and _symbol and _symbol in seen_memecoin_symbols:
+            return
+        mapped = _priority_candidate_to_home_move(item)
+        if not mapped:
+            return
+        if item.get("change") is not None:
+            mapped["change"] = item.get("change")
+        if item.get("size_guidance") is not None:
+            mapped["size_guidance"] = item.get("size_guidance")
+        secondary.append(mapped)
+        if _key:
+            seen_keys.add(_key)
+        if _system == "MEMECOINS" and _symbol:
+            seen_memecoin_symbols.add(_symbol)
+
+    # Anchor the queue to the grouped cross-system winners first so research and
+    # monitor lanes do not get crowded out by multiple same-lane rows.
+    _append_secondary(grouped.get("top_research"))
+    _append_secondary(grouped.get("top_monitor"))
+    _append_secondary(grouped.get("top_actionable"))
+    _append_secondary(grouped.get("top_gated"))
+
+    for item in ranked:
+        if len(secondary) >= 7:
+            break
+        _append_secondary(item)
+
+    if not secondary:
+        secondary = [a for a in actions[1:8] if not _priority_is_internal_meta(a)]
+
+    allocator_summary = {
+        **allocator_summary,
+        **_build_marginal_capital_route(top, secondary, capital, allocator_summary),
+    }
+    operating_mode_summary = _build_operating_mode_snapshot(capital, allocator_summary)
+    lane_policy_summary = _build_lane_policy_snapshot(
+        operating_mode_summary,
+        memecoins=_posture_memecoins(),
+        perps=_posture_perps(),
+        spot=_posture_spot(),
+        whale=_posture_whale(),
+    )
+    top = {
+        **top,
+        **_home_operating_status(top, operating_mode_summary),
+        **_home_item_lane_context(top, lane_policy_summary, lane_authority_summary, lane_unlock_summary),
+        **_home_item_constraint_context(
+            {
+                **top,
+                **_home_operating_status(top, operating_mode_summary),
+            },
+            operating_mode_summary,
+            lane_policy_summary,
+            lane_authority_summary,
+            lane_unlock_summary,
+            operating_constraints_summary,
+        ),
+    }
+    secondary = [
+        {
+            **item,
+            **_home_operating_status(item, operating_mode_summary),
+            **_home_item_lane_context(item, lane_policy_summary, lane_authority_summary, lane_unlock_summary),
+            **_home_item_constraint_context(
+                {
+                    **item,
+                    **_home_operating_status(item, operating_mode_summary),
+                },
+                operating_mode_summary,
+                lane_policy_summary,
+                lane_authority_summary,
+                lane_unlock_summary,
+                operating_constraints_summary,
+            ),
+        }
+        for item in secondary
+    ]
+    blocked = [
+        {
+            **item,
+            **_home_operating_status(item, operating_mode_summary),
+            **_home_item_lane_context(item, lane_policy_summary, lane_authority_summary, lane_unlock_summary),
+            **_home_item_constraint_context(
+                {
+                    **item,
+                    **_home_operating_status(item, operating_mode_summary),
+                },
+                operating_mode_summary,
+                lane_policy_summary,
+                lane_authority_summary,
+                lane_unlock_summary,
+                operating_constraints_summary,
+            ),
+        }
+        for item in blocked
+    ]
+    _home_stack = _build_home_operating_stack(
+        operating_mode_summary,
+        lane_policy_summary,
+        lane_authority_summary,
+        lane_unlock_summary,
+        allocator_summary,
+        top,
+        allocator_summary,
+    )
+
+    # Patch 263: surface log — snapshot queue items at generation time
+    try:
+        from utils.surface_log import surface_log_write  # type: ignore
+        _marginal_route = str(allocator_summary.get("marginal_route") or "")
+        _marginal_route_authority = str(allocator_summary.get("marginal_route_authority") or "")
+        _allocator_posture = str(allocator_summary.get("allocator_posture") or "")
+        _dominant_book = str(allocator_summary.get("dominant_book") or "")
+        _sl_items = [a for a in [top, *secondary] if a.get("symbol")]
+        _deduped_items: list[dict] = []
+        _seen_surface_keys: set[tuple[str, str]] = set()
+        for a in _sl_items:
+            _surface_key = (
+                str(a.get("system") or "").strip().upper(),
+                str(a.get("symbol") or "").strip().upper(),
+            )
+            if _surface_key in _seen_surface_keys:
+                continue
+            _seen_surface_keys.add(_surface_key)
+            _deduped_items.append(a)
+        _sl_items = _deduped_items
+        if _marginal_route or _marginal_route_authority or _allocator_posture or _dominant_book:
+            _sl_items = [{
+                **a,
+                "marginal_route": _marginal_route or a.get("marginal_route"),
+                "marginal_route_authority": _marginal_route_authority or a.get("marginal_route_authority"),
+                "allocator_posture": _allocator_posture or a.get("allocator_posture"),
+                "dominant_book": _dominant_book or a.get("dominant_book"),
+            } for a in _sl_items]
+        surface_log_write(_sl_items, "HOME_QUEUE")
+    except Exception:
+        pass
+
+    return {
+        "top_action":            top,
+        "secondary_actions":     secondary,
+        "blocked_opportunities": blocked,
+        "capital_split":         capital,
+        "allocator_summary":     allocator_summary,
+        "operating_mode_summary": operating_mode_summary,
+        "lane_policy_summary":   lane_policy_summary,
+        "lane_authority_summary": lane_authority_summary,
+        "lane_unlock_summary":   lane_unlock_summary,
+        **_home_stack,
+        "change_summary":                _change_summary,
+        "generated_at":                  now_utc.isoformat(),
+    }
+
+
+# ── Patch 213 — Decision Journal ──────────────────────────────────────────────
+
+_DJ_SCHEMA = """
+CREATE TABLE IF NOT EXISTS decision_journal (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_ts         TEXT NOT NULL,
+    source_surface     TEXT NOT NULL,
+    system             TEXT,
+    symbol             TEXT,
+    mint               TEXT DEFAULT NULL,
+    recommended_action TEXT NOT NULL,
+    priority           TEXT,
+    reason             TEXT,
+    blockers_json      TEXT,
+    snapshot_json      TEXT,
+    operator_decision  TEXT NOT NULL DEFAULT 'PENDING',
+    operator_note      TEXT,
+    last_seen_ts       TEXT,
+    surface_count      INTEGER NOT NULL DEFAULT 1,
+    resolved_ts        TEXT,
+    outcome_1h_pct     REAL,
+    outcome_4h_pct     REAL,
+    outcome_24h_pct    REAL,
+    max_return_pct     REAL,
+    max_drawdown_pct   REAL,
+    outcome_label      TEXT,
+    resolution_status  TEXT NOT NULL DEFAULT 'PENDING',
+    verdict            TEXT
+)
+"""
+
+def _dj_conn():
+    """Return a sqlite3 connection with the decision_journal table guaranteed."""
+    import sqlite3 as _s
+    db = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "..", "data_storage", "engine.db")
+    )
+    c = _s.connect(db)
+    c.row_factory = _s.Row
+    try:
+        c.execute("PRAGMA busy_timeout=5000")
+    except Exception:
+        pass
+    c.execute(_DJ_SCHEMA)
+    # Non-destructive migrations for older decision_journal tables.
+    for ddl in (
+        "ALTER TABLE decision_journal ADD COLUMN mint TEXT DEFAULT NULL",
+        "ALTER TABLE decision_journal ADD COLUMN last_seen_ts TEXT",
+        "ALTER TABLE decision_journal ADD COLUMN surface_count INTEGER NOT NULL DEFAULT 1",
+        "ALTER TABLE decision_journal ADD COLUMN outcome_1h_pct REAL",
+        "ALTER TABLE decision_journal ADD COLUMN outcome_4h_pct REAL",
+        "ALTER TABLE decision_journal ADD COLUMN max_return_pct REAL",
+        "ALTER TABLE decision_journal ADD COLUMN max_drawdown_pct REAL",
+        "ALTER TABLE decision_journal ADD COLUMN outcome_label TEXT",
+    ):
+        try:
+            c.execute(ddl)
+            c.commit()
+        except Exception:
+            pass  # column already exists
+    c.commit()
+    return c
+
+
+def _dj_verdict(operator_decision: str, outcome_24h_pct) -> str | None:
+    if outcome_24h_pct is None:
+        return None
+    pos = float(outcome_24h_pct) > 0
+    if operator_decision == "FOLLOWED":
+        return "GOOD_FOLLOW" if pos else "BAD_FOLLOW"
+    if operator_decision == "SKIPPED":
+        return "BAD_SKIP" if pos else "GOOD_SKIP"
+    if operator_decision == "OVERRIDDEN":
+        return "GOOD_OVERRIDE" if pos else "BAD_OVERRIDE"
+    return None
+
+
+def _dj_outcome_label(max_return, max_drawdown, ret_24h) -> str:
+    best = _fl(max_return)
+    worst = _fl(max_drawdown)
+    r24 = _fl(ret_24h)
+    if best >= 50:
+        return "BIG_RUNNER"
+    if best >= 25:
+        return "GOOD_RUNNER"
+    if r24 >= 8 or best >= 12:
+        return "GOOD_BUY"
+    if worst <= -18:
+        return "BAD_BUY"
+    if r24 <= -8:
+        return "WEAK_BUY"
+    return "FLAT"
+
+
+def _dj_surface_verdict(row, outcome_label: str) -> str:
+    action = str(row["recommended_action"] or "").strip().upper()
+    surface = str(row["source_surface"] or "").strip().upper()
+    bullish = outcome_label in {"BIG_RUNNER", "GOOD_RUNNER", "GOOD_BUY"}
+    bad = outcome_label in {"BAD_BUY", "WEAK_BUY"}
+    if action in {"BUY", "ACT"}:
+        return "SURFACE_GOOD" if bullish else ("SURFACE_BAD" if bad else "SURFACE_FLAT")
+    if action in {"WATCH", "RESEARCH", "MONITOR"}:
+        return "MISSED_RUNNER" if bullish else ("GOOD_WAIT" if bad else "WATCH_FLAT")
+    if surface == "BUY_DECISION_V1":
+        return "BUY_DECISION_GOOD" if bullish else ("BUY_DECISION_BAD" if bad else "BUY_DECISION_FLAT")
+    return "OBSERVED_UP" if bullish else ("OBSERVED_DOWN" if bad else "OBSERVED_FLAT")
+
+
+def _dj_lookup_memecoin_outcome(conn, *, created_ts: str, symbol: str | None, mint: str | None):
+    ts_str = (
+        str(created_ts or "")
+        .replace("T", " ")
+        .replace("+00:00", "")
+        .replace("Z", "")
+    )[:19]
+    if mint:
+        return conn.execute(
+            """SELECT return_1h_pct, return_4h_pct, return_24h_pct
+               FROM memecoin_signal_outcomes
+               WHERE mint = ?
+                 AND return_24h_pct IS NOT NULL
+                 AND scanned_at >= datetime(?, '-4 hours')
+                 AND scanned_at <= datetime(?, '+4 hours')
+               ORDER BY ABS(strftime('%s', scanned_at) - strftime('%s', ?))
+               LIMIT 1""",
+            (mint, ts_str, ts_str, ts_str),
+        ).fetchone()
+    if symbol:
+        return conn.execute(
+            """SELECT return_1h_pct, return_4h_pct, return_24h_pct
+               FROM memecoin_signal_outcomes
+               WHERE symbol = ?
+                 AND return_24h_pct IS NOT NULL
+                 AND scanned_at >= datetime(?, '-4 hours')
+                 AND scanned_at <= datetime(?, '+4 hours')
+               ORDER BY ABS(strftime('%s', scanned_at) - strftime('%s', ?))
+               LIMIT 1""",
+            (symbol, ts_str, ts_str, ts_str),
+        ).fetchone()
+    return None
+
+
+def _dj_outcome_metrics(outcome_row) -> dict:
+    r1 = outcome_row["return_1h_pct"]
+    r4 = outcome_row["return_4h_pct"]
+    r24 = outcome_row["return_24h_pct"]
+    values = [float(v) for v in (r1, r4, r24) if v is not None]
+    max_return = max(values) if values else None
+    max_drawdown = min(values) if values else None
+    label = _dj_outcome_label(max_return, max_drawdown, r24)
+    return {
+        "outcome_1h_pct": r1,
+        "outcome_4h_pct": r4,
+        "outcome_24h_pct": r24,
+        "max_return_pct": max_return,
+        "max_drawdown_pct": max_drawdown,
+        "outcome_label": label,
+    }
+
+
+def _dj_parse_dt(value) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        pass
+    try:
+        dt = datetime.strptime(raw[:19], "%Y-%m-%d %H:%M:%S")
+        return dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def _dj_pct(entry_price: float | None, future_price: float | None) -> float | None:
+    entry = _fl(entry_price)
+    future = _fl(future_price)
+    if entry <= 0 or future <= 0:
+        return None
+    return round(((future / entry) - 1.0) * 100.0, 2)
+
+
+def _dj_snapshot_entry_price(snapshot: dict) -> float | None:
+    try:
+        candidate = dict(snapshot.get("candidate") or {})
+        metrics = dict(candidate.get("metrics") or {})
+        plan = dict(snapshot.get("buy_plan") or {})
+        entry = dict(plan.get("entry") or {})
+        for value in (
+            metrics.get("price_usd"),
+            metrics.get("price"),
+            entry.get("reference_price_usd"),
+        ):
+            price = _fl(value)
+            if price > 0:
+                return price
+    except Exception:
+        pass
+    return None
+
+
+def _dj_lookup_token_intelligence_outcome(conn, *, created_ts: str, symbol: str | None, mint: str | None, snapshot: dict | None = None) -> dict | None:
+    """Compute interim/final decision returns from token_intelligence_snapshots.
+
+    This is mint-first and only falls back to symbol for legacy rows with no CA.
+    It lets Home learn at 1h/4h instead of waiting for a completed scanner outcome.
+    """
+    created = _dj_parse_dt(created_ts)
+    if created is None:
+        return None
+    now = datetime.now(timezone.utc)
+    if (now - created).total_seconds() < 45 * 60:
+        return None
+
+    key_col = "mint" if mint else "UPPER(symbol)"
+    key_val = str(mint or symbol or "").strip()
+    if not key_val:
+        return None
+    if not mint:
+        key_val = key_val.upper()
+
+    try:
+        table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='token_intelligence_snapshots'"
+        ).fetchone()
+        if not table:
+            return None
+        start = (created - timedelta(minutes=20)).isoformat()
+        end = (created + timedelta(hours=30)).isoformat()
+        rows = conn.execute(
+            f"""
+            SELECT ts_utc, price, marketcap
+            FROM token_intelligence_snapshots
+            WHERE {key_col}=?
+              AND ts_utc >= ?
+              AND ts_utc <= ?
+              AND price IS NOT NULL
+              AND price > 0
+            ORDER BY ts_utc ASC
+            LIMIT 2000
+            """,
+            (key_val, start, end),
+        ).fetchall()
+    except Exception:
+        return None
+
+    parsed: list[tuple[datetime, float]] = []
+    for row in rows:
+        ts = _dj_parse_dt(row["ts_utc"])
+        price = _fl(row["price"])
+        if ts is not None and price > 0:
+            parsed.append((ts, price))
+    if not parsed:
+        return None
+
+    entry_price = _dj_snapshot_entry_price(snapshot or {})
+    if not entry_price:
+        near = min(parsed, key=lambda x: abs((x[0] - created).total_seconds()))
+        if abs((near[0] - created).total_seconds()) <= 20 * 60:
+            entry_price = near[1]
+    if not entry_price:
+        return None
+
+    def _nearest_return(hours: float, lower_minutes: int, upper_minutes: int) -> float | None:
+        lower = created + timedelta(minutes=lower_minutes)
+        upper = created + timedelta(minutes=upper_minutes)
+        if now < lower:
+            return None
+        target = created + timedelta(hours=hours)
+        options = [(ts, price) for ts, price in parsed if lower <= ts <= upper]
+        if not options:
+            return None
+        future = min(options, key=lambda x: abs((x[0] - target).total_seconds()))
+        return _dj_pct(entry_price, future[1])
+
+    r1 = _nearest_return(1.0, 45, 90)
+    r4 = _nearest_return(4.0, 210, 300)
+    r24 = _nearest_return(24.0, 1200, 1800)
+    values = [v for v in (r1, r4, r24) if v is not None]
+    if not values:
+        return None
+    max_return = max(values)
+    max_drawdown = min(values)
+    return {
+        "outcome_1h_pct": r1,
+        "outcome_4h_pct": r4,
+        "outcome_24h_pct": r24,
+        "max_return_pct": max_return,
+        "max_drawdown_pct": max_drawdown,
+        "outcome_label": _dj_outcome_label(max_return, max_drawdown, r24),
+        "resolution_status": "RESOLVED" if r24 is not None else ("OBSERVED_4H" if r4 is not None else "OBSERVED_1H"),
+        "source": "token_intelligence_snapshots",
+    }
+
+
+def _resolve_buy_decision_observed_sync(limit: int = 80) -> dict:
+    """Fill BUY_DECISION_V1 with 1h/4h/24h observed outcomes when available."""
+    conn = _dj_conn()
+    try:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM decision_journal
+            WHERE source_surface='BUY_DECISION_V1'
+              AND resolution_status IN ('PENDING', 'OBSERVED_1H', 'OBSERVED_4H')
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (int(limit),),
+        ).fetchall()
+        updated = 0
+        for row in rows:
+            snapshot = {}
+            try:
+                parsed = json.loads(row["snapshot_json"] or "{}")
+                snapshot = parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                snapshot = {}
+            metrics = _dj_lookup_token_intelligence_outcome(
+                conn,
+                created_ts=row["created_ts"],
+                symbol=row["symbol"],
+                mint=row["mint"] if "mint" in row.keys() else None,
+                snapshot=snapshot,
+            )
+            if not metrics:
+                continue
+            r1 = metrics.get("outcome_1h_pct") if metrics.get("outcome_1h_pct") is not None else row["outcome_1h_pct"]
+            r4 = metrics.get("outcome_4h_pct") if metrics.get("outcome_4h_pct") is not None else row["outcome_4h_pct"]
+            r24 = metrics.get("outcome_24h_pct") if metrics.get("outcome_24h_pct") is not None else row["outcome_24h_pct"]
+            values = [float(v) for v in (r1, r4, r24) if v is not None]
+            if not values:
+                continue
+            max_return = max(values)
+            max_drawdown = min(values)
+            label = _dj_outcome_label(max_return, max_drawdown, r24)
+            status = "RESOLVED" if r24 is not None else ("OBSERVED_4H" if r4 is not None else "OBSERVED_1H")
+            verdict = _dj_surface_verdict(row, label)
+            conn.execute(
+                """
+                UPDATE decision_journal
+                   SET outcome_1h_pct=?,
+                       outcome_4h_pct=?,
+                       outcome_24h_pct=?,
+                       max_return_pct=?,
+                       max_drawdown_pct=?,
+                       outcome_label=?,
+                       resolution_status=?,
+                       verdict=?,
+                       resolved_ts=?
+                 WHERE id=?
+                """,
+                (r1, r4, r24, max_return, max_drawdown, label, status, verdict, now_iso, row["id"]),
+            )
+            updated += 1
+        conn.commit()
+        return {"checked": len(rows), "updated": updated, "generated_at": now_iso}
+    finally:
+        conn.close()
+
+
+def _dj_row_to_dict(row) -> dict:
+    return {
+        "id":                 row["id"],
+        "created_ts":         row["created_ts"],
+        "source_surface":     row["source_surface"],
+        "system":             row["system"],
+        "symbol":             row["symbol"],
+        "mint":               row["mint"] if "mint" in row.keys() else None,
+        "recommended_action": row["recommended_action"],
+        "priority":           row["priority"],
+        "reason":             row["reason"],
+        "blockers":           json.loads(row["blockers_json"] or "[]"),
+        "snapshot_json":      row["snapshot_json"],          # Patch 271: expose stored context
+        "operator_decision":  row["operator_decision"],
+        "operator_note":      row["operator_note"],
+        "last_seen_ts":       row["last_seen_ts"] if "last_seen_ts" in row.keys() else None,
+        "surface_count":      row["surface_count"] if "surface_count" in row.keys() else 1,
+        "resolved_ts":        row["resolved_ts"],
+        "outcome_1h_pct":     row["outcome_1h_pct"] if "outcome_1h_pct" in row.keys() else None,
+        "outcome_4h_pct":     row["outcome_4h_pct"],
+        "outcome_24h_pct":    row["outcome_24h_pct"],
+        "max_return_pct":     row["max_return_pct"] if "max_return_pct" in row.keys() else None,
+        "max_drawdown_pct":   row["max_drawdown_pct"] if "max_drawdown_pct" in row.keys() else None,
+        "outcome_label":      row["outcome_label"] if "outcome_label" in row.keys() else None,
+        "resolution_status":  row["resolution_status"],
+        "verdict":            row["verdict"],
+    }
+
+
+@router.post("/decision-journal")
+async def create_decision_journal_entry(
+    body: dict,
+    _: str = Depends(get_current_user),
+):
+    """Patch 213 — Log an operator decision against a recommendation."""
+    import asyncio as _asyncio
+
+    required = {"source_surface", "recommended_action"}
+    missing = required - body.keys()
+    if missing:
+        raise HTTPException(status_code=422, detail=f"Missing fields: {missing}")
+
+    valid_surfaces = {"NEXT_BEST_MOVE", "ACTION_QUEUE", "MANUAL", "SETUP_LADDER", "ACT_SURFACE", "ACTION_BOARD", "BUY_DECISION_V1"}  # Patch 232, 264
+    if body["source_surface"] not in valid_surfaces:
+        raise HTTPException(status_code=422, detail=f"source_surface must be one of {valid_surfaces}")
+
+    valid_decisions = {"FOLLOWED", "SKIPPED", "OVERRIDDEN", "PENDING"}
+    op_decision = body.get("operator_decision", "PENDING")
+    if op_decision not in valid_decisions:
+        raise HTTPException(status_code=422, detail=f"operator_decision must be one of {valid_decisions}")
+
+    def _run():
+        now = datetime.now(timezone.utc).isoformat()
+        conn = _dj_conn()
+        try:
+            cur = conn.execute(
+                """INSERT INTO decision_journal
+                   (created_ts, source_surface, system, symbol, mint, recommended_action,
+                    priority, reason, blockers_json, snapshot_json, last_seen_ts, surface_count,
+                    operator_decision, operator_note)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    now,
+                    body["source_surface"],
+                    body.get("system"),
+                    body.get("symbol"),
+                    body.get("mint"),
+                    body["recommended_action"],
+                    body.get("priority"),
+                    body.get("reason"),
+                    json.dumps(body.get("blockers", [])),
+                    json.dumps(body.get("snapshot", {})),
+                    now,
+                    1,
+                    op_decision,
+                    body.get("operator_note"),
+                ),
+            )
+            conn.commit()
+            row_id = cur.lastrowid
+            row = conn.execute(
+                "SELECT * FROM decision_journal WHERE id = ?", (row_id,)
+            ).fetchone()
+            return _dj_row_to_dict(row)
+        finally:
+            conn.close()
+
+    return await _asyncio.to_thread(_run)
+
+
+@router.get("/decision-journal")
+async def list_decision_journal(
+    limit: int = 20,
+    status: str = "",
+    _: str = Depends(get_current_user),
+):
+    """Patch 213 / 271 — List recent decision journal entries newest-first.
+
+    Patch 271: added ?status=resolved to filter to RESOLVED+NO_OUTCOME rows only,
+    used by the ResolvedDecisionsPanel on the Research page.
+    """
+    import asyncio as _asyncio
+
+    def _run():
+        conn = _dj_conn()
+        try:
+            if status == "resolved":
+                rows = conn.execute(
+                    "SELECT * FROM decision_journal "
+                    "WHERE resolution_status IN ('RESOLVED', 'NO_OUTCOME') "
+                    "ORDER BY COALESCE(resolved_ts, last_seen_ts, created_ts) DESC, id DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM decision_journal "
+                    "ORDER BY COALESCE(last_seen_ts, created_ts) DESC, id DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+            return [_dj_row_to_dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    return await _asyncio.to_thread(_run)
+
+
+@router.patch("/decision-journal/{entry_id}")
+async def update_decision_journal_entry(
+    entry_id: int,
+    body: dict,
+    _: str = Depends(get_current_user),
+):
+    """Patch 213 — Update operator_decision / operator_note on an existing entry."""
+    import asyncio as _asyncio
+
+    allowed_keys = {"operator_decision", "operator_note"}
+    updates = {k: v for k, v in body.items() if k in allowed_keys}
+    if not updates:
+        raise HTTPException(status_code=422, detail="Nothing to update. Allowed fields: operator_decision, operator_note")
+
+    valid_decisions = {"FOLLOWED", "SKIPPED", "OVERRIDDEN", "PENDING"}
+    if "operator_decision" in updates and updates["operator_decision"] not in valid_decisions:
+        raise HTTPException(status_code=422, detail=f"operator_decision must be one of {valid_decisions}")
+
+    def _run():
+        conn = _dj_conn()
+        try:
+            existing = conn.execute(
+                "SELECT id FROM decision_journal WHERE id = ?", (entry_id,)
+            ).fetchone()
+            if not existing:
+                raise HTTPException(status_code=404, detail=f"Entry {entry_id} not found")
+
+            set_clause = ", ".join(f"{k} = ?" for k in updates)
+            values = list(updates.values()) + [entry_id]
+            conn.execute(
+                f"UPDATE decision_journal SET {set_clause} WHERE id = ?", values
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT * FROM decision_journal WHERE id = ?", (entry_id,)
+            ).fetchone()
+            return _dj_row_to_dict(row)
+        finally:
+            conn.close()
+
+    return await _asyncio.to_thread(_run)
+
+
+@router.post("/decision-journal/resolve")
+async def resolve_decision_journal_entries(
+    _: str = Depends(get_current_user),
+):
+    """Patch 213 / 267 — Attempt to fill outcomes + verdict for operator-resolved entries.
+
+    Patch 267 fixes:
+      - Was filtering recommended_action == 'BUY', missing all ACT_SURFACE entries
+        (which have recommended_action == 'ACT'). Fixed to include both.
+      - Was querying scan_ts column which does not exist in memecoin_signal_outcomes
+        (correct column is scanned_at). Fixed.
+      - Was processing entries where operator_decision == 'PENDING' (not yet decided),
+        immediately closing them as NO_OUTCOME. Fixed: skip undecided entries.
+      - Added mint-first MSO lookup (falls back to symbol for legacy rows).
+
+    Resolution source (Patch 267):
+      - system == 'MEMECOINS' AND symbol IS NOT NULL AND recommended_action in ('BUY', 'ACT')
+        AND operator_decision != 'PENDING'
+        → mint-first (or symbol fallback) lookup in memecoin_signal_outcomes within ±4h
+      - No match after 48h → NO_OUTCOME
+      - No match before 48h → left as PENDING (background fill retries automatically)
+    """
+    import asyncio as _asyncio
+
+    def _run():
+        conn = _dj_conn()
+        try:
+            # Only process entries where operator has actually decided
+            pending = conn.execute(
+                """SELECT * FROM decision_journal
+                   WHERE resolution_status = 'PENDING'
+                     AND operator_decision != 'PENDING'
+                   ORDER BY id"""
+            ).fetchall()
+
+            resolved_count = 0
+            no_outcome_count = 0
+
+            now_iso = datetime.now(timezone.utc).isoformat()
+
+            for row in pending:
+                entry_id   = row["id"]
+                created_ts = row["created_ts"]
+                system_    = row["system"]
+                symbol     = row["symbol"]
+                rec_action = row["recommended_action"]
+                mint_      = row["mint"] if "mint" in row.keys() else None
+
+                outcome_metrics = None
+                res_status  = None  # None = skip (no update yet)
+
+                # Attempt MSO resolution for MEMECOINS entries (BUY or ACT)
+                if system_ == "MEMECOINS" and symbol and rec_action in ("BUY", "ACT"):
+                    try:
+                        mso_row = _dj_lookup_memecoin_outcome(
+                            conn,
+                            created_ts=created_ts,
+                            symbol=symbol,
+                            mint=mint_,
+                        )
+
+                        if mso_row and mso_row["return_24h_pct"] is not None:
+                            outcome_metrics = _dj_outcome_metrics(mso_row)
+                            res_status  = "RESOLVED"
+                        elif created_ts <= datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"):
+                            # Check if >= 48h old with no match → expire
+                            age_row = conn.execute(
+                                "SELECT created_ts <= datetime('now', '-48 hours') "
+                                "FROM decision_journal WHERE id = ?", (entry_id,)
+                            ).fetchone()
+                            if age_row and age_row[0]:
+                                res_status = "NO_OUTCOME"
+                    except Exception:
+                        pass
+
+                verdict = _dj_verdict(row["operator_decision"], outcome_metrics["outcome_24h_pct"]) if res_status == "RESOLVED" and outcome_metrics else None
+
+                if res_status == "RESOLVED":
+                    conn.execute(
+                        """UPDATE decision_journal
+                           SET outcome_1h_pct = ?, outcome_4h_pct = ?, outcome_24h_pct = ?,
+                               max_return_pct = ?, max_drawdown_pct = ?, outcome_label = ?,
+                               resolution_status = 'RESOLVED', verdict = ?, resolved_ts = ?
+                           WHERE id = ?""",
+                        (
+                            outcome_metrics["outcome_1h_pct"],
+                            outcome_metrics["outcome_4h_pct"],
+                            outcome_metrics["outcome_24h_pct"],
+                            outcome_metrics["max_return_pct"],
+                            outcome_metrics["max_drawdown_pct"],
+                            outcome_metrics["outcome_label"],
+                            verdict,
+                            now_iso,
+                            entry_id,
+                        ),
+                    )
+                    resolved_count += 1
+                elif res_status == "NO_OUTCOME":
+                    conn.execute(
+                        """UPDATE decision_journal
+                           SET resolution_status = 'NO_OUTCOME', resolved_ts = ?
+                           WHERE id = ?""",
+                        (now_iso, entry_id),
+                    )
+                    no_outcome_count += 1
+                # else: no update — leave as PENDING for background fill to retry
+
+            conn.commit()
+
+            observed = conn.execute(
+                """SELECT * FROM decision_journal
+                   WHERE resolution_status = 'PENDING'
+                     AND source_surface IN ('BUY_DECISION_V1', 'ACTION_BOARD', 'ACT_SURFACE')
+                     AND operator_decision = 'PENDING'
+                   ORDER BY id"""
+            ).fetchall()
+            for row in observed:
+                entry_id = row["id"]
+                created_ts = row["created_ts"]
+                symbol = row["symbol"]
+                mint_ = row["mint"] if "mint" in row.keys() else None
+                try:
+                    age_row = conn.execute(
+                        "SELECT created_ts <= datetime('now', '-24 hours') FROM decision_journal WHERE id = ?",
+                        (entry_id,),
+                    ).fetchone()
+                    if not (age_row and age_row[0]):
+                        continue
+                    mso_row = _dj_lookup_memecoin_outcome(
+                        conn,
+                        created_ts=created_ts,
+                        symbol=symbol,
+                        mint=mint_,
+                    )
+                    if not mso_row:
+                        expire_row = conn.execute(
+                            "SELECT created_ts <= datetime('now', '-72 hours') FROM decision_journal WHERE id = ?",
+                            (entry_id,),
+                        ).fetchone()
+                        if expire_row and expire_row[0]:
+                            conn.execute(
+                                """UPDATE decision_journal
+                                   SET resolution_status = 'NO_OUTCOME', resolved_ts = ?
+                                   WHERE id = ?""",
+                                (now_iso, entry_id),
+                            )
+                            no_outcome_count += 1
+                        continue
+                    outcome_metrics = _dj_outcome_metrics(mso_row)
+                    verdict = _dj_surface_verdict(row, outcome_metrics["outcome_label"])
+                    conn.execute(
+                        """UPDATE decision_journal
+                           SET outcome_1h_pct = ?, outcome_4h_pct = ?, outcome_24h_pct = ?,
+                               max_return_pct = ?, max_drawdown_pct = ?, outcome_label = ?,
+                               resolution_status = 'RESOLVED', verdict = ?, resolved_ts = ?
+                           WHERE id = ?""",
+                        (
+                            outcome_metrics["outcome_1h_pct"],
+                            outcome_metrics["outcome_4h_pct"],
+                            outcome_metrics["outcome_24h_pct"],
+                            outcome_metrics["max_return_pct"],
+                            outcome_metrics["max_drawdown_pct"],
+                            outcome_metrics["outcome_label"],
+                            verdict,
+                            now_iso,
+                            entry_id,
+                        ),
+                    )
+                    resolved_count += 1
+                except Exception:
+                    pass
+            conn.commit()
+            return {
+                "processed":     len(pending),
+                "resolved":      resolved_count,
+                "no_outcome":    no_outcome_count,
+                "generated_at":  now_iso,
+            }
+        finally:
+            conn.close()
+
+    return await _asyncio.to_thread(_run)
+
+
+# ── Patch 241 — Agent Team Scorecard ─────────────────────────────────────────
+
+@router.get("/agent-team")
+async def agent_team(_: str = Depends(get_current_user)):
+    """Patch 241 — Compact read-only view of all registered agents and their health."""
+
+    def _run() -> dict:
+        import sqlite3 as _sqlite3
+
+        # ── kv_store reader ───────────────────────────────────────────────────
+        def _kv(key: str):
+            try:
+                from utils.db import get_conn as _gc  # type: ignore
+                with _gc() as conn:
+                    row = conn.execute(
+                        "SELECT value FROM kv_store WHERE key=?", (key,)
+                    ).fetchone()
+                    return json.loads(row[0]) if row else None
+            except Exception:
+                return None
+
+        now = datetime.now(timezone.utc)
+
+        # ── Read live state from kv_store ─────────────────────────────────────
+        sys_health = _kv("system_health") or {}
+        di_status  = _kv("data_integrity_status") or {}
+
+        # ── Parse env flags ───────────────────────────────────────────────────
+        _env = os.getenv
+        dry_run          = _env("MEMECOIN_DRY_RUN",  "true").lower()  == "true"
+        auto_buy         = _env("MEMECOIN_AUTO_BUY", "false").lower() == "true"
+        executor_on      = _env("EXECUTOR_ENABLED",  "false").lower() == "true"
+        perp_exec_on     = _env("PERP_EXECUTOR_ENABLED", "false").lower() == "true"
+
+        # ── Freshness helpers ─────────────────────────────────────────────────
+        def _age_s(ts_str: str | None) -> float | None:
+            if not ts_str:
+                return None
+            try:
+                # Handle both "...Z", "...+00:00", and "...+00:00Z" (kv_store quirk)
+                s = ts_str
+                if s.endswith("+00:00Z"):
+                    s = s[:-1]   # strip trailing Z after tz offset
+                elif s.endswith("Z"):
+                    s = s[:-1] + "+00:00"
+                t = datetime.fromisoformat(s)
+                return (now - t).total_seconds()
+            except Exception:
+                return None
+
+        sh_age  = _age_s(sys_health.get("ts"))
+        di_age  = _age_s(di_status.get("ts"))
+
+        # ── health_watchdog — inferred from system_health freshness ───────────
+        if sh_age is None:
+            hw_status = "IDLE"
+            hw_reason = "No system_health in kv_store — watchdog may not have run yet"
+        elif sh_age < 300:          # wrote within 5× the 60s interval
+            hw_status = "ACTIVE"
+            hw_reason = f"Wrote system_health {round(sh_age)}s ago · {sys_health.get('agents_total', 10)} agents tracked"
+        else:
+            hw_status = "DEGRADED"
+            hw_reason = f"system_health last written {round(sh_age/60)}m ago (expected <5m)"
+
+        # ── data_integrity — kv_store has exact status ────────────────────────
+        di_agg    = di_status.get("status", "UNKNOWN")
+        di_issues = di_status.get("issues", [])
+        if di_agg == "OK":
+            di_status_str = "ACTIVE"
+            di_reason     = f"All checks clean · ran {round(di_age)}s ago" if di_age is not None else "All checks clean"
+        elif di_agg == "DEGRADED":
+            di_status_str = "DEGRADED"
+            di_reason     = di_issues[0] if di_issues else "Data integrity issue detected"
+        else:
+            di_status_str = "IDLE"
+            di_reason     = "No data_integrity_status in kv_store"
+
+        # ── memecoin_scan — inferred from scan_age_min in di_status ──────────
+        scan_age_min = di_status.get("scan_age_min")
+        if scan_age_min is not None and scan_age_min > 10:
+            scan_status = "DEGRADED"
+            scan_reason = f"Last scan {scan_age_min:.0f}m ago (expected ≤5m)"
+        else:
+            scan_status = "ACTIVE"
+            mode_label  = "paper" if dry_run else "live"
+            buy_label   = "auto-buy on" if auto_buy else "auto-buy off"
+            scan_reason = f"{mode_label} · {buy_label}"
+            if scan_age_min is not None:
+                scan_reason += f" · last scan {scan_age_min:.1f}m ago"
+
+        # ── tier_monitor ──────────────────────────────────────────────────────
+        if executor_on or perp_exec_on:
+            tier_note   = "executor enabled"
+        else:
+            tier_note   = "executor disabled — monitoring-only"
+
+        # ── spot_monitor ──────────────────────────────────────────────────────
+        # Reuse the Home spot summary truth so agent-team mode matches the rest
+        # of the dashboard. The old env-based paper/live label drifted after the
+        # spot lane moved to a live holdings posture.
+        try:
+            spot_mode = str((_spot_summary() or {}).get("mode") or "LIVE").lower()
+        except Exception:
+            spot_mode = "live"
+
+        # ── Overall system summary ────────────────────────────────────────────
+        sh_stalled = sys_health.get("agents_stalled", 0)
+        sh_slow    = sys_health.get("agents_slow",    0)
+        sh_total   = sys_health.get("agents_total",   10)
+
+        # ── Build per-agent entries ───────────────────────────────────────────
+        def _e(name: str, role: str, status: str, reason: str,
+               last_run_s: int | None = None) -> dict:
+            d: dict = {"name": name, "role": role, "status": status, "reason": reason}
+            if last_run_s is not None:
+                d["last_run_s"] = last_run_s
+            return d
+
+        entries = [
+            _e("health_watchdog",  "CORE",      hw_status,      hw_reason,
+               round(sh_age) if sh_age is not None else None),
+            _e("data_integrity",   "CORE",      di_status_str,  di_reason,
+               round(di_age) if di_age is not None else None),
+            _e("memecoin_scan",    "CORE",      scan_status,    scan_reason),
+            _e("memecoin_monitor", "CORE",      "ACTIVE",
+               f"Position lifecycle tracking · {'paper' if dry_run else 'live'}"),
+            _e("tier_monitor",     "SECONDARY", "ACTIVE",       f"Perp tier management · {tier_note}"),
+            _e("research",         "SECONDARY", "ACTIVE",       "Market synthesis every 4h"),
+            _e("spot_monitor",     "SECONDARY", "ACTIVE",       f"Spot accumulation · {spot_mode}"),
+            _e("whale_watch",      "SECONDARY", "ACTIVE",       "Whale wallet tracking every 2m"),
+            _e("confluence_engine","SECONDARY", "ACTIVE",       "Cross-lane overlap detection every 5m"),
+            _e("funding_monitor",  "SECONDARY", "ACTIVE",       "Funding rates every 30m"),
+        ]
+
+        core      = [e for e in entries if e["role"] == "CORE"      and e["status"] != "DEGRADED"]
+        secondary = [e for e in entries if e["role"] == "SECONDARY" and e["status"] != "DEGRADED"]
+        degraded  = [e for e in entries if e["status"] == "DEGRADED"]
+        paused: list = []   # all registered agents run; executor/env notes are per-entry
+
+        total = len(entries)
+        deg_n = len(degraded)
+        if deg_n == 0 and sh_stalled == 0 and sh_slow == 0:
+            summary = f"{total} agents · all healthy"
+        elif deg_n > 0:
+            names   = ", ".join(e["name"] for e in degraded)
+            summary = f"{total} agents · {deg_n} degraded ({names})"
+        else:
+            summary = f"{total} agents · {sh_stalled} stalled · {sh_slow} slow"
+
+        return {
+            "core":         core,
+            "secondary":    secondary,
+            "paused":       paused,
+            "degraded":     degraded,
+            "summary":      summary,
+            "total":        total,
+            "system_health_status": sys_health.get("status", "UNKNOWN"),
+            "generated_at": now.isoformat(),
+        }
+
+    import asyncio as _asyncio
+    return await _asyncio.to_thread(_run)
+
+# ── Patch 300: Whole-system posture layer ─────────────────────────────────────
+
+def _posture_memecoins() -> dict:
+    """Derive memecoin lane posture from env + targeted DB queries."""
+    _dry  = os.getenv("MEMECOIN_DRY_RUN",   "true").lower()  == "true"
+    _plot = os.getenv("MEMECOIN_PILOT_MODE", "false").lower() == "true"
+    _mode = "PAPER" if _dry else ("PILOT" if _plot else "LIVE")
+
+    lc_count      = 0
+    scanner_age_h: float | None = None
+    approaching   = 0
+
+    try:
+        from utils.db import get_conn
+        with get_conn() as conn:
+            # Scanner freshness — prefer scan-cache metadata written every scan cycle.
+            # Fall back to last non-empty cache, then legacy SCANNER rows.
+            try:
+                _scan_ts = None
+                _meta = conn.execute(
+                    "SELECT value FROM kv_store WHERE key='memecoin_scan_cache_meta'"
+                ).fetchone()
+                if _meta and _meta[0]:
+                    _meta_val = json.loads(_meta[0])
+                    _scan_ts = _meta_val.get("saved_at")
+                if not _scan_ts:
+                    _last_nonempty = conn.execute(
+                        "SELECT value FROM kv_store WHERE key='memecoin_scan_cache_last_nonempty'"
+                    ).fetchone()
+                    if _last_nonempty and _last_nonempty[0]:
+                        _payload = json.loads(_last_nonempty[0])
+                        _scan_ts = _payload.get("saved_at")
+                if not _scan_ts:
+                    _lr = conn.execute(
+                        "SELECT MAX(scanned_at) FROM memecoin_signal_outcomes WHERE source='SCANNER'"
+                    ).fetchone()
+                    if _lr and _lr[0]:
+                        _scan_ts = _lr[0]
+                if _scan_ts:
+                    _ts = datetime.fromisoformat(str(_scan_ts).replace("Z", "+00:00").replace(" ", "T"))
+                    if _ts.tzinfo is None:
+                        _ts = _ts.replace(tzinfo=timezone.utc)
+                    scanner_age_h = (datetime.now(timezone.utc) - _ts).total_seconds() / 3600
+            except Exception:
+                pass
+
+            # Lifecycle candidates with open/closing entry window
+            try:
+                lc_count = conn.execute(
+                    "SELECT COUNT(DISTINCT symbol) FROM symbol_lifecycle "
+                    "WHERE entry_window IN ('OPEN','CLOSING')"
+                ).fetchone()[0] or 0
+            except Exception:
+                pass
+
+            # Approaching: symbols with high vacc in last 6h (proxy for near-threshold)
+            try:
+                approaching = conn.execute("""
+                    SELECT COUNT(DISTINCT symbol)
+                    FROM memecoin_signal_outcomes
+                    WHERE source = 'SCANNER'
+                      AND vol_acceleration > 5.0
+                      AND scanned_at >= datetime('now', '-6 hours')
+                """).fetchone()[0] or 0
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    if _dry and not _plot:
+        posture = "SIM_ONLY"
+        detail  = f"paper mode · {lc_count} LC candidates"
+    elif scanner_age_h is not None and scanner_age_h > 6:
+        posture = "DEGRADED"
+        detail  = f"scanner stale {scanner_age_h:.0f}h · {lc_count} LC candidates"
+    elif approaching >= 2:
+        posture = "TRANSITION_FORMING"
+        detail  = f"{approaching} symbol(s) near scanner threshold"
+    elif lc_count >= 1:
+        posture = "MONITOR_ONLY"
+        detail  = f"{lc_count} LC candidate(s) · no scanner signal yet"
+    else:
+        posture = "MONITOR_ONLY"
+        detail  = "no active candidates"
+
+    return {
+        "posture":     posture,
+        "detail":      detail,
+        "mode":        _mode,
+        "lc_count":    lc_count,
+        "approaching": approaching,
+    }
+
+
+def _speculation_heat_snapshot() -> dict:
+    try:
+        from utils.db import get_latest_speculation_heat_snapshot
+        from utils.speculation_heat import build_speculation_heat_snapshot
+
+        latest = get_latest_speculation_heat_snapshot()
+        if latest:
+            try:
+                ts = datetime.fromisoformat(str(latest.get("ts_utc") or "").replace("Z", "+00:00"))
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                age_min = (datetime.now(timezone.utc) - ts.astimezone(timezone.utc)).total_seconds() / 60.0
+                if age_min <= 45:
+                    return latest
+            except Exception:
+                pass
+        return build_speculation_heat_snapshot()
+    except Exception:
+        return {
+            "heat_state": "UNKNOWN",
+            "heat_score": 0.0,
+            "momentum": "STEADY",
+            "speculation_heat_score": 0.0,
+            "froth_score": 0.0,
+            "sponsorship_score": 0.0,
+            "quality_score": 0.0,
+            "note": "Speculation heat unavailable.",
+            "reasons": [],
+            "inputs": {},
+        }
+
+
+def _posture_perps() -> dict:
+    """Derive perp lane posture from direct DB queries (no Jupiter call)."""
+    try:
+        from utils.db import get_conn
+        from utils.perp_executor import get_perp_status  # type: ignore
+
+        positions = 0
+        collateral = 0.0
+        try:
+            perp_status = get_perp_status() or {}
+            positions_list = perp_status.get("positions") or []
+            positions = int(perp_status.get("open_positions") or len(positions_list) or 0)
+            collateral = round(sum(float((p or {}).get("collateral_usd") or 0.0) for p in positions_list), 2)
+        except Exception as pex:
+            log.debug("posture_perps canonical perps snapshot failed: %s", pex)
+            with get_conn() as conn:
+                rows = conn.execute("""
+                    SELECT symbol, SUM(collateral_usd) AS col
+                    FROM perp_positions
+                    WHERE status='OPEN'
+                    GROUP BY symbol
+                """).fetchall()
+                positions  = len(rows)
+                collateral = sum(float(r[1] or 0) for r in rows)
+
+        with get_conn() as conn:
+            buf_row = conn.execute(
+                "SELECT value FROM kv_store WHERE key='profit_buffer_usd'"
+            ).fetchone()
+            buffer_usd = float(buf_row[0]) if buf_row else 0.0
+
+        if positions > 0 and collateral > 500:
+            if buffer_usd > 50:
+                posture = "POSITIONS_ACTIVE"
+                detail  = f"{positions} position(s) · ${collateral:,.0f} collateral · ${buffer_usd:,.0f} buffer"
+            else:
+                posture = "COLLATERAL_CONSTRAINED"
+                detail  = f"{positions} position(s) · buffer depleted"
+        elif positions > 0:
+            posture = "POSITIONS_MONITORING"
+            detail  = f"{positions} position(s) · collateral low"
+        else:
+            posture = "IDLE"
+            detail  = "no open positions"
+
+        return {"posture": posture, "detail": detail, "positions": positions, "collateral_usd": collateral}
+    except Exception:
+        return {"posture": "IDLE", "detail": "no data", "positions": 0, "collateral_usd": 0}
+
+
+def _posture_spot() -> dict:
+    """Derive spot lane posture from holdings plus current spot posture quality."""
+    try:
+        s        = _spot_summary()
+        holdings = s.get("holdings_count", 0)
+        basket   = s.get("basket_size",    0)
+        conf     = s.get("signal_confidence", "pending")
+        snap = _spot_posture_snapshot()
+        actionable = len(snap.get("actionable", []))
+        poor = len(snap.get("poor", []))
+
+        if basket > 0 and holdings >= basket:
+            posture = "AT_CAPACITY"
+            detail  = f"{holdings}/{basket} basket slots filled"
+        elif holdings > 0 and actionable > 0:
+            posture = "ACCUMULATING"
+            detail  = f"{holdings} holding(s) · {actionable} add-ready setup(s)"
+        elif holdings > 0:
+            posture = "ADDS_PAUSED"
+            if poor > 0:
+                detail = f"{holdings} holding(s) · add conditions poor on {poor} token(s)"
+            else:
+                detail = f"{holdings} holding(s) · no add-ready setup right now"
+        elif conf in ("high", "medium") and basket > 0:
+            posture = "ENTRY_WATCHING"
+            detail  = f"signals present · {basket} basket · {conf} conf"
+        else:
+            posture = "WAITING"
+            detail  = "no holdings · signals building"
+
+        return {
+            "posture": posture,
+            "detail": detail,
+            "holdings": holdings,
+            "basket": basket,
+            "actionable_setups": actionable,
+            "poor_conditions": poor,
+        }
+    except Exception:
+        return {
+            "posture": "WAITING",
+            "detail": "no data",
+            "holdings": 0,
+            "basket": 0,
+            "actionable_setups": 0,
+            "poor_conditions": 0,
+        }
+
+
+def _posture_whale() -> dict:
+    """Derive whale lane posture from recent alert activity."""
+    try:
+        try:
+            from routers.whale_watch import get_whale_summary_data
+        except Exception:
+            from whale_watch import get_whale_summary_data
+        summary = get_whale_summary_data()
+        return {
+            "posture": summary.get("posture", "QUIET"),
+            "detail": summary.get("detail", "no data"),
+            "recent_pass": summary.get("recent_pass_2h", 0),
+        }
+    except Exception:
+        return {"posture": "QUIET", "detail": "no data", "recent_pass": 0}
+
+
+def _synthesize_posture(mc: dict, perps: dict, spot: dict, whale: dict) -> tuple:
+    """
+    Derive whole-system posture + operator focus sentence from lane postures.
+    Returns (system_posture: str, focus: str).
+    """
+    mp = mc["posture"]
+    pp = perps["posture"]
+    sp = spot["posture"]
+    wp = whale["posture"]
+
+    active_count = sum([
+        pp in ("POSITIONS_ACTIVE",),
+        mp in ("ACTIVE", "TRANSITION_FORMING"),
+        sp in ("ACCUMULATING", "AT_CAPACITY"),
+        wp in ("SIGNAL_ACTIVE",),
+    ])
+
+    if active_count >= 2:
+        parts = []
+        if pp == "POSITIONS_ACTIVE":                    parts.append("perps")
+        if mp in ("ACTIVE", "TRANSITION_FORMING"):      parts.append("memecoins")
+        if sp in ("ACCUMULATING", "AT_CAPACITY"):       parts.append("spot")
+        if wp == "SIGNAL_ACTIVE":                       parts.append("whale")
+        return "FULL_ATTENTION", f"Active management required across: {', '.join(parts)}."
+
+    if pp == "POSITIONS_ACTIVE":
+        return "SINGLE_LANE_FOCUS", f"Perp positions active — {perps['detail']}."
+    if mp == "TRANSITION_FORMING":
+        return "TRANSITION_BUILDING", f"Memecoin transition forming — {mc['detail']}."
+    if wp == "SIGNAL_ACTIVE":
+        return "SINGLE_LANE_FOCUS", f"Whale signal active — {whale['detail']}."
+    if sp == "ACCUMULATING":
+        return "SINGLE_LANE_FOCUS", f"Spot accumulation in progress — {spot['detail']}."
+
+    if mp == "DEGRADED":
+        return "SYSTEM_BLOCKED", f"Memecoin scanner degraded — {mc['detail']}."
+    if pp == "COLLATERAL_CONSTRAINED":
+        return "SYSTEM_BLOCKED", f"Perp collateral constrained — {perps['detail']}."
+
+    monitoring = []
+    if pp in ("POSITIONS_MONITORING", "POSITIONS_ACTIVE"): monitoring.append("perps")
+    if mp == "MONITOR_ONLY":                               monitoring.append("memecoins")
+    if wp == "TRACKING":                                   monitoring.append("whale")
+    if sp in ("ENTRY_WATCHING", "ADDS_PAUSED"):            monitoring.append("spot")
+    if monitoring:
+        return "WATCH_AND_WAIT", f"Monitoring {', '.join(monitoring)} — no actionable signal yet."
+
+    if mp == "SIM_ONLY" and pp == "IDLE":
+        return "DATA_MODE", "All lanes in simulation/idle — building history."
+
+    return "WATCH_AND_WAIT", "No actionable signals across lanes."
+
+
+def _apply_speculation_heat_to_lane_postures(mc: dict, spot: dict, heat: dict) -> tuple[dict, dict]:
+    """
+    Apply conservative speculation-heat pressure to memecoin + spot lane posture.
+
+    We only tighten here; we do not let heat alone create aggressive posture.
+    """
+    heat_state = str(heat.get("heat_state") or "UNKNOWN").upper()
+    heat_score = float(heat.get("heat_score") or 0.0)
+    quality_score = float(heat.get("quality_score") or 0.0)
+    proof_ready = int(((heat.get("inputs") or {}).get("proof_ready_count")) or 0)
+
+    mc_out = dict(mc or {})
+    spot_out = dict(spot or {})
+
+    if heat_state == "OVERHEATED":
+        if str(mc_out.get("posture") or "").upper() in ("TRANSITION_FORMING", "MONITOR_ONLY"):
+            mc_out["posture"] = "DEGRADED"
+            mc_out["detail"] = f"{mc_out.get('detail')}; speculation overheated ({heat_score:.0f})"
+        if str(spot_out.get("posture") or "").upper() == "ACCUMULATING":
+            spot_out["posture"] = "ADDS_PAUSED"
+            spot_out["detail"] = f"{spot_out.get('detail')}; speculation overheated ({heat_score:.0f})"
+    elif heat_state == "HOT":
+        if (
+            str(mc_out.get("posture") or "").upper() == "TRANSITION_FORMING"
+            and (proof_ready <= 0 or quality_score < 55.0)
+        ):
+            mc_out["posture"] = "MONITOR_ONLY"
+            mc_out["detail"] = f"{mc_out.get('detail')}; heat high ({heat_score:.0f}) so proof quality matters more"
+        if (
+            str(spot_out.get("posture") or "").upper() == "ACCUMULATING"
+            and quality_score < 60.0
+        ):
+            spot_out["posture"] = "ADDS_PAUSED"
+            spot_out["detail"] = f"{spot_out.get('detail')}; heat high ({heat_score:.0f}) with mixed quality"
+
+    return mc_out, spot_out
+
+
+@router.get("/posture")
+async def get_home_posture(_user=Depends(get_current_user)):
+    """
+    Patch 300 — Whole-system posture layer.
+    Returns lane postures + synthesized system posture + operator focus sentence.
+    Refreshes every 60 s on the frontend.
+    """
+    def _run():
+        mc    = _posture_memecoins()
+        perps = _posture_perps()
+        spot  = _posture_spot()
+        whale = _posture_whale()
+        speculation_heat = _speculation_heat_snapshot()
+        mc, spot = _apply_speculation_heat_to_lane_postures(mc, spot, speculation_heat)
+        system_posture, focus = _synthesize_posture(mc, perps, spot, whale)
+        capital = {
+            **_home_portfolio_pressure_context(),
+            **_home_memecoin_allocator_context(),
+        }
+        capital["total_deployed_usd"] = round(
+            float(capital.get("perps_collateral_usd") or 0.0)
+            + float(capital.get("spot_invested_usd") or 0.0),
+            0,
+        )
+        allocator_summary = _build_cross_system_allocator_summary(capital)
+        operating_mode_summary = _build_operating_mode_snapshot(capital, allocator_summary)
+        lane_policy_summary = _build_lane_policy_snapshot(
+            operating_mode_summary,
+            memecoins=mc,
+            perps=perps,
+            spot=spot,
+            whale=whale,
+        )
+        lane_authority_summary = _build_lane_authority_summary(
+            operating_mode_summary,
+            memecoins=mc,
+            perps=perps,
+            spot=spot,
+            whale=whale,
+        )
+        lane_unlock_summary = _build_lane_unlock_summary(
+            operating_mode_summary,
+            lane_policy_summary,
+            lane_authority_summary,
+            memecoins=mc,
+            perps=perps,
+            spot=spot,
+            whale=whale,
+        )
+        _home_stack = _build_home_operating_stack(
+            operating_mode_summary,
+            lane_policy_summary,
+            lane_authority_summary,
+            lane_unlock_summary,
+            allocator_summary,
+            None,
+            None,
+        )
+        # ── Roadmap 3: compact authority enforcement status for posture ────
+        _authority_enforcement = None
+        try:
+            _utils_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))), "utils")
+            if _utils_path not in sys.path:
+                sys.path.insert(0, _utils_path)
+            from authority import read_snapshot, _enforce_mode, _LAW_RANK  # type: ignore[import]
+            _snap = read_snapshot()
+            if _snap:
+                _hpa  = _snap.get("highest_permitted_action", "PAPER_EXECUTION_ONLY")
+                _rank = _LAW_RANK.get(_hpa, 0)
+                _fcp  = _snap.get("fresh_capital_policy", "BLOCKED")
+                _authority_enforcement = {
+                    "enforce_active":           _enforce_mode(),
+                    "highest_permitted_action":  _hpa,
+                    "rank":                      _rank,
+                    "fresh_capital_policy":       _fcp,
+                    "new_entry_verdict":         "ALLOW" if (_rank >= 3 and _fcp != "BLOCKED") else "BLOCK",
+                    "action_law_state":          _snap.get("action_law_state"),
+                }
+        except Exception:
+            pass
+
+        return {
+            "memecoins":      mc,
+            "perps":          perps,
+            "spot":           spot,
+            "whale":          whale,
+            "speculation_heat": speculation_heat,
+            "system_posture": system_posture,
+            "focus":          focus,
+            "operating_mode_summary":        operating_mode_summary,
+            "lane_policy_summary":           lane_policy_summary,
+            "lane_authority_summary":        lane_authority_summary,
+            "lane_unlock_summary":           lane_unlock_summary,
+            **_home_stack,
+            "authority_enforcement":         _authority_enforcement,
+            "generated_at":                  datetime.now(timezone.utc).isoformat(),
+        }
+
+    try:
+        return await snapshot_or_build(
+            "home:posture",
+            _run,
+            fresh_s=30,
+            stale_s=300,
+            wait_timeout_s=4,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=504, detail=str(exc))
+
+
+# ── Patch 307: Intelligence Stack Validation Status ───────────────────────────
+
+@router.get("/intel-stack")
+async def home_intel_stack(_: str = Depends(get_current_user)):
+    """
+    Patch 307 — Compact intelligence validation status for Home.
+
+    Returns one row per major intelligence layer with:
+      name, key, verdict, n, n_required, detail
+
+    Verdict values mirror the intel-validation endpoint:
+      EARNING_ITS_PLACE — directional gradient confirmed against outcomes
+      NOT_YET_PROVEN    — insufficient labeled outcomes for a firm verdict
+      FALSIFIED         — gradient inverted (layer is anti-predictive)
+      ACTIVE            — layer is outcome-conditioned and operational
+      ACCUMULATING      — layer is live but still below minimum bucket size
+      ERROR             — query failed
+
+    SQL logic mirrors _validate_* functions in memecoins.py exactly.
+    Computed inline to avoid cross-router imports.
+    """
+    import asyncio as _aio
+
+    def _run() -> dict:
+        import sqlite3
+        from utils.db import get_conn  # type: ignore
+        from collections import defaultdict as _dd
+
+        layers: list = []
+
+        with get_conn() as conn:
+            conn.row_factory = sqlite3.Row
+            _ensure_memecoin_outcome_label_schema(conn)
+
+            # ── 1. Performance Memory (walk-forward perf-tier validity) ───────
+            try:
+                rows = conn.execute("""
+                    WITH completed AS (
+                        SELECT id, symbol, scanned_at, return_24h_pct
+                        FROM   memecoin_signal_outcomes
+                        WHERE  status         = 'COMPLETE'
+                          AND  return_24h_pct IS NOT NULL
+                          AND  (rug_label IS NULL OR rug_label != 'RUG')
+                    ),
+                    prior AS (
+                        SELECT c1.id, c1.return_24h_pct,
+                               COUNT(c2.id)  AS prior_n,
+                               AVG(c2.return_24h_pct) AS prior_avg,
+                               SUM(CASE WHEN c2.return_24h_pct >= 10 THEN 1.0 ELSE 0.0 END)
+                                   * 100.0 / NULLIF(COUNT(c2.id), 0) AS prior_wr
+                        FROM completed c1
+                        LEFT JOIN completed c2
+                               ON c2.symbol = c1.symbol AND c2.scanned_at < c1.scanned_at
+                        GROUP BY c1.id, c1.return_24h_pct
+                    )
+                    SELECT CASE
+                               WHEN prior_n >= 15 AND prior_wr >= 50 AND prior_avg >= 5 THEN 'PROVEN_POSITIVE'
+                               WHEN prior_n >= 15 AND prior_avg < -10                   THEN 'PROVEN_NEGATIVE'
+                               WHEN prior_n >= 8                                        THEN 'TESTED_NEUTRAL'
+                               ELSE                                                          'UNPROVEN'
+                           END AS tier,
+                           COUNT(*)                                                      AS n,
+                           ROUND(AVG(return_24h_pct), 1)                               AS avg_return,
+                           ROUND(SUM(CASE WHEN return_24h_pct >= 10 THEN 1.0 ELSE 0.0 END)
+                                 * 100.0 / COUNT(*), 1)                                AS wr_10
+                    FROM prior
+                    GROUP BY tier
+                """).fetchall()
+                tm      = {r["tier"]: {"n": r["n"], "avg": r["avg_return"], "wr": r["wr_10"]} for r in rows}
+                total_n = sum(r["n"] for r in rows)
+                pp      = tm.get("PROVEN_POSITIVE")
+                uv      = tm.get("UNPROVEN")
+                if pp and uv and pp["n"] >= 10 and pp["wr"] > uv["wr"] and (pp["avg"] or 0) > (uv["avg"] or 0):
+                    lift            = round(pp["wr"] - uv["wr"], 1)
+                    verdict, detail = "EARNING_ITS_PLACE", f"PP WR {pp['wr']}% vs UNPROVEN {uv['wr']}% (+{lift}pp, n={pp['n']})"
+                elif pp and uv and pp["n"] >= 10:
+                    verdict, detail = "FALSIFIED", f"no gradient: PP {pp['wr']}% vs UNPROVEN {uv['wr']}% (n={pp['n']})"
+                elif total_n < 20:
+                    verdict, detail = "NOT_YET_PROVEN", f"{total_n}/20 outcomes needed"
+                else:
+                    verdict, detail = "NOT_YET_PROVEN", f"n={total_n} — PROVEN_POSITIVE sample too thin"
+            except Exception as exc:
+                verdict, detail, total_n = "ERROR", str(exc)[:80], 0
+            layers.append({
+                "name": "Performance Memory", "key": "perf_memory",
+                "verdict": verdict, "n": total_n, "n_required": 20, "detail": detail,
+            })
+
+            # ── 2. Transition Detector ────────────────────────────────────────
+            try:
+                all_rows = conn.execute("""
+                    SELECT symbol, scanned_at, vol_acceleration, score, return_24h_pct
+                    FROM   memecoin_signal_outcomes
+                    WHERE  source = 'SCANNER'
+                      AND  vol_acceleration IS NOT NULL AND score IS NOT NULL
+                      AND  status = 'COMPLETE' AND return_24h_pct IS NOT NULL
+                    ORDER BY symbol, scanned_at
+                """).fetchall()
+                by_sym: dict = {}
+                for r in all_rows:
+                    by_sym.setdefault(r["symbol"], []).append(
+                        (float(r["vol_acceleration"]), float(r["score"]), float(r["return_24h_pct"]))
+                    )
+                labeled: list = []
+                for rows_s in by_sym.values():
+                    for i in range(1, len(rows_s)):
+                        prior = rows_s[max(0, i - 3):i]
+                        if len(prior) < 2:
+                            continue
+                        vs      = [w[0] for w in prior]
+                        ss      = [w[1] for w in prior]
+                        vacc_s  = (vs[-1] - vs[0]) / (len(prior) - 1)
+                        score_s = (ss[-1] - ss[0]) / (len(prior) - 1)
+                        st      = ("APPROACHING" if vacc_s > 0.3 and score_s > 2.0
+                                   else "FADING" if vacc_s < -0.3 or score_s < -2.0
+                                   else "DORMANT")
+                        labeled.append((st, rows_s[i][2]))
+                groups: dict = _dd(list)
+                for st, ret in labeled:
+                    groups[st].append(ret)
+
+                def _grp(st: str):
+                    rs = groups.get(st, [])
+                    if not rs:
+                        return None
+                    return {
+                        "n":   len(rs),
+                        "wr":  round(sum(1 for r in rs if r >= 10) / len(rs) * 100, 1),
+                        "avg": round(sum(rs) / len(rs), 1),
+                    }
+
+                app, fad, dor = _grp("APPROACHING"), _grp("FADING"), _grp("DORMANT")
+                baseline      = fad or dor
+                total_td      = sum(len(v) for v in groups.values())
+                if app and baseline and app["n"] >= 10:
+                    lift = round(app["wr"] - baseline["wr"], 1)
+                    if lift >= 5:
+                        verdict, detail = "EARNING_ITS_PLACE", (
+                            f"APPROACHING WR {app['wr']}% vs baseline {baseline['wr']}% (+{lift}pp, n={app['n']})"
+                        )
+                    elif lift < 0:
+                        verdict, detail = "FALSIFIED", f"APPROACHING underperforms baseline {lift:+.1f}pp (n={app['n']})"
+                    else:
+                        verdict, detail = "NOT_YET_PROVEN", f"lift +{lift}pp vs baseline — need ≥5pp (n={app['n']})"
+                        if lift > 0:
+                            detail += " · thin positive direction"
+                elif app:
+                    verdict, detail = "NOT_YET_PROVEN", f"APPROACHING n={app['n']} — too thin (need ≥10)"
+                else:
+                    verdict, detail = "NOT_YET_PROVEN", f"n={total_td} labeled — APPROACHING bucket empty"
+            except Exception as exc:
+                verdict, detail, total_td = "ERROR", str(exc)[:80], 0
+            layers.append({
+                "name": "Transition Detector", "key": "transition_detector",
+                "verdict": verdict, "n": total_td, "n_required": 10, "detail": detail,
+            })
+
+            # ── 3. Trust Labels ───────────────────────────────────────────────
+            # Patch 310: promotion uses clean-forward count only.
+            # "Clean-forward" = labeled_at IS NOT NULL (post-schema-migration)
+            #   AND (labeled_at - scanned_at) <= 48h (172800s).
+            # Bootstrap / retroactively-labeled rows remain visible in total_tl
+            # but do NOT count toward the 20-row promotion threshold.
+            try:
+                rows = conn.execute("""
+                    SELECT trust_label AS lbl,
+                           COUNT(*)                                                     AS n,
+                           SUM(CASE
+                               WHEN labeled_at IS NOT NULL
+                                AND (julianday(labeled_at) - julianday(scanned_at))
+                                    * 86400.0 <= 172800
+                               THEN 1 ELSE 0 END)                                      AS clean_n,
+                           ROUND(AVG(return_24h_pct), 1)                               AS avg,
+                           ROUND(SUM(CASE WHEN return_24h_pct >= 10 THEN 1.0 ELSE 0.0 END)
+                                 * 100.0 / COUNT(*), 1)                                AS wr
+                    FROM memecoin_signal_outcomes
+                    WHERE status = 'COMPLETE' AND return_24h_pct IS NOT NULL AND trust_label IS NOT NULL
+                    GROUP BY trust_label
+                """).fetchall()
+                lmap     = {r["lbl"]: {"n": r["n"], "clean_n": r["clean_n"],
+                                       "avg": r["avg"], "wr": r["wr"]} for r in rows}
+                total_tl = sum(r["n"] for r in rows)
+                clean_tl = sum(r["clean_n"] for r in rows)
+                dis      = lmap.get("DISTRUST")
+                hi       = lmap.get("HIGH_TRUST")
+                bootstrap_tl = max(0, total_tl - clean_tl)
+                if clean_tl >= 20 and dis and dis["avg"] is not None and dis["avg"] < 0:
+                    if hi is None or (hi["wr"] is not None and dis["wr"] is not None and hi["wr"] >= dis["wr"]):
+                        ht_str  = f" vs HIGH_TRUST {hi['avg']:+.1f}%" if hi else " (HIGH_TRUST absent)"
+                        verdict = "EARNING_ITS_PLACE"
+                        detail  = (f"DISTRUST avg {dis['avg']:+.1f}%{ht_str} "
+                                   f"({clean_tl} clean / {total_tl} total)")
+                    else:
+                        verdict, detail = "FALSIFIED", (
+                            f"gradient inverted ({clean_tl} clean / {total_tl} total)")
+                elif total_tl >= 20:
+                    _bootstrap_gradient = (
+                        dis is not None
+                        and dis["avg"] is not None
+                        and dis["avg"] < 0
+                        and (hi is None or (
+                            hi["wr"] is not None and dis["wr"] is not None and hi["wr"] >= dis["wr"]
+                        ))
+                    )
+                    verdict, detail = "NOT_YET_PROVEN", (
+                        f"{clean_tl}/20 clean-labeled "
+                        f"({total_tl} total, {bootstrap_tl} bootstrap)")
+                    if _bootstrap_gradient and bootstrap_tl > 0:
+                        detail += " · bootstrap gradient present"
+                else:
+                    verdict, detail = "NOT_YET_PROVEN", f"{total_tl}/20 labeled outcomes"
+            except Exception as exc:
+                verdict, detail, total_tl, clean_tl = "ERROR", str(exc)[:80], 0, 0
+            layers.append({
+                "name": "Trust Labels", "key": "trust_labels",
+                "verdict": verdict, "n": total_tl, "n_required": 20, "detail": detail,
+            })
+
+            # ── 4. Triage States ──────────────────────────────────────────────
+            # Patch 310: same clean-forward promotion rule as Trust Labels.
+            try:
+                rows = conn.execute("""
+                    SELECT triage_state AS st,
+                           COUNT(*)                      AS n,
+                           SUM(CASE
+                               WHEN labeled_at IS NOT NULL
+                                AND (julianday(labeled_at) - julianday(scanned_at))
+                                    * 86400.0 <= 172800
+                               THEN 1 ELSE 0 END)        AS clean_n,
+                           ROUND(AVG(return_24h_pct), 1) AS avg
+                    FROM memecoin_signal_outcomes
+                    WHERE status = 'COMPLETE' AND return_24h_pct IS NOT NULL AND triage_state IS NOT NULL
+                    GROUP BY triage_state
+                """).fetchall()
+                smap     = {r["st"]: {"n": r["n"], "clean_n": r["clean_n"],
+                                      "avg": r["avg"]} for r in rows}
+                total_ts = sum(r["n"] for r in rows)
+                clean_ts = sum(r["clean_n"] for r in rows)
+                dnt      = smap.get("DO_NOT_TOUCH")
+                inv      = smap.get("INVESTIGATE_NOW")
+                bootstrap_ts = max(0, total_ts - clean_ts)
+                if clean_ts >= 20 and dnt and dnt["avg"] is not None and dnt["avg"] < 0:
+                    if inv is None or (inv["avg"] is not None and inv["avg"] > dnt["avg"]):
+                        inv_str = (f" vs INVESTIGATE_NOW {inv['avg']:+.1f}%"
+                                   if inv else " (INVESTIGATE_NOW absent)")
+                        verdict = "EARNING_ITS_PLACE"
+                        detail  = (f"DO_NOT_TOUCH avg {dnt['avg']:+.1f}%{inv_str} "
+                                   f"({clean_ts} clean / {total_ts} total)")
+                    else:
+                        verdict, detail = "FALSIFIED", (
+                            f"triage gradient inverted ({clean_ts} clean / {total_ts} total)")
+                elif total_ts >= 20:
+                    _bootstrap_gradient = (
+                        dnt is not None
+                        and dnt["avg"] is not None
+                        and dnt["avg"] < 0
+                        and (inv is None or (
+                            inv["avg"] is not None and inv["avg"] > dnt["avg"]
+                        ))
+                    )
+                    verdict, detail = "NOT_YET_PROVEN", (
+                        f"{clean_ts}/20 clean-labeled "
+                        f"({total_ts} total, {bootstrap_ts} bootstrap)")
+                    if _bootstrap_gradient and bootstrap_ts > 0:
+                        detail += " · bootstrap gradient present"
+                else:
+                    verdict, detail = "NOT_YET_PROVEN", f"{total_ts}/20 labeled outcomes"
+            except Exception as exc:
+                verdict, detail, total_ts, clean_ts = "ERROR", str(exc)[:80], 0, 0
+            layers.append({
+                "name": "Triage States", "key": "triage_states",
+                "verdict": verdict, "n": total_ts, "n_required": 20, "detail": detail,
+            })
+
+            # ── 5. Spot Posture ───────────────────────────────────────────────
+            try:
+                spot_n = conn.execute(
+                    "SELECT COUNT(*) FROM spot_signals WHERE status='COMPLETE' AND return_7d_pct IS NOT NULL"
+                ).fetchone()[0]
+                buckets_ready = conn.execute("""
+                    SELECT COUNT(*) FROM (
+                        SELECT signal_type,
+                               CASE WHEN fg_at_signal < 15 THEN 'XFEAR'
+                                    WHEN fg_at_signal < 25 THEN 'FEAR'
+                                    WHEN fg_at_signal < 40 THEN 'CAUTIOUS'
+                                    ELSE 'NEUTRAL+' END AS bucket
+                        FROM spot_signals
+                        WHERE status = 'COMPLETE' AND return_7d_pct IS NOT NULL
+                        GROUP BY signal_type, bucket
+                        HAVING COUNT(*) >= 10
+                    )
+                """).fetchone()[0]
+                if spot_n >= 10:
+                    verdict = "ACTIVE"
+                    detail  = f"outcome-conditioned  ·  {spot_n} outcomes  {buckets_ready} bucket(s) n≥10"
+                else:
+                    verdict = "ACCUMULATING"
+                    detail  = f"{spot_n} outcomes — labels show INSUFFICIENT_DATA until n≥10 per bucket"
+            except Exception as exc:
+                spot_n, verdict, detail = 0, "ERROR", str(exc)[:80]
+            layers.append({
+                "name": "Spot Posture", "key": "spot_posture",
+                "verdict": verdict, "n": spot_n, "n_required": 10, "detail": detail,
+            })
+
+        return {
+            "layers":       layers,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    try:
+        return await _aio.to_thread(_run)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+def _registry_state(readiness: str, verdict: str | None) -> str:
+    if verdict == "EARNING_ITS_PLACE" or readiness == "PROVEN":
+        return "PROMOTED"
+    if verdict == "FALSIFIED" or readiness == "ADVERSE":
+        return "DEMOTED"
+    if readiness == "EARLY_SIGNAL":
+        return "EARLY_SIGNAL"
+    return "LOCKED"
+
+
+def _priority_block_state(action: str | None, action_state: str | None, blockers: list | None) -> str:
+    blockers = blockers or []
+    if action_state == "GATED" or action == "BLOCKED":
+        return "GATED"
+    if action in ("WAIT", "HOLD"):
+        return "BLOCKED"
+    if blockers:
+        return "CONSTRAINED"
+    return "CLEAR"
+
+
+def _priority_proof_state(system: str, symbol: str | None = None) -> str:
+    if system == "MEMECOINS":
+        reg = _kv_json_get(_VALIDATION_REGISTRY_KEY) or {}
+        tracks = [t for t in (reg.get("tracks") or []) if isinstance(t, dict)]
+        summary = reg.get("summary") or {}
+        promoted = int(summary.get("promoted", 0) or 0)
+        early = int(summary.get("early_signal", 0) or 0)
+        demoted = int(summary.get("demoted", 0) or 0)
+        adverse = int(summary.get("adverse", 0) or 0)
+        accumulating = int(summary.get("accumulating", 0) or 0)
+
+        # Treat label/triage proof as the core promotive stack for memecoin decisions.
+        key_tracks = {
+            str(t.get("key") or ""): t
+            for t in tracks
+            if str(t.get("key") or "") in ("trust_labels", "triage_states", "transition_detector")
+        }
+        trust_state = str((key_tracks.get("trust_labels") or {}).get("state") or "")
+        triage_state = str((key_tracks.get("triage_states") or {}).get("state") or "")
+        transition_state = str((key_tracks.get("transition_detector") or {}).get("state") or "")
+
+        if trust_state == "DEMOTED" or triage_state == "DEMOTED" or demoted > 0 or adverse > 0:
+            return "DEMOTED_STACK"
+        if trust_state == "PROMOTED" and triage_state == "PROMOTED":
+            return "PROMOTED_STACK"
+        if promoted > 0 and demoted == 0:
+            return "PROMOTED_STACK"
+        if (
+            trust_state == "EARLY_SIGNAL"
+            or triage_state == "EARLY_SIGNAL"
+            or transition_state == "EARLY_SIGNAL"
+            or early > 0
+        ):
+            return "EARLY_STACK"
+        if accumulating > 0:
+            return "ACCUMULATING_STACK"
+        return "LOCKED_STACK"
+    if system == "CONFLUENCE":
+        reg = _kv_json_get(_VALIDATION_REGISTRY_KEY) or {}
+        tracks = {t.get("key"): t for t in (reg.get("tracks") or []) if isinstance(t, dict)}
+        st = (tracks.get("structural_confluence") or {}).get("state")
+        if st == "PROMOTED":
+            return "PROMOTED"
+        if st == "EARLY_SIGNAL":
+            return "EARLY_SIGNAL"
+        if st == "DEMOTED":
+            return "DEMOTED"
+        return "LOCKED"
+    if system in ("PERP", "SPOT", "WHALE"):
+        return "OPERATIONAL"
+    return "UNKNOWN"
+
+
+def _proof_stack_authority_from_registry(reg: dict | None = None) -> str:
+    reg = reg or (_kv_json_get(_VALIDATION_REGISTRY_KEY) or {})
+    tracks = [t for t in (reg.get("tracks") or []) if isinstance(t, dict)]
+    key_tracks = {
+        str(t.get("key") or ""): t
+        for t in tracks
+        if str(t.get("key") or "") in ("trust_labels", "triage_states", "transition_detector")
+    }
+    trust_state = str((key_tracks.get("trust_labels") or {}).get("state") or "")
+    triage_state = str((key_tracks.get("triage_states") or {}).get("state") or "")
+    transition_state = str((key_tracks.get("transition_detector") or {}).get("state") or "")
+    promoted = sum(1 for s in (trust_state, triage_state, transition_state) if s == "PROMOTED")
+    early = sum(1 for s in (trust_state, triage_state, transition_state) if s == "EARLY_SIGNAL")
+    demoted = sum(1 for s in (trust_state, triage_state, transition_state) if s == "DEMOTED")
+
+    if demoted > 0:
+        return "ADVERSE"
+    if trust_state == "PROMOTED" and triage_state == "PROMOTED" and transition_state in ("PROMOTED", "EARLY_SIGNAL"):
+        return "FORCEFUL"
+    if promoted >= 2:
+        return "FORCEFUL"
+    if (promoted >= 1 and early >= 1) or early >= 2:
+        return "BACKED"
+    return "TENTATIVE"
+
+
+def _home_deployment_authority(item: dict | None = None) -> str:
+    row = dict(item or {})
+    promotion = str(row.get("promotion_authority") or "TENTATIVE").strip().upper() or "TENTATIVE"
+    reinforcement = str(row.get("reinforcement_authority") or "ABSENT").strip().upper() or "ABSENT"
+    ready = str(row.get("capital_ready_state") or "UNKNOWN").strip().upper() or "UNKNOWN"
+    route = str(row.get("capital_route_bucket") or "LOCKED").strip().upper() or "LOCKED"
+    headroom = str(row.get("capital_headroom_bucket") or "UNKNOWN").strip().upper() or "UNKNOWN"
+
+    if promotion == "BLOCKED" or route == "LOCKED" or headroom == "EXHAUSTED":
+        return "BLOCKED"
+    if ready != "READY":
+        return "PLANNING_ONLY"
+    if (
+        promotion == "STACKED"
+        and reinforcement == "FORCEFUL"
+        and route == "SCALE_READY"
+        and headroom == "AMPLE"
+    ):
+        return "EXECUTABLE"
+    if (
+        promotion in ("STACKED", "SUPPORTED")
+        and reinforcement in ("FORCEFUL", "BACKED")
+        and route in ("SCALE_READY", "DISCIPLINED_PROBE", "MICRO_PROBE_ONLY")
+        and headroom in ("AMPLE", "WORKABLE", "THIN")
+    ):
+        return "CONDITIONALLY_READY"
+    return "PLANNING_ONLY"
+
+
+def _home_decision_authority(item: dict | None = None) -> str:
+    row = dict(item or {})
+    proof_auth = str(row.get("proof_stack_authority") or "TENTATIVE").strip().upper() or "TENTATIVE"
+    mem_auth = str(row.get("continuation_memory_authority") or "TENTATIVE").strip().upper() or "TENTATIVE"
+    fresh_auth = str(row.get("fresh_discovery_authority") or "TENTATIVE").strip().upper() or "TENTATIVE"
+    reinf_auth = str(row.get("reinforcement_authority") or "ABSENT").strip().upper() or "ABSENT"
+    promo_auth = str(row.get("promotion_authority") or "TENTATIVE").strip().upper() or "TENTATIVE"
+    deploy_auth = str(row.get("deployment_authority") or _home_deployment_authority(row)).strip().upper() or "PLANNING_ONLY"
+
+    if (
+        proof_auth == "ADVERSE"
+        or mem_auth == "ADVERSE"
+        or fresh_auth == "ADVERSE"
+        or promo_auth == "BLOCKED"
+        or deploy_auth == "BLOCKED"
+    ):
+        return "BLOCKED"
+    if (
+        proof_auth == "FORCEFUL"
+        and mem_auth == "FORCEFUL"
+        and reinf_auth == "FORCEFUL"
+        and promo_auth == "STACKED"
+        and deploy_auth == "EXECUTABLE"
+    ):
+        return "STACKED"
+    if (
+        proof_auth in ("FORCEFUL", "BACKED")
+        and mem_auth in ("FORCEFUL", "BACKED")
+        and promo_auth in ("STACKED", "SUPPORTED")
+        and deploy_auth in ("EXECUTABLE", "CONDITIONALLY_READY")
+        and reinf_auth in ("FORCEFUL", "BACKED", "TENTATIVE")
+    ):
+        return "SUPPORTED"
+    return "TENTATIVE"
+
+
+def _priority_schema_version() -> str:
+    return "priority_candidates_v1"
+
+
+def _priority_is_internal_meta(item: dict | None) -> bool:
+    if not isinstance(item, dict):
+        return False
+    if str(item.get("system") or "") != "MEMECOINS":
+        return False
+    if item.get("symbol"):
+        return False
+    reason = str(item.get("reason") or "").lower()
+    blockers = [str(b or "").upper() for b in (item.get("blockers") or [])]
+    if "sample experiment" in reason:
+        return True
+    if "auto_buy" in reason or "advisory mode" in reason:
+        return True
+    if any(b.startswith("SAMPLE=") for b in blockers):
+        return True
+    if any("AUTO_BUY" in b for b in blockers):
+        return True
+    return False
+
+
+def _priority_opportunity_key(item: dict) -> str:
+    system = item.get("system") or "UNKNOWN"
+    symbol = item.get("symbol") or "_"
+    move_type = item.get("move_type") or "_"
+    action = item.get("action") or "_"
+    intended = item.get("intended_action") or "_"
+    if system == "MEMECOINS" and symbol != "_":
+        if action == "RESEARCH":
+            return f"{system}:{symbol}:RESEARCH"
+        return f"{system}:{symbol}:{move_type}:{intended if intended != '_' else action}"
+    if symbol != "_":
+        return f"{system}:{symbol}:{action}"
+    return f"{system}:{action}"
+
+
+def _priority_candidate_rank(item: dict) -> tuple:
+    action = str(item.get("action") or "")
+    block_state = str(item.get("block_state") or "")
+    proof_state = str(item.get("proof_state") or "")
+    system = str(item.get("system") or "")
+    move_type = str(item.get("move_type") or "")
+    continuation_archetype = str(item.get("continuation_archetype") or "")
+    reinforcement_bucket = str(item.get("reinforcement_bucket") or "")
+    proof_stack_authority = str(item.get("proof_stack_authority") or "")
+    reinforcement_authority = str(item.get("reinforcement_authority") or "")
+    promotion_authority = str(item.get("promotion_authority") or "")
+    deployment_authority = str(item.get("deployment_authority") or _home_deployment_authority(item))
+    decision_authority = str(item.get("decision_authority") or _home_decision_authority(item))
+    continuation_memory_authority = str(item.get("continuation_memory_authority") or "")
+    fresh_discovery_authority = str(item.get("fresh_discovery_authority") or "")
+    freshness_bucket = str(item.get("freshness_bucket") or "")
+    fresh_catalyst_bucket = str(item.get("fresh_catalyst_bucket") or "")
+    capital_posture = str(item.get("capital_posture") or "")
+    capital_ready_state = str(item.get("capital_ready_state") or "")
+    capital_pressure_bucket = str(item.get("capital_pressure_bucket") or "")
+    capital_regime_bucket = str(item.get("capital_regime_bucket") or "")
+    capital_route_bucket = str(item.get("capital_route_bucket") or "")
+    capital_headroom_bucket = str(item.get("capital_headroom_bucket") or "")
+    capital_window_bucket = str(item.get("capital_window_bucket") or "")
+    marginal_route = str(item.get("marginal_route") or "")
+
+    block_adjust = {
+        "CLEAR": 8,
+        "CONSTRAINED": 2,
+        "GATED": -6,
+        "BLOCKED": -14,
+    }.get(block_state, 0)
+
+    action_adjust = {
+        "MANAGE": 22,
+        "ACT": 18,
+        "BUY": 16,
+        "DCA": 10,
+        "RESEARCH": 8,
+        "MONITOR": 4,
+        "WATCH": 2,
+        "HOLD": 1,
+        "WAIT": -2,
+    }.get(action, 0)
+
+    proof_adjust = (
+        10 if proof_state in ("PROMOTED", "PROMOTED_STACK")
+        else 4 if proof_state in ("EARLY_SIGNAL", "EARLY_STACK")
+        else 1 if proof_state == "ACCUMULATING_STACK"
+        else 2 if proof_state == "OPERATIONAL"
+        else -6 if proof_state in ("DEMOTED", "DEMOTED_STACK")
+        else 0
+    )
+    memecoin_adjust = 0
+    if system == "MEMECOINS":
+        if move_type == "FRESH_QUALIFIED":
+            memecoin_adjust += 3
+            memecoin_adjust += {
+                "RECENT_REACTIVATION": 3,
+                "NEWLY_QUALIFIED": 1,
+            }.get(freshness_bucket, 0)
+            memecoin_adjust += {
+                "REACTIVATION_DRIVEN": 3,
+                "SCAN_MOMO": 2,
+                "PERSISTENCE_DRIVEN": 1,
+                "THIN_CATALYST": -2,
+            }.get(fresh_catalyst_bucket, 0)
+        memecoin_adjust += {
+            "FORCEFUL": 5,
+            "BACKED": 2,
+            "TENTATIVE": 0,
+            "ADVERSE": -6,
+        }.get(proof_stack_authority, 0)
+        memecoin_adjust += {
+            "FORCEFUL": 4,
+            "BACKED": 2,
+            "TENTATIVE": 0,
+            "ABSENT": -4,
+        }.get(reinforcement_authority, 0)
+        memecoin_adjust += {
+            "STACKED": 6,
+            "SUPPORTED": 3,
+            "TENTATIVE": 0,
+            "BLOCKED": -6,
+        }.get(promotion_authority, 0)
+        memecoin_adjust += {
+            "EXECUTABLE": 8,
+            "CONDITIONALLY_READY": 3,
+            "PLANNING_ONLY": 0,
+            "BLOCKED": -8,
+        }.get(deployment_authority, 0)
+        memecoin_adjust += {
+            "STACKED": 9,
+            "SUPPORTED": 4,
+            "TENTATIVE": 0,
+            "BLOCKED": -9,
+        }.get(decision_authority, 0)
+        memecoin_adjust += {
+            "FORCEFUL": 6,
+            "BACKED": 2,
+            "TENTATIVE": 0,
+            "ADVERSE": -6,
+        }.get(continuation_memory_authority, 0)
+        memecoin_adjust += {
+            "FORCEFUL": 5,
+            "BACKED": 2,
+            "TENTATIVE": 0,
+            "ADVERSE": -5,
+        }.get(fresh_discovery_authority, 0)
+        memecoin_adjust += {
+            "SCALE_CANDIDATE": 8,
+            "PROBE_ONLY": 3,
+            "RESEARCH_ONLY": -2,
+            "NO_DEPLOY": -8,
+        }.get(capital_posture, 0)
+        memecoin_adjust += {
+            "READY": 3,
+            "PLANNING_ONLY": 0,
+            "RESEARCH_ONLY": -2,
+        }.get(capital_ready_state, 0)
+        memecoin_adjust += {
+            "DORMANT_SECOND_LEG": 4,
+            "REVIVAL_CONTINUATION": 3,
+            "RELOAD_CONTINUATION": 2,
+            "DEEP_PULLBACK": 1,
+        }.get(continuation_archetype, 0)
+        memecoin_adjust += {
+            "STRONG_REINFORCED": 4,
+            "REINFORCED": 2,
+            "PLAIN": 0,
+        }.get(reinforcement_bucket, 0)
+        memecoin_adjust += {
+            "LOW": 1,
+            "MEDIUM": -1,
+            "HIGH": -3,
+        }.get(capital_pressure_bucket, 0)
+        memecoin_adjust += {
+            "RISK_ON": 1,
+            "MIXED": -1,
+            "RISK_OFF": -3,
+        }.get(capital_regime_bucket, 0)
+        memecoin_adjust += {
+            "OPEN": 3,
+            "DISCIPLINED": 1,
+            "TIGHT": -3,
+            "SATURATED": -5,
+            "DISABLED": -6,
+            "PAPER_ONLY": -8,
+        }.get(str(item.get("capital_allocator_stance") or ""), 0)
+        memecoin_adjust += {
+            "SCALE_READY": 8,
+            "DISCIPLINED_PROBE": 3,
+            "MICRO_PROBE_ONLY": -2,
+            "LOCKED": -8,
+        }.get(capital_route_bucket, 0)
+        memecoin_adjust += {
+            "AMPLE": 2,
+            "WORKABLE": 0,
+            "THIN": -2,
+            "EXHAUSTED": -6,
+        }.get(capital_headroom_bucket, 0)
+        memecoin_adjust += {
+            "OPEN_WINDOW": 2,
+            "LIMITED_WINDOW": 0,
+            "MICRO_WINDOW": -2,
+            "CLOSED": -6,
+        }.get(capital_window_bucket, 0)
+        memecoin_adjust += int(item.get("reinforcement_score") or 0)
+
+    route_alignment = 0
+    if marginal_route == "PERP_DEFENSE" and system == "PERP":
+        route_alignment = 6
+    elif marginal_route == "SPOT_DCA" and system == "SPOT":
+        route_alignment = 5
+    elif marginal_route in ("MEMECOIN_PROBE", "MEMECOIN_SCALE") and system == "MEMECOINS":
+        route_alignment = 5
+    elif marginal_route == "HOLD_CASH" and action in ("ACT", "BUY", "DCA"):
+        route_alignment = -6
+
+    effective_score = int(item.get("priority_score") or 0) + block_adjust + action_adjust + proof_adjust + memecoin_adjust + route_alignment
+    return (
+        effective_score,
+        1 if block_state == "CLEAR" else 0,
+        1 if block_state == "CONSTRAINED" else 0,
+        1 if item.get("action_state") == "GATED" else 0,
+        1 if item.get("source") == "next_best_move" else 0,
+        -int(item.get("position") or 0),
+    )
+
+
+def _priority_research_rank(item: dict) -> tuple:
+    rp = str(item.get("research_priority") or "")
+    rp_bonus = {"HIGH": 20, "MEDIUM": 10, "QUICK_GLANCE": 0}.get(rp, 0)
+    proof = str(item.get("proof_state") or "")
+    proof_bonus = (
+        6 if proof in ("PROMOTED", "PROMOTED_STACK")
+        else 3 if proof in ("EARLY_SIGNAL", "EARLY_STACK")
+        else 1 if proof == "ACCUMULATING_STACK"
+        else -3 if proof in ("DEMOTED", "DEMOTED_STACK")
+        else 0
+    )
+    move_type = str(item.get("move_type") or "")
+    system = str(item.get("system") or "")
+    continuation_archetype = str(item.get("continuation_archetype") or "")
+    reinforcement_bucket = str(item.get("reinforcement_bucket") or "")
+    proof_stack_authority = str(item.get("proof_stack_authority") or "")
+    reinforcement_authority = str(item.get("reinforcement_authority") or "")
+    promotion_authority = str(item.get("promotion_authority") or "")
+    deployment_authority = str(item.get("deployment_authority") or _home_deployment_authority(item))
+    decision_authority = str(item.get("decision_authority") or _home_decision_authority(item))
+    continuation_memory_authority = str(item.get("continuation_memory_authority") or "")
+    fresh_discovery_authority = str(item.get("fresh_discovery_authority") or "")
+    freshness_bucket = str(item.get("freshness_bucket") or "")
+    fresh_catalyst_bucket = str(item.get("fresh_catalyst_bucket") or "")
+    capital_posture = str(item.get("capital_posture") or "")
+    capital_ready_state = str(item.get("capital_ready_state") or "")
+    capital_pressure_bucket = str(item.get("capital_pressure_bucket") or "")
+    capital_regime_bucket = str(item.get("capital_regime_bucket") or "")
+    capital_route_bucket = str(item.get("capital_route_bucket") or "")
+    capital_headroom_bucket = str(item.get("capital_headroom_bucket") or "")
+    capital_window_bucket = str(item.get("capital_window_bucket") or "")
+    marginal_route = str(item.get("marginal_route") or "")
+    triage_tags = [str(t).lower() for t in (item.get("triage_tags") or []) if t]
+    fresh_bonus = 0
+    if system == "MEMECOINS" and move_type == "FRESH_QUALIFIED":
+        fresh_bonus += 4
+        fresh_bonus += {
+            "FORCEFUL": 5,
+            "BACKED": 2,
+            "TENTATIVE": 0,
+            "ADVERSE": -5,
+        }.get(fresh_discovery_authority, 0)
+        fresh_bonus += {
+            "RECENT_REACTIVATION": 3,
+            "NEWLY_QUALIFIED": 1,
+        }.get(freshness_bucket, 0)
+        fresh_bonus += {
+            "REACTIVATION_DRIVEN": 3,
+            "SCAN_MOMO": 2,
+            "PERSISTENCE_DRIVEN": 1,
+            "THIN_CATALYST": -2,
+        }.get(fresh_catalyst_bucket, 0)
+        if any(tag in ("reload", "revival") for tag in triage_tags):
+            fresh_bonus += 2
+    capital_bonus = 0
+    if system == "MEMECOINS":
+        capital_bonus += {
+            "FORCEFUL": 4,
+            "BACKED": 2,
+            "TENTATIVE": 0,
+            "ADVERSE": -5,
+        }.get(proof_stack_authority, 0)
+        capital_bonus += {
+            "FORCEFUL": 3,
+            "BACKED": 1,
+            "TENTATIVE": 0,
+            "ABSENT": -4,
+        }.get(reinforcement_authority, 0)
+        capital_bonus += {
+            "STACKED": 5,
+            "SUPPORTED": 2,
+            "TENTATIVE": 0,
+            "BLOCKED": -5,
+        }.get(promotion_authority, 0)
+        capital_bonus += {
+            "EXECUTABLE": 7,
+            "CONDITIONALLY_READY": 3,
+            "PLANNING_ONLY": 0,
+            "BLOCKED": -7,
+        }.get(deployment_authority, 0)
+        capital_bonus += {
+            "STACKED": 8,
+            "SUPPORTED": 3,
+            "TENTATIVE": 0,
+            "BLOCKED": -8,
+        }.get(decision_authority, 0)
+        capital_bonus += {
+            "SCALE_CANDIDATE": 8,
+            "PROBE_ONLY": 4,
+            "RESEARCH_ONLY": 0,
+            "NO_DEPLOY": -6,
+        }.get(capital_posture, 0)
+        capital_bonus += {
+            "READY": 3,
+            "PLANNING_ONLY": 0,
+            "RESEARCH_ONLY": -2,
+        }.get(capital_ready_state, 0)
+    archetype_bonus = 0
+    if system == "MEMECOINS":
+        archetype_bonus += {
+            "FORCEFUL": 6,
+            "BACKED": 2,
+            "TENTATIVE": 0,
+            "ADVERSE": -6,
+        }.get(continuation_memory_authority, 0)
+        archetype_bonus += {
+            "DORMANT_SECOND_LEG": 10,
+            "REVIVAL_CONTINUATION": 8,
+            "RELOAD_CONTINUATION": 6,
+            "DEEP_PULLBACK": 3,
+            "STRUCTURAL_PASS": 1,
+        }.get(continuation_archetype, 0)
+        archetype_bonus += {
+            "STRONG_REINFORCED": 4,
+            "REINFORCED": 2,
+            "PLAIN": 0,
+        }.get(reinforcement_bucket, 0)
+        archetype_bonus += {
+            "LOW": 1,
+            "MEDIUM": -1,
+            "HIGH": -3,
+        }.get(capital_pressure_bucket, 0)
+        archetype_bonus += {
+            "RISK_ON": 1,
+            "MIXED": -1,
+            "RISK_OFF": -3,
+        }.get(capital_regime_bucket, 0)
+        archetype_bonus += {
+            "OPEN": 3,
+            "DISCIPLINED": 1,
+            "TIGHT": -2,
+            "SATURATED": -4,
+            "DISABLED": -5,
+            "PAPER_ONLY": -6,
+        }.get(str(item.get("capital_allocator_stance") or ""), 0)
+        archetype_bonus += {
+            "SCALE_READY": 8,
+            "DISCIPLINED_PROBE": 4,
+            "MICRO_PROBE_ONLY": -2,
+            "LOCKED": -8,
+        }.get(capital_route_bucket, 0)
+        archetype_bonus += {
+            "AMPLE": 2,
+            "WORKABLE": 0,
+            "THIN": -2,
+            "EXHAUSTED": -6,
+        }.get(capital_headroom_bucket, 0)
+        archetype_bonus += {
+            "OPEN_WINDOW": 2,
+            "LIMITED_WINDOW": 0,
+            "MICRO_WINDOW": -2,
+            "CLOSED": -6,
+        }.get(capital_window_bucket, 0)
+        archetype_bonus += int(item.get("reinforcement_score") or 0)
+    route_bonus = 0
+    if marginal_route in ("MEMECOIN_PROBE", "MEMECOIN_SCALE") and system == "MEMECOINS":
+        route_bonus = 5
+    elif marginal_route == "HOLD_CASH" and system == "MEMECOINS":
+        route_bonus = -5
+    elif marginal_route == "SPOT_DCA" and system == "SPOT":
+        route_bonus = 3
+    elif marginal_route == "PERP_DEFENSE" and system == "PERP":
+        route_bonus = 3
+    return (
+        int(item.get("priority_score") or 0) + rp_bonus + proof_bonus + fresh_bonus + capital_bonus + archetype_bonus + route_bonus,
+        1 if (system == "MEMECOINS" and move_type == "FRESH_QUALIFIED") else 0,
+        1 if capital_posture == "SCALE_CANDIDATE" else 0,
+        1 if capital_posture == "PROBE_ONLY" else 0,
+        1 if capital_route_bucket == "SCALE_READY" else 0,
+        1 if capital_route_bucket == "DISCIPLINED_PROBE" else 0,
+        1 if capital_ready_state == "READY" else 0,
+        1 if continuation_archetype == "DORMANT_SECOND_LEG" else 0,
+        1 if continuation_archetype == "REVIVAL_CONTINUATION" else 0,
+        1 if system == "CONFLUENCE" else 0,
+        1 if item.get("source") == "priority_engine" else 0,
+        -int(item.get("position") or 0),
+    )
+
+
+def _apply_memecoin_reinforcement(raw_candidates: list[dict]) -> list[dict]:
+    if not raw_candidates:
+        return raw_candidates
+
+    symbol_map: dict[str, list[dict]] = {}
+    for cand in raw_candidates:
+        symbol = str(cand.get("symbol") or "").upper().strip()
+        if symbol:
+            symbol_map.setdefault(symbol, []).append(cand)
+
+    out: list[dict] = []
+    for cand in raw_candidates:
+        if str(cand.get("system") or "") != "MEMECOINS":
+            out.append(cand)
+            continue
+        symbol = str(cand.get("symbol") or "").upper().strip()
+        if not symbol:
+            out.append(cand)
+            continue
+
+        base_support_score = float(cand.get("support_overlap_score") or cand.get("reinforcement_score") or 0.0)
+        support_overlap_score = base_support_score
+        support_overlap_tags = list(cand.get("support_overlap_tags") or cand.get("reinforcement_tags") or [])
+        for other in symbol_map.get(symbol, []):
+            if other is cand:
+                continue
+            other_system = str(other.get("system") or "")
+            if other_system == "WHALE":
+                whale_bonus = _home_reinforcement_weight(other)
+                if whale_bonus > 0:
+                    support_overlap_score += whale_bonus
+                    support_overlap_tags.append("whale_overlap")
+            elif other_system == "CONFLUENCE":
+                conf_bonus = _home_reinforcement_weight(other)
+                if conf_bonus > 0:
+                    support_overlap_score += conf_bonus
+                    support_overlap_tags.append("confluence_overlap")
+
+        if support_overlap_score > base_support_score:
+            cand = dict(cand)
+            _tags = list(dict.fromkeys(support_overlap_tags))
+            cand["support_overlap_score"] = round(support_overlap_score, 2)
+            cand["support_overlap_tags"] = _tags
+            cand["reinforcement_score"] = int(round(support_overlap_score))
+            cand["reinforcement_tags"] = _tags
+            cand["reinforcement_bucket"] = _home_reinforcement_bucket(support_overlap_score, _tags)
+            cand["triage_tags"] = list(
+                dict.fromkeys(list(cand.get("triage_tags") or []) + _tags)
+            )
+        out.append(cand)
+    return out
+
+
+def _build_confluence_priority_candidate() -> dict | None:
+    try:
+        from utils.db import get_conn  # type: ignore
+        from datetime import datetime as _dt, timezone as _tz
+        with get_conn() as conn:
+            conn.row_factory = None
+            row = conn.execute("""
+                SELECT
+                    token_symbol,
+                    token_mint,
+                    confluence_type,
+                    confluence_score,
+                    ts_utc,
+                    outcome_status
+                FROM confluence_events
+                WHERE ts_utc >= datetime('now','-48 hours')
+                ORDER BY
+                    CASE
+                        WHEN confluence_type = 'TRIPLE' THEN 4
+                        WHEN confluence_type = 'DUAL' THEN 3
+                        WHEN confluence_type = 'STRUCTURAL_TRIPLE' THEN 2
+                        WHEN confluence_type = 'STRUCTURAL_DUAL' THEN 1
+                        ELSE 0
+                    END DESC,
+                    confluence_score DESC,
+                    ts_utc DESC
+                LIMIT 1
+            """).fetchone()
+        if not row:
+            return None
+        token_symbol, token_mint, ctype, score, ts_utc, outcome_status = row
+        is_true = ctype in ("DUAL", "TRIPLE")
+        type_label = "true confluence" if is_true else "structural confluence"
+        score_txt = f"score {float(score):.1f}" if score is not None else "score n/a"
+        age_txt = "recent"
+        if ts_utc:
+            try:
+                _event_dt = _dt.fromisoformat(str(ts_utc).replace("Z", "+00:00"))
+                if _event_dt.tzinfo is None:
+                    _event_dt = _event_dt.replace(tzinfo=_tz.utc)
+                _mins = (_dt.now(_tz.utc) - _event_dt).total_seconds() / 60.0
+                if _mins < 60:
+                    age_txt = f"{int(max(_mins, 0))}m ago"
+                else:
+                    age_txt = f"{_mins / 60.0:.1f}h ago"
+            except Exception:
+                pass
+        reason = (
+            f"{token_symbol} reinforced by whale overlap · {score_txt} · {age_txt}"
+            if token_symbol and is_true
+            else f"{token_symbol} {ctype} · {score_txt} · {age_txt}"
+            if token_symbol
+            else f"{type_label.title()} active · {score_txt} · {age_txt}"
+        )
+        return {
+            "schema_version": _priority_schema_version(),
+            "source": "priority_engine",
+            "kind": "supplemental",
+            "position": 0,
+            "system": "CONFLUENCE",
+            "symbol": token_symbol,
+            "token_address": token_mint,
+            "action": "RESEARCH",
+            "action_state": "OPEN",
+            "intended_action": None,
+            "priority": "HIGH" if is_true else "NORMAL",
+            "priority_score": 60 if is_true else 45,
+            "block_state": "CLEAR",
+            "proof_state": "PROMOTED" if is_true else _priority_proof_state("CONFLUENCE"),
+            "confidence": "high" if is_true else "medium",
+            "reason": reason,
+            "size_guidance": (
+                "Support signal only — confirm the underlying memecoin candidate before acting."
+                if is_true else
+                "Support signal only — review structural confluence as an earlier, weaker class."
+            ),
+            "blockers": [] if outcome_status != "COMPLETE" else ["OUTCOME_COMPLETE"],
+            "move_type": ctype,
+            "research_priority": "HIGH" if is_true else "MEDIUM",
+            "research_budget": "15m" if is_true else "5m",
+            "triage_tags": [ctype.lower()],
+            "change": None,
+        }
+    except Exception as exc:
+        log.debug("priority registry confluence direct candidate: %s", exc)
+        return None
+
+
+def _build_whale_priority_candidate() -> dict | None:
+    try:
+        from utils.db import get_conn  # type: ignore
+        from datetime import datetime as _dt, timezone as _tz
+        with get_conn() as conn:
+            row = conn.execute("""
+                SELECT
+                    ts_utc,
+                    token_symbol,
+                    token_mint,
+                    buy_amount_usd,
+                    scanner_score,
+                    mc_tier,
+                    scanner_pass,
+                    alert_type,
+                    market_cap_usd
+                FROM whale_watch_alerts
+                WHERE ts_utc >= datetime('now','-6 hours')
+                ORDER BY
+                    scanner_pass DESC,
+                    COALESCE(scanner_score, 0) DESC,
+                    COALESCE(buy_amount_usd, 0) DESC,
+                    ts_utc DESC
+                LIMIT 1
+            """).fetchone()
+        if not row:
+            return None
+        ts_utc, token_symbol, token_mint, buy_amount_usd, scanner_score, mc_tier, scanner_pass, alert_type, market_cap_usd = row
+        age_txt = "recent"
+        if ts_utc:
+            try:
+                _event_dt = _dt.fromisoformat(str(ts_utc).replace("Z", "+00:00"))
+                if _event_dt.tzinfo is None:
+                    _event_dt = _event_dt.replace(tzinfo=_tz.utc)
+                _mins = (_dt.now(_tz.utc) - _event_dt).total_seconds() / 60.0
+                if _mins < 60:
+                    age_txt = f"{int(max(_mins, 0))}m ago"
+                else:
+                    age_txt = f"{_mins / 60.0:.1f}h ago"
+            except Exception:
+                pass
+        buy_txt = f"${float(buy_amount_usd or 0)/1000:.0f}k" if float(buy_amount_usd or 0) >= 1000 else f"${float(buy_amount_usd or 0):.0f}"
+        score_txt = f"sc={float(scanner_score or 0):.0f}" if scanner_score is not None else "sc=?"
+        tier_txt = str(mc_tier or "unknown")
+        pass_txt = bool(scanner_pass)
+        action = "RESEARCH" if pass_txt else "MONITOR"
+        priority = "NORMAL" if pass_txt else "LOW"
+        priority_score = 42 if pass_txt else 24
+        reason = (
+            f"{token_symbol} {alert_type or 'WHALE'} {buy_txt} · {score_txt} · {age_txt}"
+            if token_symbol else
+            f"Whale {alert_type or 'flow'} {buy_txt} · {score_txt} · {age_txt}"
+        )
+        return {
+            "schema_version": _priority_schema_version(),
+            "source": "priority_engine",
+            "kind": "supplemental",
+            "position": 0,
+            "system": "WHALE",
+            "symbol": token_symbol,
+            "token_address": token_mint,
+            "action": action,
+            "action_state": "OPEN",
+            "intended_action": None,
+            "priority": priority,
+            "priority_score": priority_score,
+            "block_state": "CLEAR",
+            "proof_state": _priority_proof_state("WHALE"),
+            "confidence": "medium" if pass_txt else "low",
+            "reason": reason,
+            "size_guidance": (
+                "Verify scanner-pass whale alert before any action."
+                if pass_txt else
+                "Monitor whale alert flow for scanner-pass confirmation."
+            ),
+            "blockers": ([] if pass_txt else ["NO_SCANNER_PASS"]),
+            "move_type": str(alert_type or "").upper() or None,
+            "research_priority": ("MEDIUM" if pass_txt else None),
+            "research_budget": ("5m" if pass_txt else None),
+            "triage_tags": [tier_txt, "scanner-pass" if pass_txt else "tracking"],
+            "change": None,
+        }
+    except Exception as exc:
+        log.debug("priority registry whale direct candidate: %s", exc)
+        return None
+
+
+def _build_spot_priority_candidate() -> dict | None:
+    try:
+        from utils.db import get_conn  # type: ignore
+
+        snap = _spot_posture_snapshot()
+        by_symbol = snap.get("by_symbol", {}) or {}
+
+        with get_conn() as conn:
+            row = conn.execute(
+                "SELECT value FROM kv_store WHERE key='spot_current_signals'"
+            ).fetchone()
+
+        if not row:
+            return None
+
+        raw = json.loads(row[0])
+        spot_map = raw.get("data", raw) if isinstance(raw, dict) else {}
+        if not isinstance(spot_map, dict):
+            return None
+
+        ranked: list[tuple[int, float, dict]] = []
+        for symbol, data in spot_map.items():
+            if not isinstance(data, dict):
+                continue
+            gap = float(data.get("gap") or 0)
+            posture = str((by_symbol.get(symbol) or {}).get("posture") or "UNKNOWN")
+            signal_type = str(data.get("signal_type") or "WATCH")
+            score = float(data.get("score") or 0)
+            fg = data.get("fg")
+
+            if gap <= 0 and posture not in ("PRIME_ENTRY", "ACCUMULATE", "POOR_CONDITIONS"):
+                continue
+
+            if posture in ("PRIME_ENTRY", "ACCUMULATE"):
+                action = "DCA"
+                priority = "NORMAL" if signal_type == "DCA_NOW" else "LOW"
+                priority_score = 38 if signal_type == "DCA_NOW" else 24
+                block_state = "CONSTRAINED"
+                blockers = ["MANUAL_ONLY"]
+                confidence = "medium"
+                size_guidance = "Manual DCA only. Verify spot conditions before any add."
+                reason = (
+                    f"{symbol} {gap:+.1f}% under target · signal {signal_type} · "
+                    f"posture {posture}"
+                )
+                rank_bucket = 3
+            elif posture == "POOR_CONDITIONS":
+                action = "WAIT"
+                priority = "LOW"
+                priority_score = 20
+                block_state = "BLOCKED"
+                blockers = ["POOR_CONDITIONS"]
+                confidence = "high"
+                size_guidance = "Hold off until spot posture improves."
+                reason = (
+                    f"{symbol} {gap:+.1f}% under target · signal {signal_type} · "
+                    "history says wait for better conditions"
+                )
+                rank_bucket = 2
+            else:
+                action = "WATCH"
+                priority = "LOW"
+                priority_score = 16
+                block_state = "CLEAR"
+                blockers = []
+                confidence = "medium"
+                size_guidance = "No add yet. Keep monitoring spot posture."
+                reason = f"{symbol} signal {signal_type} · posture {posture}"
+                rank_bucket = 1
+
+            triage_tags = [signal_type.lower(), posture.lower()]
+            if fg is not None:
+                triage_tags.append(f"fg={fg}")
+
+            ranked.append((
+                rank_bucket,
+                gap,
+                {
+                    "schema_version": _priority_schema_version(),
+                    "source": "priority_engine",
+                    "kind": "supplemental",
+                    "position": 0,
+                    "system": "SPOT",
+                    "symbol": symbol,
+                    "token_address": (by_symbol.get(symbol) or {}).get("token_address"),
+                    "action": action,
+                    "action_state": "OPEN",
+                    "intended_action": None,
+                    "priority": priority,
+                    "priority_score": priority_score,
+                    "block_state": block_state,
+                    "proof_state": _priority_proof_state("SPOT", symbol),
+                    "confidence": confidence,
+                    "reason": reason,
+                    "size_guidance": size_guidance,
+                    "blockers": blockers,
+                    "move_type": signal_type,
+                    "research_priority": None,
+                    "research_budget": None,
+                    "triage_tags": triage_tags,
+                    "change": None,
+                    "_score": score,
+                }
+            ))
+
+        if ranked:
+            ranked.sort(key=lambda item: (item[0], item[1], item[2].get("_score", 0)), reverse=True)
+            winner = dict(ranked[0][2])
+            winner.pop("_score", None)
+            return winner
+
+        if snap.get("poor"):
+            poor_n = len(snap.get("poor") or [])
+            return {
+                "schema_version": _priority_schema_version(),
+                "source": "priority_engine",
+                "kind": "supplemental",
+                "position": 0,
+                "system": "SPOT",
+                "symbol": None,
+                "action": "WAIT",
+                "action_state": "OPEN",
+                "intended_action": None,
+                "priority": "LOW",
+                "priority_score": 18,
+                "block_state": "BLOCKED",
+                "proof_state": _priority_proof_state("SPOT"),
+                "confidence": "high",
+                "reason": f"Spot underweight names exist, but conditions are poor on {poor_n} token(s).",
+                "size_guidance": "Hold off until spot posture improves.",
+                "blockers": ["POOR_CONDITIONS"],
+                "move_type": "WAIT",
+                "research_priority": None,
+                "research_budget": None,
+                "triage_tags": ["poor_conditions"],
+                "change": None,
+            }
+        return None
+    except Exception as exc:
+        log.debug("priority registry spot direct candidate: %s", exc)
+        return None
+
+
+def _build_memecoin_fresh_qualified_priority_candidate() -> dict | None:
+    try:
+        import sqlite3
+        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+        from utils.db import get_conn  # type: ignore
+
+        _now = _dt.now(_tz.utc)
+        _cut_14d = (_now - _td(days=14)).strftime("%Y-%m-%d %H:%M:%S")
+        _cut_72h = (_now - _td(hours=72)).strftime("%Y-%m-%d %H:%M:%S")
+        _MCAP_FLOOR = 1_500_000.0
+        _meme_dry = os.getenv("MEMECOIN_DRY_RUN", "true").lower() == "true"
+        _meme_pilot = os.getenv("MEMECOIN_PILOT_MODE", "false").lower() == "true"
+        _meme_auto = os.getenv("MEMECOIN_AUTO_BUY", "false").lower() == "true"
+        _meme_max_open = int(os.getenv("MEMECOIN_MAX_OPEN", "3"))
+        _meme_mode = "PAPER" if _meme_dry else ("PILOT" if _meme_pilot else "LIVE")
+        _pressure_ctx = _home_portfolio_pressure_context()
+        _pressure_bucket = str(_pressure_ctx.get("capital_pressure_bucket") or "LOW")
+        _pressure_note = str(_pressure_ctx.get("capital_pressure_note") or "")
+
+        with get_conn() as conn:
+            conn.row_factory = sqlite3.Row
+            _fq_rows = conn.execute("""
+                SELECT symbol, COUNT(*) AS cnt
+                FROM memecoin_signal_outcomes
+                WHERE scanned_at >= ?
+                GROUP BY symbol
+            """, (_cut_72h,)).fetchall()
+            _appear_72h = {
+                str(r["symbol"]).upper(): int(r["cnt"] or 0)
+                for r in _fq_rows
+                if r["symbol"]
+            }
+
+            rows = conn.execute("""
+                SELECT
+                    c.symbol, c.scanned_at, c.source, c.score,
+                    c.mcap_at_scan, c.liquidity_usd, c.volume_24h,
+                    c.top_holder_pct, c.rug_label,
+                    lc.lifecycle_state, lc.first_leg_confirmed, lc.n_windows,
+                    lc.first_seen_at, lc.state_entered_at,
+                    lc.entry_window, lc.fuel_quality, lc.move_phase
+                FROM (
+                    SELECT m1.*
+                    FROM memecoin_signal_outcomes m1
+                    INNER JOIN (
+                        SELECT symbol, MAX(scanned_at) AS max_scanned_at
+                        FROM memecoin_signal_outcomes
+                        WHERE source IN ('DISCOVERY', 'SCANNER')
+                          AND scanned_at >= ?
+                          AND mcap_at_scan >= ?
+                          AND liquidity_usd >= 50000
+                        GROUP BY symbol
+                    ) latest
+                      ON latest.symbol = m1.symbol
+                     AND latest.max_scanned_at = m1.scanned_at
+                    WHERE m1.source IN ('DISCOVERY', 'SCANNER')
+                ) c
+                LEFT JOIN symbol_lifecycle lc ON lc.symbol = c.symbol
+                ORDER BY
+                    CASE WHEN COALESCE(lc.move_phase, '') = 'RELOAD' THEN 3
+                         WHEN COALESCE(lc.lifecycle_state, '') = 'REVIVAL' THEN 2
+                         WHEN COALESCE(lc.entry_window, '') = 'OPEN' THEN 1
+                         ELSE 0 END DESC,
+                    COALESCE(c.score, 0) DESC,
+                    c.scanned_at DESC
+                LIMIT 80
+            """, (_cut_14d, _MCAP_FLOOR)).fetchall()
+            _label_rows = conn.execute("""
+                SELECT symbol, trust_label, triage_state
+                FROM memecoin_signal_outcomes
+                WHERE id IN (
+                    SELECT MAX(id)
+                    FROM memecoin_signal_outcomes
+                    WHERE trust_label IS NOT NULL OR triage_state IS NOT NULL
+                    GROUP BY symbol
+                )
+            """).fetchall()
+            _open_cnt_row = conn.execute("""
+                SELECT COUNT(DISTINCT mint) AS open_cnt
+                FROM memecoin_signal_outcomes
+                WHERE status = 'OPEN'
+            """).fetchone()
+
+        _latest_labels = {
+            r["symbol"]: {
+                "trust_label": str(r["trust_label"] or "").strip() or None,
+                "triage_state": str(r["triage_state"] or "").strip() or None,
+            }
+            for r in _label_rows
+            if r["symbol"]
+        }
+        _meme_open_cnt = int((_open_cnt_row["open_cnt"] if _open_cnt_row else 0) or 0)
+
+        for _r in rows:
+            _sym = str(_r["symbol"] or "").upper()
+            if not _sym:
+                continue
+
+            _mcap = float(_r["mcap_at_scan"] or 0.0)
+            _liq = float(_r["liquidity_usd"] or 0.0)
+            _top1 = float(_r["top_holder_pct"] or 0.0)
+            _rug = str(_r["rug_label"] or "").upper()
+            _lc_state = str(_r["lifecycle_state"] or "")
+            _move_phase = str(_r["move_phase"] or "")
+            _entry_window = str(_r["entry_window"] or "")
+            _fuel_quality = str(_r["fuel_quality"] or "")
+            _flc = int(_r["first_leg_confirmed"] or 0)
+            _nwin = int(_r["n_windows"] or 0)
+            _appear = int(_appear_72h.get(_sym, 0))
+            _hours_first_seen = None
+            _hours_state_entered = None
+
+            if _mcap < _MCAP_FLOOR or _liq < 50_000 or _top1 > 20.0:
+                continue
+            if _rug == "DANGER" or _lc_state == "DEAD" or _fuel_quality == "WEAK":
+                continue
+
+            if _r["first_seen_at"]:
+                try:
+                    _fs_dt = _dt.fromisoformat(str(_r["first_seen_at"]).replace("Z", "+00:00"))
+                    if _fs_dt.tzinfo is None:
+                        _fs_dt = _fs_dt.replace(tzinfo=_tz.utc)
+                    _hours_first_seen = (_now - _fs_dt).total_seconds() / 3600.0
+                except Exception:
+                    _hours_first_seen = None
+            if _r["state_entered_at"]:
+                try:
+                    _se_dt = _dt.fromisoformat(str(_r["state_entered_at"]).replace("Z", "+00:00"))
+                    if _se_dt.tzinfo is None:
+                        _se_dt = _se_dt.replace(tzinfo=_tz.utc)
+                    _hours_state_entered = (_now - _se_dt).total_seconds() / 3600.0
+                except Exception:
+                    _hours_state_entered = None
+
+            _continuation = (
+                _flc == 1
+                or _nwin >= 2
+                or _lc_state in ("RELOAD", "REVIVAL")
+                or _move_phase == "RELOAD"
+            )
+            if not _continuation:
+                continue
+
+            if (
+                _hours_first_seen is not None
+                and _hours_first_seen < 48.0
+                and _flc == 0
+                and _nwin < 2
+            ):
+                continue
+            _recent_reactivation = (
+                _hours_state_entered is not None
+                and _hours_state_entered <= 168.0
+                and _lc_state in ("RELOAD", "REVIVAL", "ACTIVE")
+            )
+            _freshness_bucket = (
+                "RECENT_REACTIVATION"
+                if _recent_reactivation and (_hours_first_seen or 0) > 168.0
+                else "NEWLY_QUALIFIED"
+            )
+            _fresh_enough = (
+                _hours_first_seen is None
+                or _hours_first_seen <= 168.0
+                or _recent_reactivation
+            )
+            if not _fresh_enough:
+                continue
+
+            _fresh_catalyst = (
+                _lc_state in ("RELOAD", "REVIVAL", "ACTIVE")
+                or _move_phase == "RELOAD"
+                or _entry_window == "OPEN"
+                or _appear >= 2
+            )
+            if not _fresh_catalyst:
+                continue
+
+            _age_txt = "recent"
+            if _r["scanned_at"]:
+                try:
+                    _event_dt = _dt.fromisoformat(str(_r["scanned_at"]).replace("Z", "+00:00"))
+                    if _event_dt.tzinfo is None:
+                        _event_dt = _event_dt.replace(tzinfo=_tz.utc)
+                    _mins = (_now - _event_dt).total_seconds() / 60.0
+                    _age_txt = f"{int(max(_mins, 0))}m ago" if _mins < 60 else f"{_mins / 60.0:.1f}h ago"
+                except Exception:
+                    pass
+
+            _score = float(_r["score"] or 0.0) if _r["score"] is not None else 0.0
+            _phase_label = _move_phase or _lc_state or "continuation"
+            _arch = _home_continuation_archetype(_entry_window, _fuel_quality, _move_phase)
+            _label_ctx = _latest_labels.get(_sym, {})
+            _trust_label = str(_label_ctx.get("trust_label") or "LOW_TRUST")
+            _triage_state = str(_label_ctx.get("triage_state") or "MONITOR")
+
+            if _trust_label == "DISTRUST" or _triage_state == "DO_NOT_TOUCH":
+                _capital_posture = "NO_DEPLOY"
+                _capital_band = "ZERO"
+                _capital_guidance = "Do not deploy capital. Freshness alone does not override adverse continuation labels."
+                _capital_rationale = "persisted trust/triage labels are explicitly adverse"
+                _capital_ready_state = "RESEARCH_ONLY"
+                _capital_suggested_entry = 0.0
+                _capital_max_entry = 0.0
+                _capital_scale = []
+                _capital_blockers = ["persisted trust/triage is adverse"]
+            elif _trust_label in ("HIGH_TRUST", "CONDITIONAL_TRUST") and _triage_state in ("INVESTIGATE_NOW", "MONITOR"):
+                _capital_posture = "PROBE_ONLY"
+                _capital_band = "SMALL"
+                _capital_guidance = "Small probe only when runtime mode and slot capacity allow it. Fresh-qualified names stay conservative by default."
+                _capital_rationale = "safe fresh-qualified continuation has constructive persisted labels, but Home keeps deployment conservative"
+                _capital_ready_state = "READY" if _meme_mode in ("PILOT", "LIVE") and _meme_auto and _meme_open_cnt < _meme_max_open else "PLANNING_ONLY"
+                _capital_suggested_entry = 10.0 if _capital_ready_state == "READY" else 0.0
+                _capital_max_entry = 15.0 if _capital_ready_state == "READY" else 0.0
+                _capital_scale = [10.0] if _capital_ready_state == "READY" else []
+                _capital_blockers = [] if _capital_ready_state == "READY" else ["runtime mode or slot capacity not ready"]
+            else:
+                _capital_posture = "RESEARCH_ONLY"
+                _capital_band = "ZERO"
+                _capital_guidance = "Research only until proof stack and trust layer mature further."
+                _capital_rationale = "safe fresh-qualified continuation is visible, but capital discipline remains conservative"
+                _capital_ready_state = "PLANNING_ONLY" if _meme_mode == "PAPER" else "RESEARCH_ONLY"
+                _capital_suggested_entry = 0.0
+                _capital_max_entry = 0.0
+                _capital_scale = []
+                _capital_blockers = ["proof stack still maturing"]
+
+            if _capital_ready_state == "READY" and _pressure_bucket == "HIGH":
+                _capital_ready_state = "PLANNING_ONLY"
+                _capital_suggested_entry = 0.0
+                _capital_max_entry = 0.0
+                _capital_scale = []
+                _capital_blockers = list(dict.fromkeys(_capital_blockers + ["broader portfolio exposure is already elevated"]))
+                _capital_guidance = "Safe fresh continuation is worth research, but broader portfolio exposure is already elevated. Keep this in planning mode."
+                _capital_rationale = "portfolio pressure is high, so Home does not mark this fresh-qualified continuation as ready"
+            _capital_allocator_stance = str(_alloc_ctx.get("memecoin_allocator_stance") or "UNKNOWN")
+            _capital_allocator_note = str(_alloc_ctx.get("memecoin_allocator_note") or "")
+            _capital_route_bucket = str(_alloc_ctx.get("memecoins_capital_route_bucket") or "LOCKED")
+            _capital_headroom_bucket = str(_alloc_ctx.get("memecoins_capital_headroom_bucket") or "UNKNOWN")
+            _capital_headroom_note = str(_alloc_ctx.get("memecoins_capital_headroom_note") or "")
+            _capital_window_bucket = str(_alloc_ctx.get("memecoins_capital_window_bucket") or "CLOSED")
+            _capital_window_note = str(_alloc_ctx.get("memecoins_capital_window_note") or "")
+            _deployment_authority = _home_deployment_authority({
+                "promotion_authority": "SUPPORTED" if _capital_posture == "PROBE_ONLY" else "TENTATIVE",
+                "reinforcement_authority": "BACKED" if _capital_posture == "PROBE_ONLY" else "ABSENT",
+                "capital_ready_state": _capital_ready_state,
+                "capital_route_bucket": _capital_route_bucket,
+                "capital_headroom_bucket": _capital_headroom_bucket,
+            })
+
+            return {
+                "schema_version": _priority_schema_version(),
+                "source": "priority_engine",
+                "kind": "supplemental",
+                "position": 0,
+                "system": "MEMECOINS",
+                "symbol": _sym,
+                "token_address": _r["mint"] or None,
+                "action": "RESEARCH",
+                "action_state": "OPEN",
+                "intended_action": None,
+                "priority": "NORMAL",
+                "priority_score": 43 + min(_appear, 3),
+                "block_state": "CLEAR",
+                "proof_state": _priority_proof_state("MEMECOINS", _sym),
+                "confidence": "medium",
+                "reason": f"{_sym} fresh-qualified · {_arch} · sc={_score:.0f} · {_age_txt}",
+                "size_guidance": "Quick-check safer continuation candidate above the $1.5M floor.",
+                "blockers": [],
+                "move_type": "FRESH_QUALIFIED",
+                "continuation_archetype": _arch,
+                "capital_posture": _capital_posture,
+                "capital_band": _capital_band,
+                "capital_guidance": _capital_guidance,
+                "capital_rationale": _capital_rationale,
+                "capital_ready_state": _capital_ready_state,
+                "capital_suggested_entry_usd": _capital_suggested_entry,
+                "capital_max_entry_usd": _capital_max_entry,
+                "capital_staged_scale_usd": _capital_scale,
+                "capital_remaining_cap_usd": None,
+                "capital_remaining_slots": max(0, _meme_max_open - _meme_open_cnt),
+                "capital_deployment_blockers": _capital_blockers,
+                "capital_pressure_bucket": _pressure_bucket,
+                "capital_pressure_note": _pressure_note,
+                "proof_stack_authority": _proof_stack_authority_from_registry(),
+                "deployment_authority": _deployment_authority,
+                "capital_allocator_stance": _capital_allocator_stance,
+                "capital_allocator_note": _capital_allocator_note,
+                "capital_headroom_bucket": _capital_headroom_bucket,
+                "capital_headroom_note": _capital_headroom_note,
+                "capital_route_bucket": _capital_route_bucket,
+                "capital_window_bucket": _capital_window_bucket,
+                "capital_window_note": _capital_window_note,
+                "freshness_bucket": _freshness_bucket,
+                "data_source": str(_r["source"] or "SCANNER").lower(),
+                "data_freshness_state": "LIVE" if _freshness_bucket in ("RECENT_REACTIVATION", "NEWLY_QUALIFIED") else "CACHED",
+                "data_freshness_issues": [],
+                "research_priority": "MEDIUM" if _entry_window == "OPEN" else "QUICK_GLANCE",
+                "research_budget": "5m" if _entry_window == "OPEN" else "30s",
+                "triage_tags": ["fresh-qualified", _arch.lower(), f"{_appear}x/72h", _trust_label.lower(), _triage_state.lower()],
+                "change": None,
+            }
+    except Exception as exc:
+        log.debug("priority registry memecoin fresh-qualified candidate: %s", exc)
+        return None
+    return None
+
+
+def _build_perp_priority_candidate() -> dict | None:
+    try:
+        import sqlite3 as _sqlite3
+        from utils.tier_manager import get_profit_buffer  # type: ignore
+        from utils.perp_executor import get_perp_status  # type: ignore
+
+        root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+        db_path = os.path.join(root, "data_storage", "engine.db")
+
+        positions = []
+        open_positions = 0
+        collateral = 0.0
+        try:
+            perp_status = get_perp_status() or {}
+            positions = perp_status.get("positions") or []
+            open_positions = int(perp_status.get("open_positions") or len(positions) or 0)
+            collateral = round(sum(float((p or {}).get("collateral_usd") or 0.0) for p in positions), 2)
+        except Exception as exc:
+            log.debug("priority registry perp status snapshot failed: %s", exc)
+
+        with _sqlite3.connect(db_path) as conn:
+            conn.row_factory = _sqlite3.Row
+            buffer_usd = float(get_profit_buffer(conn) or 0.0)
+            if not open_positions:
+                rows = conn.execute("""
+                    SELECT symbol, side, collateral_usd, stop_price
+                    FROM perp_positions
+                    WHERE status='OPEN'
+                    ORDER BY opened_ts_utc DESC
+                """).fetchall()
+                positions = [dict(r) for r in rows]
+                open_positions = len(positions)
+                if not collateral:
+                    collateral = round(sum(float((p or {}).get("collateral_usd") or 0.0) for p in positions), 2)
+
+        worst_liq = None
+        try:
+            _, _, worst_liq = _fetch_jupiter_summary()
+        except Exception as exc:
+            log.debug("priority registry perp jupiter summary failed: %s", exc)
+
+        if open_positions <= 0:
+            return {
+                "schema_version": _priority_schema_version(),
+                "source": "priority_engine",
+                "kind": "supplemental",
+                "position": 0,
+                "system": "PERP",
+                "symbol": None,
+                "action": "WAIT",
+                "action_state": "OPEN",
+                "intended_action": None,
+                "priority": "LOW",
+                "priority_score": 12,
+                "block_state": "BLOCKED",
+                "proof_state": _priority_proof_state("PERP"),
+                "confidence": "high",
+                "reason": "No open positions.",
+                "size_guidance": "Stand by for next tier entry signal.",
+                "blockers": [],
+                "move_type": None,
+                "research_priority": None,
+                "research_budget": None,
+                "triage_tags": ["idle"],
+                "change": None,
+            }
+
+        primary = positions[0] if positions else {}
+        primary_symbol = str((primary or {}).get("symbol") or "").upper() or None
+        primary_side = str((primary or {}).get("side") or "").upper() or None
+        side_tag = f"{primary_side} " if primary_side else ""
+
+        if buffer_usd < 0 or (worst_liq is not None and worst_liq < 15):
+            action = "MANAGE"
+            priority = "URGENT"
+            priority_score = 95
+            block_state = "CONSTRAINED"
+            blockers = []
+            if buffer_usd < 0:
+                blockers.append(f"BUFFER=${buffer_usd:,.0f}")
+            if worst_liq is not None and worst_liq < 15:
+                blockers.append(f"LIQ={worst_liq:.1f}%")
+            reason = (
+                f"{side_tag}{primary_symbol or 'PERP'} at risk · {open_positions} open position(s) · "
+                f"${collateral:,.0f} collateral"
+            )
+            if worst_liq is not None:
+                reason += f" · worst liq {worst_liq:.1f}%"
+            size_guidance = "Do not add new perp capital. Reduce exposure or add collateral."
+            triage_tags = ["manage"] + ([f"liq={worst_liq:.1f}%"] if worst_liq is not None else [])
+        elif worst_liq is not None and worst_liq < 25:
+            action = "WATCH"
+            priority = "NORMAL"
+            priority_score = 28
+            block_state = "CONSTRAINED"
+            blockers = []
+            reason = (
+                f"{side_tag}{primary_symbol or 'PERP'} open · {open_positions} position(s) · "
+                f"${collateral:,.0f} collateral · worst liq {worst_liq:.1f}%"
+            )
+            size_guidance = "No new perp capital until liq distance improves."
+            triage_tags = ["monitor", f"liq={worst_liq:.1f}%"]
+        else:
+            action = "HOLD"
+            priority = "LOW"
+            priority_score = 18
+            block_state = "CLEAR"
+            blockers = []
+            reason = (
+                f"{side_tag}{primary_symbol or 'PERP'} healthy · {open_positions} position(s) · "
+                f"${collateral:,.0f} collateral"
+            )
+            if buffer_usd:
+                reason += f" · buffer ${buffer_usd:,.0f}"
+            size_guidance = "No new capital needed. Keep monitoring open positions."
+            triage_tags = ["healthy"]
+
+        return {
+            "schema_version": _priority_schema_version(),
+            "source": "priority_engine",
+            "kind": "supplemental",
+            "position": 0,
+            "system": "PERP",
+            "symbol": primary_symbol,
+            "action": action,
+            "action_state": "OPEN",
+            "intended_action": None,
+            "priority": priority,
+            "priority_score": priority_score,
+            "block_state": block_state,
+            "proof_state": _priority_proof_state("PERP", primary_symbol),
+            "confidence": "high" if action in ("MANAGE", "WATCH") else "medium",
+            "reason": reason,
+            "size_guidance": size_guidance,
+            "blockers": blockers,
+            "move_type": primary_side,
+            "research_priority": None,
+            "research_budget": None,
+            "triage_tags": triage_tags,
+            "change": None,
+        }
+    except Exception as exc:
+        log.debug("priority registry perp direct candidate: %s", exc)
+        return None
+
+
+def _build_priority_candidates_registry(nbm: dict | None = None, queue: dict | None = None, root: str | None = None) -> dict:
+    def _norm(item: dict, source: str, position: int, kind: str) -> dict:
+        system = item.get("system")
+        action = item.get("action")
+        blockers = item.get("blockers") or []
+        action_state = item.get("action_state")
+        proof_state = _priority_proof_state(system, item.get("symbol"))
+        priority = item.get("priority", "LOW")
+        priority_score = (
+            100 if priority == "URGENT"
+            else 70 if priority == "HIGH"
+            else 45 if priority == "NORMAL"
+            else 20
+        )
+        operating = _home_operating_status(item, operating_mode_summary)
+        lane_context = _home_item_lane_context(
+            item,
+            lane_policy_summary,
+            lane_authority_summary,
+            lane_unlock_summary,
+        )
+        item_with_operating = {
+            **item,
+            **operating,
+        }
+        constraint_context = _home_item_constraint_context(
+            item_with_operating,
+            operating_mode_summary,
+            lane_policy_summary,
+            lane_authority_summary,
+            lane_unlock_summary,
+            operating_constraints_summary,
+        )
+        return {
+            "schema_version": _priority_schema_version(),
+            "source": source,
+            "kind": kind,
+            "position": position,
+            "system": system,
+            "symbol": item.get("symbol"),
+            "token_address": item.get("token_address"),
+            "action": action,
+            "action_state": action_state or ("GATED" if action == "BLOCKED" else "OPEN"),
+            "intended_action": item.get("intended_action"),
+            "priority": priority,
+            "priority_score": priority_score,
+            "block_state": _priority_block_state(action, action_state, blockers),
+            "proof_state": proof_state,
+            "operating_status": operating.get("operating_status"),
+            "operating_note": operating.get("operating_note"),
+            "lane_policy_state": lane_context.get("lane_policy_state"),
+            "lane_policy_note": lane_context.get("lane_policy_note"),
+            "lane_authority": lane_context.get("lane_authority"),
+            "lane_authority_note": lane_context.get("lane_authority_note"),
+            "lane_authority_driver": lane_context.get("lane_authority_driver"),
+            "lane_next_unlock_state": lane_context.get("lane_next_unlock_state"),
+            "lane_next_unlock_note": lane_context.get("lane_next_unlock_note"),
+            "primary_constraint_key": constraint_context.get("primary_constraint_key"),
+            "primary_constraint_note": constraint_context.get("primary_constraint_note"),
+            "primary_constraint_source": constraint_context.get("primary_constraint_source"),
+            "confidence": item.get("confidence"),
+            "reason": item.get("reason"),
+            "size_guidance": item.get("size_guidance"),
+            "blockers": blockers,
+            "move_type": item.get("move_type"),
+            "continuation_archetype": item.get("continuation_archetype"),
+            "research_priority": item.get("research_priority"),
+            "research_budget": item.get("research_budget"),
+            "triage_tags": item.get("triage_tags"),
+            "reinforcement_score": item.get("reinforcement_score"),
+            "reinforcement_tags": item.get("reinforcement_tags"),
+            "support_overlap_score": item.get("support_overlap_score"),
+            "support_overlap_tags": item.get("support_overlap_tags"),
+            "reinforcement_bucket": item.get("reinforcement_bucket"),
+            "proof_stack_authority": item.get("proof_stack_authority"),
+            "reinforcement_authority": item.get("reinforcement_authority"),
+            "promotion_authority": item.get("promotion_authority"),
+            "deployment_authority": item.get("deployment_authority") or _home_deployment_authority(item),
+            "decision_authority": item.get("decision_authority") or _home_decision_authority(item),
+            "continuation_memory_authority": item.get("continuation_memory_authority"),
+            "fresh_catalyst_bucket": item.get("fresh_catalyst_bucket"),
+            "fresh_discovery_authority": item.get("fresh_discovery_authority"),
+            "capital_posture": item.get("capital_posture"),
+            "capital_band": item.get("capital_band"),
+            "capital_guidance": item.get("capital_guidance"),
+            "capital_rationale": item.get("capital_rationale"),
+            "capital_ready_state": item.get("capital_ready_state"),
+            "capital_pressure_bucket": item.get("capital_pressure_bucket"),
+            "capital_pressure_note": item.get("capital_pressure_note"),
+            "capital_regime_bucket": item.get("capital_regime_bucket"),
+            "capital_regime_note": item.get("capital_regime_note"),
+            "capital_mix_bucket": item.get("capital_mix_bucket"),
+            "capital_mix_note": item.get("capital_mix_note"),
+            "capital_allocator_stance": item.get("capital_allocator_stance"),
+            "capital_allocator_note": item.get("capital_allocator_note"),
+            "capital_headroom_bucket": item.get("capital_headroom_bucket"),
+            "capital_headroom_note": item.get("capital_headroom_note"),
+            "capital_route_bucket": item.get("capital_route_bucket"),
+            "capital_window_bucket": item.get("capital_window_bucket"),
+            "capital_window_note": item.get("capital_window_note"),
+            "marginal_route": item.get("marginal_route"),
+            "capital_routing_family": item.get("capital_routing_family"),
+            "capital_deployment_family": item.get("capital_deployment_family"),
+            "capital_intensity_bucket": item.get("capital_intensity_bucket"),
+            "freshness_bucket": item.get("freshness_bucket"),
+            "data_source": item.get("data_source") or item.get("candidate_data_source") or item.get("source"),
+            "data_freshness_state": item.get("data_freshness_state") or item.get("candidate_freshness_state"),
+            "data_freshness_issues": item.get("data_freshness_issues") or [],
+            "capital_suggested_entry_usd": item.get("capital_suggested_entry_usd"),
+            "capital_max_entry_usd": item.get("capital_max_entry_usd"),
+            "capital_staged_scale_usd": item.get("capital_staged_scale_usd"),
+            "capital_remaining_cap_usd": item.get("capital_remaining_cap_usd"),
+            "capital_remaining_slots": item.get("capital_remaining_slots"),
+            "capital_deployment_blockers": item.get("capital_deployment_blockers"),
+            "change": item.get("change"),
+        }
+
+    if root is None:
+        root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    if nbm is None:
+        nbm = _build_legacy_next_best_move_response(root)
+    if queue is None:
+        queue = get_action_queue()
+    operating_mode_summary = dict((queue or {}).get("operating_mode_summary") or _build_operating_mode_snapshot())
+    lane_policy_summary = dict((queue or {}).get("lane_policy_summary") or {})
+    lane_authority_summary = dict((queue or {}).get("lane_authority_summary") or {})
+    lane_unlock_summary = dict((queue or {}).get("lane_unlock_summary") or {})
+    operating_constraints_summary = dict((queue or {}).get("operating_constraints_summary") or {})
+
+    raw_candidates: list[dict] = []
+
+    top = (nbm or {}).get("next_best_move")
+    if isinstance(top, dict):
+        raw_candidates.append(_norm(top, "next_best_move", 0, "top"))
+
+    for i, alt in enumerate((nbm or {}).get("alternatives") or [], start=1):
+        if isinstance(alt, dict):
+            raw_candidates.append(_norm(alt, "next_best_move", i, "alternative"))
+
+    aq_top = (queue or {}).get("top_action")
+    if isinstance(aq_top, dict):
+        raw_candidates.append(_norm(aq_top, "action_queue", 0, "top"))
+
+    for i, row in enumerate((queue or {}).get("secondary_actions") or [], start=1):
+        if isinstance(row, dict):
+            raw_candidates.append(_norm(row, "action_queue", i, "secondary"))
+
+    _allocator_summary = dict((queue or {}).get("allocator_summary") or {})
+    _marginal_route = str(_allocator_summary.get("marginal_route") or "")
+    _marginal_route_authority = str(_allocator_summary.get("marginal_route_authority") or "")
+    if _marginal_route:
+        for _cand in raw_candidates:
+            _cand["marginal_route"] = _marginal_route
+            if _marginal_route_authority:
+                _cand["marginal_route_authority"] = _marginal_route_authority
+
+    raw_candidates = [c for c in raw_candidates if not _priority_is_internal_meta(c)]
+
+    try:
+        _direct_spot = _build_spot_priority_candidate()
+        if _direct_spot:
+            raw_candidates = [c for c in raw_candidates if str(c.get("system") or "") != "SPOT"]
+            raw_candidates.append(_direct_spot)
+    except Exception:
+        pass
+
+    try:
+        _direct_perp = _build_perp_priority_candidate()
+        if _direct_perp:
+            raw_candidates = [c for c in raw_candidates if str(c.get("system") or "") != "PERP"]
+            raw_candidates.append(_direct_perp)
+    except Exception:
+        pass
+
+    try:
+        _fresh_memecoin = _build_memecoin_fresh_qualified_priority_candidate()
+        if _fresh_memecoin:
+            raw_candidates.append(_fresh_memecoin)
+    except Exception:
+        pass
+
+    present_systems = {str(c.get("system") or "") for c in raw_candidates}
+
+    # Supplemental lane-level candidates ensure the priority engine can still
+    # reason about Whale and Confluence when older Home builders don't emit a
+    # concrete row for them. These are intentionally compact and conservative.
+    if "WHALE" not in present_systems:
+        try:
+            _direct_whale = _build_whale_priority_candidate()
+            if _direct_whale:
+                raw_candidates.append(_direct_whale)
+            else:
+                _ws = _whale_summary()
+                _recent_alerts = int(_ws.get("recent_alerts_6h") or 0)
+                _recent_pass = int(_ws.get("recent_pass_2h") or 0)
+                _detail = str(_ws.get("detail") or "watching whale flow")
+                if _recent_pass > 0:
+                    raw_candidates.append({
+                        "schema_version": _priority_schema_version(),
+                        "source": "priority_engine",
+                        "kind": "supplemental",
+                        "position": 0,
+                        "system": "WHALE",
+                        "symbol": None,
+                        "action": "RESEARCH",
+                        "action_state": "OPEN",
+                        "intended_action": None,
+                        "priority": "NORMAL",
+                        "priority_score": 42,
+                        "block_state": "CLEAR",
+                        "proof_state": _priority_proof_state("WHALE"),
+                        "confidence": "medium",
+                        "reason": f"Whale lane active — {_recent_pass} scanner-pass alert(s) in the last 2h · {_detail}",
+                        "size_guidance": "Verify fresh whale scanner-pass alerts before any action.",
+                        "blockers": [],
+                        "move_type": None,
+                        "research_priority": "MEDIUM",
+                        "research_budget": "5m",
+                        "triage_tags": ["whale lane", "scanner-pass"],
+                        "change": None,
+                    })
+                elif _recent_alerts > 0:
+                    raw_candidates.append({
+                        "schema_version": _priority_schema_version(),
+                        "source": "priority_engine",
+                        "kind": "supplemental",
+                        "position": 0,
+                        "system": "WHALE",
+                        "symbol": None,
+                        "action": "MONITOR",
+                        "action_state": "OPEN",
+                        "intended_action": None,
+                        "priority": "LOW",
+                        "priority_score": 24,
+                        "block_state": "CLEAR",
+                        "proof_state": _priority_proof_state("WHALE"),
+                        "confidence": "medium",
+                        "reason": f"Whale tracking live — {_detail}",
+                        "size_guidance": "Monitor for fresh scanner-pass alerts.",
+                        "blockers": [],
+                        "move_type": None,
+                        "research_priority": None,
+                        "research_budget": None,
+                        "triage_tags": ["whale lane", "tracking"],
+                        "change": None,
+                    })
+        except Exception as exc:
+            log.debug("priority registry whale supplemental: %s", exc)
+
+    if "CONFLUENCE" not in present_systems:
+        try:
+            _direct_conf = _build_confluence_priority_candidate()
+            if _direct_conf:
+                raw_candidates.append(_direct_conf)
+            else:
+                try:
+                    from routers.confluence import get_confluence_summary_data  # type: ignore
+                except Exception:
+                    from confluence import get_confluence_summary_data  # type: ignore
+                _conf = get_confluence_summary_data() or {}
+                _dual = int(_conf.get("recent_dual_48h") or 0)
+                _triple = int(_conf.get("recent_triple_48h") or 0)
+                _struct = int(_conf.get("recent_structural_48h") or 0)
+                if _dual > 0 or _triple > 0:
+                    raw_candidates.append({
+                        "schema_version": _priority_schema_version(),
+                        "source": "priority_engine",
+                        "kind": "supplemental",
+                        "position": 0,
+                        "system": "CONFLUENCE",
+                        "symbol": None,
+                        "action": "RESEARCH",
+                        "action_state": "OPEN",
+                        "intended_action": None,
+                        "priority": "HIGH",
+                        "priority_score": 60,
+                        "block_state": "CLEAR",
+                        "proof_state": "PROMOTED",
+                        "confidence": "high",
+                        "reason": f"True confluence active — {_dual} dual and {_triple} triple event(s) in the last 48h.",
+                        "size_guidance": "Review fresh true confluence events first.",
+                        "blockers": [],
+                        "move_type": None,
+                        "research_priority": "HIGH",
+                        "research_budget": "15m",
+                        "triage_tags": ["true confluence"],
+                        "change": None,
+                    })
+                elif _struct > 0:
+                    raw_candidates.append({
+                        "schema_version": _priority_schema_version(),
+                        "source": "priority_engine",
+                        "kind": "supplemental",
+                        "position": 0,
+                        "system": "CONFLUENCE",
+                        "symbol": None,
+                        "action": "RESEARCH",
+                        "action_state": "OPEN",
+                        "intended_action": None,
+                        "priority": "NORMAL",
+                        "priority_score": 42,
+                        "block_state": "CLEAR",
+                        "proof_state": _priority_proof_state("CONFLUENCE"),
+                        "confidence": "medium",
+                        "reason": f"Structural confluence active — {_struct} structural event(s) in the last 48h.",
+                        "size_guidance": "Review structural confluence as an earlier, weaker class.",
+                        "blockers": [],
+                        "move_type": None,
+                        "research_priority": "MEDIUM",
+                        "research_budget": "5m",
+                        "triage_tags": ["structural confluence"],
+                        "change": None,
+                    })
+        except Exception as exc:
+            log.debug("priority registry confluence supplemental: %s", exc)
+
+    blocked = []
+    for i, row in enumerate((queue or {}).get("blocked_opportunities") or []):
+        if not isinstance(row, dict):
+            continue
+        blocked.append({
+            "schema_version": _priority_schema_version(),
+            "source": "action_queue",
+            "kind": "blocked",
+            "position": i,
+            "system": row.get("system"),
+            "symbol": row.get("symbol"),
+            "action": "BLOCKED",
+            "action_state": "GATED",
+            "intended_action": None,
+            "priority": "LOW",
+            "priority_score": 10,
+            "block_state": "GATED",
+            "proof_state": _priority_proof_state(row.get("system"), row.get("symbol")),
+            "confidence": None,
+            "reason": row.get("reason"),
+            "size_guidance": None,
+            "blockers": row.get("blockers") or [],
+        })
+
+    raw_candidates = _apply_memecoin_reinforcement(raw_candidates)
+
+    merged: dict[str, dict] = {}
+    for cand in raw_candidates:
+        key = _priority_opportunity_key(cand)
+        cand["opportunity_key"] = key
+        cand["sources"] = [cand.get("source")]
+        if key not in merged:
+            merged[key] = cand
+            continue
+        prev = merged[key]
+        prev_sources = list(dict.fromkeys((prev.get("sources") or []) + [cand.get("source")]))
+        winner = cand if _priority_candidate_rank(cand) > _priority_candidate_rank(prev) else prev
+        loser = prev if winner is cand else cand
+        winner["sources"] = prev_sources
+        winner["merged_from"] = sorted(set((winner.get("merged_from") or []) + [loser.get("source")]))
+        if not winner.get("intended_action") and loser.get("intended_action"):
+            winner["intended_action"] = loser.get("intended_action")
+        if (winner.get("change") is None) and loser.get("change") is not None:
+            winner["change"] = loser.get("change")
+        winner["reinforcement_score"] = max(
+            int(winner.get("reinforcement_score") or 0),
+            int(loser.get("reinforcement_score") or 0),
+        )
+        winner["reinforcement_tags"] = list(
+            dict.fromkeys(list(winner.get("reinforcement_tags") or []) + list(loser.get("reinforcement_tags") or []))
+        )
+        winner["support_overlap_score"] = round(max(
+            float(winner.get("support_overlap_score") or winner.get("reinforcement_score") or 0.0),
+            float(loser.get("support_overlap_score") or loser.get("reinforcement_score") or 0.0),
+        ), 2)
+        winner["support_overlap_tags"] = list(
+            dict.fromkeys(list(winner.get("support_overlap_tags") or []) + list(loser.get("support_overlap_tags") or []))
+        )
+        winner["reinforcement_bucket"] = _home_reinforcement_bucket(
+            winner.get("support_overlap_score"),
+            winner.get("support_overlap_tags") or winner.get("reinforcement_tags") or [],
+        )
+        if winner.get("reinforcement_tags"):
+            winner["triage_tags"] = list(
+                dict.fromkeys(list(winner.get("triage_tags") or []) + list(winner.get("reinforcement_tags") or []))
+            )
+        if (
+            winner.get("system") == "MEMECOINS"
+            and winner.get("action") == "RESEARCH"
+            and loser.get("system") == "MEMECOINS"
+            and loser.get("action") == "RESEARCH"
+            and (
+                winner.get("move_type") == "FRESH_QUALIFIED"
+                or loser.get("move_type") == "FRESH_QUALIFIED"
+            )
+        ):
+            _fresh = winner if winner.get("move_type") == "FRESH_QUALIFIED" else loser
+            winner["move_type"] = "FRESH_QUALIFIED"
+            winner["reason"] = _fresh.get("reason") or winner.get("reason")
+            winner["size_guidance"] = _fresh.get("size_guidance") or winner.get("size_guidance")
+            winner["research_priority"] = _fresh.get("research_priority") or winner.get("research_priority")
+            winner["research_budget"] = _fresh.get("research_budget") or winner.get("research_budget")
+            winner["continuation_archetype"] = _fresh.get("continuation_archetype") or winner.get("continuation_archetype")
+            winner["proof_stack_authority"] = _fresh.get("proof_stack_authority") or winner.get("proof_stack_authority")
+            winner["reinforcement_authority"] = _fresh.get("reinforcement_authority") or winner.get("reinforcement_authority")
+            winner["promotion_authority"] = _fresh.get("promotion_authority") or winner.get("promotion_authority")
+            winner["deployment_authority"] = _fresh.get("deployment_authority") or winner.get("deployment_authority")
+            winner["decision_authority"] = _fresh.get("decision_authority") or winner.get("decision_authority")
+            winner["continuation_memory_authority"] = _fresh.get("continuation_memory_authority") or winner.get("continuation_memory_authority")
+            winner["fresh_catalyst_bucket"] = _fresh.get("fresh_catalyst_bucket") or winner.get("fresh_catalyst_bucket")
+            winner["fresh_discovery_authority"] = _fresh.get("fresh_discovery_authority") or winner.get("fresh_discovery_authority")
+            winner["capital_posture"] = _fresh.get("capital_posture") or winner.get("capital_posture")
+            winner["capital_band"] = _fresh.get("capital_band") or winner.get("capital_band")
+            winner["capital_guidance"] = _fresh.get("capital_guidance") or winner.get("capital_guidance")
+            winner["capital_rationale"] = _fresh.get("capital_rationale") or winner.get("capital_rationale")
+            winner["capital_ready_state"] = _fresh.get("capital_ready_state") or winner.get("capital_ready_state")
+            winner["capital_pressure_bucket"] = _fresh.get("capital_pressure_bucket") or winner.get("capital_pressure_bucket")
+            winner["capital_pressure_note"] = _fresh.get("capital_pressure_note") or winner.get("capital_pressure_note")
+            winner["capital_regime_bucket"] = _fresh.get("capital_regime_bucket") or winner.get("capital_regime_bucket")
+            winner["capital_regime_note"] = _fresh.get("capital_regime_note") or winner.get("capital_regime_note")
+            winner["capital_mix_bucket"] = _fresh.get("capital_mix_bucket") or winner.get("capital_mix_bucket")
+            winner["capital_mix_note"] = _fresh.get("capital_mix_note") or winner.get("capital_mix_note")
+            winner["capital_allocator_stance"] = _fresh.get("capital_allocator_stance") or winner.get("capital_allocator_stance")
+            winner["capital_allocator_note"] = _fresh.get("capital_allocator_note") or winner.get("capital_allocator_note")
+            winner["capital_headroom_bucket"] = _fresh.get("capital_headroom_bucket") or winner.get("capital_headroom_bucket")
+            winner["capital_headroom_note"] = _fresh.get("capital_headroom_note") or winner.get("capital_headroom_note")
+            winner["capital_route_bucket"] = _fresh.get("capital_route_bucket") or winner.get("capital_route_bucket")
+            winner["capital_window_bucket"] = _fresh.get("capital_window_bucket") or winner.get("capital_window_bucket")
+            winner["capital_window_note"] = _fresh.get("capital_window_note") or winner.get("capital_window_note")
+            winner["capital_deployment_family"] = _fresh.get("capital_deployment_family") or winner.get("capital_deployment_family")
+            winner["capital_intensity_bucket"] = _fresh.get("capital_intensity_bucket") or winner.get("capital_intensity_bucket")
+            winner["freshness_bucket"] = _fresh.get("freshness_bucket") or winner.get("freshness_bucket")
+            if (
+                winner.get("freshness_bucket") == "RECENT_REACTIVATION"
+                and winner.get("reason")
+                and "recent-reactivation" not in str(winner.get("reason")).lower()
+            ):
+                winner["reason"] = str(winner.get("reason")).replace(
+                    "fresh-qualified",
+                    "fresh-qualified recent-reactivation",
+                    1,
+                )
+            if _fresh.get("capital_suggested_entry_usd") is not None:
+                winner["capital_suggested_entry_usd"] = _fresh.get("capital_suggested_entry_usd")
+            if _fresh.get("capital_max_entry_usd") is not None:
+                winner["capital_max_entry_usd"] = _fresh.get("capital_max_entry_usd")
+            if _fresh.get("capital_staged_scale_usd") is not None:
+                winner["capital_staged_scale_usd"] = _fresh.get("capital_staged_scale_usd")
+            if _fresh.get("capital_remaining_cap_usd") is not None:
+                winner["capital_remaining_cap_usd"] = _fresh.get("capital_remaining_cap_usd")
+            if _fresh.get("capital_remaining_slots") is not None:
+                winner["capital_remaining_slots"] = _fresh.get("capital_remaining_slots")
+            if _fresh.get("capital_deployment_blockers"):
+                winner["capital_deployment_blockers"] = _fresh.get("capital_deployment_blockers")
+            if _fresh.get("support_overlap_score") is not None:
+                winner["support_overlap_score"] = _fresh.get("support_overlap_score")
+            if _fresh.get("support_overlap_tags"):
+                winner["support_overlap_tags"] = list(_fresh.get("support_overlap_tags") or [])
+                winner["reinforcement_tags"] = list(
+                    dict.fromkeys(list(winner.get("reinforcement_tags") or []) + list(_fresh.get("support_overlap_tags") or []))
+                )
+            winner["reinforcement_bucket"] = _fresh.get("reinforcement_bucket") or _home_reinforcement_bucket(
+                winner.get("support_overlap_score"),
+                winner.get("support_overlap_tags") or winner.get("reinforcement_tags") or [],
+            )
+            _fresh_tags = list(_fresh.get("triage_tags") or [])
+            _winner_tags = list(winner.get("triage_tags") or [])
+            winner["triage_tags"] = list(dict.fromkeys(_fresh_tags + _winner_tags))
+        merged[key] = winner
+
+    candidates = sorted(merged.values(), key=_priority_candidate_rank, reverse=True)
+    candidates = [
+        {
+            **c,
+            **(
+                _home_operating_status(c, operating_mode_summary)
+                if not c.get("operating_status")
+                else {}
+            ),
+            **(
+                _home_item_lane_context(
+                    c,
+                    lane_policy_summary,
+                    lane_authority_summary,
+                    lane_unlock_summary,
+                )
+                if not c.get("lane_policy_state")
+                else {}
+            ),
+            **(
+                _home_item_constraint_context(
+                    {
+                        **c,
+                        **(
+                            _home_operating_status(c, operating_mode_summary)
+                            if not c.get("operating_status")
+                            else {}
+                        ),
+                    },
+                    operating_mode_summary,
+                    lane_policy_summary,
+                    lane_authority_summary,
+                    lane_unlock_summary,
+                    operating_constraints_summary,
+                )
+                if not c.get("primary_constraint_key")
+                else {}
+            ),
+        }
+        for c in candidates
+    ]
+
+    def _first_where(fn):
+        for c in candidates:
+            if fn(c):
+                return c
+        return None
+
+    grouped = {
+        "top_actionable": _first_where(lambda c: c.get("block_state") == "CLEAR" and c.get("action") in ("ACT", "BUY", "DCA", "MANAGE")),
+        "top_gated": _first_where(lambda c: c.get("block_state") == "GATED"),
+        "top_research": (
+            sorted(
+                [c for c in candidates if c.get("action") == "RESEARCH" and c.get("block_state") != "GATED"],
+                key=_priority_research_rank,
+                reverse=True,
+            )[0]
+            if any(c.get("action") == "RESEARCH" and c.get("block_state") != "GATED" for c in candidates)
+            else None
+        ),
+        "top_monitor": (
+            _first_where(
+                lambda c: c.get("block_state") in ("CLEAR", "CONSTRAINED")
+                and c.get("action") in ("MONITOR", "WATCH")
+            )
+            or _first_where(
+                lambda c: c.get("block_state") != "GATED"
+                and c.get("action") in ("MONITOR", "WATCH")
+            )
+            or _first_where(
+                lambda c: c.get("block_state") in ("CLEAR", "CONSTRAINED")
+                and c.get("action") in ("HOLD", "WAIT")
+            )
+            or _first_where(
+                lambda c: c.get("block_state") != "GATED"
+                and c.get("action") in ("HOLD", "WAIT")
+            )
+        ),
+    }
+
+    return {
+        "schema_version": _priority_schema_version(),
+        "summary": {
+            "raw_candidate_count": len(raw_candidates),
+            "candidate_count": len(candidates),
+            "blocked_count": len(blocked),
+            "systems_present": sorted({c.get("system") for c in candidates if c.get("system")}),
+        },
+        "top_candidate": candidates[0] if candidates else None,
+        "grouped": grouped,
+        "allocator_summary": _allocator_summary,
+        "candidates": candidates,
+        "blocked": blocked,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _home_priority_engine_summary() -> dict:
+    try:
+        registry = _build_priority_candidates_registry()
+        grouped = registry.get("grouped") or {}
+        return {
+            "schema_version": registry.get("schema_version"),
+            "summary": registry.get("summary") or {},
+            "candidates": registry.get("candidates") or [],
+            "top_candidate": registry.get("top_candidate"),
+            "top_actionable": grouped.get("top_actionable"),
+            "top_gated": grouped.get("top_gated"),
+            "top_research": grouped.get("top_research"),
+            "top_monitor": grouped.get("top_monitor"),
+            "generated_at": registry.get("generated_at"),
+        }
+    except Exception as exc:
+        log.debug("home priority_engine summary error: %s", exc)
+        return {
+            "schema_version": _priority_schema_version(),
+            "summary": {"raw_candidate_count": 0, "candidate_count": 0, "blocked_count": 0, "systems_present": []},
+            "candidates": [],
+            "top_candidate": None,
+            "top_actionable": None,
+            "top_gated": None,
+            "top_research": None,
+            "top_monitor": None,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+
+@_ttl_cached("priority_summary")
+def _build_priority_summary_payload() -> dict:
+    priority = _home_priority_engine_summary()
+    validation = _build_validation_registry()
+    queue = get_action_queue()
+    proof_stack = None
+    try:
+        from routers.memecoins import get_proof_stack_summary_data  # type: ignore
+        _ps = get_proof_stack_summary_data(limit=10)
+        proof_stack = {
+            "mode": _ps.get("mode"),
+            "proof_ready_now": _ps.get("proof_ready_now"),
+            "proof_build_trade_count": ((_ps.get("proof_build_trades") or {}).get("total")),
+            "proof_build_closed_count": ((_ps.get("proof_build_trades") or {}).get("closed")),
+            "proof_build_return_24h": ((_ps.get("proof_build_outcomes") or {}).get("return_24h")),
+            "top_blockers": list((_ps.get("current_blockers") or [])[:3]),
+            "generated_at": _ps.get("generated_at"),
+        }
+    except Exception:
+        proof_stack = None
+    summary = priority.get("summary") or {}
+    candidates = list(priority.get("candidates") or [])
+    operating_status_counts: dict[str, int] = {}
+    for item in candidates:
+        status = str(item.get("operating_status") or "UNKNOWN").strip().upper() or "UNKNOWN"
+        operating_status_counts[status] = int(operating_status_counts.get(status) or 0) + 1
+    return {
+        "schema_version": priority.get("schema_version"),
+        "summary": summary,
+        "raw_candidate_count": int(summary.get("raw_candidate_count") or 0),
+        "candidate_count": int(summary.get("candidate_count") or 0),
+        "blocked_count": int(summary.get("blocked_count") or 0),
+        "systems_present": list(summary.get("systems_present") or []),
+        "operating_status_counts": operating_status_counts,
+        "operating_mode_summary": queue.get("operating_mode_summary"),
+        "lane_policy_summary": queue.get("lane_policy_summary"),
+        "lane_authority_summary": queue.get("lane_authority_summary"),
+        "lane_unlock_summary": queue.get("lane_unlock_summary"),
+        "operating_agenda_summary":      queue.get("operating_agenda_summary"),
+        "operating_constraints_summary": queue.get("operating_constraints_summary"),
+        "operating_transition_summary":  queue.get("operating_transition_summary"),
+        "lane_graduation_rank":          queue.get("lane_graduation_rank"),
+        "operating_recommendation":      queue.get("operating_recommendation"),
+        "cross_lane_operating_matrix":   queue.get("cross_lane_operating_matrix"),
+        "portfolio_operating_directive": queue.get("portfolio_operating_directive"),
+        "portfolio_progression_summary": queue.get("portfolio_progression_summary"),
+        "cross_lane_promotion_summary":  queue.get("cross_lane_promotion_summary"),
+        "cross_lane_routing_readiness":  queue.get("cross_lane_routing_readiness"),
+        "operator_briefing_summary":     queue.get("operator_briefing_summary"),
+        "lane_rotation_summary":         queue.get("lane_rotation_summary"),
+        "lane_suspension_summary":       queue.get("lane_suspension_summary"),
+        "portfolio_policy_summary":      queue.get("portfolio_policy_summary"),
+        "action_law_summary":            queue.get("action_law_summary"),
+        "top_candidate": priority.get("top_candidate"),
+        "top_actionable": priority.get("top_actionable"),
+        "top_gated": priority.get("top_gated"),
+        "top_research": priority.get("top_research"),
+        "top_monitor": priority.get("top_monitor"),
+        "grouped": {
+            "top_actionable": priority.get("top_actionable"),
+            "top_gated": priority.get("top_gated"),
+            "top_research": priority.get("top_research"),
+            "top_monitor": priority.get("top_monitor"),
+        },
+        "memecoin_proof_stack": proof_stack,
+        "validation_summary": (validation.get("summary") or {}),
+        "generated_at": priority.get("generated_at") or validation.get("generated_at"),
+    }
+
+
+def _action_board_state(item: dict | None) -> str:
+    row = dict(item or {})
+    action = str(row.get("action") or "").strip().upper()
+    block_state = str(row.get("block_state") or "").strip().upper()
+    action_state = str(row.get("action_state") or "").strip().upper()
+    proof_state = str(row.get("proof_state") or "").strip().upper()
+    system = str(row.get("system") or "").strip().upper()
+    capital_ready_state = str(row.get("capital_ready_state") or "").strip().upper()
+    deployment_authority = str(row.get("deployment_authority") or "").strip().upper()
+    decision_authority = str(row.get("decision_authority") or "").strip().upper()
+
+    if system == "MEMECOINS" and proof_state in ("DEMOTED", "DEMOTED_STACK", "LOCKED", "LOCKED_STACK"):
+        return "BLOCKED"
+    if system == "MEMECOINS" and action in ("BUY", "ACT", "MANAGE"):
+        if decision_authority == "BLOCKED" or deployment_authority == "BLOCKED":
+            return "BLOCKED"
+        if capital_ready_state in ("PLANNING_ONLY", "RESEARCH_ONLY", "UNKNOWN", ""):
+            return "BLOCKED"
+        if deployment_authority not in ("EXECUTABLE", "CONDITIONALLY_READY"):
+            return "BLOCKED"
+        if proof_state == "ACCUMULATING_STACK":
+            return "BLOCKED"
+
+    if action in ("BUY", "DCA", "ACT", "MANAGE") and block_state == "CLEAR" and action_state != "GATED":
+        return "READY_NOW"
+    if action == "HOLD":
+        return "HOLD"
+    if action in ("WAIT", "BLOCKED") or block_state in ("GATED", "BLOCKED") or action_state == "GATED":
+        return "BLOCKED"
+    return "WATCH"
+
+
+def _action_board_item(item: dict | None) -> dict | None:
+    if not isinstance(item, dict):
+        return None
+    row = dict(item)
+    blockers = [str(b).strip() for b in (row.get("blockers") or []) if str(b).strip()]
+    system = str(row.get("system") or "").strip().upper() or "UNKNOWN"
+    symbol = row.get("symbol")
+    lane = {
+        "PERP": "PERP",
+        "MEMECOINS": "MEMECOINS",
+        "SPOT": "SPOT",
+        "WHALE": "WHALE",
+        "CONFLUENCE": "CONFLUENCE",
+    }.get(system, system)
+    state = _action_board_state(row)
+    capital_ready_state = str(row.get("capital_ready_state") or "").strip().upper()
+    deployment_authority = str(row.get("deployment_authority") or "").strip().upper()
+    decision_authority = str(row.get("decision_authority") or "").strip().upper()
+    if system == "MEMECOINS" and state == "BLOCKED":
+        implied_blockers: list[str] = []
+        if proof_state := str(row.get("proof_state") or "").strip().upper():
+            if proof_state == "ACCUMULATING_STACK":
+                implied_blockers.append("proof_stack_accumulating")
+        if capital_ready_state in ("PLANNING_ONLY", "RESEARCH_ONLY", "UNKNOWN"):
+            implied_blockers.append(f"capital_ready_state={capital_ready_state}")
+        if deployment_authority in ("PLANNING_ONLY", "BLOCKED"):
+            implied_blockers.append(f"deployment_authority={deployment_authority}")
+        if decision_authority == "BLOCKED":
+            implied_blockers.append("decision_authority=BLOCKED")
+        blockers = list(dict.fromkeys(blockers + implied_blockers))
+    freshness = str(row.get("freshness_bucket") or "").strip().upper() or None
+    unlock_hint = (
+        row.get("lane_next_unlock_note")
+        or row.get("primary_constraint_note")
+        or row.get("lane_policy_note")
+        or row.get("capital_guidance")
+        or row.get("size_guidance")
+    )
+    return {
+        "opportunity_key": row.get("opportunity_key"),
+        "state": state,
+        "lane": lane,
+        "system": system,
+        "symbol": symbol,
+        "token_address": row.get("token_address"),
+        "action": row.get("action"),
+        "intended_action": row.get("intended_action"),
+        "priority": row.get("priority"),
+        "priority_score": row.get("priority_score"),
+        "confidence": row.get("confidence"),
+        "reason": row.get("reason"),
+        "blockers": blockers,
+        "unlock_hint": unlock_hint,
+        "block_state": row.get("block_state"),
+        "action_state": row.get("action_state"),
+        "proof_state": row.get("proof_state"),
+        "change": row.get("change"),
+        "freshness_bucket": freshness,
+        "data_source": row.get("data_source"),
+        "data_freshness_state": row.get("data_freshness_state") or (
+            "STALE_PENALIZED" if str(row.get("freshness_bucket") or "").upper() == "STALE" else None
+        ),
+        "data_freshness_issues": row.get("data_freshness_issues") or [],
+        "move_type": row.get("move_type"),
+        "research_priority": row.get("research_priority"),
+        "research_budget": row.get("research_budget"),
+        "triage_tags": row.get("triage_tags") or [],
+        "capital_posture": row.get("capital_posture"),
+        "capital_ready_state": row.get("capital_ready_state"),
+        "capital_route_bucket": row.get("capital_route_bucket"),
+        "capital_window_bucket": row.get("capital_window_bucket"),
+        "capital_allocator_stance": row.get("capital_allocator_stance"),
+        "capital_suggested_entry_usd": row.get("capital_suggested_entry_usd"),
+        "capital_max_entry_usd": row.get("capital_max_entry_usd"),
+        "size_guidance": row.get("size_guidance"),
+    }
+
+
+def _append_action_board_unique(bucket: list[dict], seen: set[str], item: dict | None) -> None:
+    normalized = _action_board_item(item)
+    if not normalized:
+        return
+    key = str(normalized.get("opportunity_key") or f"{normalized.get('system')}:{normalized.get('symbol')}:{normalized.get('action')}")
+    if key in seen:
+        return
+    seen.add(key)
+    bucket.append(normalized)
+
+
+def _is_support_only_action_board_item(item: dict | None) -> bool:
+    row = dict(item or {})
+    system = str(row.get("system") or "").strip().upper()
+    return system == "CONFLUENCE"
+
+
+def _action_board_bucket_rank(item: dict | None) -> tuple:
+    row = dict(item or {})
+    return (
+        int(row.get("priority_score") or 0),
+        1 if str(row.get("proof_state") or "").strip().upper() in ("PROMOTED", "PROMOTED_STACK") else 0,
+        1 if str(row.get("proof_state") or "").strip().upper() == "ACCUMULATING_STACK" else 0,
+        -len(list(row.get("blockers") or [])),
+        str(row.get("reason") or ""),
+    )
+
+
+def _dedupe_memecoin_bucket_rows(rows: list[dict]) -> list[dict]:
+    """Collapse same-symbol memecoin rows that differ only by candidate source/action flavor."""
+    merged: dict[tuple[str, str], dict] = {}
+    order: list[tuple[str, str]] = []
+    for row in rows:
+        system = str(row.get("system") or "").strip().upper()
+        symbol = str(row.get("symbol") or "").strip().upper()
+        if system != "MEMECOINS" or not symbol:
+            key = (str(row.get("opportunity_key") or id(row)), "")
+            merged[key] = row
+            order.append(key)
+            continue
+        key = (system, symbol)
+        if key not in merged:
+            merged[key] = row
+            order.append(key)
+            continue
+        prev = merged[key]
+        winner = row if _action_board_bucket_rank(row) > _action_board_bucket_rank(prev) else prev
+        loser = prev if winner is row else row
+        winner = dict(winner)
+        winner["blockers"] = list(dict.fromkeys(list(winner.get("blockers") or []) + list(loser.get("blockers") or [])))
+        if not winner.get("unlock_hint") and loser.get("unlock_hint"):
+            winner["unlock_hint"] = loser.get("unlock_hint")
+        merged[key] = winner
+    return [merged[key] for key in order]
+
+
+def _gb_float(value, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _gb_parse_ts(value) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        ts = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def _gb_age_minutes(value) -> float | None:
+    ts = _gb_parse_ts(value)
+    if ts is None:
+        return None
+    return max(0.0, (datetime.now(timezone.utc) - ts).total_seconds() / 60.0)
+
+
+def _gb_pct(now: float, base: float) -> float | None:
+    if now <= 0 or base <= 0:
+        return None
+    return round((now / base - 1.0) * 100.0, 1)
+
+
+def _gb_multiple(now: float, base: float) -> float | None:
+    if now <= 0 or base <= 0:
+        return None
+    return round(now / base, 2)
+
+
+def _gb_sort_key(value) -> datetime:
+    return _gb_parse_ts(value) or datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _gb_identity_key(mint: str | None, symbol: str | None = None) -> str:
+    mint_s = str(mint or "").strip()
+    if mint_s:
+        return f"mint:{mint_s}"
+    symbol_s = str(symbol or "").strip().upper()
+    return f"symbol:{symbol_s}" if symbol_s else ""
+
+
+def _gb_batch_where(
+    mints: list[str],
+    symbols: list[str],
+    *,
+    mint_col: str = "mint",
+    symbol_col: str = "symbol",
+) -> tuple[str, list[str]]:
+    clauses: list[str] = []
+    params: list[str] = []
+    clean_mints = [m for m in dict.fromkeys(str(m or "").strip() for m in mints) if m]
+    clean_symbols = [s for s in dict.fromkeys(str(s or "").strip().upper() for s in symbols) if s]
+    if clean_mints:
+        clauses.append(f"{mint_col} IN ({','.join(['?'] * len(clean_mints))})")
+        params.extend(clean_mints)
+    if clean_symbols:
+        clauses.append(f"UPPER({symbol_col}) IN ({','.join(['?'] * len(clean_symbols))})")
+        params.extend(clean_symbols)
+    return (" OR ".join(clauses) if clauses else "1=0"), params
+
+
+def _gb_group_rows(rows: list[dict], item_keys: set[str]) -> dict[str, list[dict]]:
+    grouped: dict[str, list[dict]] = {key: [] for key in item_keys}
+    for row in rows:
+        mint_key = _gb_identity_key(row.get("mint"), None)
+        symbol_key = _gb_identity_key(None, row.get("symbol"))
+        if mint_key in grouped:
+            grouped[mint_key].append(row)
+        elif symbol_key in grouped:
+            grouped[symbol_key].append(row)
+    return grouped
+
+
+def _gb_load_conflict_queue_index(conn=None) -> dict[str, dict]:
+    close_conn = False
+    try:
+        if conn is None:
+            conn = _dj_conn()
+            close_conn = True
+        row = conn.execute(
+            "SELECT value FROM kv_store WHERE key='memecoin_research_conflict_refresh_queue'"
+        ).fetchone()
+        payload = json.loads(row[0]) if row and row[0] else {}
+        if not isinstance(payload, dict):
+            return {}
+        index: dict[str, dict] = {}
+        for item in payload.values():
+            if not isinstance(item, dict):
+                continue
+            mint_key = _gb_identity_key(item.get("mint"), None)
+            symbol_key = _gb_identity_key(None, item.get("symbol"))
+            if mint_key:
+                index[mint_key] = dict(item)
+            if symbol_key and symbol_key not in index:
+                index[symbol_key] = dict(item)
+        return index
+    except Exception:
+        return {}
+    finally:
+        if close_conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _conflict_review_outcome(
+    *,
+    item_key: str,
+    conflicts: list[str],
+    conflict_state: str,
+    dossier_ts: object,
+    queue_index: dict[str, dict] | None = None,
+) -> dict:
+    queue_item = dict((queue_index or {}).get(item_key) or {})
+    queue_status = str(queue_item.get("status") or "").strip().upper()
+    completed_ts = _gb_parse_ts(queue_item.get("last_completed_at"))
+    requested_ts = _gb_parse_ts(queue_item.get("requested_at"))
+    dossier_dt = _gb_parse_ts(dossier_ts)
+    now = datetime.now(timezone.utc)
+    completed_after_dossier = bool(completed_ts and (not dossier_dt or completed_ts >= dossier_dt))
+    completed_age_h = ((now - completed_ts).total_seconds() / 3600.0) if completed_ts else None
+    requested_age_h = ((now - requested_ts).total_seconds() / 3600.0) if requested_ts else None
+
+    if not conflicts:
+        if completed_after_dossier:
+            status = "REVIEW_COMPLETE_CLEARED"
+            label = "review cleared"
+            instruction = "Research refreshed after the conflict and no active disagreement remains."
+        else:
+            status = "NO_CONFLICT"
+            label = "aligned"
+            instruction = "No active layer conflict is present."
+    elif queue_status in {"PENDING", "RETRY"}:
+        status = "PENDING_REVIEW"
+        label = "review pending"
+        instruction = "Research refresh is queued or retrying; do not upgrade this signal until review completes."
+    elif completed_after_dossier:
+        if completed_age_h is not None and completed_age_h > _CONFLICT_REVIEW_STALE_HOURS:
+            status = "STALE_REVIEW"
+            label = "review stale"
+            instruction = "A prior review completed, but it is old enough to require fresh confirmation."
+        else:
+            status = "REVIEW_COMPLETE_STILL_BLOCKED"
+            label = "reviewed still blocked"
+            instruction = "Research refresh completed and the conflict/blocker is still present. Treat as blocked."
+    elif queue_item:
+        status = "STALE_REVIEW"
+        label = "review stale"
+        instruction = "The last conflict review is older than the current research state. Queue or wait for a fresh review."
+    elif str(conflict_state or "").upper().startswith("CONFLICT"):
+        status = "PENDING_REVIEW"
+        label = "review needed"
+        instruction = "Layers disagree and no completed review is attached yet."
+    else:
+        status = "NO_CONFLICT"
+        label = "aligned"
+        instruction = "No active layer conflict is present."
+
+    return {
+        "status": status,
+        "label": label,
+        "instruction": instruction,
+        "queue_status": queue_status or None,
+        "requested_at": queue_item.get("requested_at"),
+        "last_attempt_at": queue_item.get("last_attempt_at"),
+        "last_completed_at": queue_item.get("last_completed_at"),
+        "attempts": queue_item.get("attempts"),
+        "requested_age_hours": round(requested_age_h, 2) if requested_age_h is not None else None,
+        "completed_age_hours": round(completed_age_h, 2) if completed_age_h is not None else None,
+        "completed_after_dossier": completed_after_dossier,
+    }
+
+
+def _build_good_buy_signal_replay_from_rows(
+    *,
+    mint: str,
+    symbol: str,
+    current_marketcap: float,
+    outcomes: list[dict],
+    entries: list[dict],
+    catalysts: list[dict],
+) -> dict:
+    outcomes.sort(key=lambda r: _gb_sort_key(r.get("scanned_at")))
+    entries.sort(key=lambda r: _gb_sort_key(r.get("created_at")))
+    catalysts.sort(key=lambda r: _gb_sort_key(r.get("event_ts")))
+
+    first_seen = next((r for r in outcomes if _gb_float(r.get("mcap_at_scan")) > 0), None)
+    first_actionable = next((
+        r for r in outcomes
+        if _gb_float(r.get("mcap_at_scan")) > 0 and int(_gb_float(r.get("is_actionable_at_scan"))) == 1
+    ), None)
+    first_entry_now = next((
+        r for r in entries
+        if str(r.get("entry_state") or "").strip().upper() == "ENTRY_NOW"
+        and _gb_float(r.get("entry_marketcap")) > 0
+        and str(r.get("guard_status") or "").strip().upper() != "STALE"
+    ), None)
+    first_catalyst = next((r for r in catalysts if _gb_float(r.get("marketcap")) > 0), None)
+    latest_entry = entries[-1] if entries else None
+
+    first_seen_mcap = _gb_float((first_seen or {}).get("mcap_at_scan"))
+    first_actionable_mcap = _gb_float((first_actionable or {}).get("mcap_at_scan"))
+    first_entry_mcap = _gb_float((first_entry_now or {}).get("entry_marketcap"))
+    first_buy_mcap = first_entry_mcap or first_actionable_mcap or first_seen_mcap
+    first_buy_ts = (first_entry_now or first_actionable or first_seen or {}).get("created_at") or (first_entry_now or first_actionable or first_seen or {}).get("scanned_at")
+    first_buy_source = "ENTRY_NOW" if first_entry_now else ("ACTIONABLE_SCAN" if first_actionable else "FIRST_SCAN")
+
+    return {
+        "available": bool(first_seen or first_entry_now or first_catalyst),
+        "symbol": symbol or (first_seen or first_entry_now or {}).get("symbol"),
+        "mint": mint or (first_seen or first_entry_now or {}).get("mint"),
+        "current_marketcap": round(current_marketcap, 2) if current_marketcap > 0 else None,
+        "first_seen": {
+            "ts": (first_seen or {}).get("scanned_at"),
+            "marketcap": round(first_seen_mcap, 2) if first_seen_mcap > 0 else None,
+            "source": (first_seen or {}).get("source"),
+            "score": (first_seen or {}).get("score"),
+            "actionable": bool(int(_gb_float((first_seen or {}).get("is_actionable_at_scan")))),
+        } if first_seen else None,
+        "first_actionable": {
+            "ts": (first_actionable or {}).get("scanned_at"),
+            "marketcap": round(first_actionable_mcap, 2) if first_actionable_mcap > 0 else None,
+            "source": (first_actionable or {}).get("source"),
+            "score": (first_actionable or {}).get("score"),
+        } if first_actionable else None,
+        "first_buy_signal": {
+            "ts": first_buy_ts,
+            "marketcap": round(first_buy_mcap, 2) if first_buy_mcap > 0 else None,
+            "source": first_buy_source,
+            "entry_score": (first_entry_now or {}).get("entry_score") if first_entry_now else (first_actionable or {}).get("score"),
+            "action": (first_entry_now or {}).get("action"),
+            "guard_status": (first_entry_now or {}).get("guard_status"),
+        } if first_buy_mcap > 0 else None,
+        "first_catalyst": {
+            "ts": (first_catalyst or {}).get("event_ts"),
+            "marketcap": round(_gb_float((first_catalyst or {}).get("marketcap")), 2),
+            "event_type": (first_catalyst or {}).get("event_type"),
+            "confidence": (first_catalyst or {}).get("confidence"),
+            "headline": (first_catalyst or {}).get("headline"),
+        } if first_catalyst else None,
+        "latest_entry_signal": {
+            "ts": (latest_entry or {}).get("created_at"),
+            "marketcap": round(_gb_float((latest_entry or {}).get("entry_marketcap")), 2) if latest_entry else None,
+            "entry_state": (latest_entry or {}).get("entry_state"),
+            "entry_score": (latest_entry or {}).get("entry_score"),
+            "action": (latest_entry or {}).get("action"),
+            "guard_status": (latest_entry or {}).get("guard_status"),
+            "last_blocker": (latest_entry or {}).get("last_blocker"),
+        } if latest_entry else None,
+        "multiple_from_first_seen": _gb_multiple(current_marketcap, first_seen_mcap),
+        "multiple_from_first_buy_signal": _gb_multiple(current_marketcap, first_buy_mcap),
+        "return_from_first_seen_pct": _gb_pct(current_marketcap, first_seen_mcap),
+        "return_from_first_buy_signal_pct": _gb_pct(current_marketcap, first_buy_mcap),
+        "counts": {
+            "outcomes": len(outcomes),
+            "entry_signals": len(entries),
+            "catalysts": len(catalysts),
+        },
+    }
+
+
+def _good_buy_signal_replay(mint: str, symbol: str, current_marketcap: float) -> dict:
+    """Replay when the system first saw and first called a token buyable."""
+    mint = str(mint or "").strip()
+    symbol = str(symbol or "").strip().upper()
+    if not mint and not symbol:
+        return {"available": False, "reason": "missing_identity"}
+
+    outcomes: list[dict] = []
+    entries: list[dict] = []
+    catalysts: list[dict] = []
+    where = "mint = ?" if mint else "UPPER(symbol) = ?"
+    params = (mint or symbol,)
+    try:
+        conn = _dj_conn()
+        try:
+            outcomes = [dict(r) for r in conn.execute(
+                f"""
+                SELECT id, scanned_at, symbol, mint, source, status, score,
+                       mcap_at_scan, price_at_scan, volume_24h,
+                       is_actionable_at_scan, bought
+                FROM memecoin_signal_outcomes
+                WHERE {where}
+                """,
+                params,
+            ).fetchall()]
+            entries = [dict(r) for r in conn.execute(
+                f"""
+                SELECT id, created_at, symbol, mint, entry_state, entry_score,
+                       guard_status, action, status, entry_marketcap,
+                       entry_price, entry_volume_24h, last_blocker
+                FROM memecoin_entry_signals
+                WHERE {where}
+                """,
+                params,
+            ).fetchall()]
+            catalysts = [dict(r) for r in conn.execute(
+                f"""
+                SELECT id, event_ts, event_type, confidence, marketcap,
+                       volume_24h, headline
+                FROM memecoin_catalyst_events
+                WHERE {where}
+                """,
+                params,
+            ).fetchall()]
+        finally:
+            conn.close()
+    except Exception as exc:
+        return {"available": False, "reason": f"query_error:{exc}"}
+
+    return _build_good_buy_signal_replay_from_rows(
+        mint=mint,
+        symbol=symbol,
+        current_marketcap=current_marketcap,
+        outcomes=outcomes,
+        entries=entries,
+        catalysts=catalysts,
+    )
+
+
+def _build_good_buy_conflict_resolution_from_rows(
+    item: dict,
+    replay: dict | None,
+    dossier_row: dict | None,
+    blocker_clear_row: dict | None,
+    queue_index: dict[str, dict] | None = None,
+) -> dict:
+    mint = str(item.get("mint") or "").strip()
+    symbol = str(item.get("symbol") or "").strip().upper()
+    item_key = _gb_identity_key(mint, symbol)
+    gate_state = str(item.get("state") or "").strip().upper()
+    d = dict(dossier_row or {})
+    clear = dict(blocker_clear_row or {})
+    dossier_action = str(d.get("action") or "").strip().upper()
+    conviction = str(d.get("conviction_band") or "").strip().upper()
+    proof_status = str(d.get("proof_status") or "").strip().upper()
+    blocker = str(d.get("blocker_key") or d.get("entry_blocker") or "").strip()
+    entry_state = str(d.get("entry_state") or "").strip().upper()
+    entry_guard = str(d.get("entry_guard_status") or "").strip().upper()
+    latest_entry = dict((replay or {}).get("latest_entry_signal") or {})
+    latest_entry_clean = (
+        str(latest_entry.get("entry_state") or "").upper() == "ENTRY_NOW"
+        and str(latest_entry.get("guard_status") or "").upper() == "FRESH"
+        and not str(latest_entry.get("last_blocker") or "").strip()
+    )
+
+    conflicts: list[str] = []
+    if gate_state == "BUYABLE" and dossier_action in {"IGNORE", "TOO_LATE"}:
+        conflicts.append(f"good_buy_{gate_state.lower()}_research_{dossier_action.lower()}")
+    if gate_state == "BUYABLE" and blocker:
+        conflicts.append(f"research_blocker_{blocker}")
+    if gate_state == "BUYABLE" and proof_status in {"REJECTED", "BLOCKED"}:
+        conflicts.append(f"proof_{proof_status.lower()}")
+    if latest_entry_clean and dossier_action in {"IGNORE", "TOO_LATE"}:
+        conflicts.append(f"entry_clean_research_{dossier_action.lower()}")
+    if latest_entry_clean and blocker:
+        conflicts.append(f"entry_clean_research_blocker_{blocker}")
+    if latest_entry_clean and proof_status in {"REJECTED", "BLOCKED"}:
+        conflicts.append(f"entry_clean_proof_{proof_status.lower()}")
+    if dossier_action in {"PAPER_ENTRY", "MANUAL_REVIEW", "WATCH"} and gate_state == "BLOCKED":
+        conflicts.append("research_hot_good_buy_blocked")
+
+    clear_ts = _gb_parse_ts(clear.get("event_ts"))
+    dossier_ts = _gb_parse_ts(d.get("generated_at"))
+    clear_after_dossier = bool(clear_ts and dossier_ts and clear_ts >= dossier_ts)
+    clear_recent = bool(clear_ts and (datetime.now(timezone.utc) - clear_ts).total_seconds() <= 24 * 3600)
+
+    if conflicts:
+        if latest_entry_clean and clear_recent:
+            trusted = "ENTRY_SIGNAL_WITH_BLOCKER_CLEAR"
+            state = "CONFLICT_REVIEW"
+            instruction = "Entry layer is clean and a blocker-clear event exists, but research still disagrees. Treat as manual review or scout only until the next dossier agrees."
+        elif clear_after_dossier:
+            trusted = "BLOCKER_CLEAR_EVENT"
+            state = "CONFLICT_REVIEW"
+            instruction = "A blocker cleared after research. Rebuild/review before acting."
+        else:
+            trusted = "RESEARCH_DOSSIER"
+            state = "CONFLICT_BLOCKED"
+            instruction = "Do not treat this as a clean buy until the conflicting research blocker is resolved."
+    else:
+        trusted = "GOOD_BUY_GATE"
+        state = "ALIGNED"
+        instruction = "Layers are aligned enough for the chase-control rule to decide sizing."
+
+    self_heal = None
+    if state == "CONFLICT_REVIEW" and latest_entry_clean and clear_recent and mint:
+        try:
+            from utils.memecoin_research import queue_memecoin_research_conflict_refresh  # type: ignore
+
+            self_heal = queue_memecoin_research_conflict_refresh(
+                mint=mint,
+                symbol=symbol,
+                reason="entry_clean_research_conflict",
+                conflict_state=state,
+                conflicts=list(dict.fromkeys(conflicts)),
+                source="home_good_buy_conflict_resolution",
+            )
+        except Exception as exc:
+            self_heal = {"queued": False, "reason": f"queue_error:{exc}"}
+
+    if self_heal and self_heal.get("queued"):
+        try:
+            queue_index = _gb_load_conflict_queue_index()
+        except Exception:
+            pass
+    review_outcome = _conflict_review_outcome(
+        item_key=item_key,
+        conflicts=list(dict.fromkeys(conflicts)),
+        conflict_state=state,
+        dossier_ts=d.get("generated_at"),
+        queue_index=queue_index,
+    )
+    if review_outcome.get("status") == "REVIEW_COMPLETE_STILL_BLOCKED":
+        trusted = "RESEARCH_DOSSIER"
+        state = "CONFLICT_BLOCKED"
+        instruction = f"{review_outcome.get('instruction')} {instruction}"
+    elif review_outcome.get("status") == "STALE_REVIEW" and state.startswith("CONFLICT"):
+        trusted = "RESEARCH_DOSSIER"
+        instruction = f"{review_outcome.get('instruction')} {instruction}"
+
+    return {
+        "state": state,
+        "trusted_layer": trusted,
+        "conflicts": list(dict.fromkeys(conflicts)),
+        "instruction": instruction,
+        "self_heal": self_heal,
+        "review_outcome": review_outcome,
+        "review_status": review_outcome.get("status"),
+        "review_label": review_outcome.get("label"),
+        "research": {
+            "generated_at": d.get("generated_at"),
+            "action": dossier_action or None,
+            "conviction_band": conviction or None,
+            "proof_status": proof_status or None,
+            "blocker_key": blocker or None,
+            "entry_state": entry_state or None,
+            "entry_guard_status": entry_guard or None,
+            "risk_score": d.get("risk_score"),
+            "research_score": d.get("research_score"),
+            "operator_priority": d.get("operator_priority"),
+        } if d else None,
+        "latest_blocker_clear": {
+            "event_ts": clear.get("event_ts"),
+            "confidence": clear.get("confidence"),
+            "headline": clear.get("headline"),
+            "marketcap": clear.get("marketcap"),
+        } if clear else None,
+    }
+
+
+def _good_buy_conflict_resolution(item: dict, replay: dict | None = None) -> dict:
+    """Detect when research, entry, and good-buy layers disagree."""
+    mint = str(item.get("mint") or "").strip()
+    symbol = str(item.get("symbol") or "").strip().upper()
+    where = "mint = ?" if mint else "UPPER(symbol) = ?"
+    params = (mint or symbol,)
+    queue_index: dict[str, dict] = {}
+    try:
+        conn = _dj_conn()
+        try:
+            queue_index = _gb_load_conflict_queue_index(conn)
+            dossier = conn.execute(
+                f"""
+                SELECT generated_at, action, conviction_band, proof_status,
+                       blocker_key, entry_state, entry_score, entry_guard_status,
+                       entry_blocker, risk_score, research_score, operator_priority,
+                       mint, symbol
+                FROM memecoin_research_dossiers
+                WHERE {where}
+                ORDER BY generated_at DESC
+                LIMIT 1
+                """,
+                params,
+            ).fetchone()
+            latest_blocker_clear = conn.execute(
+                f"""
+                SELECT event_ts, event_type, confidence, marketcap,
+                       headline, mint, symbol
+                FROM memecoin_catalyst_events
+                WHERE event_type='LAST_BLOCKER_CLEARED'
+                  AND {where}
+                ORDER BY event_ts DESC
+                LIMIT 1
+                """,
+                params,
+            ).fetchone()
+        finally:
+            conn.close()
+    except Exception as exc:
+        return {"state": "UNKNOWN", "trusted_layer": "GOOD_BUY_GATE", "conflicts": [f"resolver_error:{exc}"], "instruction": "Use manual review; resolver could not read all layers."}
+
+    return _build_good_buy_conflict_resolution_from_rows(
+        item,
+        replay,
+        dict(dossier) if dossier else None,
+        dict(latest_blocker_clear) if latest_blocker_clear else None,
+        queue_index,
+    )
+
+
+def _good_buy_chase_control(item: dict, replay: dict | None, conflict: dict | None = None) -> dict:
+    """Turn first-signal replay into disciplined entry sizing."""
+    metrics = dict(item.get("metrics") or {})
+    current_mcap = _gb_float(metrics.get("marketcap_usd"))
+    pressure = _gb_float(metrics.get("pressure_score"))
+    change_1h = _gb_float(metrics.get("change_1h_pct"))
+    first_buy = dict((replay or {}).get("first_buy_signal") or {})
+    first_buy_mcap = _gb_float(first_buy.get("marketcap"))
+    move_pct = _gb_pct(current_mcap, first_buy_mcap)
+    multiple = _gb_multiple(current_mcap, first_buy_mcap)
+    conflict_state = str((conflict or {}).get("state") or "").upper()
+
+    if first_buy_mcap <= 0:
+        state = "NO_REPLAY"
+        label = "NO REPLAY"
+        action = "WAIT_CONFIRMATION"
+        instruction = "No first buy signal baseline exists yet; use normal buy rules only."
+    elif conflict_state.startswith("CONFLICT"):
+        state = "CONFLICT_SCOUT_ONLY"
+        label = "CONFLICT"
+        action = "MANUAL_REVIEW_ONLY"
+        instruction = "Signals disagree. No full entry until research, entry, and blocker state agree."
+    elif move_pct is not None and move_pct <= 25:
+        state = "FULL_ENTRY_ZONE"
+        label = "EARLY ENOUGH"
+        action = "FULL_ENTRY_ALLOWED"
+        instruction = "Still close to the first buy signal; normal sizing can be considered if the live chart matches."
+    elif move_pct is not None and move_pct <= 75:
+        state = "SCOUT_ONLY"
+        label = "SCOUT ONLY"
+        action = "SCOUT_ONLY"
+        instruction = "Move is already materially above first signal. Use scout sizing only or wait for a clean pullback."
+    elif move_pct is not None and move_pct <= 150 and pressure >= 72 and change_1h >= 0:
+        state = "CONFIRMED_CONTINUATION"
+        label = "CONTINUATION"
+        action = "SCOUT_ONLY"
+        instruction = "Continuation is still possible, but the first leg is gone. Scout only and demand sustained pressure."
+    elif move_pct is not None and move_pct <= 150:
+        state = "WAIT_PULLBACK"
+        label = "WAIT PULLBACK"
+        action = "WAIT_PULLBACK"
+        instruction = "The first leg is extended without enough pressure. Wait for a base or pullback before buying."
+    else:
+        state = "DO_NOT_CHASE"
+        label = "DO NOT CHASE"
+        action = "WAIT_RESET"
+        instruction = "Too far above the first buy signal for a clean fresh entry. Wait for reset/new catalyst."
+
+    return {
+        "state": state,
+        "label": label,
+        "action": action,
+        "instruction": instruction,
+        "current_marketcap": round(current_mcap, 2) if current_mcap > 0 else None,
+        "first_buy_marketcap": round(first_buy_mcap, 2) if first_buy_mcap > 0 else None,
+        "move_from_first_buy_pct": move_pct,
+        "multiple_from_first_buy": multiple,
+        "full_entry_ceiling_marketcap": round(first_buy_mcap * 1.25, 2) if first_buy_mcap > 0 else None,
+        "scout_ceiling_marketcap": round(first_buy_mcap * 1.75, 2) if first_buy_mcap > 0 else None,
+        "continuation_ceiling_marketcap": round(first_buy_mcap * 2.5, 2) if first_buy_mcap > 0 else None,
+        "preferred_pullback_marketcap": round(max(first_buy_mcap * 1.15, current_mcap * 0.82), 2) if first_buy_mcap > 0 and current_mcap > 0 else None,
+    }
+
+
+def _good_buy_memory_index() -> dict[str, dict]:
+    """Resolved decision outcomes by mint/symbol for light good-buy calibration."""
+    try:
+        conn = _dj_conn()
+        try:
+            rows = conn.execute(
+                """
+                SELECT COALESCE(mint, '') AS mint,
+                       UPPER(COALESCE(symbol, '')) AS symbol,
+                       COALESCE(outcome_label, '') AS outcome_label,
+                       COALESCE(max_return_pct, 0) AS max_return_pct
+                FROM decision_journal
+                WHERE resolution_status='RESOLVED'
+                  AND source_surface IN ('BUY_DECISION_V1', 'ACTION_BOARD', 'ACT_SURFACE')
+                  AND outcome_label IS NOT NULL
+                ORDER BY resolved_ts DESC
+                LIMIT 600
+                """
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        rows = []
+
+    index: dict[str, dict] = {}
+    good_labels = {"BIG_RUNNER", "GOOD_RUNNER", "GOOD_BUY"}
+    bad_labels = {"BAD_BUY", "WEAK_BUY"}
+    for row in rows:
+        keys = [str(row["mint"] or "").strip(), str(row["symbol"] or "").strip().upper()]
+        for key in [k for k in keys if k]:
+            item = index.setdefault(key, {"sample_n": 0, "good_n": 0, "bad_n": 0, "max_sum": 0.0})
+            label = str(row["outcome_label"] or "").strip().upper()
+            item["sample_n"] += 1
+            item["max_sum"] += _fl(row["max_return_pct"])
+            if label in good_labels:
+                item["good_n"] += 1
+            elif label in bad_labels:
+                item["bad_n"] += 1
+    for item in index.values():
+        n = max(1, int(item.get("sample_n") or 0))
+        item["avg_max_return_pct"] = round(float(item.get("max_sum") or 0.0) / n, 2)
+        item["good_rate_pct"] = round(float(item.get("good_n") or 0) * 100.0 / n, 1)
+        item["bad_rate_pct"] = round(float(item.get("bad_n") or 0) * 100.0 / n, 1)
+    return index
+
+
+def _good_buy_gate(row: dict, provider_context: dict, memory_index: dict[str, dict] | None = None) -> dict:
+    identity = str(row.get("identity_status") or "UNKNOWN").strip().upper()
+    freshness = str(row.get("data_freshness") or "UNKNOWN").strip().upper()
+    confidence = str(row.get("data_confidence") or "UNKNOWN").strip().upper()
+    symbol = str(row.get("symbol") or "").strip().upper()
+    mint = str(row.get("mint") or "").strip()
+    market_source = str(row.get("market_source") or "").strip().lower()
+    age_minutes = _gb_age_minutes(row.get("updated_at"))
+
+    liquidity = _gb_float(row.get("liquidity"))
+    volume_24h = _gb_float(row.get("volume_24h_usd"))
+    volume_1h = _gb_float(row.get("volume_1h_usd"))
+    quality = _gb_float(row.get("quality_score"))
+    risk = _gb_float(row.get("risk_score"))
+    pressure = _gb_float(row.get("pressure_score"))
+    buy_pressure = _gb_float(row.get("buy_pressure_1h"), 50.0)
+    change_1h = _gb_float(row.get("price_change_1h_percent"))
+    change_24h = _gb_float(row.get("price_change_24h_percent"))
+    top1 = _gb_float(row.get("holder_top1_pct"))
+    top10 = _gb_float(row.get("holder_top10_pct"))
+    trade_1h = int(_gb_float(row.get("trade_1h")))
+    vol_liq = (volume_24h / liquidity) if liquidity > 0 else 0.0
+
+    blockers: list[str] = []
+    warnings: list[str] = []
+    strengths: list[str] = []
+
+    if not symbol or not mint:
+        blockers.append("missing_symbol_or_ca")
+    if identity in {"MISMATCH", "QUARANTINED"}:
+        blockers.append(f"identity_{identity.lower()}")
+    elif identity not in {"RESOLVED", "ASSERTED"}:
+        blockers.append("identity_unresolved")
+    elif identity == "ASSERTED":
+        warnings.append("identity_asserted_not_live_confirmed")
+    else:
+        strengths.append("identity_resolved")
+
+    if freshness == "STALE" or confidence == "LOW":
+        blockers.append("market_data_stale")
+    elif freshness == "RECENT":
+        warnings.append("market_data_recent_not_live")
+    elif freshness == "LIVE":
+        strengths.append("live_market_data")
+
+    if age_minutes is None:
+        blockers.append("missing_snapshot_age")
+    elif age_minutes > 180:
+        blockers.append(f"snapshot_old_{int(age_minutes)}m")
+    elif age_minutes > 45:
+        warnings.append(f"snapshot_aging_{int(age_minutes)}m")
+
+    if provider_context.get("hard_block"):
+        warnings.append(str(provider_context.get("hard_block")))
+
+    if liquidity < 75_000:
+        blockers.append(f"liquidity_thin_{int(liquidity)}")
+    elif liquidity < 150_000:
+        warnings.append("liquidity_watch")
+    else:
+        strengths.append("liquidity_ok")
+
+    if volume_24h < 75_000:
+        blockers.append(f"volume_24h_weak_{int(volume_24h)}")
+    elif volume_24h < 175_000:
+        warnings.append("volume_watch")
+    else:
+        strengths.append("volume_ok")
+
+    if quality < 72:
+        blockers.append(f"quality_low_{quality:.1f}")
+    elif quality < 80:
+        warnings.append("quality_watch")
+    else:
+        strengths.append("quality_high")
+
+    if risk < 65:
+        blockers.append(f"risk_score_low_{risk:.1f}")
+    elif risk < 75:
+        warnings.append("risk_watch")
+    else:
+        strengths.append("risk_ok")
+
+    if pressure < 55:
+        blockers.append(f"pressure_weak_{pressure:.1f}")
+    elif pressure < 62:
+        warnings.append("pressure_watch")
+    else:
+        strengths.append("pressure_ok")
+
+    if top1 > 20:
+        blockers.append(f"top_holder_high_{top1:.1f}%")
+    elif top1 > 12:
+        warnings.append("top_holder_watch")
+    if top10 > 55:
+        blockers.append(f"top10_concentrated_{top10:.1f}%")
+    elif top10 > 42:
+        warnings.append("top10_watch")
+
+    if trade_1h and trade_1h < 20:
+        warnings.append("thin_1h_trade_count")
+    if buy_pressure >= 55:
+        strengths.append("buy_pressure_positive")
+    elif buy_pressure < 45 and trade_1h:
+        warnings.append("sell_pressure_watch")
+    if change_1h >= 0 and change_24h >= 0:
+        strengths.append("positive_trend")
+    elif change_1h < -6:
+        blockers.append("sharp_1h_drop")
+    elif change_24h < -15:
+        warnings.append("weak_24h_trend")
+
+    memory = {}
+    if memory_index:
+        memory = dict(memory_index.get(mint) or memory_index.get(symbol) or {})
+        if int(memory.get("sample_n") or 0) >= 2:
+            if int(memory.get("good_n") or 0) > int(memory.get("bad_n") or 0):
+                strengths.append("positive_outcome_memory")
+            elif int(memory.get("bad_n") or 0) > int(memory.get("good_n") or 0):
+                warnings.append("outcome_memory_caution")
+
+    clean_blockers = list(dict.fromkeys(blockers))
+    clean_warnings = list(dict.fromkeys(warnings))
+    clean_strengths = list(dict.fromkeys(strengths))
+    memory_adjustment = 0.0
+    if memory:
+        memory_adjustment = min(8.0, max(-8.0,
+            min(25.0, _fl(memory.get("avg_max_return_pct"))) * 0.08
+            + _fl(memory.get("good_n")) * 1.2
+            - _fl(memory.get("bad_n")) * 1.8
+        ))
+    score = round(
+        quality * 0.42
+        + risk * 0.18
+        + pressure * 0.22
+        + min(100.0, liquidity / 10_000.0) * 0.08
+        + min(100.0, vol_liq * 25.0) * 0.10
+        + memory_adjustment
+        - len(clean_blockers) * 9.0
+        - len(clean_warnings) * 2.5,
+        1,
+    )
+
+    strict_buy_warnings = {
+        "market_data_recent_not_live",
+        "sell_pressure_watch",
+        "weak_24h_trend",
+        "liquidity_watch",
+        "volume_watch",
+        "risk_watch",
+        "pressure_watch",
+        "identity_asserted_not_live_confirmed",
+    }
+
+    if clean_blockers:
+        state = "BLOCKED"
+        action = "DO_NOT_BUY"
+    elif (
+        score >= 78
+        and freshness == "LIVE"
+        and identity == "RESOLVED"
+        and not any(w in strict_buy_warnings for w in clean_warnings)
+    ):
+        state = "BUYABLE"
+        action = "GOOD_BUY"
+    else:
+        state = "WAIT"
+        action = "WATCH"
+
+    if state == "BUYABLE":
+        headline = f"{symbol} is structurally buyable if the chart still matches the live read."
+    elif state == "WAIT":
+        headline = f"{symbol} is close, but not clean enough for a good-buy label yet."
+    else:
+        headline = f"{symbol or 'Token'} is blocked from good-buy status."
+
+    return {
+        "state": state,
+        "action": action,
+        "good_buy_score": max(0.0, min(100.0, score)),
+        "headline": headline,
+        "blockers": clean_blockers,
+        "warnings": clean_warnings,
+        "strengths": clean_strengths[:6],
+        "learning": {
+            "outcome_memory": memory,
+            "score_adjustment": round(memory_adjustment, 2),
+        },
+        "metrics": {
+            "quality_score": round(quality, 1),
+            "risk_score": round(risk, 1),
+            "pressure_score": round(pressure, 1),
+            "price_usd": _gb_float(row.get("price")) or None,
+            "liquidity_usd": round(liquidity, 2),
+            "marketcap_usd": round(_gb_float(row.get("marketcap")), 2),
+            "volume_24h_usd": round(volume_24h, 2),
+            "volume_1h_usd": round(volume_1h, 2),
+            "vol_liq_ratio": round(vol_liq, 3),
+            "buy_pressure_1h": round(buy_pressure, 1),
+            "trade_1h": trade_1h,
+            "change_1h_pct": round(change_1h, 2),
+            "change_24h_pct": round(change_24h, 2),
+            "holder_top1_pct": round(top1, 2) if top1 else None,
+            "holder_top10_pct": round(top10, 2) if top10 else None,
+            "age_minutes": round(age_minutes, 1) if age_minutes is not None else None,
+        },
+        "data": {
+            "identity_status": identity,
+            "identity_source": row.get("identity_source"),
+            "identity_confidence": row.get("identity_confidence"),
+            "identity_reason": row.get("identity_reason"),
+            "resolved_mint": row.get("resolved_mint"),
+            "data_freshness": freshness,
+            "data_confidence": confidence,
+            "market_source": market_source,
+            "pair_address": row.get("pair_address"),
+            "updated_at": row.get("updated_at"),
+        },
+    }
+
+
+def _execution_ticket_for_good_buy(item: dict, provider_context: dict) -> dict:
+    """Operator-facing execution plan for a market-clean token row.
+
+    This is deliberately read-only: it exposes whether the token is actionable,
+    what still blocks it, and the disciplined entry/exit frame. It does not
+    grant execution authority or trigger any executor.
+    """
+    state = str(item.get("state") or "BLOCKED").strip().upper()
+    lane = str(item.get("lane") or "MEMECOINS").strip().upper()
+    metrics = dict(item.get("metrics") or {})
+    data = dict(item.get("data") or {})
+    symbol = str(item.get("symbol") or "").strip().upper()
+    mint = str(item.get("mint") or "").strip()
+
+    price = _gb_float(metrics.get("price_usd"))
+    marketcap = _gb_float(metrics.get("marketcap_usd"))
+    pressure = _gb_float(metrics.get("pressure_score"))
+    change_1h = _gb_float(metrics.get("change_1h_pct"))
+    blockers = list(item.get("blockers") or [])
+    warnings = list(item.get("warnings") or [])
+    chase_control = dict(item.get("chase_control") or {})
+    conflict_resolution = dict(item.get("conflict_resolution") or {})
+
+    mode = "PAPER"
+    auto_enabled = False
+    max_size_usd = 0.0
+    if lane == "MEMECOINS":
+        dry = os.getenv("MEMECOIN_DRY_RUN", "true").lower() == "true"
+        pilot = os.getenv("MEMECOIN_PILOT_MODE", "false").lower() == "true"
+        auto_enabled = os.getenv("MEMECOIN_AUTO_BUY", "false").lower() == "true"
+        mode = "PAPER" if dry else ("PILOT" if pilot else "LIVE")
+        max_size_usd = float(os.getenv("MEMECOIN_PILOT_MAX_USD" if pilot else "MEMECOIN_BUY_USD", "10"))
+    elif lane == "SPOT":
+        mode = "PAPER"
+        auto_enabled = False
+        max_size_usd = float(os.getenv("SPOT_TICKET_MAX_USD", "0"))
+
+    authority = {
+        "snapshot_present": False,
+        "snapshot_stale": None,
+        "action_law_state": "UNKNOWN",
+        "highest_permitted_action": "UNKNOWN",
+        "fresh_capital_policy": "UNKNOWN",
+        "lane_suspension_state": "UNKNOWN",
+        "rank": 0,
+        "required_rank": 3,
+    }
+    try:
+        from authority import read_snapshot, _LAW_RANK  # type: ignore[import]
+
+        snap = read_snapshot() or {}
+        computed_at = _gb_parse_ts(snap.get("computed_at"))
+        age_s = None if computed_at is None else max(0, int((datetime.now(timezone.utc) - computed_at).total_seconds()))
+        hpa = str(snap.get("highest_permitted_action") or "PAPER_EXECUTION_ONLY").strip().upper()
+        lane_key = "spot" if lane == "SPOT" else "memecoins"
+        authority = {
+            "snapshot_present": bool(snap),
+            "snapshot_stale": bool(age_s is not None and age_s > 600),
+            "snapshot_age_s": age_s,
+            "action_law_state": str(snap.get("action_law_state") or "UNKNOWN").strip().upper(),
+            "highest_permitted_action": hpa,
+            "fresh_capital_policy": str(snap.get("fresh_capital_policy") or "UNKNOWN").strip().upper(),
+            "lane_suspension_state": str(snap.get(f"{lane_key}_suspension_state") or "UNKNOWN").strip().upper(),
+            "rank": int(_LAW_RANK.get(hpa, 0)),
+            "required_rank": 3,
+        }
+    except Exception as exc:
+        authority["error"] = str(exc)
+
+    authority_blockers: list[str] = []
+    if not authority.get("snapshot_present"):
+        authority_blockers.append("authority_snapshot_missing")
+    elif authority.get("snapshot_stale"):
+        authority_blockers.append("authority_snapshot_stale")
+    if int(authority.get("rank") or 0) < int(authority.get("required_rank") or 3):
+        authority_blockers.append(f"authority_rank_{authority.get('highest_permitted_action')}")
+    if str(authority.get("fresh_capital_policy") or "").upper() not in {"SELECTIVE", "OPEN"}:
+        authority_blockers.append(f"fresh_capital_{authority.get('fresh_capital_policy')}")
+    if str(authority.get("lane_suspension_state") or "").upper() in {"SUSPENDED", "HARD_BLOCKED"}:
+        authority_blockers.append(f"lane_{authority.get('lane_suspension_state')}")
+    if provider_context.get("hard_block"):
+        authority_blockers.append(str(provider_context.get("hard_block")))
+    chase_action = str(chase_control.get("action") or "").strip().upper()
+    if chase_action in {"MANUAL_REVIEW_ONLY", "WAIT_PULLBACK", "WAIT_RESET"}:
+        authority_blockers.append(f"chase_{str(chase_control.get('state') or chase_action).lower()}")
+    elif chase_action == "SCOUT_ONLY":
+        warnings.append(f"chase_{str(chase_control.get('state') or 'scout_only').lower()}")
+
+    market_clean = state == "BUYABLE"
+    authority_clean = not authority_blockers
+    executable = bool(market_clean and authority_clean and max_size_usd > 0)
+
+    if not market_clean:
+        execution_state = "MARKET_BLOCKED" if state == "BLOCKED" else "WAIT_CONFIRMATION"
+        suggested_action = "DO_NOT_BUY" if state == "BLOCKED" else "WATCH"
+        size_usd = 0.0
+    elif not authority_clean:
+        execution_state = "AUTHORITY_BLOCKED"
+        suggested_action = "MANUAL_REVIEW_ONLY"
+        size_usd = 0.0
+    elif chase_action == "SCOUT_ONLY":
+        execution_state = "SCOUT_ONLY"
+        suggested_action = "MANUAL_SCOUT_ONLY"
+        size_usd = max_size_usd * 0.35
+    elif not auto_enabled or mode in {"PAPER", "PILOT"}:
+        execution_state = "READY_MANUAL_CONFIRM"
+        suggested_action = "MANUAL_CONFIRM_BUY"
+        size_usd = max_size_usd
+    else:
+        execution_state = "READY_GUARDED"
+        suggested_action = "GUARDED_BUY"
+        size_usd = max_size_usd
+
+    max_chase_price = round(price * 1.03, 12) if price > 0 else None
+    invalid_price = round(price * 0.9, 12) if price > 0 else None
+    tp1_price = round(price * 1.25, 12) if price > 0 else None
+    tp2_price = round(price * 1.6, 12) if price > 0 else None
+    tp1_mcap = round(marketcap * 1.25, 2) if marketcap > 0 else None
+    tp2_mcap = round(marketcap * 1.6, 2) if marketcap > 0 else None
+
+    return {
+        "ticket_version": "execution_ticket_v1",
+        "symbol": symbol,
+        "mint": mint,
+        "lane": lane,
+        "route": "MEMECOIN_PILOT" if lane == "MEMECOINS" and mode == "PILOT" else f"{lane}_PAPER",
+        "mode": mode,
+        "executable": executable,
+        "execution_state": execution_state,
+        "suggested_action": suggested_action,
+        "suggested_size_usd": round(size_usd, 2),
+        "max_size_usd": round(max_size_usd if executable or market_clean else 0.0, 2),
+        "entry": {
+            "reference_price_usd": price or None,
+            "max_chase_price_usd": max_chase_price,
+            "reference_marketcap_usd": marketcap or None,
+            "instruction": "Use the live chart; avoid chasing more than 3% above the ticket snapshot.",
+        },
+        "invalidation": {
+            "price_usd": invalid_price,
+            "pressure_below": 55,
+            "change_1h_below_pct": -6,
+            "instruction": "Invalidate if price loses the ticket level, pressure drops under 55, or the 1h candle breaks down.",
+        },
+        "take_profit": {
+            "tp1_price_usd": tp1_price,
+            "tp2_price_usd": tp2_price,
+            "tp1_marketcap_usd": tp1_mcap,
+            "tp2_marketcap_usd": tp2_mcap,
+            "runner_rule": "Only hold beyond TP2 while pressure stays constructive and sell-pressure warnings remain absent.",
+        },
+        "authority": authority,
+        "blockers": list(dict.fromkeys(blockers + authority_blockers)),
+        "warnings": warnings,
+        "chase_control": chase_control or None,
+        "conflict_resolution": conflict_resolution or None,
+        "snapshot": {
+            "data_freshness": data.get("data_freshness"),
+            "identity_status": data.get("identity_status"),
+            "market_source": data.get("market_source"),
+            "pressure_score": round(pressure, 1),
+            "change_1h_pct": round(change_1h, 2),
+            "updated_at": data.get("updated_at"),
+        },
+    }
+
+
+_STRICT_BUY_WARNINGS = {
+    "market_data_recent_not_live",
+    "sell_pressure_watch",
+    "weak_24h_trend",
+    "liquidity_watch",
+    "volume_watch",
+    "risk_watch",
+    "pressure_watch",
+    "identity_asserted_not_live_confirmed",
+}
+
+
+def _failure_detail(key: str) -> dict:
+    raw = str(key or "unknown").strip()
+    norm = raw.lower()
+    label = raw.replace("_", " ")
+    category = "confirmation"
+    severity = "CONFIRMATION"
+    priority = 90
+    unlock = "Wait for this check to clear before treating the setup as buyable."
+    why = "This condition keeps the setup below the strict buy threshold."
+
+    if norm.startswith("identity_mismatch") or norm.startswith("identity_quarantined"):
+        category, severity, priority = "identity", "HARD_BLOCK", 1
+        unlock = "Skip unless token identity is corrected and the CA is independently verified."
+        why = "Wrong or quarantined identity can route you into the wrong token."
+    elif norm.startswith("identity_") or norm in {"missing_symbol_or_ca", "no_candidate"}:
+        category, severity, priority = "identity", "BLOCKER", 5
+        unlock = "Wait for resolved identity and a verified contract address."
+        why = "The system should not suggest a buy until the ticker maps to the correct CA."
+    elif norm.startswith("freshness_") or norm.startswith("market_data_") or norm.startswith("snapshot_") or norm == "data_confidence_low":
+        category, severity, priority = "freshness", "BLOCKER", 10
+        unlock = "Wait for live market data to refresh; confirm the live chart after it clears."
+        why = "Stale or low-confidence market data can make momentum and liquidity reads false."
+    elif norm.startswith("liquidity") or norm.startswith("volume"):
+        category, severity, priority = "depth", "BLOCKER", 20
+        unlock = "Wait for cleaner liquidity and real volume so the entry is not thin."
+        why = "Thin depth makes entries harder to fill and exits easier to punish."
+    elif norm.startswith("risk_score_low") or norm.startswith("quality_low") or norm.startswith("top_holder") or norm.startswith("top10"):
+        category, severity, priority = "quality", "HARD_BLOCK", 30
+        unlock = "Skip unless holder/risk/quality structure materially improves."
+        why = "The token structure is not clean enough for a high-quality buy."
+    elif norm.startswith("risk_") or norm.startswith("quality_"):
+        category, severity, priority = "quality", "BLOCKER", 34
+        unlock = "Wait for risk and quality scores to move back above clean-buy thresholds."
+        why = "The setup is close, but the structural quality is still below the buy bar."
+    elif norm.startswith("pressure") or norm.startswith("sell_pressure") or norm.startswith("weak_24h") or norm.startswith("sharp_1h"):
+        category, severity, priority = "momentum", "TRIGGER", 40
+        unlock = "Wait for pressure to recover and the short-term chart to stop weakening."
+        why = "The coin may be good, but the current tape is not clean enough yet."
+    elif norm.startswith("authority") or norm.startswith("fresh_capital") or norm.startswith("lane_"):
+        category, severity, priority = "authority", "BLOCKER", 50
+        unlock = "Wait for system authority/fresh-capital policy to allow the entry."
+        why = "The market setup may be valid, but the system is not authorized to act cleanly."
+    elif norm.startswith("signal_conflict") or norm.startswith("research_blocker") or norm.startswith("proof_"):
+        category, severity, priority = "resolver", "BLOCKER", 42
+        unlock = "Wait for the entry, research, and blocker-clear layers to agree."
+        why = "The system has conflicting reads, so the safest answer is manual review instead of a clean buy."
+    elif norm.startswith("chase_"):
+        category, severity, priority = "chase_control", "TRIGGER", 45
+        unlock = "Wait for a pullback/base or use scout-only sizing if continuation pressure stays strong."
+        why = "The coin moved materially from the first system buy signal; full-size fresh entry would be chasing."
+    elif norm in {"authority_blocked", "market_blocked", "no_execution_ticket"} or norm.startswith("state_"):
+        category, severity, priority = "execution", "BLOCKER", 60
+        unlock = "Wait for the setup state and execution ticket to become clean."
+        why = "The setup is not in a clean executable state."
+    elif norm.endswith("_cooldown") or "cooldown" in norm:
+        category, severity, priority = "provider", "BLOCKER", 70
+        unlock = "Wait for provider cooldown to clear so live data can be trusted."
+        why = "Provider limits can leave the system under-informed."
+
+    return {
+        "key": raw,
+        "label": label,
+        "category": category,
+        "severity": severity,
+        "priority": priority,
+        "unlock": unlock,
+        "why": why,
+    }
+
+
+def _failure_ladder(failures: list[str]) -> list[dict]:
+    details = [_failure_detail(f) for f in failures if str(f or "").strip()]
+    return sorted(details, key=lambda d: (int(d.get("priority") or 999), str(d.get("key") or "")))
+
+
+def _buy_decision_v1(item: dict | None, provider_context: dict | None = None) -> dict:
+    """Backend source-of-truth for the Home top-card buy verdict."""
+    now = datetime.now(timezone.utc).isoformat()
+    if not item:
+        return {
+            "version": "buy_decision_v1",
+            "generated_at": now,
+            "verdict": "NO_BUY",
+            "label": "NO BUY",
+            "is_buy_now": False,
+            "confidence": 0,
+            "symbol": None,
+            "mint": None,
+            "lane": None,
+            "failures": ["no_candidate"],
+            "warnings": [],
+            "reason": "No good-buy candidate is available.",
+            "decision_state": "NO_BUY",
+            "primary_blocker": _failure_detail("no_candidate"),
+            "blocker_ladder": [_failure_detail("no_candidate")],
+            "operator_instruction": "Do nothing until a clean candidate appears.",
+            "next_unlock": "Wait for the system to surface a verified, live-data candidate.",
+            "candidate": None,
+            "buy_plan": None,
+        }
+
+    metrics = dict(item.get("metrics") or {})
+    data = dict(item.get("data") or {})
+    ticket = dict(item.get("execution_ticket") or {})
+    chase_control = dict(item.get("chase_control") or {})
+    conflict_resolution = dict(item.get("conflict_resolution") or {})
+    execution_state = str(ticket.get("execution_state") or "NO_TICKET").strip().upper()
+    failures: list[str] = []
+
+    if str(item.get("state") or "").strip().upper() != "BUYABLE":
+        failures.append(f"state_{str(item.get('state') or 'unknown').lower()}")
+    if not ticket:
+        failures.append("no_execution_ticket")
+    if execution_state in {"AUTHORITY_BLOCKED", "MARKET_BLOCKED"}:
+        failures.append(execution_state.lower())
+    if str(data.get("identity_status") or "").strip().upper() != "RESOLVED":
+        failures.append(f"identity_{str(data.get('identity_status') or 'unknown').lower()}")
+    if str(data.get("data_freshness") or "").strip().upper() != "LIVE":
+        failures.append(f"freshness_{str(data.get('data_freshness') or 'unknown').lower()}")
+    if str(data.get("data_confidence") or "").strip().upper() == "LOW":
+        failures.append("data_confidence_low")
+    if _gb_float(metrics.get("liquidity_usd")) < 150000:
+        failures.append("liquidity_below_clean_buy")
+    if _gb_float(metrics.get("volume_24h_usd")) < 175000:
+        failures.append("volume_below_clean_buy")
+    if _gb_float(metrics.get("quality_score")) < 80:
+        failures.append("quality_below_clean_buy")
+    if _gb_float(metrics.get("risk_score")) < 75:
+        failures.append("risk_below_clean_buy")
+    if _gb_float(metrics.get("pressure_score")) < 62:
+        failures.append("pressure_below_clean_buy")
+    if _gb_float(metrics.get("change_1h_pct")) <= -6:
+        failures.append("sharp_1h_drop")
+    chase_state = str(chase_control.get("state") or "").strip().upper()
+    chase_action = str(chase_control.get("action") or "").strip().upper()
+    conflict_state = str(conflict_resolution.get("state") or "").strip().upper()
+    review_status = str(conflict_resolution.get("review_status") or (conflict_resolution.get("review_outcome") or {}).get("status") or "").strip().upper()
+    if conflict_state == "CONFLICT_BLOCKED":
+        failures.append("signal_conflict_unresolved")
+    elif conflict_state == "CONFLICT_REVIEW":
+        failures.append("signal_conflict_review")
+    if review_status in {"PENDING_REVIEW", "REVIEW_COMPLETE_STILL_BLOCKED", "STALE_REVIEW"}:
+        failures.append(f"conflict_{review_status.lower()}")
+    if chase_action in {"MANUAL_REVIEW_ONLY", "WAIT_PULLBACK", "WAIT_RESET"}:
+        failures.append(f"chase_{chase_state.lower() or chase_action.lower()}")
+    elif chase_action == "SCOUT_ONLY":
+        failures.append(f"chase_{chase_state.lower() or 'scout_only'}")
+
+    failures.extend(str(x) for x in (item.get("blockers") or []) if str(x).strip())
+    failures.extend(str(x) for x in (ticket.get("blockers") or []) if str(x).strip())
+    warning_failures = [
+        str(x)
+        for x in (item.get("warnings") or [])
+        if str(x).strip() in _STRICT_BUY_WARNINGS
+    ]
+    failures.extend(warning_failures)
+    failures = list(dict.fromkeys(failures))
+    blocker_ladder = _failure_ladder(failures)
+    primary_blocker = blocker_ladder[0] if blocker_ladder else None
+
+    is_buy_now = not failures
+    hard_skip = bool(
+        primary_blocker
+        and primary_blocker.get("severity") == "HARD_BLOCK"
+        and primary_blocker.get("category") in {"identity", "quality"}
+    )
+    if is_buy_now:
+        decision_state = "BUY_NOW"
+        verdict = "BUY_NOW"
+        label = "BUY NOW"
+    elif chase_action == "SCOUT_ONLY":
+        decision_state = "SCOUT_ONLY"
+        verdict = "SCOUT_ONLY"
+        label = "SCOUT ONLY"
+    elif chase_state in {"WAIT_PULLBACK", "DO_NOT_CHASE"}:
+        decision_state = "WAIT_PULLBACK"
+        verdict = "WAIT_PULLBACK"
+        label = "WAIT PULLBACK"
+    elif conflict_state.startswith("CONFLICT"):
+        decision_state = "CONFLICT_REVIEW"
+        verdict = "CONFLICT_REVIEW"
+        label = "CONFLICT REVIEW"
+    else:
+        decision_state = "SKIP_FOR_NOW" if hard_skip else "WAIT_FOR_TRIGGER"
+        verdict = "SKIP_FOR_NOW" if hard_skip else "WAIT_NEEDS_CONFIRMATION"
+        label = "SKIP FOR NOW" if hard_skip else "WAIT - NEEDS CONFIRMATION"
+    confidence = 92 if is_buy_now else max(40, min(78, int(round(_gb_float(item.get("good_buy_score")) - len(failures) * 4))))
+    symbol = str(item.get("symbol") or "").strip().upper() or None
+
+    if is_buy_now:
+        reason = f"{symbol or 'Token'} passes strict identity, freshness, market-quality, pressure, and blocker checks."
+        operator_instruction = "Buy only after confirming the CA and live chart still match this ticket."
+        next_unlock = "Already unlocked; confirm live chart and execute with the listed risk plan."
+    elif chase_action == "SCOUT_ONLY":
+        reason = f"{symbol or 'Token'} is valid but extended from the first buy signal; full-size entry is no longer clean."
+        operator_instruction = str(chase_control.get("instruction") or "Scout only or wait for a pullback.")
+        next_unlock = f"Full entry improves near {chase_control.get('preferred_pullback_marketcap') or 'a reset/base'} market cap."
+    elif chase_state in {"WAIT_PULLBACK", "DO_NOT_CHASE"}:
+        reason = f"{symbol or 'Token'} already moved too far from the first buy signal for a clean fresh entry."
+        operator_instruction = str(chase_control.get("instruction") or "Do not chase; wait for reset.")
+        next_unlock = f"Reconsider near {chase_control.get('preferred_pullback_marketcap') or 'a clean pullback/base'} market cap or after a new catalyst."
+    elif conflict_state.startswith("CONFLICT"):
+        review = dict(conflict_resolution.get("review_outcome") or {})
+        reason = f"{symbol or 'Token'} has a signal conflict: {', '.join((conflict_resolution.get('conflicts') or [])[:2]) or 'layers disagree'}."
+        if review.get("status") == "REVIEW_COMPLETE_STILL_BLOCKED":
+            reason = f"{symbol or 'Token'} was re-reviewed and is still blocked by research."
+        operator_instruction = str(review.get("instruction") or conflict_resolution.get("instruction") or "Manual review only until layers agree.")
+        next_unlock = (
+            "Do not buy until the blocker disappears in a fresh research review."
+            if review.get("status") == "REVIEW_COMPLETE_STILL_BLOCKED"
+            else "Wait for research, entry, and blocker-clear layers to agree."
+        )
+    else:
+        clean = primary_blocker.get("label") if primary_blocker else ", ".join(x.replace("_", " ") for x in failures[:4])
+        reason = f"{symbol or 'Token'} is visible, but the top blocker is: {clean or 'fresh confirmation'}."
+        next_unlock = str((primary_blocker or {}).get("unlock") or "Wait for the listed blocker to clear.")
+        operator_instruction = (
+            f"Skip this setup for now: {next_unlock}"
+            if hard_skip
+            else f"Do not buy yet: {next_unlock}"
+        )
+
+    alert_rule = None
+    if is_buy_now:
+        alert_rule = {
+            "kind": "BUY_NOW",
+            "severity": "HIGH",
+            "message": f"{symbol or 'Token'} is buy-now clean. Confirm CA and plan before entry.",
+        }
+    elif len(failures) == 1 and str(item.get("state") or "").strip().upper() in {"BUYABLE", "WAIT"}:
+        alert_rule = {
+            "kind": "LAST_BLOCKER",
+            "severity": "MEDIUM",
+            "message": f"{symbol or 'Token'} is one blocker away: {failures[0].replace('_', ' ')}.",
+        }
+    elif (
+        _gb_float(metrics.get("pressure_score")) >= 72
+        and _gb_float(metrics.get("change_1h_pct")) >= 8
+        and _gb_float(metrics.get("volume_24h_usd")) >= 250000
+    ):
+        alert_rule = {
+            "kind": "RUNNER_ACCELERATION",
+            "severity": "MEDIUM",
+            "message": f"{symbol or 'Token'} is accelerating; wait for strict blockers to clear before buying.",
+        }
+
+    return {
+        "version": "buy_decision_v1",
+        "generated_at": now,
+        "verdict": verdict,
+        "label": label,
+        "is_buy_now": is_buy_now,
+        "confidence": confidence,
+        "symbol": symbol,
+        "mint": str(item.get("mint") or "").strip() or None,
+        "lane": str(item.get("lane") or "").strip().upper() or None,
+        "failures": failures,
+        "warnings": list(item.get("warnings") or []),
+        "decision_state": decision_state,
+        "primary_blocker": primary_blocker,
+        "blocker_ladder": blocker_ladder[:8],
+        "operator_instruction": operator_instruction,
+        "next_unlock": next_unlock,
+        "strict_checks": {
+            "identity_status": data.get("identity_status"),
+            "data_freshness": data.get("data_freshness"),
+            "data_confidence": data.get("data_confidence"),
+            "liquidity_min_usd": 150000,
+            "volume_24h_min_usd": 175000,
+            "quality_min": 80,
+            "risk_min": 75,
+            "pressure_min": 62,
+            "change_1h_floor_pct": -6,
+            "execution_state": execution_state,
+            "provider_warning": (provider_context or {}).get("hard_block"),
+        },
+        "reason": reason,
+        "alert_rule": alert_rule,
+        "candidate": {
+            "symbol": symbol,
+            "mint": str(item.get("mint") or "").strip() or None,
+            "lane": str(item.get("lane") or "").strip().upper() or None,
+            "state": item.get("state"),
+            "score": item.get("good_buy_score"),
+            "headline": item.get("headline"),
+            "metrics": metrics,
+            "data": data,
+            "signal_replay": item.get("signal_replay"),
+            "conflict_resolution": conflict_resolution or None,
+            "chase_control": chase_control or None,
+        },
+        "buy_plan": ticket or None,
+        "signal_replay": item.get("signal_replay"),
+        "conflict_resolution": conflict_resolution or None,
+        "chase_control": chase_control or None,
+    }
+
+
+_BUY_DECISION_BULLISH_LABELS = {"BIG_RUNNER", "GOOD_RUNNER", "GOOD_BUY"}
+
+
+def _decision_snapshot(row) -> dict:
+    try:
+        raw = row["snapshot_json"] if "snapshot_json" in row.keys() else None
+        parsed = json.loads(raw or "{}")
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def _decision_blockers(row) -> list[str]:
+    try:
+        raw = row["blockers_json"] if "blockers_json" in row.keys() else None
+        parsed = json.loads(raw or "[]")
+        if isinstance(parsed, list):
+            return [str(x) for x in parsed if str(x or "").strip()]
+    except Exception:
+        pass
+    return []
+
+
+def _decision_state_from_row(row, snapshot: dict) -> str:
+    state = str(snapshot.get("decision_state") or "").strip().upper()
+    if state:
+        return state
+    priority = str(row["priority"] or "").strip().upper()
+    action = str(row["recommended_action"] or "").strip().upper()
+    if action == "BUY" or priority == "BUY_NOW":
+        return "BUY_NOW"
+    if priority.startswith("SKIP"):
+        return "SKIP_FOR_NOW"
+    if priority in {"NO_BUY", "NO BUY"}:
+        return "NO_BUY"
+    return "WAIT_FOR_TRIGGER"
+
+
+def _primary_blocker_from_row(row, snapshot: dict) -> dict | None:
+    primary = snapshot.get("primary_blocker")
+    if isinstance(primary, dict) and str(primary.get("key") or "").strip():
+        return primary
+    ladder = snapshot.get("blocker_ladder")
+    if isinstance(ladder, list):
+        for item in ladder:
+            if isinstance(item, dict) and str(item.get("key") or "").strip():
+                return item
+    blockers = _decision_blockers(row)
+    if blockers:
+        return _failure_detail(blockers[0])
+    return None
+
+
+def _avg(values: list[float]) -> float | None:
+    values = [float(v) for v in values if v is not None]
+    return round(sum(values) / len(values), 2) if values else None
+
+
+def _nullable_float(value) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _evidence_label(final_n: int, observed_n: int) -> str:
+    if final_n >= 20:
+        return "FINAL_PROVEN"
+    if final_n >= 5:
+        return "FINAL_EARLY"
+    if final_n > 0:
+        return "FINAL_THIN"
+    if observed_n >= 5:
+        return "INTERIM_ACTIVE"
+    if observed_n > 0:
+        return "INTERIM_THIN"
+    return "NO_EVIDENCE"
+
+
+def _learning_takeaway(global_trust: str, final_n: int, observed_n: int, pending_n: int) -> str:
+    if final_n >= 20:
+        return "24h outcomes are now strong enough to tune rules with real confidence."
+    if final_n >= 5:
+        return "Final 24h outcomes exist, but keep changes conservative until the sample grows."
+    if observed_n > 0:
+        return "Use this as an early read only; final 24h outcomes have not confirmed the rule yet."
+    if pending_n > 0:
+        return "Decisions are being captured; wait for 1h/4h/24h windows to mature before tuning."
+    return "No decision evidence has been captured yet."
+
+
+def _buy_decision_state_verdict(state: str, sample_n: int, correct_n: int, missed_n: int) -> str:
+    if sample_n < 5:
+        return "LEARNING"
+    correct_rate = correct_n / max(1, sample_n)
+    missed_rate = missed_n / max(1, sample_n)
+    if state == "BUY_NOW":
+        if correct_rate >= 0.65:
+            return "WORKING"
+        if correct_rate <= 0.45:
+            return "TOO_LOOSE"
+        return "MIXED"
+    if missed_rate >= 0.35:
+        return "TOO_STRICT"
+    if correct_rate >= 0.65:
+        return "PROTECTING"
+    return "MIXED"
+
+
+def _blocker_lesson_verdict(sample_n: int, protected_n: int, missed_n: int) -> str:
+    if sample_n < 4:
+        return "LEARNING"
+    protected_rate = protected_n / max(1, sample_n)
+    missed_rate = missed_n / max(1, sample_n)
+    if missed_rate >= 0.35:
+        return "TOO_STRICT"
+    if protected_rate >= 0.65:
+        return "PROTECTING"
+    return "MIXED"
+
+
+def _blocker_lesson_recommendation(trust_label: str, label: str) -> str:
+    if trust_label == "TOO_STRICT":
+        return f"Review {label}; it has missed enough runners to consider a softer threshold."
+    if trust_label == "PROTECTING":
+        return f"Respect {label}; history says it usually protects from weak entries."
+    if trust_label == "MIXED":
+        return f"Keep {label} visible, but require another confirmation before treating it as decisive."
+    return f"Keep collecting outcomes for {label}; sample is still thin."
+
+
+def _build_buy_decision_learning(current_decision: dict | None = None) -> dict:
+    """Audit whether Home's buy/wait/skip calls and blockers are learning correctly."""
+    now = datetime.now(timezone.utc).isoformat()
+    resolver_stats = None
+    try:
+        resolver_stats = _resolve_buy_decision_observed_sync()
+    except Exception as exc:
+        resolver_stats = {"error": str(exc)}
+    empty = {
+        "generated_at": now,
+        "status": "LEARNING",
+        "summary": {
+            "resolved_n": 0,
+            "final_n": 0,
+            "observed_n": 0,
+            "pending_n": 0,
+            "no_outcome_n": 0,
+            "trust_label": "NEEDS_OUTCOMES",
+            "evidence_label": "NO_EVIDENCE",
+            "takeaway": "No decision evidence has been captured yet.",
+            "resolver": resolver_stats,
+        },
+        "by_decision_state": [],
+        "primary_blocker_accuracy": [],
+        "current_state_lesson": None,
+        "current_blocker_lesson": None,
+    }
+    try:
+        conn = _dj_conn()
+        try:
+            pending_row = conn.execute(
+                """
+                SELECT
+                    SUM(CASE WHEN resolution_status='PENDING' THEN 1 ELSE 0 END) AS pending_n,
+                    SUM(CASE WHEN resolution_status='NO_OUTCOME' THEN 1 ELSE 0 END) AS no_outcome_n,
+                    SUM(CASE WHEN resolution_status='RESOLVED' THEN 1 ELSE 0 END) AS final_n,
+                    SUM(CASE WHEN resolution_status IN ('OBSERVED_1H', 'OBSERVED_4H') THEN 1 ELSE 0 END) AS observed_n
+                FROM decision_journal
+                WHERE source_surface='BUY_DECISION_V1'
+                """
+            ).fetchone()
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM decision_journal
+                WHERE source_surface='BUY_DECISION_V1'
+                  AND resolution_status IN ('RESOLVED', 'OBSERVED_1H', 'OBSERVED_4H')
+                  AND outcome_label IS NOT NULL
+                ORDER BY COALESCE(resolved_ts, created_ts) DESC, id DESC
+                LIMIT 500
+                """
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception as exc:
+        out = dict(empty)
+        out["status"] = "ERROR"
+        out["summary"] = {**empty["summary"], "error": str(exc)}
+        return out
+
+    pending_n = int(pending_row["pending_n"] or 0) if pending_row is not None else 0
+    no_outcome_n = int(pending_row["no_outcome_n"] or 0) if pending_row is not None else 0
+    final_n = int(pending_row["final_n"] or 0) if pending_row is not None else 0
+    observed_n = int(pending_row["observed_n"] or 0) if pending_row is not None else 0
+    state_stats: dict[str, dict] = {}
+    blocker_stats: dict[str, dict] = {}
+
+    for row in rows:
+        snapshot = _decision_snapshot(row)
+        state = _decision_state_from_row(row, snapshot)
+        label = str(row["outcome_label"] or "").strip().upper()
+        status = str(row["resolution_status"] or "").strip().upper()
+        bullish = label in _BUY_DECISION_BULLISH_LABELS
+        max_return = _nullable_float(row["max_return_pct"])
+        ret_1h = _nullable_float(row["outcome_1h_pct"])
+        ret_4h = _nullable_float(row["outcome_4h_pct"])
+        ret_24h = _nullable_float(row["outcome_24h_pct"])
+        stat = state_stats.setdefault(state, {
+            "decision_state": state,
+            "sample_n": 0,
+            "observed_n": 0,
+            "final_n": 0,
+            "correct_n": 0,
+            "missed_runner_n": 0,
+            "bad_entry_n": 0,
+            "avg_1h_values": [],
+            "avg_4h_values": [],
+            "avg_max_return_values": [],
+            "avg_24h_values": [],
+        })
+        stat["sample_n"] += 1
+        if status == "RESOLVED":
+            stat["final_n"] += 1
+        elif status in {"OBSERVED_1H", "OBSERVED_4H"}:
+            stat["observed_n"] += 1
+        stat["avg_1h_values"].append(ret_1h)
+        stat["avg_4h_values"].append(ret_4h)
+        stat["avg_max_return_values"].append(max_return)
+        stat["avg_24h_values"].append(ret_24h)
+        if state == "BUY_NOW":
+            if bullish:
+                stat["correct_n"] += 1
+            else:
+                stat["bad_entry_n"] += 1
+        else:
+            if bullish:
+                stat["missed_runner_n"] += 1
+            else:
+                stat["correct_n"] += 1
+
+        primary = _primary_blocker_from_row(row, snapshot)
+        if primary and state != "BUY_NOW":
+            key = str(primary.get("key") or "").strip()
+            if key:
+                b = blocker_stats.setdefault(key, {
+                    "key": key,
+                    "label": str(primary.get("label") or key.replace("_", " ").title()),
+                    "category": str(primary.get("category") or "other"),
+                    "sample_n": 0,
+                    "observed_n": 0,
+                    "final_n": 0,
+                    "protected_n": 0,
+                    "missed_runner_n": 0,
+                    "avg_missed_return_values": [],
+                    "avg_protected_1h_values": [],
+                    "avg_protected_4h_values": [],
+                    "avg_protected_24h_values": [],
+                })
+                b["sample_n"] += 1
+                if status == "RESOLVED":
+                    b["final_n"] += 1
+                elif status in {"OBSERVED_1H", "OBSERVED_4H"}:
+                    b["observed_n"] += 1
+                if bullish:
+                    b["missed_runner_n"] += 1
+                    b["avg_missed_return_values"].append(max_return)
+                else:
+                    b["protected_n"] += 1
+                    b["avg_protected_1h_values"].append(ret_1h)
+                    b["avg_protected_4h_values"].append(ret_4h)
+                    b["avg_protected_24h_values"].append(ret_24h)
+
+    by_state = []
+    for state in ("BUY_NOW", "WAIT_FOR_TRIGGER", "SKIP_FOR_NOW", "NO_BUY"):
+        stat = state_stats.get(state, {
+            "decision_state": state,
+            "sample_n": 0,
+            "observed_n": 0,
+            "final_n": 0,
+            "correct_n": 0,
+            "missed_runner_n": 0,
+            "bad_entry_n": 0,
+            "avg_1h_values": [],
+            "avg_4h_values": [],
+            "avg_max_return_values": [],
+            "avg_24h_values": [],
+        })
+        sample_n = int(stat["sample_n"])
+        observed_state_n = int(stat["observed_n"])
+        final_state_n = int(stat["final_n"])
+        correct_n = int(stat["correct_n"])
+        missed_n = int(stat["missed_runner_n"])
+        verdict = _buy_decision_state_verdict(state, sample_n, correct_n, missed_n)
+        by_state.append({
+            "decision_state": state,
+            "sample_n": sample_n,
+            "observed_n": observed_state_n,
+            "final_n": final_state_n,
+            "correct_n": correct_n,
+            "correct_rate_pct": round((correct_n / sample_n) * 100, 1) if sample_n else None,
+            "missed_runner_n": missed_n,
+            "bad_entry_n": int(stat["bad_entry_n"]),
+            "avg_1h_pct": _avg(stat["avg_1h_values"]),
+            "avg_4h_pct": _avg(stat["avg_4h_values"]),
+            "avg_max_return_pct": _avg(stat["avg_max_return_values"]),
+            "avg_24h_pct": _avg(stat["avg_24h_values"]),
+            "trust_label": verdict,
+            "evidence_label": _evidence_label(final_state_n, observed_state_n),
+        })
+
+    blockers = []
+    for b in blocker_stats.values():
+        sample_n = int(b["sample_n"])
+        observed_blocker_n = int(b["observed_n"])
+        final_blocker_n = int(b["final_n"])
+        protected_n = int(b["protected_n"])
+        missed_n = int(b["missed_runner_n"])
+        trust_label = _blocker_lesson_verdict(sample_n, protected_n, missed_n)
+        blockers.append({
+            "key": b["key"],
+            "label": b["label"],
+            "category": b["category"],
+            "sample_n": sample_n,
+            "observed_n": observed_blocker_n,
+            "final_n": final_blocker_n,
+            "protected_n": protected_n,
+            "missed_runner_n": missed_n,
+            "accuracy_pct": round((protected_n / sample_n) * 100, 1) if sample_n else None,
+            "avg_missed_return_pct": _avg(b["avg_missed_return_values"]),
+            "avg_protected_1h_pct": _avg(b["avg_protected_1h_values"]),
+            "avg_protected_4h_pct": _avg(b["avg_protected_4h_values"]),
+            "avg_protected_24h_pct": _avg(b["avg_protected_24h_values"]),
+            "trust_label": trust_label,
+            "evidence_label": _evidence_label(final_blocker_n, observed_blocker_n),
+            "recommendation": _blocker_lesson_recommendation(trust_label, b["label"]),
+        })
+    blockers.sort(key=lambda x: (int(x.get("sample_n") or 0), int(x.get("missed_runner_n") or 0)), reverse=True)
+
+    current_lesson = None
+    current_primary = dict((current_decision or {}).get("primary_blocker") or {})
+    current_key = str(current_primary.get("key") or "").strip()
+    if current_key:
+        current_lesson = next((b for b in blockers if b.get("key") == current_key), None)
+        if not current_lesson:
+            detail = _failure_detail(current_key)
+            current_lesson = {
+                "key": current_key,
+                "label": str(current_primary.get("label") or detail.get("label") or current_key),
+                "category": str(current_primary.get("category") or detail.get("category") or "other"),
+                "sample_n": 0,
+                "observed_n": 0,
+                "final_n": 0,
+                "protected_n": 0,
+                "missed_runner_n": 0,
+                "accuracy_pct": None,
+                "avg_missed_return_pct": None,
+                "avg_protected_1h_pct": None,
+                "avg_protected_4h_pct": None,
+                "avg_protected_24h_pct": None,
+                "trust_label": "LEARNING",
+                "evidence_label": "NO_EVIDENCE",
+                "recommendation": _blocker_lesson_recommendation("LEARNING", str(current_primary.get("label") or detail.get("label") or current_key)),
+            }
+
+    resolved_n = len(rows)
+    global_trust = "NEEDS_OUTCOMES"
+    if resolved_n >= 40:
+        global_trust = "ACTIVE"
+    elif resolved_n >= 12:
+        global_trust = "EARLY_SIGNAL"
+    elif resolved_n > 0:
+        global_trust = "THIN_SAMPLE"
+    evidence_label = _evidence_label(final_n, observed_n)
+    current_state = str((current_decision or {}).get("decision_state") or "").strip().upper()
+    current_state_lesson = next((row for row in by_state if row.get("decision_state") == current_state), None) if current_state else None
+
+    return {
+        "generated_at": now,
+        "status": "OK",
+        "summary": {
+            "resolved_n": resolved_n,
+            "final_n": final_n,
+            "observed_n": observed_n,
+            "pending_n": pending_n,
+            "no_outcome_n": no_outcome_n,
+            "trust_label": global_trust,
+            "evidence_label": evidence_label,
+            "takeaway": _learning_takeaway(global_trust, final_n, observed_n, pending_n),
+            "resolver": resolver_stats,
+        },
+        "by_decision_state": by_state,
+        "primary_blocker_accuracy": blockers[:12],
+        "current_state_lesson": current_state_lesson,
+        "current_blocker_lesson": current_lesson,
+    }
+
+
+def _good_buy_rank_score(item: dict) -> float:
+    """Rank Home's best-buy list by buy quality, not generic visibility."""
+    metrics = dict(item.get("metrics") or {})
+    data = dict(item.get("data") or {})
+    ticket = dict(item.get("execution_ticket") or {})
+    blockers = list(dict.fromkeys(list(item.get("blockers") or []) + list(ticket.get("blockers") or [])))
+    warnings = list(item.get("warnings") or [])
+    strengths = set(str(x) for x in (item.get("strengths") or []))
+    chase_state = str((item.get("chase_control") or {}).get("state") or "").upper()
+    conflict_state = str((item.get("conflict_resolution") or {}).get("state") or "").upper()
+
+    score = _gb_float(item.get("good_buy_score"))
+    quality = _gb_float(metrics.get("quality_score"))
+    risk = _gb_float(metrics.get("risk_score"))
+    pressure = _gb_float(metrics.get("pressure_score"))
+    liquidity = _gb_float(metrics.get("liquidity_usd"))
+    volume = _gb_float(metrics.get("volume_24h_usd"))
+    change_1h = _gb_float(metrics.get("change_1h_pct"))
+    vol_liq = _gb_float(metrics.get("vol_liq_ratio"))
+    marketcap = _gb_float(metrics.get("marketcap_usd"))
+
+    rank = (
+        score * 0.38
+        + quality * 0.18
+        + risk * 0.12
+        + pressure * 0.16
+        + min(100.0, liquidity / 12_500.0) * 0.05
+        + min(100.0, volume / 20_000.0) * 0.05
+        + min(100.0, vol_liq * 30.0) * 0.04
+        + max(-15.0, min(18.0, change_1h)) * 0.25
+    )
+
+    if str(data.get("identity_status") or "").upper() == "RESOLVED":
+        rank += 6.0
+    if str(data.get("data_freshness") or "").upper() == "LIVE":
+        rank += 6.0
+    if "positive_outcome_memory" in strengths:
+        rank += 4.0
+    if marketcap >= 1_500_000:
+        rank += 2.0
+    if marketcap >= 8_000_000:
+        rank += 2.0
+    if str(ticket.get("execution_state") or "").upper() == "MARKET_CLEAN":
+        rank += 5.0
+    if chase_state == "FULL_ENTRY_ZONE":
+        rank += 4.0
+    elif chase_state in {"SCOUT_ONLY", "CONFIRMED_CONTINUATION"}:
+        rank -= 8.0
+    elif chase_state in {"WAIT_PULLBACK", "DO_NOT_CHASE", "CONFLICT_SCOUT_ONLY"}:
+        rank -= 18.0
+    if conflict_state.startswith("CONFLICT"):
+        rank -= 12.0
+
+    rank -= len(blockers) * 16.0
+    rank -= len(warnings) * 3.0
+    return round(max(0.0, min(100.0, rank)), 2)
+
+
+def _good_buy_sort_key(item: dict) -> tuple[int, float]:
+    """Prefer clean full-entry names, then scout-only, then conflict/wait."""
+    state = str(item.get("state") or "").upper()
+    chase_state = str((item.get("chase_control") or {}).get("state") or "").upper()
+    conflict_state = str((item.get("conflict_resolution") or {}).get("state") or "").upper()
+    rank = _gb_float(item.get("buy_rank_score"))
+    aligned = not conflict_state.startswith("CONFLICT")
+    if state == "BUYABLE" and aligned and chase_state in {"FULL_ENTRY_ZONE", "NO_REPLAY", ""}:
+        bucket = 70
+    elif state == "BUYABLE" and aligned and chase_state in {"SCOUT_ONLY", "CONFIRMED_CONTINUATION"}:
+        bucket = 60
+    elif state == "BUYABLE" and aligned:
+        bucket = 55
+    elif state == "BUYABLE":
+        bucket = 50
+    elif state == "WAIT" and aligned and chase_state in {"SCOUT_ONLY", "CONFIRMED_CONTINUATION"}:
+        bucket = 40
+    elif state == "WAIT" and aligned:
+        bucket = 35
+    elif conflict_state.startswith("CONFLICT"):
+        bucket = 20
+    elif state == "BLOCKED":
+        bucket = 10
+    else:
+        bucket = 0
+    return (bucket, rank)
+
+
+def _apply_good_buy_replay_enrichment(
+    item: dict,
+    replay: dict,
+    conflict: dict,
+    chase: dict,
+) -> None:
+    item["signal_replay"] = replay
+    item["conflict_resolution"] = conflict
+    item["chase_control"] = chase
+    chase_state = str(chase.get("state") or "").upper()
+    conflict_state = str(conflict.get("state") or "").upper()
+    if chase_state in {"SCOUT_ONLY", "CONFIRMED_CONTINUATION", "CONFLICT_SCOUT_ONLY"}:
+        item["warnings"] = list(dict.fromkeys(list(item.get("warnings") or []) + [f"chase_{chase_state.lower()}"]))
+    elif chase_state in {"WAIT_PULLBACK", "DO_NOT_CHASE"}:
+        item["blockers"] = list(dict.fromkeys(list(item.get("blockers") or []) + [f"chase_{chase_state.lower()}"]))
+        if item.get("state") == "BUYABLE":
+            item["state"] = "WAIT"
+            item["action"] = "WATCH"
+    if conflict_state == "CONFLICT_BLOCKED":
+        item["blockers"] = list(dict.fromkeys(list(item.get("blockers") or []) + ["signal_conflict_unresolved"]))
+        if item.get("state") == "BUYABLE":
+            item["state"] = "WAIT"
+            item["action"] = "WATCH"
+    elif conflict_state == "CONFLICT_REVIEW":
+        item["warnings"] = list(dict.fromkeys(list(item.get("warnings") or []) + ["signal_conflict_review"]))
+    review_status = str(conflict.get("review_status") or (conflict.get("review_outcome") or {}).get("status") or "").strip().upper()
+    if review_status in {"PENDING_REVIEW", "REVIEW_COMPLETE_STILL_BLOCKED", "REVIEW_COMPLETE_CLEARED", "STALE_REVIEW"}:
+        try:
+            _record_conflict_review_memory({
+                "symbol": item.get("symbol"),
+                "mint": item.get("mint"),
+                "lane": item.get("lane"),
+                "decision_state": item.get("state"),
+                "verdict": item.get("action"),
+                "reason": item.get("headline"),
+                "candidate": {
+                    "symbol": item.get("symbol"),
+                    "mint": item.get("mint"),
+                    "lane": item.get("lane"),
+                    "state": item.get("state"),
+                    "score": item.get("good_buy_score"),
+                    "headline": item.get("headline"),
+                    "metrics": item.get("metrics"),
+                    "data": item.get("data"),
+                    "signal_replay": replay,
+                    "conflict_resolution": conflict,
+                    "chase_control": chase,
+                },
+                "signal_replay": replay,
+                "conflict_resolution": conflict,
+                "chase_control": chase,
+            })
+        except Exception as exc:
+            log.debug("row conflict review memory skipped: %s", exc)
+
+
+def _enrich_good_buy_items_batch(items: list[dict], *, limit: int | None = None) -> dict:
+    enrich_limit = max(1, int(limit or _GOOD_BUY_BATCH_ENRICH_LIMIT))
+    pool = sorted(
+        [x for x in items if str(x.get("lane") or "").upper() == "MEMECOINS"],
+        key=lambda x: (
+            str(x.get("state") or "").upper() == "BUYABLE",
+            _gb_float(x.get("good_buy_score")),
+            _gb_float((x.get("metrics") or {}).get("pressure_score")),
+        ),
+        reverse=True,
+    )[:enrich_limit]
+    item_keys = {
+        _gb_identity_key(item.get("mint"), item.get("symbol"))
+        for item in pool
+        if _gb_identity_key(item.get("mint"), item.get("symbol"))
+    }
+    if not pool or not item_keys:
+        return {"mode": "BATCH", "requested": len(pool), "enriched": 0, "errors": []}
+
+    mints = [str(item.get("mint") or "").strip() for item in pool if str(item.get("mint") or "").strip()]
+    symbols = [str(item.get("symbol") or "").strip().upper() for item in pool if str(item.get("symbol") or "").strip()]
+    errors: list[str] = []
+    outcome_rows: list[dict] = []
+    entry_rows: list[dict] = []
+    catalyst_rows: list[dict] = []
+    dossier_rows: list[dict] = []
+    blocker_clear_rows: list[dict] = []
+    queue_index: dict[str, dict] = {}
+
+    try:
+        conn = _dj_conn()
+        try:
+            queue_index = _gb_load_conflict_queue_index(conn)
+            outcome_where, outcome_params = _gb_batch_where(mints, symbols)
+            outcome_rows = [dict(r) for r in conn.execute(
+                f"""
+                SELECT id, scanned_at, symbol, mint, source, status, score,
+                       mcap_at_scan, price_at_scan, volume_24h,
+                       is_actionable_at_scan, bought
+                FROM memecoin_signal_outcomes
+                WHERE {outcome_where}
+                """,
+                outcome_params,
+            ).fetchall()]
+
+            entry_where, entry_params = _gb_batch_where(mints, symbols)
+            entry_rows = [dict(r) for r in conn.execute(
+                f"""
+                SELECT id, created_at, symbol, mint, entry_state, entry_score,
+                       guard_status, action, status, entry_marketcap,
+                       entry_price, entry_volume_24h, last_blocker
+                FROM memecoin_entry_signals
+                WHERE {entry_where}
+                """,
+                entry_params,
+            ).fetchall()]
+
+            catalyst_where, catalyst_params = _gb_batch_where(mints, symbols)
+            catalyst_rows = [dict(r) for r in conn.execute(
+                f"""
+                SELECT id, event_ts, event_type, confidence, marketcap,
+                       volume_24h, headline, mint, symbol
+                FROM memecoin_catalyst_events
+                WHERE {catalyst_where}
+                """,
+                catalyst_params,
+            ).fetchall()]
+
+            dossier_where, dossier_params = _gb_batch_where(mints, symbols)
+            dossier_rows = [dict(r) for r in conn.execute(
+                f"""
+                SELECT generated_at, action, conviction_band, proof_status,
+                       blocker_key, entry_state, entry_score, entry_guard_status,
+                       entry_blocker, risk_score, research_score, operator_priority,
+                       mint, symbol
+                FROM memecoin_research_dossiers
+                WHERE {dossier_where}
+                ORDER BY generated_at DESC
+                """,
+                dossier_params,
+            ).fetchall()]
+
+            blocker_where, blocker_params = _gb_batch_where(mints, symbols)
+            blocker_clear_rows = [dict(r) for r in conn.execute(
+                f"""
+                SELECT event_ts, event_type, confidence, marketcap,
+                       headline, mint, symbol
+                FROM memecoin_catalyst_events
+                WHERE event_type='LAST_BLOCKER_CLEARED'
+                  AND ({blocker_where})
+                ORDER BY event_ts DESC
+                """,
+                blocker_params,
+            ).fetchall()]
+        finally:
+            conn.close()
+    except Exception as exc:
+        errors.append(str(exc))
+        return {"mode": "BATCH", "requested": len(pool), "enriched": 0, "errors": errors}
+
+    outcomes_by_key = _gb_group_rows(outcome_rows, item_keys)
+    entries_by_key = _gb_group_rows(entry_rows, item_keys)
+    catalysts_by_key = _gb_group_rows(catalyst_rows, item_keys)
+
+    latest_dossier_by_key: dict[str, dict] = {}
+    for row in sorted(dossier_rows, key=lambda r: _gb_sort_key(r.get("generated_at")), reverse=True):
+        key = _gb_identity_key(row.get("mint"), row.get("symbol"))
+        if key in item_keys and key not in latest_dossier_by_key:
+            latest_dossier_by_key[key] = row
+
+    latest_clear_by_key: dict[str, dict] = {}
+    for row in sorted(blocker_clear_rows, key=lambda r: _gb_sort_key(r.get("event_ts")), reverse=True):
+        key = _gb_identity_key(row.get("mint"), row.get("symbol"))
+        if key in item_keys and key not in latest_clear_by_key:
+            latest_clear_by_key[key] = row
+
+    enriched = 0
+    for item in pool:
+        key = _gb_identity_key(item.get("mint"), item.get("symbol"))
+        if not key:
+            continue
+        replay = _build_good_buy_signal_replay_from_rows(
+            mint=str(item.get("mint") or "").strip(),
+            symbol=str(item.get("symbol") or "").strip().upper(),
+            current_marketcap=_gb_float(item.get("metrics", {}).get("marketcap_usd")),
+            outcomes=list(outcomes_by_key.get(key) or []),
+            entries=list(entries_by_key.get(key) or []),
+            catalysts=list(catalysts_by_key.get(key) or []),
+        )
+        conflict = _build_good_buy_conflict_resolution_from_rows(
+            item,
+            replay,
+            latest_dossier_by_key.get(key),
+            latest_clear_by_key.get(key),
+            queue_index,
+        )
+        chase = _good_buy_chase_control(item, replay, conflict)
+        _apply_good_buy_replay_enrichment(item, replay, conflict, chase)
+        enriched += 1
+
+    return {
+        "mode": "BATCH",
+        "requested": len(pool),
+        "enriched": enriched,
+        "errors": errors,
+        "row_counts": {
+            "outcomes": len(outcome_rows),
+            "entry_signals": len(entry_rows),
+            "catalysts": len(catalyst_rows),
+            "dossiers": len(dossier_rows),
+            "blocker_clears": len(blocker_clear_rows),
+        },
+    }
+
+
+def _build_good_buy_board_v2(limit: int = 8) -> dict:
+    provider_context = {"hard_block": None, "providers": {}}
+    try:
+        from utils.provider_budget import provider_budget_snapshot  # type: ignore
+        from utils.db import provider_in_cooldown  # type: ignore
+
+        providers = {}
+        for name in ("dexscreener", "geckoterminal"):
+            cooldown, status = provider_in_cooldown(name)
+            budget = provider_budget_snapshot(name)
+            providers[name] = {"cooldown": bool(cooldown), "status": status, "budget": budget}
+            if cooldown:
+                provider_context["hard_block"] = f"{name}_cooldown"
+        provider_context["providers"] = providers
+    except Exception:
+        provider_context = {"hard_block": None, "providers": {}}
+
+    items: list[dict] = []
+    try:
+        from utils.db import get_conn  # type: ignore
+
+        with get_conn() as conn:
+            table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='token_intelligence_current'"
+            ).fetchone()
+            if not table:
+                rows = []
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT *
+                    FROM token_intelligence_current
+                    WHERE mint IS NOT NULL AND TRIM(mint) != ''
+                      AND symbol IS NOT NULL AND TRIM(symbol) != ''
+                    ORDER BY quality_score DESC, updated_at DESC
+                    LIMIT 80
+                    """
+                ).fetchall()
+    except Exception as exc:
+        return {
+            "policy_version": "good_buy_board_v2",
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "status": "ERROR",
+            "headline": f"Good Buy Board unavailable: {exc}",
+            "summary": {"buyable": 0, "wait": 0, "blocked": 0, "total": 0},
+            "buyable": [],
+            "wait": [],
+            "blocked": [],
+            "provider_context": provider_context,
+        }
+
+    memory_index = _good_buy_memory_index()
+    for raw in rows:
+        row = dict(raw)
+        gate = _good_buy_gate(row, provider_context, memory_index)
+        lane_sources = [s for s in str(row.get("lane_sources") or "").split(",") if s]
+        source_text = ",".join(lane_sources).lower()
+        lane = "SPOT" if "spot_basket" in source_text else "MEMECOINS"
+        item = {
+            "symbol": str(row.get("symbol") or "").strip().upper(),
+            "mint": str(row.get("mint") or "").strip(),
+            "lane": lane,
+            "lane_sources": lane_sources,
+            **gate,
+        }
+        items.append(item)
+
+    enrichment_summary = _enrich_good_buy_items_batch(
+        items,
+        limit=max(_GOOD_BUY_BATCH_ENRICH_LIMIT, int(limit or 8) * 2),
+    )
+
+    for item in items:
+        item["execution_ticket"] = _execution_ticket_for_good_buy(item, provider_context)
+        item["buy_rank_score"] = _good_buy_rank_score(item)
+
+    items.sort(key=_good_buy_sort_key, reverse=True)
+    buyable = [x for x in items if x.get("state") == "BUYABLE"][:limit]
+    wait = sorted([x for x in items if x.get("state") == "WAIT"], key=_good_buy_sort_key, reverse=True)[:limit]
+    blocked = sorted([x for x in items if x.get("state") == "BLOCKED"], key=_good_buy_sort_key, reverse=True)[:limit]
+
+    if buyable:
+        status = "BUYABLE"
+        headline = f"{len(buyable)} clean good-buy candidate(s) passed Token Intelligence gates."
+    elif wait:
+        status = "WAIT"
+        headline = "No clean buy yet. Best names are close but still need cleaner data, pressure, or risk."
+    elif blocked:
+        status = "BLOCKED"
+        headline = "Visible tokens are blocked by identity, stale data, liquidity, risk, or momentum."
+    else:
+        status = "NO_DATA"
+        headline = "Token Intelligence has not produced enough named tokens yet."
+    decision_item = buyable[0] if buyable else (wait[0] if wait else (blocked[0] if blocked else None))
+    buy_decision = _buy_decision_v1(decision_item, provider_context)
+    decision_learning = _build_buy_decision_learning(buy_decision)
+    if decision_learning.get("current_blocker_lesson"):
+        buy_decision["current_blocker_lesson"] = decision_learning.get("current_blocker_lesson")
+
+    return {
+        "policy_version": "good_buy_board_v2",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "status": status,
+        "headline": headline,
+        "summary": {
+            "buyable": len(buyable),
+            "wait": len(wait),
+            "blocked": len(blocked),
+            "total": len(items),
+            "provider_warning": provider_context.get("hard_block"),
+        },
+        "enrichment": enrichment_summary,
+        "buyable": buyable,
+        "wait": wait,
+        "blocked": blocked,
+        "provider_context": provider_context,
+        "buy_decision_v1": buy_decision,
+        "decision_learning": decision_learning,
+    }
+
+
+def _record_action_board_memory(payload: dict) -> None:
+    """Persist top action-board surfacings into decision_journal for later outcome review."""
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+        rows: list[dict] = []
+        for bucket in ("ready_now", "best_blocked", "watchlist"):
+            for item in list(payload.get(bucket) or [])[:4]:
+                row = dict(item or {})
+                system = str(row.get("system") or "").strip().upper()
+                symbol = str(row.get("symbol") or "").strip().upper()
+                mint = str(row.get("token_address") or "").strip()
+                if not symbol and not mint:
+                    continue
+                rows.append({
+                    "source_surface": "ACTION_BOARD",
+                    "system": system,
+                    "symbol": symbol or None,
+                    "mint": mint or None,
+                    "recommended_action": str(row.get("intended_action") or row.get("action") or "WATCH").strip().upper(),
+                    "priority": str(row.get("priority") or row.get("state") or "").strip().upper(),
+                    "reason": str(row.get("reason") or ""),
+                    "blockers": list(row.get("blockers") or []),
+                    "snapshot": row,
+                })
+        if not rows:
+            return
+
+        conn = _dj_conn()
+        try:
+            pending = conn.execute(
+                """
+                SELECT id, system, symbol, mint, recommended_action, COALESCE(surface_count, 1) AS surface_count
+                FROM decision_journal
+                WHERE source_surface='ACTION_BOARD'
+                  AND resolution_status='PENDING'
+                  AND operator_decision='PENDING'
+                """
+            ).fetchall()
+            existing: dict[tuple[str, str, str, str], tuple[int, int]] = {}
+            for row in pending:
+                key = (
+                    str(row["system"] or "").strip().upper(),
+                    str(row["symbol"] or "").strip().upper(),
+                    str(row["mint"] or "").strip(),
+                    str(row["recommended_action"] or "").strip().upper(),
+                )
+                existing[key] = (int(row["id"]), int(row["surface_count"] or 1))
+
+            for row in rows:
+                key = (
+                    str(row.get("system") or "").strip().upper(),
+                    str(row.get("symbol") or "").strip().upper(),
+                    str(row.get("mint") or "").strip(),
+                    str(row.get("recommended_action") or "").strip().upper(),
+                )
+                blockers_json = json.dumps(row.get("blockers") or [], separators=(",", ":"))
+                snapshot_json = json.dumps(row.get("snapshot") or {}, separators=(",", ":"))
+                if key in existing:
+                    row_id, seen_count = existing[key]
+                    conn.execute(
+                        """
+                        UPDATE decision_journal
+                           SET priority=?,
+                               reason=?,
+                               blockers_json=?,
+                               snapshot_json=?,
+                               last_seen_ts=?,
+                               surface_count=?
+                         WHERE id=?
+                        """,
+                        (
+                            row.get("priority"),
+                            row.get("reason"),
+                            blockers_json,
+                            snapshot_json,
+                            now,
+                            seen_count + 1,
+                            row_id,
+                        ),
+                    )
+                    existing[key] = (row_id, seen_count + 1)
+                    continue
+
+                conn.execute(
+                    """
+                    INSERT INTO decision_journal
+                        (created_ts, source_surface, system, symbol, mint, recommended_action,
+                         priority, reason, blockers_json, snapshot_json, last_seen_ts, surface_count,
+                         operator_decision, resolution_status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'PENDING', 'PENDING')
+                    """,
+                    (
+                        now,
+                        row.get("source_surface"),
+                        row.get("system"),
+                        row.get("symbol"),
+                        row.get("mint"),
+                        row.get("recommended_action"),
+                        row.get("priority"),
+                        row.get("reason"),
+                        blockers_json,
+                        snapshot_json,
+                        now,
+                    ),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as exc:
+        log.debug("action board memory skipped: %s", exc)
+
+
+def _record_buy_decision_memory(payload: dict) -> None:
+    """Persist the Home top-card buy verdict so later returns can calibrate the gate."""
+    decision = dict(payload.get("buy_decision_v1") or {})
+    candidate = dict(decision.get("candidate") or {})
+    symbol = str(decision.get("symbol") or candidate.get("symbol") or "").strip().upper()
+    mint = str(decision.get("mint") or candidate.get("mint") or "").strip()
+    if not symbol and not mint:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    recommended = "BUY" if decision.get("is_buy_now") else "WATCH"
+    priority = str(decision.get("verdict") or "NO_BUY").strip().upper()
+    reason = str(decision.get("reason") or "")
+    blockers = list(decision.get("failures") or [])
+    snapshot_json = json.dumps(decision, separators=(",", ":"))
+    blockers_json = json.dumps(blockers, separators=(",", ":"))
+
+    try:
+        conn = _dj_conn()
+        try:
+            existing = conn.execute(
+                """
+                SELECT id, COALESCE(surface_count, 1) AS surface_count
+                FROM decision_journal
+                WHERE source_surface='BUY_DECISION_V1'
+                  AND resolution_status='PENDING'
+                  AND COALESCE(mint, '')=?
+                  AND COALESCE(symbol, '')=?
+                  AND recommended_action=?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (mint, symbol, recommended),
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    """
+                    UPDATE decision_journal
+                       SET priority=?,
+                           reason=?,
+                           blockers_json=?,
+                           snapshot_json=?,
+                           last_seen_ts=?,
+                           surface_count=?
+                     WHERE id=?
+                    """,
+                    (
+                        priority,
+                        reason,
+                        blockers_json,
+                        snapshot_json,
+                        now,
+                        int(existing["surface_count"] or 1) + 1,
+                        int(existing["id"]),
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO decision_journal
+                        (created_ts, source_surface, system, symbol, mint, recommended_action,
+                         priority, reason, blockers_json, snapshot_json, last_seen_ts, surface_count,
+                         operator_decision, resolution_status)
+                    VALUES (?, 'BUY_DECISION_V1', ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'PENDING', 'PENDING')
+                    """,
+                    (
+                        now,
+                        str(candidate.get("lane") or decision.get("lane") or "MEMECOINS").strip().upper(),
+                        symbol or None,
+                        mint or None,
+                        recommended,
+                        priority,
+                        reason,
+                        blockers_json,
+                        snapshot_json,
+                        now,
+                    ),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as exc:
+        log.debug("buy decision memory skipped: %s", exc)
+
+    _record_conflict_review_memory(decision)
+
+
+def _record_conflict_review_memory(decision: dict) -> None:
+    """Persist conflict-review outcomes separately so review quality can be audited."""
+    candidate = dict(decision.get("candidate") or {})
+    conflict = dict(decision.get("conflict_resolution") or candidate.get("conflict_resolution") or {})
+    review = dict(conflict.get("review_outcome") or {})
+    review_status = str(conflict.get("review_status") or review.get("status") or "").strip().upper()
+    if review_status not in {"PENDING_REVIEW", "REVIEW_COMPLETE_STILL_BLOCKED", "REVIEW_COMPLETE_CLEARED", "STALE_REVIEW"}:
+        return
+    symbol = str(decision.get("symbol") or candidate.get("symbol") or "").strip().upper()
+    mint = str(decision.get("mint") or candidate.get("mint") or "").strip()
+    if not symbol and not mint:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    conflicts = list(conflict.get("conflicts") or [])
+    blocker = str(((conflict.get("research") or {}).get("blocker_key") or "")).strip()
+    blockers = [
+        value
+        for value in dict.fromkeys([*(str(x).strip() for x in conflicts), blocker, review_status.lower()])
+        if value
+    ]
+    reason = str(review.get("instruction") or conflict.get("instruction") or decision.get("reason") or "")
+    snapshot = {
+        "symbol": symbol or None,
+        "mint": mint or None,
+        "decision_state": decision.get("decision_state"),
+        "verdict": decision.get("verdict"),
+        "review_status": review_status,
+        "review_outcome": review,
+        "conflict_resolution": conflict,
+        "signal_replay": decision.get("signal_replay") or candidate.get("signal_replay"),
+        "chase_control": decision.get("chase_control") or candidate.get("chase_control"),
+    }
+    try:
+        conn = _dj_conn()
+        try:
+            existing = conn.execute(
+                """
+                SELECT id, COALESCE(surface_count, 1) AS surface_count
+                FROM decision_journal
+                WHERE source_surface='BUY_CONFLICT_REVIEW'
+                  AND resolution_status='PENDING'
+                  AND COALESCE(mint, '')=?
+                  AND COALESCE(symbol, '')=?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (mint, symbol),
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    """
+                    UPDATE decision_journal
+                       SET priority=?,
+                           reason=?,
+                           blockers_json=?,
+                           snapshot_json=?,
+                           last_seen_ts=?,
+                           surface_count=?
+                     WHERE id=?
+                    """,
+                    (
+                        review_status,
+                        reason,
+                        json.dumps(blockers, separators=(",", ":")),
+                        json.dumps(snapshot, separators=(",", ":")),
+                        now,
+                        int(existing["surface_count"] or 1) + 1,
+                        int(existing["id"]),
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO decision_journal
+                        (created_ts, source_surface, system, symbol, mint, recommended_action,
+                         priority, reason, blockers_json, snapshot_json, last_seen_ts, surface_count,
+                         operator_decision, resolution_status)
+                    VALUES (?, 'BUY_CONFLICT_REVIEW', 'MEMECOINS', ?, ?, 'WATCH', ?, ?, ?, ?, ?, 1, 'PENDING', 'PENDING')
+                    """,
+                    (
+                        now,
+                        symbol or None,
+                        mint or None,
+                        review_status,
+                        reason,
+                        json.dumps(blockers, separators=(",", ":")),
+                        json.dumps(snapshot, separators=(",", ":")),
+                        now,
+                    ),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as exc:
+        log.debug("conflict review memory skipped: %s", exc)
+
+
+def _latest_prior_blockers_for_items(items: list[dict]) -> dict[str, dict]:
+    keys: set[str] = set()
+    for item in items:
+        symbol = str(item.get("symbol") or "").strip().upper()
+        mint = str(item.get("token_address") or item.get("mint") or "").strip()
+        if mint:
+            keys.add(f"mint:{mint}")
+        if symbol:
+            keys.add(f"symbol:{symbol}")
+    if not keys:
+        return {}
+
+    out: dict[str, dict] = {}
+    try:
+        conn = _dj_conn()
+        try:
+            rows = conn.execute(
+                """
+                SELECT symbol, mint, blockers_json, snapshot_json, last_seen_ts, created_ts, source_surface
+                FROM decision_journal
+                WHERE source_surface IN ('ACTION_BOARD', 'BUY_DECISION_V1', 'ACT_SURFACE')
+                  AND resolution_status='PENDING'
+                  AND blockers_json IS NOT NULL
+                  AND blockers_json NOT IN ('', '[]')
+                ORDER BY COALESCE(last_seen_ts, created_ts) DESC
+                LIMIT 400
+                """
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        return {}
+
+    for row in rows:
+        blockers = []
+        try:
+            parsed = json.loads(row["blockers_json"] or "[]")
+            blockers = parsed if isinstance(parsed, list) else []
+        except Exception:
+            blockers = []
+        if not blockers:
+            continue
+        for key in (
+            f"mint:{str(row['mint'] or '').strip()}",
+            f"symbol:{str(row['symbol'] or '').strip().upper()}",
+        ):
+            if key in keys and key not in out:
+                out[key] = {
+                    "prior_blockers": blockers,
+                    "last_seen_ts": row["last_seen_ts"] or row["created_ts"],
+                    "source_surface": row["source_surface"],
+                }
+    return out
+
+
+def _build_blocker_cleared_alerts(ready_now: list[dict], good_buy_board: dict) -> list[dict]:
+    candidates: list[dict] = []
+    for item in ready_now:
+        if not item.get("blockers"):
+            candidates.append(item)
+    for item in good_buy_board.get("buyable") or []:
+        candidates.append({
+            "system": item.get("lane") or "MEMECOINS",
+            "symbol": item.get("symbol"),
+            "token_address": item.get("mint"),
+            "priority_score": item.get("buy_rank_score") or item.get("good_buy_score"),
+            "reason": item.get("headline"),
+            "blockers": item.get("blockers") or [],
+        })
+
+    prior = _latest_prior_blockers_for_items(candidates)
+    alerts: list[dict] = []
+    seen: set[str] = set()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    for item in candidates:
+        symbol = str(item.get("symbol") or "").strip().upper()
+        mint = str(item.get("token_address") or item.get("mint") or "").strip()
+        lookup = prior.get(f"mint:{mint}") if mint else None
+        lookup = lookup or (prior.get(f"symbol:{symbol}") if symbol else None)
+        if not lookup:
+            continue
+        key = mint or symbol
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        prior_blockers = list(lookup.get("prior_blockers") or [])
+        last_blocker = prior_blockers[0] if prior_blockers else None
+        alerts.append({
+            "kind": "BLOCKER_CLEARED",
+            "priority": "REVIEW_NOW",
+            "system": str(item.get("system") or item.get("lane") or "MEMECOINS").strip().upper(),
+            "symbol": symbol or None,
+            "token_address": mint or None,
+            "score": item.get("priority_score") or item.get("buy_rank_score") or item.get("good_buy_score"),
+            "last_blocker": last_blocker,
+            "prior_blockers": prior_blockers[:5],
+            "message": f"{symbol or 'Token'} cleared prior blocker {str(last_blocker or 'unknown').replace('_', ' ')}. Review live CA/chart now.",
+            "last_blocker_seen_at": lookup.get("last_seen_ts"),
+            "generated_at": now_iso,
+        })
+        if len(alerts) >= 4:
+            break
+    return alerts
+
+
+def _build_replay_aware_alerts(good_buy_board: dict) -> list[dict]:
+    """Surface when replay says the first clean entry is no longer available."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    alerts: list[dict] = []
+    seen: set[str] = set()
+    candidates: list[dict] = []
+    for bucket in ("buyable", "wait", "blocked"):
+        candidates.extend(list(good_buy_board.get(bucket) or []))
+    for item in candidates:
+        symbol = str(item.get("symbol") or "").strip().upper()
+        mint = str(item.get("mint") or "").strip()
+        key = mint or symbol
+        if not key or key in seen:
+            continue
+        chase = dict(item.get("chase_control") or {})
+        replay = dict(item.get("signal_replay") or {})
+        state = str(chase.get("state") or "").strip().upper()
+        if state not in {"SCOUT_ONLY", "CONFIRMED_CONTINUATION", "WAIT_PULLBACK", "DO_NOT_CHASE", "CONFLICT_SCOUT_ONLY"}:
+            continue
+        seen.add(key)
+        move_pct = chase.get("move_from_first_buy_pct")
+        if move_pct is None:
+            move_pct = replay.get("return_from_first_buy_signal_pct")
+        priority = "REVIEW_NOW" if state in {"SCOUT_ONLY", "CONFIRMED_CONTINUATION", "CONFLICT_SCOUT_ONLY"} else "WAIT_RESET"
+        first_buy_mcap = chase.get("first_buy_marketcap") or (replay.get("first_buy_signal") or {}).get("marketcap")
+        current_mcap = chase.get("current_marketcap") or replay.get("current_marketcap")
+        pullback = chase.get("preferred_pullback_marketcap")
+        alerts.append({
+            "kind": "REPLAY_ENTRY_SHIFT",
+            "priority": priority,
+            "system": str(item.get("lane") or "MEMECOINS").strip().upper(),
+            "symbol": symbol or None,
+            "token_address": mint or None,
+            "score": item.get("buy_rank_score") or item.get("good_buy_score"),
+            "chase_state": state,
+            "first_buy_marketcap": first_buy_mcap,
+            "current_marketcap": current_mcap,
+            "move_from_first_buy_pct": move_pct,
+            "preferred_pullback_marketcap": pullback,
+            "message": (
+                f"{symbol or 'Token'} moved {round(float(move_pct or 0), 1)}% from first buy signal; "
+                f"{str(chase.get('label') or state).replace('_', ' ').lower()} now."
+            ),
+            "generated_at": now_iso,
+        })
+        if len(alerts) >= 4:
+            break
+    return alerts
+
+
+def _build_action_board_fast_payload(limit: int = 5, base_payload: dict | None = None) -> dict:
+    """Fast Home top-card overlay for when the full action-board builder is slow.
+
+    The full board depends on several broad priority surfaces. This overlay keeps
+    the operator-critical buy decision fresh from Token Intelligence while
+    preserving the last known heavier buckets from the cached board.
+    """
+    base = copy.deepcopy(base_payload) if isinstance(base_payload, dict) else {}
+    now_iso = datetime.now(timezone.utc).isoformat()
+    good_buy_board_v2 = _build_good_buy_board_v2(limit=max(8, int(limit or 5)))
+    ready_now = list(base.get("ready_now") or [])
+    best_blocked = list(base.get("best_blocked") or [])
+    watchlist = list(base.get("watchlist") or [])
+    holds = list(base.get("holds") or [])
+    recently_changed = list(base.get("new_since_last_check") or [])
+    blocker_cleared_alerts = _build_blocker_cleared_alerts(ready_now, good_buy_board_v2)
+    replay_aware_alerts = _build_replay_aware_alerts(good_buy_board_v2)
+
+    decision = dict(good_buy_board_v2.get("buy_decision_v1") or {})
+    headline = dict(base.get("headline") or {})
+    if decision.get("symbol"):
+        headline = {
+            "state": decision.get("decision_state") or headline.get("state") or "WATCHLIST",
+            "note": decision.get("operator_instruction") or decision.get("reason") or headline.get("note"),
+            "top_candidate": headline.get("top_candidate"),
+        }
+
+    summary = dict(base.get("summary") or {})
+    summary.update({
+        "ready_now_count": max(
+            int(summary.get("ready_now_count") or 0),
+            int((good_buy_board_v2.get("summary") or {}).get("buyable") or 0),
+        ),
+        "blocked_count": int(summary.get("blocked_count") or len(best_blocked)),
+        "watch_count": int(summary.get("watch_count") or len(watchlist)),
+        "hold_count": int(summary.get("hold_count") or len(holds)),
+        "changed_count": int(summary.get("changed_count") or len(recently_changed)),
+        "candidate_count": int(summary.get("candidate_count") or (good_buy_board_v2.get("summary") or {}).get("total") or 0),
+        "good_buy_ready_count": int((good_buy_board_v2.get("summary") or {}).get("buyable") or 0),
+    })
+
+    payload = {
+        **base,
+        "schema_version": 5,
+        "refresh_mode": "FAST_DECISION_OVERLAY",
+        "generated_at": now_iso,
+        "headline": headline,
+        "summary": summary,
+        "ready_now": ready_now[: max(int(limit), 1)],
+        "best_blocked": best_blocked[: max(int(limit), 1)],
+        "watchlist": watchlist[: max(int(limit), 1)],
+        "holds": holds[: max(int(limit), 1)],
+        "new_since_last_check": recently_changed[: max(int(limit), 1)],
+        "good_buy_board_v2": good_buy_board_v2,
+        "buy_decision_v1": decision,
+        "buy_decision_learning": good_buy_board_v2.get("decision_learning"),
+        "blocker_cleared_alerts": blocker_cleared_alerts,
+        "replay_aware_alerts": replay_aware_alerts,
+    }
+    _record_buy_decision_memory(payload)
+    return payload
+
+
+def _build_action_board_warming_payload(limit: int = 5, *, detail: str | None = None) -> dict:
+    now_iso = datetime.now(timezone.utc).isoformat()
+    return {
+        "schema_version": 5,
+        "refresh_mode": "SNAPSHOT_WARMING",
+        "generated_at": now_iso,
+        "headline": {
+            "state": "UPDATING",
+            "note": detail or "Action board snapshot is warming. Keep current plan until the next refresh lands.",
+            "top_candidate": None,
+        },
+        "summary": {
+            "ready_now_count": 0,
+            "blocked_count": 0,
+            "watch_count": 0,
+            "hold_count": 0,
+            "changed_count": 0,
+            "candidate_count": 0,
+            "good_buy_ready_count": 0,
+        },
+        "ready_now": [],
+        "best_blocked": [],
+        "watchlist": [],
+        "holds": [],
+        "new_since_last_check": [],
+        "good_buy_board_v2": {
+            "generated_at": now_iso,
+            "summary": {"total": 0, "buyable": 0, "watch": 0, "blocked": 0},
+            "rows": [],
+            "buy_decision_v1": {
+                "decision_state": "UPDATING",
+                "operator_instruction": "Dashboard snapshot is warming; do not treat this as a buy signal.",
+            },
+            "decision_learning": {},
+        },
+        "buy_decision_v1": {
+            "decision_state": "UPDATING",
+            "operator_instruction": "Dashboard snapshot is warming; do not treat this as a buy signal.",
+        },
+        "buy_decision_learning": {},
+        "blocker_cleared_alerts": [],
+        "replay_aware_alerts": [],
+    }
+
+
+def _action_board_stale_payload(base_payload: dict | None, *, detail: str | None = None) -> dict:
+    payload = copy.deepcopy(base_payload) if isinstance(base_payload, dict) else _build_action_board_warming_payload(5)
+    payload["schema_version"] = 5
+    payload["refresh_mode"] = "STALE_SNAPSHOT_FALLBACK"
+    payload["stale_reason"] = detail or "Fresh overlay could not be rebuilt immediately; serving the last known action-board snapshot."
+    return payload
+
+
+def _seed_action_board_bucket(
+    item: dict | None,
+    ready_now: list[dict],
+    best_blocked: list[dict],
+    watchlist: list[dict],
+    holds: list[dict],
+    seen_ready: set[str],
+    seen_blocked: set[str],
+    seen_watch: set[str],
+    seen_holds: set[str],
+) -> None:
+    state = _action_board_state(item)
+    if state == "READY_NOW":
+        _append_action_board_unique(ready_now, seen_ready, item)
+    elif state == "BLOCKED":
+        _append_action_board_unique(best_blocked, seen_blocked, item)
+    elif state == "HOLD":
+        _append_action_board_unique(holds, seen_holds, item)
+    else:
+        _append_action_board_unique(watchlist, seen_watch, item)
+
+
+def _build_action_board_payload(limit: int = 5) -> dict:
+    priority = _home_priority_engine_summary()
+    queue = get_action_queue()
+    candidates = list(priority.get("candidates") or [])
+    grouped = {
+        "top_candidate": priority.get("top_candidate"),
+        "top_actionable": priority.get("top_actionable"),
+        "top_gated": priority.get("top_gated"),
+        "top_research": priority.get("top_research"),
+        "top_monitor": priority.get("top_monitor"),
+    }
+
+    ready_now = []
+    best_blocked = []
+    watchlist = []
+    holds = []
+    recently_changed = []
+
+    seen_ready: set[str] = set()
+    seen_blocked: set[str] = set()
+    seen_watch: set[str] = set()
+    seen_holds: set[str] = set()
+    seen_recent: set[str] = set()
+
+    for key in ("top_actionable", "top_gated", "top_research", "top_monitor"):
+        _seed_action_board_bucket(
+            grouped.get(key),
+            ready_now,
+            best_blocked,
+            watchlist,
+            holds,
+            seen_ready,
+            seen_blocked,
+            seen_watch,
+            seen_holds,
+        )
+
+    for item in candidates:
+        state = _action_board_state(item)
+        if state == "READY_NOW":
+            _append_action_board_unique(ready_now, seen_ready, item)
+        elif state == "BLOCKED":
+            _append_action_board_unique(best_blocked, seen_blocked, item)
+        elif state == "HOLD":
+            _append_action_board_unique(holds, seen_holds, item)
+        else:
+            _append_action_board_unique(watchlist, seen_watch, item)
+
+        change = str(item.get("change") or "").strip().upper()
+        if change in ("NEW", "UPGRADED"):
+            _append_action_board_unique(recently_changed, seen_recent, item)
+
+    ready_now = _dedupe_memecoin_bucket_rows(ready_now)
+    best_blocked = _dedupe_memecoin_bucket_rows(best_blocked)
+    watchlist = _dedupe_memecoin_bucket_rows(watchlist)
+    watchlist.sort(
+        key=lambda row: (
+            1 if _is_support_only_action_board_item(row) else 0,
+            -(int(row.get("priority_score") or 0)),
+        )
+    )
+    ready_now = ready_now[: max(int(limit), 1)]
+    best_blocked = best_blocked[: max(int(limit), 1)]
+    watchlist = watchlist[: max(int(limit), 1)]
+    holds = holds[: max(int(limit), 1)]
+    recently_changed = recently_changed[: max(int(limit), 1)]
+
+    headline_state = "READY_NOW"
+    headline_note = "A lane has a clear actionable candidate right now."
+    if not ready_now:
+        if best_blocked:
+            headline_state = "BLOCKED_BEST"
+            headline_note = "The strongest current ideas exist, but they are still blocked by live policy, proof, or lane constraints."
+        elif watchlist:
+            headline_state = "WATCHLIST"
+            headline_note = "The system has names worth keeping on screen, but nothing is buy-ready right now."
+        elif holds:
+            headline_state = "MANAGE_OPEN"
+            headline_note = "No new buys are ready. The main job is managing current open exposure."
+        else:
+            headline_state = "QUIET"
+            headline_note = "No meaningful action candidates are surfacing right now."
+
+    queue_top = dict((queue or {}).get("top_action") or {})
+    headline_item = None
+    if ready_now:
+        headline_item = ready_now[0]
+    elif best_blocked:
+        headline_item = best_blocked[0]
+    elif watchlist:
+        headline_item = next(
+            (row for row in watchlist if not _is_support_only_action_board_item(row)),
+            watchlist[0],
+        )
+    elif holds:
+        headline_item = holds[0]
+    else:
+        headline_item = _action_board_item(grouped.get("top_candidate") or queue_top)
+    good_buy_board_v2 = _build_good_buy_board_v2(limit=max(8, int(limit or 5)))
+    blocker_cleared_alerts = _build_blocker_cleared_alerts(ready_now, good_buy_board_v2)
+    replay_aware_alerts = _build_replay_aware_alerts(good_buy_board_v2)
+    payload = {
+        "schema_version": 5,
+        "generated_at": priority.get("generated_at"),
+        "headline": {
+            "state": headline_state,
+            "note": headline_note,
+            "top_candidate": headline_item,
+        },
+        "summary": {
+            "ready_now_count": len(ready_now),
+            "blocked_count": len(best_blocked),
+            "watch_count": len(watchlist),
+            "hold_count": len(holds),
+            "changed_count": len(recently_changed),
+            "candidate_count": int((priority.get("summary") or {}).get("candidate_count") or len(candidates)),
+        },
+        "ready_now": ready_now,
+        "best_blocked": best_blocked,
+        "watchlist": watchlist,
+        "holds": holds,
+        "new_since_last_check": recently_changed,
+        "operating_mode_summary": queue.get("operating_mode_summary"),
+        "lane_policy_summary": queue.get("lane_policy_summary"),
+        "lane_authority_summary": queue.get("lane_authority_summary"),
+        "lane_unlock_summary": queue.get("lane_unlock_summary"),
+        "good_buy_board_v2": good_buy_board_v2,
+        "buy_decision_v1": good_buy_board_v2.get("buy_decision_v1"),
+        "buy_decision_learning": good_buy_board_v2.get("decision_learning"),
+        "blocker_cleared_alerts": blocker_cleared_alerts,
+        "replay_aware_alerts": replay_aware_alerts,
+    }
+    _record_action_board_memory(payload)
+    _record_buy_decision_memory(payload)
+    return payload
+
+
+_VALIDATION_REGISTRY_KEY = "validation_registry"
+_VALIDATION_REGISTRY_EVENTS_KEY = "validation_registry_events"
+_VALIDATION_EVENT_LIMIT = 200
+
+
+def _kv_json_get(key: str) -> dict | list | None:
+    try:
+        from utils.db import get_conn  # type: ignore
+        with get_conn() as conn:
+            row = conn.execute("SELECT value FROM kv_store WHERE key=?", (key,)).fetchone()
+            return json.loads(row[0]) if row and row[0] else None
+    except Exception:
+        return None
+
+
+def _validation_transition_reason(track: dict, to_state: str) -> str:
+    if to_state == "PROMOTED":
+        return str(track.get("promotion_reason") or track.get("detail") or "promotion threshold met")
+    if to_state == "DEMOTED":
+        return str(track.get("demotion_reason") or track.get("detail") or "demotion condition met")
+    return str(track.get("detail") or track.get("next_unlock") or "state changed")
+
+
+def _validation_registry_with_history(payload: dict) -> dict:
+    prior = _kv_json_get(_VALIDATION_REGISTRY_KEY) or {}
+    prior_tracks = {t.get("key"): t for t in (prior.get("tracks") or []) if isinstance(t, dict) and t.get("key")}
+    events = _kv_json_get(_VALIDATION_REGISTRY_EVENTS_KEY)
+    if not isinstance(events, list):
+        events = []
+
+    now_ts = payload.get("generated_at") or datetime.now(timezone.utc).isoformat()
+    new_events: list[dict] = []
+
+    for track in payload.get("tracks", []):
+        key = track.get("key")
+        if not key:
+            continue
+        prev = prior_tracks.get(key) or {}
+        prev_state = prev.get("state")
+        curr_state = track.get("state")
+        if prev_state and prev_state != curr_state:
+            new_events.append({
+                "ts": now_ts,
+                "key": key,
+                "name": track.get("name"),
+                "from_state": prev_state,
+                "to_state": curr_state,
+                "readiness": track.get("readiness"),
+                "verdict": track.get("verdict"),
+                "evidence_mode": track.get("evidence_mode"),
+                "reason": _validation_transition_reason(track, curr_state),
+            })
+
+    if new_events:
+        events = (new_events + events)[:_VALIDATION_EVENT_LIMIT]
+
+    for track in payload.get("tracks", []):
+        key = track.get("key")
+        if not key:
+            continue
+        promoted_event = next((e for e in events if e.get("key") == key and e.get("to_state") == "PROMOTED"), None)
+        demoted_event = next((e for e in events if e.get("key") == key and e.get("to_state") == "DEMOTED"), None)
+        track["promoted_at"] = promoted_event.get("ts") if promoted_event else None
+        track["demoted_at"] = demoted_event.get("ts") if demoted_event else None
+
+    payload["recent_events"] = events[:10]
+    summary = payload.get("summary") or {}
+    summary["event_count"] = len(events)
+    summary["recent_state_changes"] = len(new_events)
+    payload["summary"] = summary
+    payload["generated_at"] = now_ts
+    return {"payload": payload, "events": events}
+
+
+def _persist_validation_registry(payload: dict, events: list[dict]) -> None:
+    try:
+        from utils.db import get_conn  # type: ignore
+        with get_conn() as conn:
+            conn.execute(
+                "INSERT INTO kv_store (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (_VALIDATION_REGISTRY_KEY, json.dumps(payload)),
+            )
+            conn.execute(
+                "INSERT INTO kv_store (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (_VALIDATION_REGISTRY_EVENTS_KEY, json.dumps(events)),
+            )
+    except Exception as exc:
+        log.debug("persist validation_registry failed: %s", exc)
+
+
+def _build_validation_registry() -> dict:
+    import sqlite3
+    from utils.db import get_conn  # type: ignore
+    from routers.memecoins import (  # type: ignore
+        _validate_transition_detector,
+        _validate_trust_labels,
+        _validate_triage_states,
+    )
+    from routers.confluence import get_confluence_summary_data  # type: ignore
+
+    tracks: list[dict] = []
+
+    with get_conn() as conn:
+        conn.row_factory = sqlite3.Row
+        _ensure_memecoin_outcome_label_schema(conn)
+
+        td = _validate_transition_detector(conn)
+        td_track = (td.get("validation_tracks") or {}).get("promotive_track") or {}
+        td_signal = td.get("directional_state") or "NO_SIGNAL"
+        td_readiness = (
+            "PROVEN" if td.get("verdict") == "EARNING_ITS_PLACE"
+            else "EARLY_SIGNAL" if td_signal == "THIN_POSITIVE_SIGNAL"
+            else "ADVERSE" if td_signal == "NEGATIVE_SIGNAL"
+            else "ACCUMULATING"
+        )
+        tracks.append({
+            "name": "Transition Detector",
+            "key": "transition_detector",
+            "state": _registry_state(td_readiness, td.get("verdict")),
+            "readiness": td_readiness,
+            "verdict": td.get("verdict"),
+            "detail": td.get("verdict_reason"),
+            "scope_note": td.get("scope_note"),
+            "evidence_mode": "clean_promotive_vs_baseline",
+            "promotion_reason": td.get("verdict_reason") if td.get("verdict") == "EARNING_ITS_PLACE" else None,
+            "demotion_reason": td.get("verdict_reason") if td.get("verdict") == "FALSIFIED" or td_readiness == "ADVERSE" else None,
+            "promoted_at": None,
+            "current": {
+                "approaching_n": ((td_track.get("approaching") or {}).get("n")),
+                "baseline_status": ((td_track.get("baseline") or {}).get("status")),
+                "lift_pp": td_track.get("lift_pp"),
+                "directional_state": td_signal,
+            },
+            "target": {
+                "approaching_n": 10,
+                "lift_pp": 5.0,
+            },
+            "next_unlock": (
+                "Need ≥5pp lift vs baseline to earn promotion"
+                if td.get("verdict") != "EARNING_ITS_PLACE"
+                else "Already promotive"
+            ),
+        })
+
+        tl = _validate_trust_labels(conn)
+        tl_bootstrap_track = (tl.get("validation_tracks") or {}).get("bootstrap_observed") or {}
+        tl_clean_n = int(tl.get("clean_n") or 0)
+        tl_bootstrap_n = int(tl.get("bootstrap_n") or 0)
+        tl_readiness = (
+            "PROVEN" if tl.get("verdict") == "EARNING_ITS_PLACE"
+            else "EARLY_SIGNAL" if tl_bootstrap_track.get("gradient_present")
+            else "ACCUMULATING"
+        )
+        tracks.append({
+            "name": "Trust Labels",
+            "key": "trust_labels",
+            "state": _registry_state(tl_readiness, tl.get("verdict")),
+            "readiness": tl_readiness,
+            "verdict": tl.get("verdict"),
+            "detail": tl.get("verdict_reason"),
+            "scope_note": tl.get("scope_note"),
+            "evidence_mode": "clean_near_scan_only",
+            "promotion_reason": tl.get("verdict_reason") if tl.get("verdict") == "EARNING_ITS_PLACE" else None,
+            "demotion_reason": tl.get("verdict_reason") if tl.get("verdict") == "FALSIFIED" else None,
+            "promoted_at": None,
+            "current": {
+                "clean_n": tl_clean_n,
+                "bootstrap_n": tl_bootstrap_n,
+                "bootstrap_gradient_present": bool(tl_bootstrap_track.get("gradient_present")),
+            },
+            "target": {"clean_n": 20},
+            "next_unlock": (
+                f"Need {max(0, 20 - tl_clean_n)} more clean near-scan labels"
+                if tl.get("verdict") != "EARNING_ITS_PLACE"
+                else "Already promotive"
+            ),
+        })
+
+        ts = _validate_triage_states(conn)
+        ts_bootstrap_track = (ts.get("validation_tracks") or {}).get("bootstrap_observed") or {}
+        ts_clean_n = int(ts.get("clean_n") or 0)
+        ts_bootstrap_n = int(ts.get("bootstrap_n") or 0)
+        ts_readiness = (
+            "PROVEN" if ts.get("verdict") == "EARNING_ITS_PLACE"
+            else "EARLY_SIGNAL" if ts_bootstrap_track.get("gradient_present")
+            else "ACCUMULATING"
+        )
+        tracks.append({
+            "name": "Triage States",
+            "key": "triage_states",
+            "state": _registry_state(ts_readiness, ts.get("verdict")),
+            "readiness": ts_readiness,
+            "verdict": ts.get("verdict"),
+            "detail": ts.get("verdict_reason"),
+            "scope_note": ts.get("scope_note"),
+            "evidence_mode": "clean_near_scan_only",
+            "promotion_reason": ts.get("verdict_reason") if ts.get("verdict") == "EARNING_ITS_PLACE" else None,
+            "demotion_reason": ts.get("verdict_reason") if ts.get("verdict") == "FALSIFIED" else None,
+            "promoted_at": None,
+            "current": {
+                "clean_n": ts_clean_n,
+                "bootstrap_n": ts_bootstrap_n,
+                "bootstrap_gradient_present": bool(ts_bootstrap_track.get("gradient_present")),
+            },
+            "target": {"clean_n": 20},
+            "next_unlock": (
+                f"Need {max(0, 20 - ts_clean_n)} more clean near-scan labels"
+                if ts.get("verdict") != "EARNING_ITS_PLACE"
+                else "Already promotive"
+            ),
+        })
+
+    conf = get_confluence_summary_data()
+    structural = (conf.get("validation_tracks") or {}).get("structural_confluence") or {}
+    structural_total = int(structural.get("total_events") or 0)
+    structural_complete = int(structural.get("complete_events") or 0)
+    structural_readiness = (
+        "PROVEN" if structural_complete >= 20
+        else "EARLY_SIGNAL" if structural_total > 0
+        else "ACCUMULATING"
+    )
+    structural_verdict = "EARNING_ITS_PLACE" if structural_complete >= 20 else "NOT_YET_PROVEN"
+    tracks.append({
+        "name": "Structural Confluence",
+        "key": "structural_confluence",
+        "state": _registry_state(structural_readiness, structural_verdict),
+        "readiness": structural_readiness,
+        "verdict": structural_verdict,
+        "detail": f"{structural_complete}/20 complete outcomes ({structural_total} total structural events)",
+        "scope_note": "STRUCTURAL_DUAL/TRIPLE is a weaker class than fresh DUAL/TRIPLE",
+        "evidence_mode": "structural_outcomes_only",
+        "promotion_reason": f"{structural_complete}/20 complete structural outcomes" if structural_complete >= 20 else None,
+        "demotion_reason": None,
+        "promoted_at": None,
+        "current": {
+            "total_events": structural_total,
+            "complete_events": structural_complete,
+            "pending_events": int(structural.get("pending_events") or 0),
+            "avg_confluence_score": structural.get("avg_confluence_score"),
+            "wr_24h": structural.get("wr_24h"),
+        },
+        "target": {"complete_events": 20},
+        "next_unlock": (
+            f"Need {max(0, 20 - structural_complete)} more complete structural outcomes"
+            if structural_complete < 20 else "Already promotive"
+        ),
+    })
+
+    payload = {
+        "policy_version": "validation_registry_v1",
+        "summary": {
+            "promoted": sum(1 for t in tracks if t["state"] == "PROMOTED"),
+            "early_signal": sum(1 for t in tracks if t["state"] == "EARLY_SIGNAL"),
+            "locked": sum(1 for t in tracks if t["state"] == "LOCKED"),
+            "demoted": sum(1 for t in tracks if t["state"] == "DEMOTED"),
+            "proven": sum(1 for t in tracks if t["readiness"] == "PROVEN"),
+            "accumulating": sum(1 for t in tracks if t["readiness"] == "ACCUMULATING"),
+            "adverse": sum(1 for t in tracks if t["readiness"] == "ADVERSE"),
+            "proof_stack_authority": _proof_stack_authority_from_registry({"tracks": tracks}),
+        },
+        "tracks": tracks,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    reconciled = _validation_registry_with_history(payload)
+    _persist_validation_registry(reconciled["payload"], reconciled["events"])
+    return reconciled["payload"]
+
+
+@router.get("/validation-registry")
+async def home_validation_registry(_: str = Depends(get_current_user)):
+    """Canonical maturity registry for newer intelligence layers."""
+    import asyncio as _aio
+
+    try:
+        return await _aio.to_thread(_build_validation_registry)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/validation-registry/events")
+async def home_validation_registry_events(_: str = Depends(get_current_user)):
+    """Recent promotion/demotion state transitions for the validation registry."""
+    import asyncio as _aio
+
+    def _run() -> dict:
+        registry = _build_validation_registry()
+        events = _kv_json_get(_VALIDATION_REGISTRY_EVENTS_KEY)
+        if not isinstance(events, list):
+            events = []
+        return {
+            "policy_version": registry.get("policy_version"),
+            "count": len(events),
+            "events": events[:50],
+            "generated_at": registry.get("generated_at"),
+        }
+
+    try:
+        return await _aio.to_thread(_run)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/proof-runway")
+async def home_proof_runway(_: str = Depends(get_current_user)):
+    """
+    Compact proof-progress surface for the newer intelligence layers.
+
+    Uses the canonical validation registry and preserves the existing payload
+    shape expected by the Home page.
+    """
+    import asyncio as _aio
+
+    def _run() -> dict:
+        registry = _build_validation_registry()
+        summary = registry.get("summary") or {}
+        return {
+            "policy_version": registry.get("policy_version"),
+            "summary": {
+                "proven": summary.get("proven", 0),
+                "early_signal": summary.get("early_signal", 0),
+                "accumulating": summary.get("accumulating", 0),
+                "adverse": summary.get("adverse", 0),
+                "proof_stack_authority": summary.get("proof_stack_authority", "TENTATIVE"),
+            },
+            "tracks": registry.get("tracks", []),
+            "generated_at": registry.get("generated_at"),
+        }
+
+    try:
+        return await _aio.to_thread(_run)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/priority-candidates")
+async def home_priority_candidates(_: str = Depends(get_current_user)):
+    """
+    Canonical cross-system candidate registry.
+
+    Normalizes the current Home action surfaces into one shared candidate schema
+    so the next priority-engine layers can rank from a common model.
+    """
+    import asyncio as _aio
+
+    try:
+        return await _aio.to_thread(_build_priority_candidates_registry)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/priority-summary")
+async def home_priority_summary(_: str = Depends(get_current_user)):
+    """
+    Compact frontend-facing summary of the cross-system priority engine.
+
+    Keeps the payload focused on grouped winners and overall state so the Home
+    UI can consume one clean surface instead of stitching multiple legacy
+    endpoints together.
+    """
+    import asyncio as _aio
+
+    try:
+        return await _aio.to_thread(_build_priority_summary_payload)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/action-board")
+async def home_action_board(_: str = Depends(get_current_user), limit: int = 5):
+    """
+    Compact operator-facing action board.
+
+    Gives the frontend one clean surface for:
+    - what is ready now
+    - the best blocked ideas
+    - the current watchlist
+    - active holds
+    - what changed since the last check
+    """
+    import asyncio as _aio
+
+    try:
+        from snapshot_cache import load_snapshot  # type: ignore
+
+        snapshot_name = f"home:action-board:{int(limit)}"
+
+        def _build_fast_action_board_payload() -> dict:
+            snap = load_snapshot(snapshot_name)
+            base = snap.get("data") if isinstance(snap, dict) else None
+            return _build_action_board_fast_payload(limit, base if isinstance(base, dict) else None)
+
+        payload = await snapshot_or_build(
+            snapshot_name,
+            _build_fast_action_board_payload,
+            fresh_s=180,
+            stale_s=600,
+            wait_timeout_s=8,
+        )
+        if (
+            isinstance(payload, dict)
+            and int(payload.get("schema_version") or 0) < 5
+            and str(((payload.get("_snapshot") or {}).get("status") or "")).upper() == "STALE"
+        ):
+            try:
+                return await _aio.wait_for(
+                    _aio.to_thread(_build_action_board_fast_payload, limit, payload),
+                    timeout=_ACTION_BOARD_OVERLAY_TIMEOUT_SECONDS,
+                )
+            except Exception:
+                return _action_board_stale_payload(payload, detail="Cached action-board schema is older than the current frontend.")
+        if (
+            isinstance(payload, dict)
+            and str(((payload.get("_snapshot") or {}).get("status") or "")).upper() == "STALE"
+        ):
+            try:
+                return await _aio.wait_for(
+                    _aio.to_thread(_build_action_board_fast_payload, limit, payload),
+                    timeout=_ACTION_BOARD_OVERLAY_TIMEOUT_SECONDS,
+                )
+            except Exception:
+                return _action_board_stale_payload(payload, detail="Fast decision overlay timed out; serving stale snapshot.")
+        return payload
+    except Exception as exc:
+        try:
+            from snapshot_cache import load_snapshot  # type: ignore
+            snapshot_name = f"home:action-board:{int(limit)}"
+            snap = load_snapshot(snapshot_name)
+            if not snap:
+                return _build_action_board_warming_payload(limit, detail=str(exc))
+            return _action_board_stale_payload(snap.get("data"), detail=str(exc))
+        except Exception:
+            raise HTTPException(status_code=504, detail=str(exc))
+
+
+@router.get("/good-buy-board")
+async def home_good_buy_board(_: str = Depends(get_current_user), limit: int = 8):
+    """Token Intelligence powered good-buy / wait / blocked board."""
+    try:
+        return await snapshot_or_build(
+            f"home:good-buy-board:{int(limit)}",
+            lambda: _build_good_buy_board_v2(limit),
+            fresh_s=20,
+            stale_s=300,
+            wait_timeout_s=6,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=504, detail=str(exc))
+
+
+def _build_early_runner_radar(limit: int = 8, lookback_hours: int = 24) -> dict:
+    from utils.early_runner_radar import build_early_runner_radar  # type: ignore
+
+    return build_early_runner_radar(limit=limit, lookback_hours=lookback_hours, record=True)
+
+
+@router.get("/early-runners")
+async def home_early_runners(
+    _: str = Depends(get_current_user),
+    limit: int = 8,
+    lookback_hours: int = 24,
+):
+    try:
+        return await snapshot_or_build(
+            f"home:early-runners:{int(limit)}:{int(lookback_hours)}",
+            lambda: _build_early_runner_radar(limit, lookback_hours),
+            fresh_s=240,
+            stale_s=600,
+            wait_timeout_s=7,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=504, detail=str(exc))
+
+
+def _build_conviction_recovery(limit: int = 8) -> dict:
+    from utils.conviction_recovery import build_conviction_recovery_cached  # type: ignore
+
+    return build_conviction_recovery_cached(limit=limit)
+
+
+@router.get("/conviction-recovery")
+async def home_conviction_recovery(
+    _: str = Depends(get_current_user),
+    limit: int = 8,
+):
+    try:
+        return await snapshot_or_build(
+            f"home:conviction-recovery:{int(limit)}",
+            lambda: _build_conviction_recovery(limit),
+            fresh_s=180,
+            stale_s=1800,
+            wait_timeout_s=5,
+        )
+    except Exception as exc:
+        try:
+            from snapshot_cache import load_snapshot  # type: ignore
+            for fallback_key in (
+                f"home:conviction-recovery:{int(limit)}",
+                "home:conviction-recovery:10",
+            ):
+                snap = load_snapshot(fallback_key)
+                if snap and snap.get("data") not in (None, {}, []):
+                    payload = copy.deepcopy(snap.get("data"))
+                    if isinstance(payload, dict):
+                        payload["refresh_mode"] = "CONVICTION_RECOVERY_STALE_SNAPSHOT"
+                        payload["stale_reason"] = str(exc)
+                    return payload
+        except Exception:
+            pass
+        raise HTTPException(status_code=504, detail=str(exc))
+
+
+_RUNNER_REVIEW_SCHEMA = """
+CREATE TABLE IF NOT EXISTS runner_review_decisions (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_ts            TEXT NOT NULL,
+    symbol                TEXT,
+    mint                  TEXT NOT NULL,
+    runner_state          TEXT,
+    decision              TEXT NOT NULL,
+    operator_note         TEXT,
+    blocker_key           TEXT,
+    score                 REAL,
+    proof_score           REAL,
+    readiness_score       REAL,
+    market_quality_score  REAL,
+    buy_pressure          REAL,
+    vol_acceleration      REAL,
+    entry_window          TEXT,
+    fuel_quality          TEXT,
+    move_phase            TEXT,
+    first_leg_confirmed   INTEGER,
+    snapshot_json         TEXT
+)
+"""
+
+
+def _runner_review_conn():
+    import sqlite3 as _sqlite3
+
+    db = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "..", "data_storage", "engine.db")
+    )
+    conn = _sqlite3.connect(db)
+    conn.row_factory = _sqlite3.Row
+    conn.execute(_RUNNER_REVIEW_SCHEMA)
+    conn.commit()
+    return conn
+
+
+def _runner_review_decision_row(row) -> dict:
+    item = {
+        "id": row["id"],
+        "created_ts": row["created_ts"],
+        "symbol": row["symbol"],
+        "mint": row["mint"],
+        "runner_state": row["runner_state"],
+        "decision": row["decision"],
+        "operator_note": row["operator_note"],
+        "blocker_key": row["blocker_key"],
+        "score": row["score"],
+        "proof_score": row["proof_score"],
+        "readiness_score": row["readiness_score"],
+        "market_quality_score": row["market_quality_score"],
+        "buy_pressure": row["buy_pressure"],
+        "vol_acceleration": row["vol_acceleration"],
+        "entry_window": row["entry_window"],
+        "fuel_quality": row["fuel_quality"],
+        "move_phase": row["move_phase"],
+        "first_leg_confirmed": row["first_leg_confirmed"],
+    }
+    keys = set(row.keys())
+    for key in (
+        "entry_price",
+        "entry_marketcap",
+        "entry_stats_ts",
+        "entry_capture_status",
+        "entry_market_source",
+        "entry_data_age_seconds",
+        "current_price",
+        "current_marketcap",
+        "current_stats_ts",
+        "current_market_source",
+        "current_data_age_seconds",
+        "return_1h_pct",
+        "return_4h_pct",
+        "return_24h_pct",
+        "return_72h_pct",
+        "current_return_pct",
+        "max_return_pct",
+        "min_return_pct",
+        "drawdown_from_max_pct",
+        "best_horizon",
+        "exit_signal",
+        "exit_urgency",
+        "exit_signal_reason",
+        "exit_signal_ts",
+        "outcome_status",
+        "outcome_label",
+        "evaluated_ts",
+        "follow_up_status",
+        "follow_up_due_ts",
+        "follow_up_reason",
+        "suppressed_until_ts",
+        "resolved_ts",
+        "suggested_decision",
+        "suggestion_confidence",
+        "suggestion_reason",
+        "decision_alignment",
+        "decision_source",
+    ):
+        if key in keys:
+            item[key] = row[key]
+    return item
+
+
+def _runner_review_latest_decisions(conn) -> dict[str, dict]:
+    rows = conn.execute(
+        """
+        SELECT r.*
+        FROM runner_review_decisions r
+        INNER JOIN (
+            SELECT mint, MAX(id) AS max_id
+            FROM runner_review_decisions
+            GROUP BY mint
+        ) latest
+          ON latest.mint = r.mint AND latest.max_id = r.id
+        """
+    ).fetchall()
+    return {str(row["mint"]): _runner_review_decision_row(row) for row in rows if row["mint"]}
+
+
+def _runner_review_decision_guidance(
+    *,
+    candidate: dict,
+    state: str,
+    blocker: str,
+    remaining_keys: list,
+    reasons: list[str],
+    scanner: dict,
+    lifecycle: dict,
+) -> dict:
+    """Convert runner-policy diagnostics into a concrete operator label prompt."""
+    readiness = _fl(candidate.get("readiness_score"))
+    market_quality = _fl(candidate.get("market_quality_score") or scanner.get("market_quality_score"))
+    buy_pressure = _fl(scanner.get("buy_pressure"))
+    vol_accel = _fl(scanner.get("vol_acceleration"))
+    first_leg = bool(int(candidate.get("first_leg_confirmed") or lifecycle.get("first_leg_confirmed") or 0))
+    blocker_key = str(blocker or "").strip()
+    blockers = [str(k).strip() for k in remaining_keys if str(k).strip()]
+    next_blocker = blocker_key or (blockers[0] if blockers else "")
+
+    decision = "WATCH"
+    confidence = 68
+    urgency = "WATCH"
+    reason = "Runner is worth tracking, but the system still wants a human label before it learns from this setup."
+    next_trigger = "Wait for the current blocker to clear or for buy pressure and volume acceleration to improve."
+    invalid_if = "Pass if quality weakens, CA identity changes, or the move becomes visibly stretched before entry."
+    checklist = [
+        "Confirm the contract address matches the intended token.",
+        "Check current market cap versus the dashboard snapshot before acting.",
+        "Log the decision so the runner policy can score the outcome later.",
+    ]
+
+    if state == "RUNNER_READY":
+        decision = "MANUAL_BUY"
+        confidence = 82
+        urgency = "NOW"
+        reason = "Runner policy is clear and this is the exact state that needs a manual buy/pass label."
+        next_trigger = "If you do not buy now, keep it on WATCH until buy pressure/volume either confirms or fades."
+        invalid_if = "Do not chase if market cap has already expanded materially since this snapshot."
+        checklist = [
+            "Confirm CA exactly before buying.",
+            "Check that buy pressure is still holding above the runner threshold.",
+            "Check that volume acceleration has not collapsed since the snapshot.",
+            "Have an exit plan before entry; this label will be judged by follow-up returns.",
+        ]
+        if market_quality >= 80 and buy_pressure >= 60 and vol_accel >= 4 and first_leg:
+            confidence = 92
+            reason = "Clean runner-ready state with strong quality, buy pressure, acceleration, and confirmed first leg."
+        elif market_quality >= 75 and (buy_pressure >= 55 or vol_accel >= 3):
+            confidence = 86
+            reason = "Runner-ready state has enough quality and momentum to deserve an immediate manual decision."
+        elif not first_leg:
+            decision = "WATCH"
+            confidence = 74
+            urgency = "VERIFY"
+            reason = "Policy is ready, but the first leg is not confirmed enough to treat this as a clean buy label."
+            next_trigger = "Move to MANUAL BUY only after the first leg confirms without quality deterioration."
+    elif state == "RUNNER_NEEDS_MOMENTUM":
+        decision = "WATCH"
+        confidence = 84
+        urgency = "TRIGGER"
+        reason = "Quality is present, but the missing edge is momentum confirmation."
+        if next_blocker:
+            next_trigger = f"Trigger a new review when `{next_blocker}` clears."
+        else:
+            next_trigger = "Trigger a new review when buy pressure or volume acceleration clears the runner threshold."
+        checklist = [
+            "Keep it on watch instead of forcing an entry.",
+            "Promote only if the last blocker clears while quality stays intact.",
+            "Log WATCH so the system can learn whether this watch state later became a runner.",
+        ]
+    elif state == "RUNNER_LIFECYCLE_UNCONFIRMED":
+        decision = "WATCH"
+        confidence = 78
+        urgency = "VERIFY"
+        reason = "The token has an established profile, but lifecycle confirmation is not clean yet."
+        next_trigger = "Re-review after first-leg confirmation and sustained buy pressure."
+    elif state == "RUNNER_EXTENSION_RISK":
+        decision = "TOO_LATE"
+        confidence = 86
+        urgency = "COOLDOWN"
+        reason = "The setup looks extended; the useful label is whether this was too late instead of chasing."
+        next_trigger = "Only re-open after a reset, cooldown, or a fresh clean continuation base."
+        invalid_if = "If it keeps running after a TOO LATE label, the follow-up will teach the system this extension filter was too strict."
+        checklist = [
+            "Avoid chasing the current leg.",
+            "Watch for a reset or clean continuation base.",
+            "Log TOO LATE so missed-extension outcomes are measured.",
+        ]
+    elif state == "RUNNER_QUALITY_LOW":
+        decision = "PASS"
+        confidence = 80
+        urgency = "AVOID"
+        reason = "The profile is not strong enough for the established-runner lane right now."
+        next_trigger = "Only reconsider if market quality, holder/volume health, and momentum all improve."
+        checklist = [
+            "Do not force a trade from a weak quality state.",
+            "Log PASS so future spikes can expose false negatives.",
+        ]
+
+    if reasons and decision == "WATCH":
+        reason = f"{reason} Current reason: {reasons[0]}"
+
+    return {
+        "suggested_decision": decision,
+        "suggestion_label": f"Recommended: {decision.replace('_', ' ')}",
+        "suggestion_confidence": confidence,
+        "suggestion_urgency": urgency,
+        "suggestion_reason": reason,
+        "next_trigger": next_trigger,
+        "invalid_if": invalid_if,
+        "entry_checklist": checklist[:4],
+        "learning_prompt": (
+            f"Logging {decision.replace('_', ' ')} creates a labeled runner outcome, "
+            "so future established-name entries can be scored instead of guessed."
+        ),
+    }
+
+
+def _runner_review_candidate_row(candidate: dict, latest_decision: dict | None = None) -> dict:
+    proof_components = dict(candidate.get("proof_components") or {})
+    scanner = dict(proof_components.get("scanner") or {})
+    lifecycle = dict(proof_components.get("lifecycle") or {})
+    policy = dict(candidate.get("established_runner_policy") or proof_components.get("established_runner_policy") or {})
+    profile = dict(candidate.get("established_runner_profile") or proof_components.get("established_runner") or {})
+    remaining_keys = list(candidate.get("remaining_blocker_keys") or proof_components.get("remaining_blocker_keys") or [])
+    reasons = [
+        str(item.get("reason") or item.get("key") or "").strip()
+        for item in list(candidate.get("remaining_blockers") or proof_components.get("remaining_blockers") or [])
+        if isinstance(item, dict) and str(item.get("reason") or item.get("key") or "").strip()
+    ]
+    state = str(policy.get("state") or candidate.get("runner_policy_state") or "RUNNER_WATCHING").upper()
+    blocker = str(candidate.get("blocker_key") or proof_components.get("blocker_key") or policy.get("blocker_key") or "").strip()
+    if state == "RUNNER_READY":
+        operator_hint = "Review now. The runner policy says this is clean, but auto proof-ready is intentionally manual."
+    elif state == "RUNNER_NEEDS_MOMENTUM":
+        operator_hint = "Watch closely. A buy only improves if buy pressure or volume acceleration clears."
+    elif state == "RUNNER_EXTENSION_RISK":
+        operator_hint = "Avoid chasing. Let it reset or prove another clean leg."
+    else:
+        operator_hint = "Keep on watch until the policy state improves."
+
+    guidance = _runner_review_decision_guidance(
+        candidate=candidate,
+        state=state,
+        blocker=blocker,
+        remaining_keys=remaining_keys,
+        reasons=reasons,
+        scanner=scanner,
+        lifecycle=lifecycle,
+    )
+
+    return {
+        "symbol": str(candidate.get("symbol") or "UNKNOWN").upper(),
+        "mint": str(candidate.get("mint") or "").strip(),
+        "proof_status": candidate.get("proof_status"),
+        "runner_state": state,
+        "blocker_key": blocker or None,
+        "remaining_blocker_keys": [str(k) for k in remaining_keys if str(k).strip()],
+        "blocker_reasons": reasons[:4],
+        "manual_review_required": bool(policy.get("manual_review_required")),
+        "operator_hint": operator_hint,
+        "profile": profile.get("profile"),
+        "thesis": profile.get("thesis"),
+        "score": candidate.get("score"),
+        "proof_score": candidate.get("proof_score"),
+        "readiness_score": candidate.get("readiness_score"),
+        "market_quality_score": candidate.get("market_quality_score") or scanner.get("market_quality_score"),
+        "market_quality_verdict": candidate.get("market_quality_verdict") or scanner.get("market_quality_verdict"),
+        "buy_pressure": scanner.get("buy_pressure"),
+        "vol_acceleration": scanner.get("vol_acceleration"),
+        "entry_window": candidate.get("entry_window") or lifecycle.get("entry_window"),
+        "fuel_quality": candidate.get("fuel_quality") or lifecycle.get("fuel_quality"),
+        "move_phase": candidate.get("move_phase") or lifecycle.get("move_phase"),
+        "first_leg_confirmed": int(candidate.get("first_leg_confirmed") or lifecycle.get("first_leg_confirmed") or 0),
+        "last_decision": latest_decision,
+        **guidance,
+        "snapshot": {
+            "candidate": candidate,
+            "policy": policy,
+            "profile": profile,
+            "guidance": guidance,
+        },
+    }
+
+
+def _build_runner_review_payload(limit: int = 10) -> dict:
+    from utils.memecoin_manager import get_proof_candidate_snapshot  # type: ignore
+    from utils.runner_review import build_runner_follow_up_queue, build_runner_review_outcome_summary, build_runner_trade_tracker  # type: ignore
+
+    generated_at = datetime.now(timezone.utc).isoformat()
+    conn = _runner_review_conn()
+    try:
+        latest_by_mint = _runner_review_latest_decisions(conn)
+        recent_rows = conn.execute(
+            """
+            SELECT *
+            FROM runner_review_decisions
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (20,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    snapshot = get_proof_candidate_snapshot(limit=max(int(limit) * 3, 24), include_recent_complete=True)
+    rows: list[dict] = []
+    for candidate in list(snapshot.get("candidates") or []):
+        policy = dict(
+            candidate.get("established_runner_policy")
+            or (candidate.get("proof_components") or {}).get("established_runner_policy")
+            or {}
+        )
+        profile = candidate.get("established_runner_profile") or (candidate.get("proof_components") or {}).get("established_runner")
+        state = str(policy.get("state") or candidate.get("runner_policy_state") or "").upper()
+        blocker = str(candidate.get("blocker_key") or "").strip()
+        if not profile or state not in {
+            "RUNNER_READY",
+            "RUNNER_NEEDS_MOMENTUM",
+            "RUNNER_EXTENSION_RISK",
+            "RUNNER_LIFECYCLE_UNCONFIRMED",
+            "RUNNER_QUALITY_LOW",
+        }:
+            continue
+        if blocker in {
+            "score_below_floor",
+            "score_above_hard_ceiling",
+            "rug_warning",
+            "rug_danger",
+            "rug_not_good",
+            "mint_not_revoked",
+            "holder_concentration",
+            "market_quality_avoid",
+            "market_quality_unstable",
+        }:
+            continue
+        mint = str(candidate.get("mint") or "")
+        rows.append(_runner_review_candidate_row(candidate, latest_by_mint.get(mint)))
+
+    state_rank = {
+        "RUNNER_READY": 0,
+        "RUNNER_NEEDS_MOMENTUM": 1,
+        "RUNNER_LIFECYCLE_UNCONFIRMED": 2,
+        "RUNNER_EXTENSION_RISK": 3,
+        "RUNNER_QUALITY_LOW": 4,
+    }
+    rows.sort(
+        key=lambda row: (
+            state_rank.get(str(row.get("runner_state") or ""), 9),
+            -float(row.get("readiness_score") or 0.0),
+            -float(row.get("market_quality_score") or 0.0),
+            str(row.get("symbol") or ""),
+        )
+    )
+    rows = rows[: max(1, min(int(limit), 20))]
+    counts: dict[str, int] = {}
+    for row in rows:
+        key = str(row.get("runner_state") or "UNKNOWN")
+        counts[key] = counts.get(key, 0) + 1
+    ready_count = counts.get("RUNNER_READY", 0)
+    momentum_count = counts.get("RUNNER_NEEDS_MOMENTUM", 0)
+    extension_count = counts.get("RUNNER_EXTENSION_RISK", 0)
+    decision_needed_count = sum(1 for row in rows if not row.get("last_decision"))
+    suggested_manual_buy_count = sum(1 for row in rows if row.get("suggested_decision") == "MANUAL_BUY")
+    suggested_watch_count = sum(1 for row in rows if row.get("suggested_decision") == "WATCH")
+    suggested_avoid_count = sum(1 for row in rows if row.get("suggested_decision") in {"PASS", "TOO_LATE"})
+    headline = (
+        f"{ready_count} established runner(s) need manual review now."
+        if ready_count
+        else f"{momentum_count} runner(s) are waiting on momentum confirmation."
+        if momentum_count
+        else f"{extension_count} runner(s) are extended; avoid chasing."
+        if extension_count
+        else "No established runner needs immediate review."
+    )
+    return {
+        "generated_at": generated_at,
+        "headline": headline,
+        "summary": {
+            "total": len(rows),
+            "ready": ready_count,
+            "needs_momentum": momentum_count,
+            "extension_risk": extension_count,
+            "decisions_logged": len(recent_rows),
+            "decision_needed": decision_needed_count,
+            "suggested_manual_buy": suggested_manual_buy_count,
+            "suggested_watch": suggested_watch_count,
+            "suggested_avoid": suggested_avoid_count,
+        },
+        "decision_bridge": {
+            "state": "NEEDS_LABELS" if decision_needed_count else "LABELING_ACTIVE",
+            "headline": (
+                f"Log {decision_needed_count} runner decision(s) to turn these setups into training data."
+                if decision_needed_count
+                else "Runner labels are flowing; follow-ups will grade these decisions."
+            ),
+            "primary_prompt": (
+                "Use the recommendation as the default, override it if your chart read disagrees, and every click becomes outcome data."
+            ),
+            "manual_buy_suggestions": suggested_manual_buy_count,
+            "watch_suggestions": suggested_watch_count,
+            "avoid_suggestions": suggested_avoid_count,
+        },
+        "opportunities": rows,
+        "recent_decisions": [_runner_review_decision_row(row) for row in recent_rows[:8]],
+        "outcome_summary": build_runner_review_outcome_summary(limit=100),
+        "follow_up": build_runner_follow_up_queue(limit=50),
+        "trade_tracker": build_runner_trade_tracker(limit=50),
+        "last_evaluation": {
+            "mode": "BACKGROUND_OWNED",
+            "detail": "Outcome evaluation runs in the headless engine; Home reads the latest stored state.",
+        },
+        "proof_input_source": snapshot.get("proof_input_source"),
+    }
+
+
+@router.get("/runner-review")
+async def home_runner_review(
+    _: str = Depends(get_current_user),
+    limit: int = 10,
+):
+    try:
+        return await snapshot_or_build(
+            f"home:runner-review:{int(limit)}",
+            lambda: _build_runner_review_payload(limit),
+            fresh_s=240,
+            stale_s=600,
+            wait_timeout_s=7,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=504, detail=str(exc))
+
+
+@router.post("/runner-review/decision")
+async def home_runner_review_decision(
+    body: dict,
+    _: str = Depends(get_current_user),
+):
+    import asyncio as _aio
+
+    decision = str(body.get("decision") or "").strip().upper()
+    valid = {"WATCH", "PASS", "MANUAL_BUY", "TOO_LATE"}
+    if decision not in valid:
+        raise HTTPException(status_code=422, detail=f"decision must be one of {sorted(valid)}")
+    mint = str(body.get("mint") or "").strip()
+    if not mint:
+        raise HTTPException(status_code=422, detail="mint is required")
+
+    def _run() -> dict:
+        from utils.runner_review import record_runner_review_decision  # type: ignore
+
+        return record_runner_review_decision(dict(body))
+
+    try:
+        return await _aio.to_thread(_run)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/runner-review/outcomes")
+async def home_runner_review_outcomes(
+    _: str = Depends(get_current_user),
+    limit: int = 100,
+):
+    import asyncio as _aio
+
+    def _run() -> dict:
+        from utils.runner_review import build_runner_review_outcome_summary  # type: ignore
+
+        return build_runner_review_outcome_summary(limit=limit)
+
+    try:
+        return await _aio.to_thread(_run)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/runner-review/tracker")
+async def home_runner_review_tracker(
+    _: str = Depends(get_current_user),
+    limit: int = 50,
+):
+    import asyncio as _aio
+
+    def _run() -> dict:
+        from utils.runner_review import build_runner_trade_tracker  # type: ignore
+
+        return build_runner_trade_tracker(limit=limit)
+
+    try:
+        return await _aio.to_thread(_run)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/runner-review/follow-ups")
+async def home_runner_review_followups(
+    _: str = Depends(get_current_user),
+    limit: int = 50,
+):
+    import asyncio as _aio
+
+    def _run() -> dict:
+        from utils.runner_review import build_runner_follow_up_queue  # type: ignore
+
+        return build_runner_follow_up_queue(limit=limit)
+
+    try:
+        return await _aio.to_thread(_run)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post("/runner-review/evaluate")
+async def home_runner_review_evaluate(_: str = Depends(get_current_user)):
+    import asyncio as _aio
+
+    def _run() -> dict:
+        from utils.runner_review import evaluate_runner_review_outcomes, build_runner_review_outcome_summary  # type: ignore
+
+        return {
+            "evaluation": evaluate_runner_review_outcomes(limit=100),
+            "outcomes": build_runner_review_outcome_summary(limit=100),
+        }
+
+    try:
+        return await _aio.to_thread(_run)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+def _build_memecoin_research_payload(limit: int = 12) -> dict:
+    from utils.memecoin_research import build_memecoin_research_payload  # type: ignore
+
+    return build_memecoin_research_payload(limit=limit)
+
+
+@router.get("/memecoin-research")
+async def home_memecoin_research(
+    _: str = Depends(get_current_user),
+    limit: int = 12,
+):
+    try:
+        return await snapshot_or_build(
+            f"home:memecoin-research:{int(limit)}",
+            lambda: _build_memecoin_research_payload(limit),
+            fresh_s=240,
+            stale_s=600,
+            wait_timeout_s=8,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=504, detail=str(exc))
+
+
+@router.get("/memecoin-catalysts")
+async def home_memecoin_catalysts(
+    _: str = Depends(get_current_user),
+    limit: int = 20,
+):
+    import asyncio as _aio
+
+    def _run() -> dict:
+        from utils.memecoin_research import build_memecoin_catalyst_payload  # type: ignore
+
+        return build_memecoin_catalyst_payload(limit=limit)
+
+    try:
+        return await _aio.to_thread(_run)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post("/memecoin-research/decision")
+async def home_memecoin_research_decision(
+    body: dict,
+    _: str = Depends(get_current_user),
+):
+    import asyncio as _aio
+
+    decision = str(body.get("decision") or "").strip().upper()
+    valid = {"BUY", "WATCH", "SKIP", "TOO_LATE", "BAD_CA", "NEEDS_MORE_PROOF"}
+    if decision not in valid:
+        raise HTTPException(status_code=422, detail=f"decision must be one of {sorted(valid)}")
+    if not str(body.get("mint") or "").strip():
+        raise HTTPException(status_code=422, detail="mint is required")
+
+    def _run() -> dict:
+        from utils.memecoin_research import record_memecoin_manual_review_decision  # type: ignore
+
+        return record_memecoin_manual_review_decision(dict(body))
+
+    try:
+        return await _aio.to_thread(_run)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/authority/decisions")
+async def home_authority_decisions(
+    limit: int = 50,
+    _: str = Depends(get_current_user),
+):
+    """
+    Roadmap 3 — Authority observability endpoint.
+
+    Returns the most recent authority resolution events from all engine executors,
+    plus a summary breakdown by verdict.  Supports observe-before-enforce review.
+
+    Query params:
+      limit  — max rows to return (1–500, default 50)
+    """
+    import asyncio as _aio
+
+    def _build():
+        try:
+            _utils_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))), "utils"
+            )
+            if _utils_path not in sys.path:
+                sys.path.insert(0, _utils_path)
+            from db import get_recent_authority_decisions  # type: ignore[import]
+        except Exception as exc:
+            raise RuntimeError(f"authority db import failed: {exc}")
+
+        rows = get_recent_authority_decisions(limit=max(1, min(int(limit), 500)))
+
+        # Summary counts by verdict
+        counts: dict[str, int] = {"ALLOW": 0, "CONDITIONAL": 0, "BLOCK": 0}
+        block_reasons: dict[str, int] = {}
+        for r in rows:
+            v = r.get("verdict", "ALLOW")
+            counts[v] = counts.get(v, 0) + 1
+            if v == "BLOCK":
+                for part in (r.get("reasons") or "").split(";"):
+                    key = part.strip().split(" — ")[0].strip()
+                    if key:
+                        block_reasons[key] = block_reasons.get(key, 0) + 1
+
+        # Snapshot freshness from kv_store
+        from authority import read_snapshot  # type: ignore[import]
+        snap = read_snapshot()
+        snap_age_s = None
+        if snap and snap.get("computed_at"):
+            try:
+                computed_at = datetime.fromisoformat(snap["computed_at"])
+                if computed_at.tzinfo is None:
+                    computed_at = computed_at.replace(tzinfo=timezone.utc)
+                snap_age_s = int((datetime.now(tz=timezone.utc) - computed_at).total_seconds())
+            except Exception:
+                pass
+
+        from authority import build_enforcement_readiness  # type: ignore[import]
+        readiness = build_enforcement_readiness(snap, rows)
+
+        return {
+            "snapshot": {
+                "action_law_state":         snap.get("action_law_state") if snap else None,
+                "highest_permitted_action": snap.get("highest_permitted_action") if snap else None,
+                "fresh_capital_policy":     snap.get("fresh_capital_policy") if snap else None,
+                "policy_state":             snap.get("policy_state") if snap else None,
+                "memecoins_suspension_state": snap.get("memecoins_suspension_state") if snap else None,
+                "spot_suspension_state":    snap.get("spot_suspension_state") if snap else None,
+                "perps_suspension_state":   snap.get("perps_suspension_state") if snap else None,
+                "whale_suspension_state":   snap.get("whale_suspension_state") if snap else None,
+                "snapshot_age_s":           snap_age_s,
+            },
+            "summary": {
+                "total":       len(rows),
+                "by_verdict":  counts,
+                "block_reasons": dict(
+                    sorted(block_reasons.items(), key=lambda x: x[1], reverse=True)
+                ),
+            },
+            "readiness": readiness,
+            "decisions": rows,
+        }
+
+    try:
+        return await _aio.to_thread(_build)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/authority/readiness")
+async def home_authority_readiness(_: str = Depends(get_current_user)):
+    """
+    Roadmap 3 — Enforcement readiness summary.
+
+    Synthesizes from the live authority snapshot + recent decision stream to
+    answer: which action classes are safe to enforce right now, what is blocking
+    full enforcement, and what the recommended phased rollout looks like.
+
+    Returns:
+      enforcement_state          OBSERVE_ONLY | PROTECTIVE_ONLY | PARTIAL_READY
+                                 | DEPLOYMENT_READY | FULLY_READY
+      enforcement_note           Human-readable context line
+      deployment_enforcement_ready  bool
+      management_enforcement_ready  bool
+      protective_enforcement_ready  bool
+      primary_enforcement_blocker   str
+      recommended_rollout           str
+      authority_enforce_active      bool — whether AUTHORITY_ENFORCE=true right now
+      per_action_class              per-action-class readiness table
+      decision_stream               recent decision counts
+      advance_condition             what needs to change for next rank
+    """
+    import asyncio as _aio
+
+    def _build():
+        _utils_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))), "utils"
+        )
+        if _utils_path not in sys.path:
+            sys.path.insert(0, _utils_path)
+        from authority import read_snapshot, build_enforcement_readiness  # type: ignore[import]
+        from db import get_recent_authority_decisions  # type: ignore[import]
+        snap      = read_snapshot()
+        decisions = get_recent_authority_decisions(limit=100)
+        return build_enforcement_readiness(snap, decisions)
+
+    try:
+        return await _aio.to_thread(_build)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/authority/validate")
+async def home_authority_validate(_: str = Depends(get_current_user)):
+    """
+    Roadmap 3 — Rank transition validation harness.
+
+    Runs synthetic snapshots (rank 0–4) through the authority evaluation logic
+    and asserts expected verdicts.  Does NOT read or modify the live DB snapshot.
+    Does NOT change enforcement state.
+
+    Returns:
+      validation        'rank_transition_harness'
+      pass              int — assertions that matched expected verdict
+      fail              int — assertions that did not match
+      total_assertions  int
+      all_passed        bool
+      scenarios         list of per-scenario results with per-action verdicts,
+                        reasons, expected value, and pass/fail flag
+    """
+    import asyncio as _aio
+
+    def _run():
+        _utils_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))), "utils"
+        )
+        if _utils_path not in sys.path:
+            sys.path.insert(0, _utils_path)
+        from authority import validate_rank_transitions, validate_outcome_gates  # type: ignore[import]
+        r3 = validate_rank_transitions()
+        p4 = validate_outcome_gates()
+        return {
+            "rank_transitions": r3,
+            "outcome_gates":    p4,
+            "all_passed":       r3["all_passed"] and p4["all_passed"],
+            "total_pass":       r3["pass"] + p4["pass"],
+            "total_fail":       r3["fail"] + p4["fail"],
+            "total_assertions": r3["total_assertions"] + p4["total_assertions"],
+        }
+
+    try:
+        return await _aio.to_thread(_run)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/outcome-attribution")
+async def home_outcome_attribution(
+    lookback_days: int = 30,
+    _: str = Depends(get_current_user),
+):
+    """
+    Phase 4, Step 1 — Outcome attribution layer.
+
+    Aggregates per-lane outcome performance from existing outcome tables:
+      perp_outcomes, perp_positions, alert_outcomes, memecoin_signal_outcomes.
+
+    Returns per-lane win rates, avg returns, sample counts, and a
+    sufficient flag (True when n >= min_n).
+    """
+    import asyncio as _aio
+
+    def _run():
+        _utils_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))), "utils"
+        )
+        if _utils_path not in sys.path:
+            sys.path.insert(0, _utils_path)
+        from outcome_attribution import build_outcome_attribution  # type: ignore[import]
+        return build_outcome_attribution(lookback_days=lookback_days)
+
+    try:
+        return await _aio.to_thread(_run)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/execution-intents")
+async def home_execution_intents(
+    limit: int = 50,
+    _: str = Depends(get_current_user),
+):
+    """
+    Phase 5, Step 1 — Execution intent audit log.
+
+    Returns recent execution intents (proposed, observed, or executed),
+    newest first.
+    """
+    import asyncio as _aio
+
+    def _run():
+        _utils_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))), "utils"
+        )
+        if _utils_path not in sys.path:
+            sys.path.insert(0, _utils_path)
+        from db import get_recent_execution_intents  # type: ignore[import]
+        return {"intents": get_recent_execution_intents(limit=limit)}
+
+    try:
+        return await _aio.to_thread(_run)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ── Phase 6 Step 2: Automation status endpoint ────────────────────────────────
+
+@router.get("/automation/status")
+async def home_automation_status(_: str = Depends(get_current_user)):
+    """
+    Phase 6 — Operator-facing automation guardrail status.
+
+    Returns global kill switch state, per-monitor gate states,
+    daily cap usage, and recent guardrail blocks.
+    """
+    import asyncio as _aio
+
+    def _run():
+        _utils_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))), "utils"
+        )
+        if _utils_path not in sys.path:
+            sys.path.insert(0, _utils_path)
+        from execution_pipeline import build_automation_status  # type: ignore[import]
+        return build_automation_status()
+
+    try:
+        return await _aio.to_thread(_run)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ── Best Action Now — Cross-Arm Decision Engine ───────────────────────────────
+
+def _build_best_action() -> dict:
+    """
+    Synthesize signals from all three arms into a single ranked recommendation.
+
+    Scoring (0–100 conviction per arm):
+      MEMECOINS: scanner_score × route_mult × reinf_mult × profit_room_mult × lane_mult × blocker_penalty
+      SPOT:      rank_score×100 × posture_mult × cooldown_mult
+      PERPS:     regime_base × capacity_mult × risk_mode_mult × liq_mult
+
+    Winner = highest conviction above 55 threshold.
+    When SYSTEM_PRIMARY_FOCUS is MEMECOINS_SPOT, perps remain visible as
+    background context but cannot take the Home headline.
+    DO_NOTHING when no arm clears threshold.
+    """
+    import sqlite3 as _sqlite3
+    from datetime import datetime, timezone
+
+    generated_at = datetime.now(timezone.utc).isoformat()
+    focus_mode = os.getenv("SYSTEM_PRIMARY_FOCUS", "MEMECOINS_SPOT").strip().upper()
+    memecoin_spot_focus = focus_mode in ("MEMECOINS_SPOT", "MEMECOINS+SPOT", "MEMECOINS,SPOT")
+    candidates: list[dict] = []
+
+    # ── 1. MEMECOINS arm ──────────────────────────────────────────────────────
+    try:
+        root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+        db_path = os.path.join(root, "data_storage", "engine.db")
+        conn = _sqlite3.connect(db_path)
+        conn.row_factory = _sqlite3.Row
+
+        # Read lane authority from kv_store
+        lane_auth_row = conn.execute(
+            "SELECT value FROM kv_store WHERE key='v3_lane_state'"
+        ).fetchone()
+        lane_auth = "BLOCKED"
+        if lane_auth_row:
+            try:
+                ls = json.loads(lane_auth_row[0])
+                lane_auth = str(ls.get("deployment_authority") or "BLOCKED").upper()
+            except Exception:
+                pass
+
+        best_meme: dict | None = None
+        best_meme_conviction = 0.0
+
+        # Try richer data from v3 queue cache first
+        v3q_row = conn.execute(
+            "SELECT value FROM kv_store WHERE key='v3_queue_cache'"
+        ).fetchone()
+        if v3q_row:
+            try:
+                v3q = json.loads(v3q_row[0])
+                groups = v3q.get("groups", {})
+                for stage_key in ("proof_ready", "reinforced_pending", "scanner_pending"):
+                    stage_cands = groups.get(stage_key, [])
+                    for c in stage_cands:
+                        sc     = float(c.get("scanner_score") or 0)
+                        proof  = c.get("proof") or {}
+                        reinf  = c.get("reinforcement") or {}
+                        safety = c.get("safety") or {}
+                        profit = c.get("profit_room") or {}
+
+                        if safety.get("rug_label") == "WARN":
+                            continue
+
+                        route  = str(proof.get("route") or "NORMAL").upper()
+                        rlevel = str(reinf.get("level") or "NONE").upper()
+                        pr_label = str(profit.get("label") or "").upper()
+                        r4h    = c.get("return_4h_pct")
+
+                        route_mult = {"NORMAL": 1.0, "RELAXED": 0.75, "RESEARCH_ONLY": 0.4}.get(route, 0.6)
+                        r_mult = {"STRONG": 1.0, "MODERATE": 0.85, "LIGHT": 0.65, "NONE": 0.45}.get(rlevel, 0.45)
+                        profit_room_mult = {
+                            "EARLY": 1.0,
+                            "WORKABLE": 0.92,
+                            "STRETCHED": 0.68,
+                            "TOO_LATE": 0.35,
+                        }.get(pr_label, 1.0)
+
+                        hard_blockers = [b for b in proof.get("hard_blockers", [])
+                                         if b.get("key") != "deployment_blocked"]
+                        blocker_penalty = 0.80 ** len(hard_blockers)
+
+                        if lane_auth in ("SUPPORTED", "FORCEFUL"):
+                            l_mult = 1.0
+                            m_only = False
+                        else:
+                            l_mult = 0.5
+                            m_only = True
+
+                        conviction = min(sc * route_mult * r_mult * profit_room_mult * l_mult * blocker_penalty, 100.0)
+                        if m_only:
+                            conviction = min(conviction, 65.0)
+
+                        if conviction > best_meme_conviction:
+                            best_meme_conviction = conviction
+                            r4h_str = f"+{r4h:.1f}%" if r4h and r4h > 0 else (f"{r4h:.1f}%" if r4h else "")
+                            reason_parts = [f"sc={sc:.0f}", f"{rlevel.lower()} reinf", f"route={route}"]
+                            if pr_label:
+                                reason_parts.append(f"room={pr_label.lower()}")
+                            if r4h_str:
+                                reason_parts.append(r4h_str)
+                            if m_only:
+                                reason_parts.append("lane BLOCKED")
+                            blocker_labels = [b.get("label", b.get("key", "?")) for b in hard_blockers]
+                            best_meme = {
+                                "arm": "MEMECOINS",
+                                "asset": str(c.get("symbol", "")),
+                                "token_address": c.get("mint") or c.get("token_address"),
+                                "action": "BUY",
+                                "conviction": round(conviction),
+                                "reason": ", ".join(reason_parts),
+                                "manual_only": m_only,
+                                "blockers": (["Lane authority blocked"] if m_only else []) + blocker_labels,
+                            }
+            except Exception as ve:
+                log.debug("best_action v3 queue parse: %s", ve)
+
+        # Fallback: raw signal outcomes table
+        if not best_meme:
+            meme_rows = conn.execute("""
+                SELECT symbol, mint, score, COALESCE(scanner_regime, 'NORMAL') AS scanner_regime,
+                       return_4h_pct
+                FROM memecoin_signal_outcomes
+                WHERE status = 'PENDING' AND score >= 60
+                  AND (rug_label = 'GOOD' OR rug_label IS NULL)
+                ORDER BY score DESC LIMIT 5
+            """).fetchall()
+            for row in meme_rows:
+                sc     = float(row["score"] or 0)
+                regime = str(row["scanner_regime"] or "NORMAL").upper()
+                r4h    = row["return_4h_pct"]
+                route_mult = 1.0 if regime == "NORMAL" else (0.75 if "RELAXED" in regime else 0.4)
+                reinf_mult = 0.65
+                l_mult = 1.0 if lane_auth in ("SUPPORTED", "FORCEFUL") else 0.5
+                m_only = lane_auth not in ("SUPPORTED", "FORCEFUL")
+                conviction = min(sc * route_mult * reinf_mult * l_mult, 100.0)
+                if m_only:
+                    conviction = min(conviction, 65.0)
+                if conviction > best_meme_conviction:
+                    best_meme_conviction = conviction
+                    r4h_str = f"+{r4h:.1f}%" if r4h and r4h > 0 else (f"{r4h:.1f}%" if r4h else "")
+                    reason_parts = [f"sc={sc:.0f}", f"route={regime}"]
+                    if r4h_str:
+                        reason_parts.append(r4h_str)
+                    if m_only:
+                        reason_parts.append("lane BLOCKED")
+                    best_meme = {
+                        "arm": "MEMECOINS",
+                        "asset": str(row["symbol"]),
+                        "token_address": row["mint"],
+                        "action": "BUY",
+                        "conviction": round(conviction),
+                        "reason": ", ".join(reason_parts),
+                        "manual_only": m_only,
+                        "blockers": ["Lane authority blocked"] if m_only else [],
+                    }
+
+        conn.close()
+        if best_meme:
+            candidates.append(best_meme)
+
+    except Exception as me:
+        log.debug("best_action memecoins arm: %s", me)
+
+    # ── 2. SPOT arm ───────────────────────────────────────────────────────────
+    try:
+        snap   = _spot_posture_snapshot()
+        by_sym = snap.get("by_symbol", {})
+        best_spot: dict | None = None
+        best_spot_conviction = 0.0
+
+        posture_mult_map = {
+            "PRIME_ENTRY": 1.0, "ACCUMULATE": 0.80,
+            "HOLD": 0.40, "POOR_CONDITIONS": 0.10,
+            "INSUFFICIENT_DATA": 0.30, "F&G_FEED_DOWN": 0.20,
+        }
+
+        for sym, sig in by_sym.items():
+            posture = str(sig.get("posture") or "HOLD").upper()
+            if posture not in ("PRIME_ENTRY", "ACCUMULATE"):
+                continue
+            gap   = float(sig.get("gap") or 0)
+            score = float(sig.get("score") or 0)
+            fg    = sig.get("fg")
+
+            gap_weight  = max(0.0, min(1.0, gap / 100.0)) if gap > 0 else 0.0
+            fear_weight = 1.0 if (fg is not None and fg < 25) else (0.7 if (fg is not None and fg <= 40) else 0.35)
+            rank_score  = gap_weight * 0.45 + (score / 10.0) * 0.35 + fear_weight * 0.20
+
+            p_mult     = posture_mult_map.get(posture, 0.3)
+            conviction = min(rank_score * 100.0 * p_mult, 100.0)
+
+            if conviction > best_spot_conviction:
+                best_spot_conviction = conviction
+                reason_parts = [posture]
+                if gap > 0:
+                    reason_parts.append(f"{gap:.0f}% below target")
+                if fg is not None:
+                    reason_parts.append(f"F&G {fg}")
+                if score > 0:
+                    reason_parts.append(f"signal {score:.0f}")
+                best_spot = {
+                    "arm": "SPOT",
+                    "asset": sym,
+                    "token_address": sig.get("token_address"),
+                    "action": "DCA",
+                    "conviction": round(conviction),
+                    "reason": ", ".join(reason_parts),
+                    "manual_only": False,
+                    "blockers": [],
+                }
+
+        if best_spot:
+            candidates.append(best_spot)
+
+    except Exception as se:
+        log.debug("best_action spot arm: %s", se)
+
+    # ── 3. PERPS arm ─────────────────────────────────────────────────────────
+    try:
+        root    = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+        db_path = os.path.join(root, "data_storage", "engine.db")
+        conn2   = _sqlite3.connect(db_path)
+        conn2.row_factory = _sqlite3.Row
+
+        reg_row = conn2.execute(
+            "SELECT value FROM kv_store WHERE key='last_regime_label'"
+        ).fetchone()
+        regime = str(reg_row[0] if reg_row else "NEUTRAL").strip().upper()
+
+        try:
+            utils_path = os.path.join(root, "utils")
+            if utils_path not in sys.path:
+                sys.path.insert(0, utils_path)
+            from utils.db import get_risk_mode  # type: ignore[import]
+            risk_mode = str((get_risk_mode() or {}).get("mode") or "NORMAL").upper()
+        except Exception:
+            risk_mode = "NORMAL"
+
+        try:
+            from utils.perp_executor import get_perp_status  # type: ignore[import]
+            ps    = get_perp_status() or {}
+            n_pos = int(ps.get("open_positions") or 0)
+        except Exception:
+            n_pos = 0
+        max_pos = int(os.getenv("MAX_PERP_POSITIONS", "3"))
+
+        worst_liq: float | None = None
+        try:
+            _, _, worst_liq = _fetch_jupiter_summary()
+        except Exception:
+            pass
+
+        conn2.close()
+
+        if regime in ("BULL", "RISK_ON"):
+            action, regime_base = "LONG", 75.0
+        elif regime in ("BEAR", "RISK_OFF"):
+            action, regime_base = "SHORT", 60.0
+        else:
+            action = None
+
+        if action:
+            cap_mult  = 1.0 if n_pos < max_pos else 0.15
+            risk_mult = {"NORMAL": 1.0, "CAUTIOUS": 0.75, "DEFENSIVE": 0.40}.get(risk_mode, 1.0)
+            liq_mult  = 1.0 if (worst_liq is None or worst_liq >= 30.0) else (0.5 if worst_liq >= 15.0 else 0.1)
+            conviction = min(regime_base * cap_mult * risk_mult * liq_mult, 100.0)
+            perps_background_only = bool(memecoin_spot_focus)
+            if perps_background_only:
+                conviction = min(conviction, 35.0)
+
+            perp_blockers: list[str] = []
+            if n_pos >= max_pos:
+                perp_blockers.append(f"Positions at capacity ({n_pos}/{max_pos})")
+            if worst_liq is not None and worst_liq < 15.0:
+                perp_blockers.append(f"Liq warning {worst_liq:.1f}%")
+            if risk_mode != "NORMAL":
+                perp_blockers.append(f"Risk mode {risk_mode}")
+            if perps_background_only:
+                perp_blockers.append("Perps paused by memecoin/spot focus")
+
+            candidates.append({
+                "arm": "PERPS",
+                "asset": "SOL",
+                "action": action,
+                "conviction": round(conviction),
+                "reason": f"{regime} regime, {n_pos}/{max_pos} positions, risk={risk_mode}"
+                          + ("; background only" if perps_background_only else ""),
+                "manual_only": perps_background_only,
+                "blockers": perp_blockers,
+            })
+
+    except Exception as pe:
+        log.debug("best_action perps arm: %s", pe)
+
+    # ── 4. Pick winner ────────────────────────────────────────────────────────
+    THRESHOLD = 55
+    candidates.sort(key=lambda c: c["conviction"], reverse=True)
+    headline_candidates = [
+        c for c in candidates
+        if not (memecoin_spot_focus and c.get("arm") == "PERPS")
+    ]
+    if not headline_candidates and not memecoin_spot_focus:
+        headline_candidates = candidates
+
+    def _display_candidates(items: list[dict]) -> list[dict]:
+        if not memecoin_spot_focus:
+            return items
+        focused = [c for c in items if c.get("arm") in ("MEMECOINS", "SPOT")]
+        return focused
+
+    winner = None
+    # Prefer automated (non-manual) winner first
+    for c in headline_candidates:
+        if c["conviction"] >= THRESHOLD and not c.get("manual_only"):
+            winner = c
+            break
+    # Fall back to manual-only if it clears threshold
+    if winner is None:
+        for c in headline_candidates:
+            if c["conviction"] >= THRESHOLD:
+                winner = c
+                break
+
+    if winner:
+        runners_up = _display_candidates([c for c in candidates if c is not winner])
+        return {
+            "generated_at":      generated_at,
+            "focus_mode":        focus_mode,
+            "verdict":           winner["action"],
+            "arm":               winner["arm"],
+            "asset":             winner["asset"],
+            "token_address":     winner.get("token_address"),
+            "action":            winner["action"],
+            "conviction":        winner["conviction"],
+            "reason":            winner["reason"],
+            "execution_blocked": winner.get("manual_only", False),
+            "candidates":        runners_up[:3],
+        }
+    else:
+        no_signal = all(c["conviction"] < THRESHOLD for c in candidates)
+        reason = ("No arm has a qualifying signal above threshold."
+                  if no_signal else
+                  "Best available signals are manual-only or below confidence threshold.")
+        return {
+            "generated_at":      generated_at,
+            "focus_mode":        focus_mode,
+            "verdict":           "DO_NOTHING",
+            "arm":               None,
+            "asset":             None,
+            "token_address":     None,
+            "action":            None,
+            "conviction":        0,
+            "reason":            reason,
+            "execution_blocked": False,
+            "candidates":        _display_candidates(candidates)[:3],
+        }
+
+
+@router.get("/best-action")
+async def home_best_action(_: str = Depends(get_current_user)):
+    """
+    Cross-arm decision engine — returns the single best available action
+    across Memecoins, Spot, and Perps, or DO_NOTHING when no arm qualifies.
+    Refreshed every 30 s by the frontend.
+    """
+    try:
+        return await snapshot_or_build(
+            "home:best-action",
+            _build_best_action,
+            fresh_s=20,
+            stale_s=180,
+            wait_timeout_s=6,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=504, detail=str(exc))

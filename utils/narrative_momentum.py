@@ -30,6 +30,11 @@ def _get_conn():
     return get_conn()
 
 
+def _with_db_retry(fn):
+    from utils.db import with_db_retry  # type: ignore
+    return with_db_retry(fn, retries=5, base_sleep_s=0.35)
+
+
 # ── Fetchers ──────────────────────────────────────────────────────────────────
 
 def fetch_coingecko_trending() -> list:
@@ -64,17 +69,9 @@ def fetch_coingecko_trending() -> list:
 def fetch_dexscreener_trending_solana() -> list:
     """Fetch DexScreener top-boosted Solana tokens. Returns list of {symbol, mint, boosts, source}."""
     try:
-        r = requests.get(
-            DEXSCREENER_BOOSTS_URL,
-            timeout=REQUEST_TIMEOUT,
-            headers={"User-Agent": "memecoin-engine/1.0"},
-        )
-        if r.status_code != 200:
-            log.warning("DexScreener boosts HTTP %s", r.status_code)
-            return []
-        items = r.json()
-        if not isinstance(items, list):
-            return []
+        from data.dexscreener import fetch_token_boosts  # type: ignore
+
+        items = fetch_token_boosts("top", reason="narrative_boosts_top_429")
         result = []
         for item in items:
             if item.get("chainId") != "solana":
@@ -121,14 +118,17 @@ def update_narrative_momentum() -> dict:
     }
 
     try:
-        with _get_conn() as conn:
-            conn.execute(
-                "INSERT INTO kv_store (key, value) VALUES (?, ?) "
-                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (KV_KEY, json.dumps(payload)),
-            )
+        def _write() -> None:
+            with _get_conn() as conn:
+                conn.execute(
+                    "INSERT INTO kv_store (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (KV_KEY, json.dumps(payload)),
+                )
+
+        _with_db_retry(_write)
     except Exception as exc:
-        log.warning("narrative_momentum kv_store write error: %s", exc)
+        log.debug("narrative_momentum kv_store write skipped: %s", exc)
 
     log.info(
         "Narrative updated: CoinGecko=%d trending, DexScreener=%d Solana boosted",
@@ -136,7 +136,6 @@ def update_narrative_momentum() -> dict:
         len(dex_tokens),
     )
     return payload
-
 
 # ── Lookups ───────────────────────────────────────────────────────────────────
 

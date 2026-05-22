@@ -12,8 +12,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect, status
@@ -54,27 +55,62 @@ from db_read import (
 )
 from dex_proxy import get_watchlist_cards_async
 from jupiter_proxy import get_perps_position, get_sol_price, get_dca_summary, add_dca_entry_proxy, clear_dca_entries
-from news_feed import fetch_news
 from ws_manager import manager, signal_poller
 from outcome_tracker import outcome_tracker_loop
 
 # ── Router modules (Patch 126 refactor) ──────────────────────────────────────
-from routers.memecoins   import router as _router_memecoins
+from routers.memecoins   import router as _router_memecoins, router_v3 as _router_memecoins_v3
 from routers.wallet      import router as _router_wallet
 from routers.tiers       import router as _router_tiers
 from routers.portfolio   import router as _router_portfolio
 from routers.spot        import router as _router_spot        # Patch 128
 from routers.home        import router as _router_home        # Patch 140
 from routers.whale_watch import router as _router_whale_watch # Patch 140
-from routers.confluence  import router as _router_confluence  # Patch 143
 from routers.funding     import router as _router_funding     # Patch 144
 from routers.wallets     import router as _router_wallets     # Patch 145
+from routers.confluence  import router as _router_confluence  # Patch 247
+from routers.system_audit import router as _router_system_audit
 
 log = logging.getLogger("dashboard")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
 # Patch 120 — cycle counter for data integrity cadence (every 5 min = every 5th 60s cycle)
 _monitor_cycle: int = 0
+_dashboard_snapshot_refresh_started: dict[str, float] = {}
+
+
+def _env_bool(name: str, default: bool = True) -> bool:
+    return os.getenv(name, "true" if default else "false").lower() in ("1", "true", "yes")
+
+
+DASHBOARD_PERP_MONITOR_LOOP_ENABLED = _env_bool("DASHBOARD_PERP_MONITOR_LOOP_ENABLED", False)
+DASHBOARD_PERP_SIGNAL_SCAN_LOOP_ENABLED = _env_bool("DASHBOARD_PERP_SIGNAL_SCAN_LOOP_ENABLED", False)
+DASHBOARD_SCALP_MONITOR_LOOP_ENABLED = _env_bool("DASHBOARD_SCALP_MONITOR_LOOP_ENABLED", False)
+DASHBOARD_SCALP_SIGNAL_SCAN_LOOP_ENABLED = _env_bool("DASHBOARD_SCALP_SIGNAL_SCAN_LOOP_ENABLED", False)
+DASHBOARD_OUTCOME_TRACKER_LOOP_ENABLED = _env_bool("DASHBOARD_OUTCOME_TRACKER_LOOP_ENABLED", False)
+DASHBOARD_MEMECOIN_SCAN_LOOP_ENABLED = _env_bool("DASHBOARD_MEMECOIN_SCAN_LOOP_ENABLED", False)
+DASHBOARD_SPOT_MONITOR_LOOP_ENABLED = _env_bool("DASHBOARD_SPOT_MONITOR_LOOP_ENABLED", False)
+DASHBOARD_SPOT_SIGNAL_SCAN_LOOP_ENABLED = _env_bool("DASHBOARD_SPOT_SIGNAL_SCAN_LOOP_ENABLED", False)
+DASHBOARD_RESEARCH_LOOP_ENABLED = _env_bool("DASHBOARD_RESEARCH_LOOP_ENABLED", False)
+DASHBOARD_MEMECOIN_DISCOVERY_LOOP_ENABLED = _env_bool("DASHBOARD_MEMECOIN_DISCOVERY_LOOP_ENABLED", False)
+DASHBOARD_AUTHORITY_REFRESH_LOOP_ENABLED = _env_bool("DASHBOARD_AUTHORITY_REFRESH_LOOP_ENABLED", False)
+DASHBOARD_WHALE_WATCH_LOOP_ENABLED = _env_bool("DASHBOARD_WHALE_WATCH_LOOP_ENABLED", False)
+DASHBOARD_STARTUP_DB_MAINTENANCE_ENABLED = _env_bool("DASHBOARD_STARTUP_DB_MAINTENANCE_ENABLED", False)
+DASHBOARD_SNAPSHOT_BACKGROUND_REFRESH_ENABLED = _env_bool("DASHBOARD_SNAPSHOT_BACKGROUND_REFRESH_ENABLED", False)
+
+
+async def _startup_db_task(label: str, fn, *, retries: int = 4, sleep_s: float = 1.5):
+    """Run startup DB maintenance with bounded lock retry."""
+    from utils.db import is_database_locked_error  # type: ignore
+
+    for attempt in range(max(1, int(retries))):
+        try:
+            return await asyncio.to_thread(fn)
+        except Exception as exc:
+            if not is_database_locked_error(exc) or attempt >= retries - 1:
+                raise
+            log.info("%s waiting for DB writer lock (%s/%s)", label, attempt + 1, retries)
+            await asyncio.sleep(max(0.25, sleep_s) * (attempt + 1))
 
 
 # ---------------------------------------------------------------------------
@@ -128,19 +164,19 @@ async def _perp_monitor_loop():
                 await asyncio.to_thread(_ww_outcome)
             except Exception as _wwe:
                 log.debug("whale_watch_outcome_step error: %s", _wwe)
-        if _monitor_cycle % 5 == 0:  # Patch 143 — confluence engine every 5 min
+        if _monitor_cycle % 5 == 0:  # Confluence engine every 5 min — same cadence as its source lanes
             try:
-                from utils.confluence_engine import confluence_step as _cf_step  # type: ignore
-                await asyncio.to_thread(_cf_step)
-            except Exception as _cfe:
-                log.debug("confluence_step error: %s", _cfe)
+                from utils.confluence_engine import confluence_step as _conf_step  # type: ignore
+                await asyncio.to_thread(_conf_step)
+            except Exception as _ce:
+                log.debug("confluence_step error: %s", _ce)
         if _monitor_cycle % 30 == 0 or _monitor_cycle == 1:  # Patch 144 — funding rates (30 min + startup)
             try:
                 from utils.funding_monitor import funding_step as _fund_step  # type: ignore
                 await asyncio.to_thread(_fund_step)
             except Exception as _fde:
                 log.debug("funding_step error: %s", _fde)
-        if _monitor_cycle % 5 == 0:  # Patch 145 — smart wallet tracker every 5 min
+        if _monitor_cycle % 5 == 0 and os.getenv("SMART_WALLET_ENABLED", "false").lower() == "true":  # Patch 233 — disabled by default (avg -39.4% returns)
             try:
                 from utils.smart_wallet_tracker import smart_wallet_step as _swt_step  # type: ignore
                 await asyncio.to_thread(_swt_step)
@@ -177,13 +213,63 @@ async def _memecoin_scan_loop():
         try:
             from utils.memecoin_scanner import scan_trending_solana, cache_signals  # type: ignore
             from utils import orchestrator  # type: ignore
+            from utils.lifecycle_engine import compute_lifecycle  # type: ignore  # Patch 240
+            from utils.lifecycle_validation import (               # Patch 243
+                snapshot_lifecycle_lane, link_lifecycle_outcomes)  # type: ignore
             signals = await asyncio.to_thread(scan_trending_solana)
             await asyncio.to_thread(cache_signals, signals)
+            await asyncio.to_thread(compute_lifecycle)          # Patch 240
+            await asyncio.to_thread(snapshot_lifecycle_lane)    # Patch 243
+            await asyncio.to_thread(link_lifecycle_outcomes)    # Patch 243
             orchestrator.heartbeat("memecoin_scan")
             log.debug("memecoin_scan: cached %d signals", len(signals))
         except Exception as _e:
             log.debug("memecoin_scan_loop error: %s", _e)
         await asyncio.sleep(300)  # every 5 min
+
+
+async def _memecoin_discovery_loop():
+    """Patch 249 — Broad Solana memecoin discovery ingress, every 10 min.
+
+    Calls ingest_discovery_candidates() which fetches DexScreener /pairs/solana
+    (broader than trending/boost/profile feeds), applies a structural ingress gate,
+    and writes qualifying mints to MSO with status='WATCH' and source='DISCOVERY'.
+    The lifecycle engine picks them up on its next compute cycle.
+    """
+    import sys
+    root = _engine_root()
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    await asyncio.sleep(90)  # startup delay — after main scan first run
+    while True:
+        try:
+            from utils.memecoin_scanner import ingest_discovery_candidates  # type: ignore
+            n = await asyncio.to_thread(ingest_discovery_candidates)
+            log.debug("[DISCOVERY] loop: %d candidates ingested", n)
+        except Exception as _e:
+            log.warning("[DISCOVERY] loop error: %s", _e)
+        await asyncio.sleep(600)  # 10 min
+
+
+async def _authority_snapshot_refresh_loop():
+    """Roadmap 3 — keep the authority snapshot fresh even when nobody views the dashboard.
+
+    Calls refresh_authority_snapshot() in home.py every 120s.
+    The snapshot drives the engine's authority bridge — if it goes stale (>600s)
+    the engine falls back to ALLOW-with-warning, effectively disabling enforcement.
+    """
+    await asyncio.sleep(30)  # let other startup tasks settle
+    while True:
+        try:
+            from routers.home import refresh_authority_snapshot  # type: ignore[import]
+            ok = await asyncio.to_thread(refresh_authority_snapshot)
+            if ok:
+                log.debug("[AUTHORITY] snapshot refreshed")
+            else:
+                log.warning("[AUTHORITY] snapshot refresh returned False")
+        except Exception as exc:
+            log.warning("[AUTHORITY] snapshot refresh error: %s", exc)
+        await asyncio.sleep(120)
 
 
 async def _perp_signal_scan_loop():
@@ -562,24 +648,239 @@ async def _whale_watch_loop():
         log.warning("whale_watch_loop fatal: %s", _wwe)
 
 
+async def _dashboard_snapshot_prewarm_once() -> None:
+    """Warm high-traffic dashboard snapshots after startup without blocking API boot."""
+    await asyncio.sleep(1.5)
+    try:
+        from snapshot_cache import load_snapshot, store_snapshot  # type: ignore
+        from routers import home as home_router  # type: ignore
+
+        def _action_board_builder() -> dict:
+            snap = load_snapshot("home:action-board:5")
+            base = snap.get("data") if isinstance(snap, dict) else None
+            return home_router._build_action_board_fast_payload(5, base if isinstance(base, dict) else None)
+
+        jobs = [
+            ("home:summary", home_router._build_home_summary_payload),
+            ("home:modes", home_router._build_runtime_modes_payload),
+            ("home:posture", lambda: {}),
+            ("home:action-board:5", _action_board_builder),
+            ("home:memecoin-research:8", lambda: home_router._build_memecoin_research_payload(8)),
+            ("home:runner-review:8", lambda: home_router._build_runner_review_payload(8)),
+            ("home:early-runners:8:24", lambda: home_router._build_early_runner_radar(8, 24)),
+            ("home:conviction-recovery:8", lambda: home_router._build_conviction_recovery(8)),
+        ]
+
+        # The posture builder is scoped inside the endpoint, so use the route's cache
+        # path through a small auth-free internal wrapper equivalent.
+        def _posture_builder() -> dict:
+            mc = home_router._posture_memecoins()
+            perps = home_router._posture_perps()
+            spot = home_router._posture_spot()
+            whale = home_router._posture_whale()
+            heat = home_router._speculation_heat_snapshot()
+            mc, spot = home_router._apply_speculation_heat_to_lane_postures(mc, spot, heat)
+            system_posture, focus = home_router._synthesize_posture(mc, perps, spot, whale)
+            capital = {
+                **home_router._home_portfolio_pressure_context(),
+                **home_router._home_memecoin_allocator_context(),
+            }
+            capital["total_deployed_usd"] = round(
+                float(capital.get("perps_collateral_usd") or 0.0)
+                + float(capital.get("spot_invested_usd") or 0.0),
+                0,
+            )
+            allocator = home_router._build_cross_system_allocator_summary(capital)
+            operating = home_router._build_operating_mode_snapshot(capital, allocator)
+            lane_policy = home_router._build_lane_policy_snapshot(operating, memecoins=mc, perps=perps, spot=spot, whale=whale)
+            lane_authority = home_router._build_lane_authority_summary(operating, memecoins=mc, perps=perps, spot=spot, whale=whale)
+            lane_unlock = home_router._build_lane_unlock_summary(
+                operating, lane_policy, lane_authority, memecoins=mc, perps=perps, spot=spot, whale=whale
+            )
+            stack = home_router._build_home_operating_stack(operating, lane_policy, lane_authority, lane_unlock, allocator, None, None)
+            return {
+                "memecoins": mc,
+                "perps": perps,
+                "spot": spot,
+                "whale": whale,
+                "speculation_heat": heat,
+                "system_posture": system_posture,
+                "focus": focus,
+                "operating_mode_summary": operating,
+                "lane_policy_summary": lane_policy,
+                "lane_authority_summary": lane_authority,
+                "lane_unlock_summary": lane_unlock,
+                **stack,
+                "authority_enforcement": None,
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+        jobs[2] = ("home:posture", _posture_builder)
+
+        for name, builder in jobs:
+            await _dashboard_build_and_store_snapshot(name, builder)
+            await asyncio.sleep(2.0)
+        log.info("Dashboard snapshot prewarm completed for %d surface(s).", len(jobs))
+    except Exception as exc:
+        log.warning("Dashboard snapshot prewarm failed: %s", exc)
+
+
+async def _dashboard_build_and_store_snapshot(name: str, builder) -> bool:
+    """Build/store one dashboard snapshot without stampeding SQLite writers."""
+    try:
+        from snapshot_cache import store_snapshot  # type: ignore
+
+        def _run() -> None:
+            store_snapshot(name, builder(), status="OK")
+
+        await asyncio.to_thread(_run)
+        _dashboard_snapshot_refresh_started[name] = time.monotonic()
+        return True
+    except Exception as exc:
+        log.debug("Dashboard snapshot refresh failed for %s: %s", name, exc)
+        return False
+
+
+async def _dashboard_snapshot_refresh_loop() -> None:
+    """Periodically refresh operator-critical dashboard snapshots.
+
+    Endpoints still serve cached snapshots immediately; this loop prevents key
+    Home/System surfaces from going day-stale when no browser is actively open.
+    """
+    await asyncio.sleep(45)
+    while True:
+        try:
+            from snapshot_cache import load_snapshot  # type: ignore
+            from routers import home as home_router  # type: ignore
+            from routers.system_audit import get_system_audit_data  # type: ignore
+
+            def _action_board_builder() -> dict:
+                snap = load_snapshot("home:action-board:5")
+                base = snap.get("data") if isinstance(snap, dict) else None
+                return home_router._build_action_board_fast_payload(5, base if isinstance(base, dict) else None)
+
+            jobs = [
+                ("home:summary", home_router._build_home_summary_payload, 180),
+                ("home:modes", home_router._build_runtime_modes_payload, 180),
+                ("home:action-board:5", _action_board_builder, 180),
+                ("home:memecoin-research:8", lambda: home_router._build_memecoin_research_payload(8), 300),
+                ("home:runner-review:8", lambda: home_router._build_runner_review_payload(8), 300),
+                ("home:early-runners:8:24", lambda: home_router._build_early_runner_radar(8, 24), 300),
+                ("home:conviction-recovery:8", lambda: home_router._build_conviction_recovery(8), 300),
+                ("system:audit", get_system_audit_data, 1800),
+            ]
+            now = time.monotonic()
+            for name, builder, min_interval_s in jobs:
+                if now - _dashboard_snapshot_refresh_started.get(name, 0.0) < min_interval_s:
+                    continue
+                await _dashboard_build_and_store_snapshot(name, builder)
+                await asyncio.sleep(4.0)
+        except Exception as exc:
+            log.debug("Dashboard snapshot refresh loop failed: %s", exc)
+        await asyncio.sleep(45)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # ── Patch 244: run schema migrations before any background task starts ────
+    # init_db() is idempotent — ALTER TABLE ... ADD COLUMN uses try/except so
+    # columns that already exist are silently skipped. Without this call the
+    # dashboard process runs on the original schema and every queue_alert_outcome()
+    # INSERT (which references lane/source/cycle_phase) fails silently.
+    if DASHBOARD_STARTUP_DB_MAINTENANCE_ENABLED:
+        try:
+            from utils.db import init_db  # type: ignore
+
+            await _startup_db_task("Patch 244 init_db", init_db, retries=1)
+            log.info("Patch 244 — init_db() complete, schema migrations applied.")
+        except Exception as _idb_err:
+            log.warning("Patch 244 — init_db() failed, schema may be stale: %s", _idb_err)
+    else:
+        log.info("Patch 244 — startup DB maintenance skipped by dashboard control-plane policy.")
+
+    # ── Patch 245: expire zombie PENDING outcomes before evaluator starts ─────
+    # Any PENDING row with no 1h eval older than 72h is a zombie — if the
+    # evaluator processes it, it computes returns from a 27-day-old entry price
+    # and labels them as "24h returns", poisoning the learning dataset.
+    # expire_stale_pending_outcomes() is idempotent: already-EXPIRED rows are
+    # skipped. get_pending_alert_outcomes() now uses WHERE status='PENDING' so
+    # EXPIRED rows are never re-evaluated even if this call fails.
+    if DASHBOARD_STARTUP_DB_MAINTENANCE_ENABLED:
+        try:
+            from utils.db import expire_stale_pending_outcomes  # type: ignore
+
+            _expired_n = await _startup_db_task(
+                "Patch 245 expire_stale_pending_outcomes",
+                lambda: expire_stale_pending_outcomes(stale_hours=72),
+                retries=1,
+            )
+            if _expired_n:
+                log.info("Patch 245 — expired %d stale PENDING outcome(s).", _expired_n)
+            else:
+                log.info("Patch 245 — no stale outcomes to expire.")
+        except Exception as _exp_err:
+            log.warning("Patch 245 — expire_stale_pending_outcomes() failed: %s", _exp_err)
+    else:
+        log.info("Patch 245 — stale outcome maintenance skipped by dashboard control-plane policy.")
+
     task_poller        = asyncio.create_task(signal_poller())
-    task_tracker       = asyncio.create_task(outcome_tracker_loop())
-    task_perp_mon      = asyncio.create_task(_perp_monitor_loop())
-    task_perp_scan     = asyncio.create_task(_perp_signal_scan_loop())
-    task_scalp_mon     = asyncio.create_task(_scalp_monitor_loop())
-    task_scalp_scan    = asyncio.create_task(_scalp_signal_scan_loop())
-    task_spot_mon      = asyncio.create_task(_spot_monitor_loop())
-    task_spot_scan     = asyncio.create_task(_spot_signal_scan_loop())
-    task_memecoin_scan = asyncio.create_task(_memecoin_scan_loop())  # Patch 115
-    task_research      = asyncio.create_task(_research_loop())        # Patch 120
-    task_whale_watch   = asyncio.create_task(_whale_watch_loop())     # Patch 139
-    log.info("Dashboard started — perp swing + scalp + spot paper bots running.")
+    task_tracker       = (
+        asyncio.create_task(outcome_tracker_loop()) if DASHBOARD_OUTCOME_TRACKER_LOOP_ENABLED else None
+    )  # Phase 1 runtime demotion
+    task_perp_mon      = (
+        asyncio.create_task(_perp_monitor_loop()) if DASHBOARD_PERP_MONITOR_LOOP_ENABLED else None
+    )  # Phase 1 runtime demotion
+    task_perp_scan     = (
+        asyncio.create_task(_perp_signal_scan_loop()) if DASHBOARD_PERP_SIGNAL_SCAN_LOOP_ENABLED else None
+    )  # Phase 1 runtime demotion
+    task_scalp_mon     = (
+        asyncio.create_task(_scalp_monitor_loop()) if DASHBOARD_SCALP_MONITOR_LOOP_ENABLED else None
+    )  # Phase 1 runtime demotion
+    task_scalp_scan    = (
+        asyncio.create_task(_scalp_signal_scan_loop()) if DASHBOARD_SCALP_SIGNAL_SCAN_LOOP_ENABLED else None
+    )  # Phase 1 runtime demotion
+    task_spot_mon      = (
+        asyncio.create_task(_spot_monitor_loop()) if DASHBOARD_SPOT_MONITOR_LOOP_ENABLED else None
+    )  # Phase 1 runtime demotion
+    task_spot_scan     = (
+        asyncio.create_task(_spot_signal_scan_loop()) if DASHBOARD_SPOT_SIGNAL_SCAN_LOOP_ENABLED else None
+    )  # Phase 1 runtime demotion
+    task_memecoin_scan = (
+        asyncio.create_task(_memecoin_scan_loop()) if DASHBOARD_MEMECOIN_SCAN_LOOP_ENABLED else None
+    )  # Phase 1 runtime demotion
+    task_research      = (
+        asyncio.create_task(_research_loop()) if DASHBOARD_RESEARCH_LOOP_ENABLED else None
+    )  # Phase 1 runtime demotion
+    task_whale_watch        = (
+        asyncio.create_task(_whale_watch_loop()) if DASHBOARD_WHALE_WATCH_LOOP_ENABLED else None
+    )  # Phase 1 runtime demotion
+    task_memecoin_discovery = (
+        asyncio.create_task(_memecoin_discovery_loop())
+        if DASHBOARD_MEMECOIN_DISCOVERY_LOOP_ENABLED else None
+    )  # Phase 1 runtime demotion
+    task_authority_refresh  = (
+        asyncio.create_task(_authority_snapshot_refresh_loop())
+        if DASHBOARD_AUTHORITY_REFRESH_LOOP_ENABLED else None
+    )  # Phase 1 runtime demotion
+    task_snapshot_prewarm = (
+        asyncio.create_task(_dashboard_snapshot_prewarm_once())
+        if DASHBOARD_SNAPSHOT_BACKGROUND_REFRESH_ENABLED else None
+    )
+    task_snapshot_refresh = (
+        asyncio.create_task(_dashboard_snapshot_refresh_loop())
+        if DASHBOARD_SNAPSHOT_BACKGROUND_REFRESH_ENABLED else None
+    )
+    log.info("Dashboard started — API/control plane active; runtime loops are partially headless-owned.")
     yield
-    all_tasks = (task_poller, task_tracker, task_perp_mon, task_perp_scan,
-                 task_scalp_mon, task_scalp_scan, task_spot_mon, task_spot_scan,
-                 task_memecoin_scan, task_research, task_whale_watch)
+    all_tasks = tuple(
+        t for t in (
+            task_poller, task_tracker, task_perp_mon, task_perp_scan,
+            task_scalp_mon, task_scalp_scan, task_spot_mon, task_spot_scan,
+            task_memecoin_scan, task_research, task_whale_watch,
+            task_memecoin_discovery, task_authority_refresh, task_snapshot_prewarm, task_snapshot_refresh,
+        )
+        if t is not None
+    )
     for t in all_tasks:
         t.cancel()
     for t in all_tasks:
@@ -613,24 +914,71 @@ from starlette.middleware.base import BaseHTTPMiddleware  # noqa: E402
 
 class _CacheMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
-        response = await call_next(request)
+        path = request.url.path
+        lower_path = path.lower()
+        if (
+            lower_path.startswith("/.")
+            or lower_path.endswith((".env", ".ini", ".sql", ".bak", ".log"))
+            or any(part in lower_path for part in ("/wp-", "/phpmyadmin", "/_next/", "/cgi-bin"))
+        ):
+            return JSONResponse(status_code=404, content={"detail": "not_found"})
+
+        timeout_s = 30.0
+        if path.startswith("/assets/") or path in {"/", "/login"}:
+            timeout_s = 60.0
+        elif path.startswith("/api/system/audit"):
+            timeout_s = 35.0
+        elif path.startswith("/api/home/action-board"):
+            timeout_s = 25.0
+        elif path.startswith("/api/home/"):
+            timeout_s = 20.0
+        elif path.startswith("/api/memecoins/"):
+            timeout_s = 25.0
+
+        try:
+            response = await asyncio.wait_for(call_next(request), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            log.warning("Dashboard request timed out after %.1fs: %s", timeout_s, path)
+            return JSONResponse(
+                status_code=504,
+                content={
+                    "detail": "dashboard_request_timeout",
+                    "path": path,
+                    "timeout_seconds": timeout_s,
+                },
+            )
+        except asyncio.CancelledError:
+            log.info("Dashboard request cancelled during shutdown: %s", path)
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "dashboard_request_cancelled", "path": path},
+            )
         if request.url.path.startswith("/assets/"):
             response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        elif request.url.path.startswith("/api/"):
+            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+            response.headers["Pragma"] = "no-cache"
+            response.headers["Expires"] = "0"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer"
         return response
 
 app.add_middleware(_CacheMiddleware)
 
 # ── Include routers (Patch 126) ───────────────────────────────────────────────
 app.include_router(_router_memecoins)
+app.include_router(_router_memecoins_v3)
 app.include_router(_router_wallet)
 app.include_router(_router_tiers)
 app.include_router(_router_portfolio)
 app.include_router(_router_spot)           # Patch 128
 app.include_router(_router_home)           # Patch 140
 app.include_router(_router_whale_watch)    # Patch 140
-app.include_router(_router_confluence)     # Patch 143
 app.include_router(_router_funding)        # Patch 144
 app.include_router(_router_wallets)        # Patch 145
+app.include_router(_router_confluence)     # Patch 247
+app.include_router(_router_system_audit)
 
 
 # ---------------------------------------------------------------------------
@@ -985,20 +1333,6 @@ async def watchlist(_: str = Depends(get_current_user)):
 
 
 # ---------------------------------------------------------------------------
-# News feed (aggregated RSS)
-# ---------------------------------------------------------------------------
-
-@app.get("/api/news")
-async def news(
-    limit: int = 40,
-    tag: str | None = None,
-    _: str = Depends(get_current_user),
-):
-    items = await asyncio.to_thread(fetch_news, min(80, limit), tag)
-    return items
-
-
-# ---------------------------------------------------------------------------
 # Position management — open / close manual trades from dashboard
 # ---------------------------------------------------------------------------
 
@@ -1190,75 +1524,6 @@ async def snapshot(_: str = Depends(get_current_user)):
 
 
 # ---------------------------------------------------------------------------
-# Global market metrics (market cap, dominance, fear & greed, altcoin season)
-# ---------------------------------------------------------------------------
-
-_global_cache: dict = {"data": {}, "ts": 0.0}
-_GLOBAL_TTL = 60  # seconds
-
-@app.get("/api/market-global")
-async def market_global(_: str = Depends(get_current_user)):
-    import time, requests as _req
-    now = time.time()
-    if now - _global_cache["ts"] < _GLOBAL_TTL and _global_cache["data"]:
-        return _global_cache["data"]
-    try:
-        # CoinGecko global
-        cg = await asyncio.to_thread(
-            lambda: _req.get("https://api.coingecko.com/api/v3/global", timeout=8).json()
-        )
-        cg_data = cg.get("data", {})
-        total_mcap = cg_data.get("total_market_cap", {}).get("usd")
-        mcap_change = cg_data.get("market_cap_change_percentage_24h_usd")
-        btc_dom = cg_data.get("market_cap_percentage", {}).get("btc")
-        eth_dom = cg_data.get("market_cap_percentage", {}).get("eth")
-
-        # Fear & Greed
-        fg_raw = await asyncio.to_thread(
-            lambda: _req.get("https://api.alternative.me/fng/?limit=1", timeout=6).json()
-        )
-        fg = (fg_raw.get("data") or [{}])[0]
-
-        # Top 10 coins 24h change for simple RSI proxy (% positive = altcoin heat)
-        top = await asyncio.to_thread(
-            lambda: _req.get(
-                "https://api.coingecko.com/api/v3/coins/markets"
-                "?vs_currency=usd&order=market_cap_desc&per_page=20&page=1"
-                "&price_change_percentage=24h",
-                timeout=8,
-            ).json()
-        )
-        changes = [c.get("price_change_percentage_24h") or 0 for c in top if c.get("id") != "tether" and c.get("id") != "usdc" and c.get("id") != "usdt"]
-        positive = sum(1 for x in changes if x > 0)
-        avg_change = sum(changes) / len(changes) if changes else 0
-        # Altcoin season: % of top 20 (ex-stables) outperforming → scale 0-100
-        btc_change = next((c.get("price_change_percentage_24h", 0) for c in top if c.get("id") == "bitcoin"), 0)
-        outperforming = sum(1 for x in changes if x > (btc_change or 0))
-        altcoin_season = round((outperforming / len(changes)) * 100) if changes else 0
-
-        # Simplified RSI proxy: map avg 24h change to 0-100 (0% = 50, +10% = 80, -10% = 20)
-        rsi_proxy = max(0, min(100, 50 + avg_change * 3))
-
-        data = {
-            "market_cap_usd":       total_mcap,
-            "market_cap_change_24h": mcap_change,
-            "btc_dominance":        btc_dom,
-            "eth_dominance":        eth_dom,
-            "fear_greed_value":     fg.get("value"),
-            "fear_greed_label":     fg.get("value_classification"),
-            "altcoin_season":       altcoin_season,
-            "top20_positive_pct":   round(positive / len(changes) * 100) if changes else 0,
-            "avg_change_24h":       round(avg_change, 2),
-            "rsi_proxy":            round(rsi_proxy, 1),
-        }
-        _global_cache["data"] = data
-        _global_cache["ts"] = now
-        return data
-    except Exception as exc:
-        log.warning("market_global error: %s", exc)
-        return _global_cache.get("data") or {}
-
-
 # Market cycle endpoints (Phase 3)
 # ---------------------------------------------------------------------------
 
@@ -1301,6 +1566,76 @@ async def market_cycle_playbooks(_: str = Depends(get_current_user)):
 _prices_cache: dict = {"data": {}, "ts": 0.0}
 _PRICES_TTL = 30  # seconds
 
+
+def _prices_payload_valid(data: dict) -> bool:
+    try:
+        return any(
+            isinstance((data or {}).get(sym, {}).get("price"), (int, float))
+            and (data or {}).get(sym, {}).get("price") is not None
+            for sym in ("BTC", "ETH", "SOL")
+        )
+    except Exception:
+        return False
+
+
+def _fetch_coingecko_prices():
+    import requests as _req
+    r = _req.get(
+        "https://api.coingecko.com/api/v3/simple/price"
+        "?ids=bitcoin,ethereum,solana"
+        "&vs_currencies=usd"
+        "&include_24hr_change=true",
+        timeout=8,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"CoinGecko HTTP {r.status_code}")
+    payload = r.json()
+    data = {
+        "BTC": {
+            "price": payload.get("bitcoin", {}).get("usd"),
+            "change_24h": payload.get("bitcoin", {}).get("usd_24h_change"),
+        },
+        "ETH": {
+            "price": payload.get("ethereum", {}).get("usd"),
+            "change_24h": payload.get("ethereum", {}).get("usd_24h_change"),
+        },
+        "SOL": {
+            "price": payload.get("solana", {}).get("usd"),
+            "change_24h": payload.get("solana", {}).get("usd_24h_change"),
+        },
+    }
+    if not _prices_payload_valid(data):
+        raise RuntimeError("CoinGecko payload missing BTC/ETH/SOL prices")
+    return data
+
+
+def _fetch_coinbase_prices():
+    import requests as _req
+
+    def _one(product: str) -> dict:
+        r = _req.get(
+            f"https://api.exchange.coinbase.com/products/{product}-USD/stats",
+            timeout=8,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        if r.status_code != 200:
+            raise RuntimeError(f"Coinbase {product} HTTP {r.status_code}")
+        payload = r.json()
+        last = float(payload["last"])
+        open_ = float(payload["open"])
+        change = ((last - open_) / open_ * 100.0) if open_ else None
+        return {"price": last, "change_24h": round(change, 2) if change is not None else None}
+
+    data = {
+        "BTC": _one("BTC"),
+        "ETH": _one("ETH"),
+        "SOL": _one("SOL"),
+    }
+    if not _prices_payload_valid(data):
+        raise RuntimeError("Coinbase payload missing BTC/ETH/SOL prices")
+    return data
+
+
 @app.get("/api/prices")
 async def crypto_prices(_: str = Depends(get_current_user)):
     import time, requests as _req
@@ -1308,29 +1643,12 @@ async def crypto_prices(_: str = Depends(get_current_user)):
     if now - _prices_cache["ts"] < _PRICES_TTL and _prices_cache["data"]:
         return _prices_cache["data"]
     try:
-        r = await asyncio.to_thread(
-            lambda: _req.get(
-                "https://api.coingecko.com/api/v3/simple/price"
-                "?ids=bitcoin,ethereum,solana"
-                "&vs_currencies=usd"
-                "&include_24hr_change=true",
-                timeout=8,
-            ).json()
-        )
-        data = {
-            "BTC": {
-                "price": r.get("bitcoin", {}).get("usd"),
-                "change_24h": r.get("bitcoin", {}).get("usd_24h_change"),
-            },
-            "ETH": {
-                "price": r.get("ethereum", {}).get("usd"),
-                "change_24h": r.get("ethereum", {}).get("usd_24h_change"),
-            },
-            "SOL": {
-                "price": r.get("solana", {}).get("usd"),
-                "change_24h": r.get("solana", {}).get("usd_24h_change"),
-            },
-        }
+        try:
+            data = await asyncio.to_thread(_fetch_coingecko_prices)
+        except Exception as cg_exc:
+            log.warning("crypto_prices coingecko fallback: %s", cg_exc)
+            data = await asyncio.to_thread(_fetch_coinbase_prices)
+
         _prices_cache["data"] = data
         _prices_cache["ts"] = now
         return data
@@ -4648,53 +4966,287 @@ async def perf_export_csv(
 
 @app.get("/api/sniper/second-leg")
 async def get_second_leg_candidates_api():
-    """Return tokens currently in second-leg territory from ATH tracker."""
-    try:
-        import sys, os
-        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
-        from utils.ath_tracker import get_second_leg_candidates
-        from utils.db import get_conn
+    raise HTTPException(
+        status_code=410,
+        detail={
+            "message": "The second-leg sniper surface has been retired.",
+            "replacement": "Use the readiness-driven memecoin queue and Top 5 surfaces instead.",
+        },
+    )
 
-        # Prime candidates (75%+ drawdown)
-        candidates = get_second_leg_candidates(min_drawdown_pct=75.0, limit=20)
 
-        # Approaching zone (60-74%)
-        approaching = []
-        try:
-            with get_conn() as conn:
-                rows = conn.execute(
-                    """SELECT mint, symbol, ath_price, last_price, pct_from_ath, leg, ath_ts_utc, last_seen_utc
-                       FROM token_ath
-                       WHERE pct_from_ath >= 0.60 AND pct_from_ath < 0.75
-                       ORDER BY pct_from_ath DESC LIMIT 10"""
-                ).fetchall()
-                approaching = [
-                    {
-                        "mint": r[0], "symbol": r[1], "ath_price": r[2],
-                        "last_price": r[3], "drawdown_pct": round(r[4] * 100, 1),
-                        "leg": r[5], "ath_ts_utc": r[6], "last_seen_utc": r[7],
-                    }
-                    for r in rows
-                ]
-        except Exception:
-            pass
+# ---------------------------------------------------------------------------
+# Roadmap 2: Perp lane operating summary helper
+# ---------------------------------------------------------------------------
 
-        # Total ATH tracking count
-        total_tracked = 0
-        try:
-            with get_conn() as conn:
-                total_tracked = conn.execute("SELECT COUNT(*) FROM token_ath").fetchone()[0]
-        except Exception:
-            pass
+def _perp_lane_operating_summary(
+    enabled: bool,
+    dry_run: bool,
+    open_positions: int,
+    total_closed: int,
+    win_rate: "float | None",
+    avg_pnl_pct: "float | None",
+    collateral_usd: float,
+    buffer_usd: float,
+    worst_liq: "float | None",
+    max_positions: int,
+) -> dict:
+    """
+    Compact operating-model summary for the Perp lane.
 
-        return {
-            "prime_candidates": candidates,
-            "approaching": approaching,
-            "total_tracked": total_tracked,
-            "updated_at": datetime.utcnow().isoformat(),
-        }
-    except Exception as e:
-        return {"prime_candidates": [], "approaching": [], "total_tracked": 0, "error": str(e)}
+    Operating states
+    ─────────────────
+    SIM_ACTIVE      — executor running, all trades are paper/dry-run
+    LIVE_MANAGED    — executor running with real capital deployed
+    LIVE_AT_RISK    — live positions with buffer depleted or liq distance tight
+    MONITORING      — positions open but executor disabled
+    IDLE            — executor enabled but no open positions
+    BLOCKED         — executor disabled, no positions
+
+    Checklist (4 items)
+    ────────────────────
+    live_capital_deployed    — dry_run == False
+    performance_proven       — win_rate >= 50 AND total_closed >= 20
+    buffer_healthy           — buffer_usd > 50 (N/A if no positions)
+    position_risk_managed    — worst_liq is None or worst_liq >= 25
+    """
+    # ── checklist ──────────────────────────────────────────────────────────────
+    chk_live         = not dry_run
+    chk_performance  = (win_rate is not None and win_rate >= 50.0 and total_closed >= 20)
+    chk_buffer       = (open_positions == 0) or (buffer_usd > 50)
+    chk_liq          = (worst_liq is None or worst_liq >= 25.0)
+
+    checklist = [
+        {
+            "key":    "live_capital_deployed",
+            "label":  "Live capital deployed (not paper)",
+            "passed": chk_live,
+            "note":   (
+                "Executor in dry-run / paper mode"
+                if not chk_live
+                else "Live execution enabled"
+            ),
+        },
+        {
+            "key":    "performance_proven",
+            "label":  "Performance proven (≥50% WR, ≥20 closed)",
+            "passed": chk_performance,
+            "note":   (
+                f"{total_closed} closed trade(s) — "
+                + (
+                    f"{win_rate:.1f}% win rate (need ≥50%)"
+                    if (win_rate is not None and total_closed >= 20)
+                    else "need ≥20 closed trades for assessment"
+                    if total_closed < 20
+                    else "no closed trades yet"
+                )
+            ),
+        },
+        {
+            "key":    "buffer_healthy",
+            "label":  "Profit buffer healthy (>$50)",
+            "passed": chk_buffer,
+            "note":   (
+                "No open positions — buffer check N/A"
+                if open_positions == 0
+                else f"Buffer ${buffer_usd:,.0f} — needs >$50"
+                if not chk_buffer
+                else f"Buffer ${buffer_usd:,.0f}"
+            ),
+        },
+        {
+            "key":    "position_risk_managed",
+            "label":  "Position risk managed (liq ≥25%)",
+            "passed": chk_liq,
+            "note":   (
+                "No Jupiter position data available"
+                if worst_liq is None
+                else f"Worst liq distance {worst_liq:.1f}% (need ≥25%)"
+                if not chk_liq
+                else f"Worst liq distance {worst_liq:.1f}%"
+            ),
+        },
+    ]
+
+    passed = sum(1 for c in checklist if c["passed"])
+    total  = len(checklist)
+
+    # ── operating state ────────────────────────────────────────────────────────
+    if not enabled:
+        lane_operating_state = "BLOCKED"
+        lane_operating_note  = "Perp executor is disabled. No auto-trades will fire."
+    elif not dry_run and open_positions > 0:
+        if buffer_usd < 0 or (worst_liq is not None and worst_liq < 15):
+            lane_operating_state = "LIVE_AT_RISK"
+            lane_operating_note  = (
+                f"{open_positions} live position(s) — "
+                + ("buffer depleted. " if buffer_usd < 0 else "")
+                + (f"worst liq {worst_liq:.1f}%. " if worst_liq is not None and worst_liq < 15 else "")
+                + "Reduce exposure or add collateral."
+            )
+        else:
+            lane_operating_state = "LIVE_MANAGED"
+            lane_operating_note  = (
+                f"{open_positions} live position(s) · ${collateral_usd:,.0f} collateral. "
+                "Executor managing active exposure."
+            )
+    elif dry_run and open_positions > 0:
+        lane_operating_state = "SIM_ACTIVE"
+        lane_operating_note  = (
+            f"{open_positions} paper position(s) · ${collateral_usd:,.0f} simulated collateral. "
+            f"Win rate {win_rate:.1f}% over {total_closed} closed trades."
+            if win_rate is not None and total_closed > 0
+            else f"{open_positions} paper position(s). Accumulating performance data."
+        )
+    elif open_positions > 0:
+        # positions but executor state unclear
+        lane_operating_state = "MONITORING"
+        lane_operating_note  = (
+            f"{open_positions} position(s) open. Executor not actively managing."
+        )
+    else:
+        lane_operating_state = "IDLE"
+        lane_operating_note  = (
+            "Executor enabled — no open positions. Awaiting next entry signal."
+        )
+
+    # ── next unlock ────────────────────────────────────────────────────────────
+    if not enabled:
+        next_unlock_state = "EXECUTOR_ENABLE"
+        next_unlock_note  = "Enable the perp executor to begin auto-trading."
+    elif dry_run:
+        next_unlock_state = "LIVE_CAPITAL_DEPLOY"
+        next_unlock_note  = (
+            "Disable dry-run to deploy real capital. "
+            f"Current sim record: {win_rate:.1f}% WR over {total_closed} closed trades."
+            if (win_rate is not None and total_closed > 0)
+            else "Disable dry-run to deploy real capital."
+        )
+    elif total_closed < 20:
+        next_unlock_state = "PROOF_20_TRADES"
+        next_unlock_note  = (
+            f"Need {20 - total_closed} more closed trades (have {total_closed}) "
+            "before performance can be fully assessed."
+        )
+    elif win_rate is not None and win_rate < 50.0:
+        next_unlock_state = "WIN_RATE_50_PCT"
+        next_unlock_note  = (
+            f"Win rate {win_rate:.1f}% below 50% threshold over {total_closed} trades. "
+            "Review signal quality and regime filters."
+        )
+    elif not chk_liq:
+        next_unlock_state = "LIQ_IMPROVEMENT"
+        next_unlock_note  = (
+            f"Worst liquidation distance {worst_liq:.1f}% — "
+            "reduce leverage or add collateral to improve liq distance above 25%."
+        )
+    elif not chk_buffer:
+        next_unlock_state = "BUFFER_REBUILD"
+        next_unlock_note  = (
+            f"Profit buffer ${buffer_usd:,.0f} — needs >$50 to support additional exposure."
+        )
+    else:
+        next_unlock_state = "MAINTAIN_EDGE"
+        next_unlock_note  = (
+            "Lane operating normally. Maintain signal discipline and position sizing."
+        )
+
+    # ── primary constraint ─────────────────────────────────────────────────────
+    if not enabled:
+        primary_constraint_key  = "EXECUTOR_DISABLED"
+        primary_constraint_note = "Perp executor is off — no trades will execute automatically."
+    elif dry_run:
+        primary_constraint_key  = "PAPER_MODE_ONLY"
+        primary_constraint_note = (
+            "Executor is in dry-run mode. All trades are simulated — "
+            "no real capital is at work in the perp lane."
+        )
+    elif buffer_usd < 0:
+        primary_constraint_key  = "BUFFER_DEPLETED"
+        primary_constraint_note = (
+            f"Profit buffer is negative (${buffer_usd:,.0f}). "
+            "Do not add new exposure until buffer is restored."
+        )
+    elif worst_liq is not None and worst_liq < 15:
+        primary_constraint_key  = "LIQ_DISTANCE_CRITICAL"
+        primary_constraint_note = (
+            f"Worst liquidation distance {worst_liq:.1f}% — critical range. "
+            "Reduce leverage or close weaker positions."
+        )
+    elif worst_liq is not None and worst_liq < 25:
+        primary_constraint_key  = "LIQ_DISTANCE_TIGHT"
+        primary_constraint_note = (
+            f"Worst liquidation distance {worst_liq:.1f}% — tighter than 25%. "
+            "No new positions until liq distance improves."
+        )
+    elif total_closed < 20:
+        primary_constraint_key  = "PROOF_BUILDING"
+        primary_constraint_note = (
+            f"Only {total_closed} closed trade(s) — "
+            "need 20+ for reliable performance assessment."
+        )
+    elif win_rate is not None and win_rate < 50.0:
+        primary_constraint_key  = "WIN_RATE_BELOW_THRESHOLD"
+        primary_constraint_note = (
+            f"Win rate {win_rate:.1f}% over {total_closed} trades. "
+            "Review entry signals and regime filter before scaling."
+        )
+    else:
+        primary_constraint_key  = "NONE"
+        primary_constraint_note = "No binding constraint — lane operating within normal parameters."
+
+    # ── alignment ──────────────────────────────────────────────────────────────
+    if lane_operating_state == "LIVE_AT_RISK":
+        operating_alignment = "ADVERSE"
+    elif lane_operating_state == "LIVE_MANAGED":
+        if chk_performance and chk_buffer and chk_liq:
+            operating_alignment = "BACKED"
+        else:
+            operating_alignment = "TENTATIVE"
+    elif lane_operating_state == "SIM_ACTIVE":
+        operating_alignment = "TENTATIVE" if chk_performance else "QUIET"
+    else:
+        operating_alignment = "QUIET"
+
+    # Lane momentum — directional signal for cross-lane consumers
+    if lane_operating_state == "BLOCKED":
+        lane_momentum = "BLOCKED"
+    elif lane_operating_state == "LIVE_AT_RISK":
+        lane_momentum = "STALLING"     # live capital but risk conditions deteriorating
+    elif lane_operating_state == "LIVE_MANAGED":
+        lane_momentum = "ADVANCING"    # live capital, risk managed
+    elif lane_operating_state == "SIM_ACTIVE" and chk_performance:
+        lane_momentum = "ADVANCING"    # proven sim performance — nearing live unlock
+    elif lane_operating_state in ("SIM_ACTIVE", "MONITORING", "IDLE"):
+        lane_momentum = "BUILDING"
+    else:
+        lane_momentum = "BUILDING"
+
+    # Unlock horizon — how many checks remain
+    _perp_outstanding = total - passed
+    if next_unlock_state == "MAINTAIN_EDGE" or _perp_outstanding <= 0:
+        unlock_horizon = "NONE"
+    elif _perp_outstanding == 1:
+        unlock_horizon = "NEAR"
+    elif _perp_outstanding <= 3:
+        unlock_horizon = "MEDIUM"
+    else:
+        unlock_horizon = "FAR"
+
+    return {
+        "lane_operating_state":     lane_operating_state,
+        "lane_operating_note":      lane_operating_note,
+        "next_unlock_state":        next_unlock_state,
+        "next_unlock_note":         next_unlock_note,
+        "primary_constraint_key":   primary_constraint_key,
+        "primary_constraint_note":  primary_constraint_note,
+        "passed_checks":            passed,
+        "total_checks":             total,
+        "checklist":                checklist,
+        "operating_alignment":      operating_alignment,
+        "lane_momentum":            lane_momentum,
+        "unlock_horizon":           unlock_horizon,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -4711,11 +5263,53 @@ def _ensure_perp_executor():
 
 @app.get("/api/perps/status")
 async def perps_status(_: str = Depends(get_current_user)):
-    """Return perp executor state + open positions."""
+    """Return perp executor state + open positions + Roadmap 2 operating summary."""
     try:
         _ensure_perp_executor()
         from utils.perp_executor import get_perp_status  # type: ignore
-        return get_perp_status()
+        status = get_perp_status()
+
+        # ── Roadmap 2: derive operating summary ───────────────────────────────
+        try:
+            import sqlite3 as _sq
+            from pathlib import Path as _Path
+            _db = _Path(__file__).resolve().parents[1] / ".." / "data_storage" / "engine.db"
+            _buffer_usd = 0.0
+            try:
+                with _sq.connect(f"file:{_db}?mode=ro", uri=True) as _c:
+                    _c.row_factory = _sq.Row
+                    from utils.tier_manager import get_profit_buffer  # type: ignore
+                    _buffer_usd = float(get_profit_buffer(_c) or 0.0)
+            except Exception:
+                pass
+            # worst Jupiter liquidation distance (best-effort, doesn't block)
+            _worst_liq = None
+            try:
+                from routers.home import _fetch_jupiter_summary  # type: ignore
+                _, _, _worst_liq = _fetch_jupiter_summary()
+            except Exception:
+                pass
+            _positions = status.get("positions") or []
+            _collateral = round(
+                sum(float((p or {}).get("collateral_usd") or 0.0) for p in _positions), 2
+            )
+            _op_summary = _perp_lane_operating_summary(
+                enabled        = bool(status.get("enabled", False)),
+                dry_run        = bool(status.get("dry_run", True)),
+                open_positions = int(status.get("open_positions") or 0),
+                total_closed   = int(status.get("total_closed") or 0),
+                win_rate       = status.get("win_rate"),
+                avg_pnl_pct    = status.get("avg_pnl_pct"),
+                collateral_usd = _collateral,
+                buffer_usd     = _buffer_usd,
+                worst_liq      = _worst_liq,
+                max_positions  = int(status.get("max_positions") or 6),
+            )
+            status = {**status, "operating_summary": _op_summary}
+        except Exception as _oe:
+            log.debug("perps_status operating_summary error: %s", _oe)
+
+        return status
     except Exception as exc:
         log.warning("perps_status error: %s", exc)
         return JSONResponse(
@@ -4883,8 +5477,38 @@ _ROUTERS_MOUNTED = True  # memecoins, wallet, tiers, portfolio
 # Must be defined LAST so it doesn't shadow any /api/ or /ws/ routes.
 # ---------------------------------------------------------------------------
 
+def _resolve_dist_file(full_path: str) -> str | None:
+    cleaned = str(full_path or "").lstrip("/")
+    if not cleaned:
+        return None
+    candidate = os.path.realpath(os.path.join(_DIST, cleaned))
+    if not candidate.startswith(_DIST + os.sep):
+        return None
+    if os.path.isfile(candidate):
+        return candidate
+    return None
+
+
+def _should_reject_spa_path(full_path: str) -> bool:
+    cleaned = str(full_path or "").strip("/")
+    if not cleaned:
+        return False
+    segments = [segment for segment in cleaned.split("/") if segment]
+    if any(segment.startswith(".") for segment in segments):
+        return True
+    leaf = segments[-1]
+    if "." in leaf and _resolve_dist_file(cleaned) is None:
+        return True
+    return False
+
+
 @app.get("/{full_path:path}", include_in_schema=False)
 async def spa_fallback(full_path: str):
+    static_file = _resolve_dist_file(full_path)
+    if static_file:
+        return FileResponse(static_file)
+    if _should_reject_spa_path(full_path):
+        return JSONResponse({"detail": "Not Found"}, status_code=404)
     index = os.path.join(_DIST, "index.html")
     if os.path.isfile(index):
         # no-store: browser must re-fetch index.html every time so it always

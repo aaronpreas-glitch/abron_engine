@@ -18,6 +18,8 @@ import os
 
 import requests
 
+import config as _config  # noqa: F401  # ensures .env is loaded for ad-hoc imports
+
 log = logging.getLogger(__name__)
 
 PERPS_API    = "https://perps-api.jup.ag/v2"
@@ -81,6 +83,24 @@ def _usd_to_lamports(usd: float, sol_price: float) -> str:
         return "0"
     sol_amount = usd / sol_price
     return str(int(sol_amount * 10 ** SOL_DECIMALS))
+
+
+def _get_sol_balance(wallet: str) -> float | None:
+    """Fetch current SOL wallet balance from chain. Returns None on error."""
+    try:
+        r = requests.post(
+            "https://api.mainnet-beta.solana.com",
+            json={"jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [wallet]},
+            timeout=8,
+        )
+        r.raise_for_status()
+        lamports = r.json().get("result", {}).get("value")
+        if lamports is None:
+            return None
+        return float(lamports) / (10 ** SOL_DECIMALS)
+    except Exception as exc:
+        log.warning("Could not fetch SOL balance for perp preflight: %s", exc)
+        return None
 
 
 # ── Transaction signing ───────────────────────────────────────────────────────
@@ -171,6 +191,29 @@ def open_perp_sync(
             "response_body_excerpt": None,
         }
     input_amount = _usd_to_lamports(collateral_usd, sol_price)
+    input_lamports = int(input_amount or "0")
+    required_sol = input_lamports / (10 ** SOL_DECIMALS)
+    reserve_sol = max(float(os.getenv("PERP_MIN_SOL_RESERVE", "0.02") or 0.02), 0.0)
+    wallet_sol_balance = _get_sol_balance(wallet)
+    if wallet_sol_balance is not None:
+        spendable_sol = max(wallet_sol_balance - reserve_sol, 0.0)
+        if spendable_sol + 1e-12 < required_sol:
+            error = (
+                "Insufficient SOL collateral balance for perp open "
+                f"(need {required_sol:.4f} SOL + reserve {reserve_sol:.4f}, "
+                f"wallet has {wallet_sol_balance:.4f} SOL)"
+            )
+            log.warning(
+                "[PERPS PREFLIGHT] %s for %s %s collateral=$%.2f lev=%.1fx",
+                error, side, symbol, collateral_usd, leverage,
+            )
+            return {
+                "ok": False, "success": False, "state": "PRECHECK_FAILED",
+                "error": error, "presigned_tx_sig": None,
+                "position_pubkey": None, "tx_sig": None,
+                "entry_price_usd": 0.0, "size_usd": 0.0, "liq_price_usd": 0.0,
+                "response_body_excerpt": None,
+            }
     log.info(
         "[PERPS] Collateral $%.2f @ SOL $%.2f = %s lamports",
         collateral_usd, sol_price, input_amount,
