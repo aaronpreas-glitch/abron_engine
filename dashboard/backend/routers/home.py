@@ -16126,18 +16126,37 @@ def _build_memecoin_research_payload(limit: int = 12) -> dict:
 @router.get("/memecoin-research")
 async def home_memecoin_research(
     _: str = Depends(get_current_user),
-    limit: int = 12,
+    limit: int = 8,
 ):
+    key = f"home:memecoin-research:{int(limit)}"
     try:
         return await snapshot_or_build(
-            f"home:memecoin-research:{int(limit)}",
+            key,
             lambda: _build_memecoin_research_payload(limit),
             fresh_s=240,
-            stale_s=600,
-            wait_timeout_s=8,
+            stale_s=1800,
+            wait_timeout_s=3,
         )
     except Exception as exc:
-        raise HTTPException(status_code=504, detail=str(exc))
+        try:
+            from snapshot_cache import load_snapshot  # type: ignore
+            for fallback_key in (key, "home:memecoin-research:8"):
+                snap = load_snapshot(fallback_key)
+                if snap and snap.get("data") not in (None, {}, []):
+                    payload = copy.deepcopy(snap.get("data"))
+                    if isinstance(payload, dict):
+                        payload["refresh_mode"] = "MEMECOIN_RESEARCH_STALE_SNAPSHOT"
+                        payload["stale_reason"] = str(exc)
+                    return payload
+        except Exception:
+            pass
+        return {
+            **_warming_snapshot(key),
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "status": "WARMING",
+            "items": [],
+            "detail": str(exc),
+        }
 
 
 @router.get("/memecoin-catalysts")
