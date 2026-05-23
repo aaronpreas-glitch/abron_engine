@@ -14650,16 +14650,18 @@ def _build_provider_reliability_scorecard(repair_rows: list[dict]) -> dict:
         item["attempts"] += 1
         item["latency_total_ms"] += int(_gb_float(row.get("latency_ms")))
         status_counts[status] = status_counts.get(status, 0) + 1
-        failure_counts[failure] = failure_counts.get(failure, 0) + 1
         if status == "LIVE_REPAIRED":
             item["live_repaired"] += 1
         elif status == "FALLBACK_REPAIRED":
             item["fallback_repaired"] += 1
         elif status == "RETIRED_UNRESOLVED":
             item["retired"] += 1
+            failure_counts[failure] = failure_counts.get(failure, 0) + 1
+            item["failure_classes"][failure] = item["failure_classes"].get(failure, 0) + 1
         else:
             item["unresolved"] += 1
-        item["failure_classes"][failure] = item["failure_classes"].get(failure, 0) + 1
+            failure_counts[failure] = failure_counts.get(failure, 0) + 1
+            item["failure_classes"][failure] = item["failure_classes"].get(failure, 0) + 1
     providers = []
     for item in provider_map.values():
         attempts = max(1, int(item.get("attempts") or 0))
