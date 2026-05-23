@@ -244,6 +244,17 @@ def _ensure_tables(conn) -> None:
             ("last_action_ts", "TEXT"),
             ("sla_due_ts", "TEXT"),
             ("raw_json", "TEXT"),
+            ("outcome_check_ts", "TEXT"),
+            ("outcome_status", "TEXT"),
+            ("outcome_source", "TEXT"),
+            ("outcome_return_1h_pct", "REAL"),
+            ("outcome_return_4h_pct", "REAL"),
+            ("outcome_return_24h_pct", "REAL"),
+            ("outcome_max_return_pct", "REAL"),
+            ("outcome_max_drawdown_pct", "REAL"),
+            ("blocker_correctness", "TEXT"),
+            ("confidence_impact", "REAL"),
+            ("outcome_reason", "TEXT"),
         ]:
             if col not in cols:
                 conn.execute(f"ALTER TABLE provider_repair_escalations ADD COLUMN {col} {col_type}")
@@ -261,6 +272,27 @@ def _ensure_tables(conn) -> None:
         ON provider_repair_escalations(escalation_status, sla_due_ts)
         """
     )
+
+
+def _parse_iso(value: Any) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _pct_change(now_value: Any, base_value: Any) -> float | None:
+    base = _f(base_value)
+    current = _f(now_value)
+    if base <= 0:
+        return None
+    return round(((current - base) / base) * 100.0, 2)
 
 
 def _add_token(tokens: dict[str, dict], mint: str, symbol: str | None, source: str, raw: dict | None = None) -> None:
@@ -1391,6 +1423,223 @@ def _record_provider_repair_events(events: list[dict]) -> int:
     return inserted
 
 
+def _latest_escalation_outcome(conn, row: dict) -> dict:
+    mint = str(row.get("mint") or "").strip()
+    symbol = str(row.get("symbol") or "").strip().upper()
+    created = _parse_iso(row.get("created_ts") or row.get("updated_ts")) or datetime.now(timezone.utc)
+    since = (created - timedelta(hours=6)).isoformat()
+    params: list[Any] = []
+    clauses = []
+    if mint:
+        clauses.append("mint=?")
+        params.append(mint)
+    if symbol:
+        clauses.append("UPPER(symbol)=?")
+        params.append(symbol)
+    if not clauses:
+        return {"source": "none", "status": "NO_IDENTITY"}
+    where = " OR ".join(clauses)
+    try:
+        outcome = conn.execute(
+            f"""
+            SELECT scanned_at, symbol, mint, status, outcome_label,
+                   return_1h_pct, return_4h_pct, return_24h_pct,
+                   max_return_pct, max_drawdown_pct
+            FROM memecoin_signal_outcomes
+            WHERE ({where})
+              AND COALESCE(scanned_at, '') >= ?
+            ORDER BY
+                CASE WHEN COALESCE(outcome_label, '') NOT IN ('', 'PENDING', 'TRACKING') THEN 1 ELSE 0 END DESC,
+                COALESCE(max_return_pct, -999999) DESC,
+                scanned_at DESC
+            LIMIT 1
+            """,
+            tuple(params + [since]),
+        ).fetchone()
+        if outcome:
+            return {"source": "memecoin_signal_outcomes", "row": dict(outcome)}
+    except Exception:
+        pass
+
+    try:
+        current = conn.execute(
+            """
+            SELECT mint, symbol, updated_at, marketcap, liquidity, data_freshness,
+                   data_confidence, provider_repair_status, provider_repair_failure_class
+            FROM token_intelligence_current
+            WHERE mint=? OR UPPER(symbol)=?
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            (mint, symbol),
+        ).fetchone()
+        if current:
+            snapshot = conn.execute(
+                """
+                SELECT marketcap, liquidity, ts_utc
+                FROM token_intelligence_snapshots
+                WHERE mint=?
+                  AND COALESCE(ts_utc, '') >= ?
+                  AND COALESCE(marketcap, 0) > 0
+                ORDER BY ts_utc ASC
+                LIMIT 1
+                """,
+                (mint, since),
+            ).fetchone()
+            cur = dict(current)
+            base = dict(snapshot) if snapshot else {}
+            return {
+                "source": "token_intelligence_current",
+                "row": {
+                    "scanned_at": cur.get("updated_at"),
+                    "symbol": cur.get("symbol"),
+                    "mint": cur.get("mint"),
+                    "status": cur.get("data_freshness"),
+                    "outcome_label": None,
+                    "return_1h_pct": None,
+                    "return_4h_pct": None,
+                    "return_24h_pct": _pct_change(cur.get("marketcap"), base.get("marketcap")),
+                    "max_return_pct": _pct_change(cur.get("marketcap"), base.get("marketcap")),
+                    "max_drawdown_pct": None,
+                    "marketcap": cur.get("marketcap"),
+                    "data_confidence": cur.get("data_confidence"),
+                    "provider_repair_status": cur.get("provider_repair_status"),
+                },
+            }
+    except Exception:
+        pass
+    return {"source": "none", "status": "NO_OUTCOME_ROW"}
+
+
+def _classify_escalation_correctness(escalation: dict, outcome: dict, now: datetime) -> dict:
+    status = str(escalation.get("escalation_status") or "").upper()
+    lane = str(escalation.get("escalation_lane") or "").upper()
+    failure = str(escalation.get("failure_class") or "").lower()
+    created = _parse_iso(escalation.get("created_ts") or escalation.get("updated_ts")) or now
+    age_h = max(0.0, (now - created).total_seconds() / 3600.0)
+    row = dict(outcome.get("row") or {})
+    label = str(row.get("outcome_label") or "").upper()
+    max_return = _f(row.get("max_return_pct"))
+    ret_4h = _f(row.get("return_4h_pct"))
+    ret_24h = _f(row.get("return_24h_pct"))
+    marketcap = _f(row.get("marketcap"))
+    bullish_labels = {"BIG_RUNNER", "GOOD_RUNNER", "GOOD_BUY", "WIN", "PROFIT"}
+    weak_labels = {"BAD_BUY", "WEAK_BUY", "FLAT", "LOSS"}
+    is_suppression = status == "SUPPRESSED" or lane == "RETIRE_OR_SUPPRESS"
+    is_repaired = status == "RESOLVED_REPAIRED"
+
+    if is_repaired:
+        return {
+            "outcome_status": "COMPLETE",
+            "blocker_correctness": "REPAIR_RESOLVED",
+            "confidence_impact": 0.0,
+            "reason": "Provider repair later recovered usable market data.",
+        }
+    if label in bullish_labels or max_return >= 35.0 or ret_24h >= 35.0:
+        return {
+            "outcome_status": "COMPLETE",
+            "blocker_correctness": "SUPPRESSION_TOO_AGGRESSIVE" if is_suppression else "BLOCK_MISSED_RUNNER",
+            "confidence_impact": -12.0 if is_suppression else -15.0,
+            "reason": f"Blocked escalation later showed bullish outcome ({label or round(max_return, 1)}).",
+        }
+    if label in weak_labels or max(max_return, ret_4h, ret_24h) <= 10.0 and age_h >= 4.0:
+        return {
+            "outcome_status": "COMPLETE",
+            "blocker_correctness": "SUPPRESSION_CORRECT" if is_suppression else "BLOCK_CORRECT",
+            "confidence_impact": 5.0 if failure in {"no_market_data", "bad_ca_or_pair_mismatch", "provider_miss"} else 3.0,
+            "reason": f"Blocked escalation did not produce a meaningful runner within the review window ({label or 'low_return'}).",
+        }
+    if marketcap <= 0 and age_h >= 4.0 and failure in {"no_market_data", "bad_ca_or_pair_mismatch", "provider_miss"}:
+        return {
+            "outcome_status": "COMPLETE",
+            "blocker_correctness": "SUPPRESSION_CORRECT" if is_suppression else "BLOCK_CORRECT",
+            "confidence_impact": 4.0,
+            "reason": "No usable market data or positive market cap appeared after review.",
+        }
+    return {
+        "outcome_status": "PENDING",
+        "blocker_correctness": "PENDING_OUTCOME",
+        "confidence_impact": 0.0,
+        "reason": "Waiting for enough post-review outcome evidence.",
+    }
+
+
+def evaluate_provider_escalation_outcomes(limit: int = 120) -> dict:
+    """Backtest reviewed provider escalations against later market outcomes."""
+    now = datetime.now(timezone.utc)
+    stale_cutoff = (now - timedelta(minutes=55)).isoformat()
+    checked = 0
+    updated = 0
+    counts: dict[str, int] = {}
+    try:
+        with _get_conn() as conn:
+            _ensure_tables(conn)
+            rows = [
+                dict(r)
+                for r in conn.execute(
+                    """
+                    SELECT *
+                    FROM provider_repair_escalations
+                    WHERE escalation_status IN (
+                        'REVIEW_COMPLETE_STILL_BLOCKED',
+                        'SUPPRESSED',
+                        'RESOLVED_REPAIRED'
+                    )
+                      AND (
+                        outcome_check_ts IS NULL
+                        OR outcome_status='PENDING'
+                        OR outcome_check_ts < ?
+                      )
+                    ORDER BY COALESCE(last_action_ts, updated_ts, created_ts) DESC
+                    LIMIT ?
+                    """,
+                    (stale_cutoff, max(1, int(limit))),
+                ).fetchall()
+            ]
+            for row in rows:
+                checked += 1
+                outcome = _latest_escalation_outcome(conn, row)
+                classification = _classify_escalation_correctness(row, outcome, now)
+                out_row = dict(outcome.get("row") or {})
+                correctness = classification.get("blocker_correctness") or "PENDING_OUTCOME"
+                counts[str(correctness)] = counts.get(str(correctness), 0) + 1
+                conn.execute(
+                    """
+                    UPDATE provider_repair_escalations
+                       SET outcome_check_ts=?,
+                           outcome_status=?,
+                           outcome_source=?,
+                           outcome_return_1h_pct=?,
+                           outcome_return_4h_pct=?,
+                           outcome_return_24h_pct=?,
+                           outcome_max_return_pct=?,
+                           outcome_max_drawdown_pct=?,
+                           blocker_correctness=?,
+                           confidence_impact=?,
+                           outcome_reason=?
+                     WHERE id=?
+                    """,
+                    (
+                        now.isoformat(),
+                        classification.get("outcome_status"),
+                        outcome.get("source"),
+                        _f(out_row.get("return_1h_pct")) if out_row.get("return_1h_pct") is not None else None,
+                        _f(out_row.get("return_4h_pct")) if out_row.get("return_4h_pct") is not None else None,
+                        _f(out_row.get("return_24h_pct")) if out_row.get("return_24h_pct") is not None else None,
+                        _f(out_row.get("max_return_pct")) if out_row.get("max_return_pct") is not None else None,
+                        _f(out_row.get("max_drawdown_pct")) if out_row.get("max_drawdown_pct") is not None else None,
+                        correctness,
+                        _f(classification.get("confidence_impact")),
+                        str(classification.get("reason") or "")[:500],
+                        int(row.get("id") or 0),
+                    ),
+                )
+                updated += 1
+    except Exception as exc:
+        return {"checked": checked, "updated": updated, "counts": counts, "error": str(exc)}
+    return {"checked": checked, "updated": updated, "counts": counts}
+
+
 def _record_live_confirmation_status(payload: dict) -> None:
     try:
         with _get_conn() as conn:
@@ -1508,6 +1757,7 @@ def token_intelligence_step(*, force: bool = False) -> dict:
     inserted = _record_snapshots(rows)
     token_stats_inserted = _backfill_token_stats(rows)
     repair_events_inserted = _record_provider_repair_events(repair_events)
+    escalation_outcomes = evaluate_provider_escalation_outcomes(limit=120)
     conflicts = len([r for r in rows if str(r.get("identity_status") or "").upper() in {"QUARANTINED", "MISMATCH"}])
     live = len([r for r in rows if str(r.get("data_freshness") or "").upper() == "LIVE"])
     high_conf = len([r for r in rows if str(r.get("data_confidence") or "").upper() == "HIGH"])
@@ -1539,6 +1789,7 @@ def token_intelligence_step(*, force: bool = False) -> dict:
             "failure_classes": sorted({str(e.get("failure_class") or "unknown") for e in repair_events}),
             "symbols": [e.get("symbol") for e in repair_events[:10] if e.get("symbol")],
         },
+        "provider_escalation_outcomes": escalation_outcomes,
         "top_symbols": [r.get("symbol") for r in rows[:10] if r.get("symbol")],
         "detail": f"Independent token intelligence refreshed {inserted}/{len(tokens)} focused token(s).",
     }

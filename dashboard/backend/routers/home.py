@@ -14786,12 +14786,98 @@ def _build_provider_escalation_queue(escalation_rows: list[dict], now: datetime 
     }
 
 
-def _build_rule_promotion_gate(simulator: dict, watchdog: dict, freshness_sla: dict, provider_reliability: dict | None = None) -> dict:
+def _build_provider_escalation_accuracy(escalation_rows: list[dict]) -> dict:
+    rows = [dict(row) for row in escalation_rows or [] if str(row.get("blocker_correctness") or "").strip()]
+    complete = [
+        row for row in rows
+        if str(row.get("blocker_correctness") or "").upper() not in {"PENDING_OUTCOME", "PENDING"}
+    ]
+    correctness_counts: dict[str, int] = {}
+    lane_stats: dict[str, dict] = {}
+    failure_stats: dict[str, dict] = {}
+    examples = []
+    correct_labels = {"BLOCK_CORRECT", "SUPPRESSION_CORRECT", "REPAIR_RESOLVED"}
+    miss_labels = {"BLOCK_MISSED_RUNNER", "SUPPRESSION_TOO_AGGRESSIVE"}
+    confidence_adjustment = 0.0
+    for row in rows:
+        correctness = str(row.get("blocker_correctness") or "UNKNOWN").upper()
+        correctness_counts[correctness] = correctness_counts.get(correctness, 0) + 1
+        confidence_adjustment += _gb_float(row.get("confidence_impact"))
+        lane = str(row.get("escalation_lane") or "UNKNOWN").upper()
+        failure = str(row.get("failure_class") or "unknown").lower()
+        for bucket, key in ((lane_stats, lane), (failure_stats, failure)):
+            item = bucket.setdefault(key, {"key": key, "sample_n": 0, "correct": 0, "missed": 0, "pending": 0})
+            item["sample_n"] += 1
+            if correctness in correct_labels:
+                item["correct"] += 1
+            elif correctness in miss_labels:
+                item["missed"] += 1
+            else:
+                item["pending"] += 1
+        if correctness in miss_labels and len(examples) < 5:
+            examples.append({
+                "symbol": row.get("symbol"),
+                "mint": row.get("mint"),
+                "lane": lane,
+                "failure_class": failure,
+                "correctness": correctness,
+                "max_return_pct": _nullable_float(row.get("outcome_max_return_pct")),
+                "reason": row.get("outcome_reason"),
+            })
+    correct = sum(1 for row in complete if str(row.get("blocker_correctness") or "").upper() in correct_labels)
+    missed = sum(1 for row in complete if str(row.get("blocker_correctness") or "").upper() in miss_labels)
+    accuracy = round((correct / max(1, correct + missed)) * 100.0, 1) if complete else None
+    status = (
+        "LEARNING" if len(complete) < 5
+        else "REVIEW" if missed or _gb_float(accuracy, 100.0) < 70
+        else "RELIABLE" if _gb_float(accuracy) >= 80
+        else "WATCH"
+    )
+    def _finish(bucket: dict[str, dict]) -> list[dict]:
+        out = []
+        for item in bucket.values():
+            sample = max(1, int(item.get("correct") or 0) + int(item.get("missed") or 0))
+            item["accuracy_pct"] = round((int(item.get("correct") or 0) / sample) * 100.0, 1)
+            out.append(item)
+        out.sort(key=lambda x: (int(x.get("missed") or 0), int(x.get("sample_n") or 0)), reverse=True)
+        return out[:8]
+    return {
+        "status": status,
+        "sample_n": len(complete),
+        "pending_n": len(rows) - len(complete),
+        "correct_n": correct,
+        "missed_n": missed,
+        "accuracy_pct": accuracy,
+        "confidence_adjustment": round(confidence_adjustment, 1),
+        "correctness_counts": correctness_counts,
+        "by_lane": _finish(lane_stats),
+        "by_failure": _finish(failure_stats),
+        "missed_examples": examples,
+        "next_action": (
+            "Inspect missed escalation blocks before trusting provider suppression."
+            if missed
+            else "Keep collecting escalation outcomes until the sample is stronger."
+            if len(complete) < 5
+            else "Escalation blocking is behaving correctly."
+        ),
+    }
+
+
+def _build_rule_promotion_gate(
+    simulator: dict,
+    watchdog: dict,
+    freshness_sla: dict,
+    provider_reliability: dict | None = None,
+    escalation_accuracy: dict | None = None,
+) -> dict:
     top = dict((simulator or {}).get("top_candidate") or {})
     data_status = str((watchdog or {}).get("status") or "").upper()
     sla_status = str((freshness_sla or {}).get("status") or "").upper()
     score = _gb_float((freshness_sla or {}).get("score"))
     provider_hit_rate = _gb_float((provider_reliability or {}).get("repair_hit_rate_pct"), 100.0)
+    escalation_sample = int((escalation_accuracy or {}).get("sample_n") or 0)
+    escalation_accuracy_pct = _gb_float((escalation_accuracy or {}).get("accuracy_pct"), 100.0)
+    escalation_missed = int((escalation_accuracy or {}).get("missed_n") or 0)
     if not top:
         status = "NO_RULE"
         reason = "No simulator candidate has enough outcome evidence."
@@ -14801,6 +14887,9 @@ def _build_rule_promotion_gate(simulator: dict, watchdog: dict, freshness_sla: d
     elif provider_hit_rate < 35 and int((provider_reliability or {}).get("attempts_24h") or 0) >= 8:
         status = "BLOCKED_PROVIDER_REPAIR"
         reason = "Provider repair hit rate is too weak to trust rule promotion."
+    elif escalation_sample >= 5 and (escalation_missed > 0 or escalation_accuracy_pct < 70):
+        status = "BLOCKED_ESCALATION_ACCURACY"
+        reason = "Escalation backtests show missed runners or weak blocker correctness."
     elif int(top.get("net_score") or 0) < 8:
         status = "OBSERVE"
         reason = "Top rule edge is not large enough to promote."
@@ -14818,6 +14907,8 @@ def _build_rule_promotion_gate(simulator: dict, watchdog: dict, freshness_sla: d
             "data_status": data_status or "UNKNOWN",
             "freshness_sla_status": sla_status or "UNKNOWN",
             "provider_repair_hit_rate_pct": provider_hit_rate,
+            "escalation_accuracy_pct": escalation_accuracy_pct,
+            "escalation_sample_n": escalation_sample,
         },
     }
 
@@ -14956,6 +15047,7 @@ def _build_daily_build_score(
     catalyst_context: dict,
     paper_gate: dict,
     escalation_queue: dict | None = None,
+    escalation_accuracy: dict | None = None,
 ) -> dict:
     data_score = _gb_float((freshness_sla or {}).get("score"))
     rule_score = 70.0 if str((rule_gate or {}).get("status") or "") == "READY_REVIEW" else 45.0 if (rule_gate or {}).get("candidate") else 25.0
@@ -14965,11 +15057,18 @@ def _build_daily_build_score(
     active_escalations = int((escalation_queue or {}).get("active_count") or 0)
     sla_breaches = int((escalation_queue or {}).get("sla_breached_count") or 0)
     escalation_score = max(10.0, 100.0 - (active_escalations * 8.0) - (sla_breaches * 20.0))
+    escalation_sample = int((escalation_accuracy or {}).get("sample_n") or 0)
+    escalation_missed = int((escalation_accuracy or {}).get("missed_n") or 0)
+    if escalation_sample <= 0:
+        escalation_accuracy_score = 50.0
+    else:
+        escalation_accuracy_score = max(10.0, min(100.0, _gb_float((escalation_accuracy or {}).get("accuracy_pct"), 50.0) + _gb_float((escalation_accuracy or {}).get("confidence_adjustment"))))
     components = {
         "data": round(data_score, 1),
         "rules": round(rule_score, 1),
         "research": round(research_score, 1),
         "escalations": round(escalation_score, 1),
+        "escalation_accuracy": round(escalation_accuracy_score, 1),
         "execution_safety": round(execution_score, 1),
         "paper": round(paper_score, 1),
     }
@@ -14979,6 +15078,8 @@ def _build_daily_build_score(
         focus = "ESCALATION_SLA"
     elif active_escalations:
         focus = "ESCALATIONS"
+    elif escalation_missed:
+        focus = "ESCALATION_ACCURACY"
     elif int((decision_quality or {}).get("missed_runner_count") or 0) > 3:
         focus = "MISSED_RUNNERS"
     elif str((rule_gate or {}).get("status") or "") == "READY_REVIEW":
@@ -14998,6 +15099,7 @@ def _build_daily_build_score(
             "DATA": "Keep repairing stale provider coverage before rule changes.",
             "ESCALATION_SLA": "Clear breached provider escalations before new tuning work.",
             "ESCALATIONS": "Work the provider escalation queue before promoting candidates.",
+            "ESCALATION_ACCURACY": "Review missed escalation outcomes before trusting provider blockers.",
             "MISSED_RUNNERS": "Cluster missed-runner blockers and promote scout timing fixes only after data is fresh.",
             "RULES": "Manually review the simulator candidate; do not auto-promote.",
             "CATALYSTS": "Refresh narrative and confluence context.",
@@ -15157,7 +15259,12 @@ def _build_daily_crypto_brief(lookback_hours: int = 24) -> dict:
                                repair_status, escalation_lane, escalation_status,
                                priority_score, queue_flags_json, provider_path, reason,
                                source_event_id, operator_decision, operator_note,
-                               outcome_label, last_action_ts, sla_due_ts
+                               outcome_label, last_action_ts, sla_due_ts,
+                               outcome_check_ts, outcome_status, outcome_source,
+                               outcome_return_1h_pct, outcome_return_4h_pct,
+                               outcome_return_24h_pct, outcome_max_return_pct,
+                               outcome_max_drawdown_pct, blocker_correctness,
+                               confidence_impact, outcome_reason
                         FROM provider_repair_escalations
                         WHERE created_ts >= ?
                            OR updated_ts >= ?
@@ -15310,7 +15417,14 @@ def _build_daily_crypto_brief(lookback_hours: int = 24) -> dict:
     provider_reliability = _build_provider_reliability_scorecard(repair_rows)
     provider_failure_drilldown = _build_provider_failure_drilldown(repair_rows)
     provider_escalation_queue = _build_provider_escalation_queue(escalation_rows, now)
-    rule_promotion_gate = _build_rule_promotion_gate(rule_simulator, data_watchdog, freshness_sla, provider_reliability)
+    provider_escalation_accuracy = _build_provider_escalation_accuracy(escalation_rows)
+    rule_promotion_gate = _build_rule_promotion_gate(
+        rule_simulator,
+        data_watchdog,
+        freshness_sla,
+        provider_reliability,
+        provider_escalation_accuracy,
+    )
     missed_runner_clusters = _build_missed_runner_clusters(journal_24h)
     catalyst_context = _build_catalyst_context(kv_rows, confluence_rows, journal_24h)
     missed_count = len(missed)
@@ -15334,6 +15448,7 @@ def _build_daily_crypto_brief(lookback_hours: int = 24) -> dict:
         catalyst_context,
         paper_gate,
         provider_escalation_queue,
+        provider_escalation_accuracy,
     )
     daily_build_hooks = _build_daily_build_hooks(outcome_autopsy, rule_simulator, data_watchdog, lock_ok, rule_promotion_gate)
     if lock_ok and data_ok and missed_count <= 3:
@@ -15357,6 +15472,8 @@ def _build_daily_crypto_brief(lookback_hours: int = 24) -> dict:
         next_actions.append(str(daily_build_score.get("next_action")))
     if int(provider_escalation_queue.get("active_count") or 0):
         next_actions.append(str(provider_escalation_queue.get("next_action") or "Work the provider escalation queue."))
+    if int(provider_escalation_accuracy.get("missed_n") or 0):
+        next_actions.append(str(provider_escalation_accuracy.get("next_action") or "Review missed escalation outcomes."))
     if missed_count:
         next_actions.append("Review missed-runner blockers and scout-only timing.")
     if weak_count:
@@ -15405,6 +15522,7 @@ def _build_daily_crypto_brief(lookback_hours: int = 24) -> dict:
         "provider_reliability": provider_reliability,
         "provider_failure_drilldown": provider_failure_drilldown,
         "provider_escalation_queue": provider_escalation_queue,
+        "provider_escalation_accuracy": provider_escalation_accuracy,
         "rule_promotion_gate": rule_promotion_gate,
         "missed_runner_clusters": missed_runner_clusters,
         "catalyst_context": catalyst_context,

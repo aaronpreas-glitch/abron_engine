@@ -349,6 +349,28 @@ interface DailyCryptoBriefData {
     items?: ProviderEscalationItem[]
     next_action?: string | null
   }
+  provider_escalation_accuracy?: {
+    status?: string
+    sample_n?: number
+    pending_n?: number
+    correct_n?: number
+    missed_n?: number
+    accuracy_pct?: number | null
+    confidence_adjustment?: number | null
+    correctness_counts?: Record<string, number>
+    by_lane?: Array<{ key?: string; sample_n?: number; correct?: number; missed?: number; pending?: number; accuracy_pct?: number | null }>
+    by_failure?: Array<{ key?: string; sample_n?: number; correct?: number; missed?: number; pending?: number; accuracy_pct?: number | null }>
+    missed_examples?: Array<{
+      symbol?: string | null
+      mint?: string | null
+      lane?: string | null
+      failure_class?: string | null
+      correctness?: string | null
+      max_return_pct?: number | null
+      reason?: string | null
+    }>
+    next_action?: string | null
+  }
   rule_promotion_gate?: {
     status?: string
     reason?: string | null
@@ -4493,6 +4515,7 @@ function DailyCryptoBriefPanel({
     const providerReliability = data.provider_reliability ?? {}
     const providerDrilldown = data.provider_failure_drilldown ?? {}
     const escalationQueue = data.provider_escalation_queue ?? {}
+    const escalationAccuracy = data.provider_escalation_accuracy ?? {}
     const ruleGate = data.rule_promotion_gate ?? {}
     const missedClusters = data.missed_runner_clusters ?? {}
     const catalystContext = data.catalyst_context ?? {}
@@ -4507,6 +4530,7 @@ function DailyCryptoBriefPanel({
     const topProviderFailure = providerReliability.top_failures?.[0]
     const topProviderDrilldown = providerDrilldown.items?.[0]
     const topEscalation = escalationQueue.items?.[0]
+    const topEscalationMiss = escalationAccuracy.missed_examples?.[0]
     const buildHooks = data.daily_build_hooks ?? {}
     const countText = (counts: Record<string, number>, keys: string[]) =>
       keys.map(key => `${key.toLowerCase()} ${counts[key] ?? 0}`).join(' · ')
@@ -4724,6 +4748,20 @@ function DailyCryptoBriefPanel({
                 ))}
               </div>
             )}
+          </div>
+
+          <div style={{ border: `1px solid ${(escalationAccuracy.missed_n ?? 0) ? 'rgba(239,68,68,0.22)' : 'rgba(0,212,138,0.18)'}`, borderRadius: 10, padding: 10, background: (escalationAccuracy.missed_n ?? 0) ? 'rgba(239,68,68,0.03)' : 'rgba(0,212,138,0.025)' }}>
+            <span style={{ ...MONO, fontSize: 8, color: (escalationAccuracy.missed_n ?? 0) ? '#ef4444' : '#00d48a', fontWeight: 900, letterSpacing: '0.14em' }}>
+              ESCALATION ACCURACY
+            </span>
+            <div style={{ ...MONO, fontSize: 10, color: '#d7e1ea', marginTop: 7, lineHeight: 1.45 }}>
+              {escalationAccuracy.status || 'LEARNING'} · {fmtFixed(escalationAccuracy.accuracy_pct, 0)}% · sample {escalationAccuracy.sample_n ?? 0}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              {topEscalationMiss
+                ? `${topEscalationMiss.symbol || 'UNKNOWN'} · ${String(topEscalationMiss.correctness || 'missed').replace(/_/g, ' ').toLowerCase()} · max ${fmtPct(topEscalationMiss.max_return_pct)}`
+                : `correct ${escalationAccuracy.correct_n ?? 0} · missed ${escalationAccuracy.missed_n ?? 0} · pending ${escalationAccuracy.pending_n ?? 0}`}
+            </div>
           </div>
 
           <div style={{ border: '1px solid rgba(239,68,68,0.18)', borderRadius: 10, padding: 10, background: 'rgba(239,68,68,0.025)' }}>
