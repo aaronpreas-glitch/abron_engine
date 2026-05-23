@@ -639,11 +639,15 @@ interface DailyCryptoBriefData {
           status?: string
           checked_count?: number
           fetched_count?: number
+          trusted_count?: number
+          partial_count?: number
+          quarantined_count?: number
         }
         outcome_writer?: {
           status?: string
           updated_count?: number
           windows_written?: Record<string, number>
+          quarantined_count?: number
           read_only_execution?: boolean
         }
       }
@@ -663,6 +667,47 @@ interface DailyCryptoBriefData {
         benefit_n?: number
         harm_n?: number
         gate_status?: string | null
+        raw_sample_n?: number
+        weighted_sample_n?: number
+        quarantined_sample_n?: number
+        trusted_evidence_n?: number
+        partial_evidence_n?: number
+        quarantined_evidence_n?: number
+        next_action?: string | null
+      }
+      outcome_trust_meter?: {
+        status?: string
+        trusted_count?: number
+        partial_count?: number
+        quarantined_count?: number
+        unknown_count?: number
+        raw_count?: number
+        weighted_sample?: number
+        avg_confidence_score?: number | null
+        next_action?: string | null
+      }
+      bad_outcome_quarantine?: {
+        status?: string
+        quarantined_count?: number
+        items?: Array<{
+          decision_id?: number | string | null
+          symbol?: string | null
+          outcome_label?: string | null
+          max_return_pct?: number | null
+          score?: number | null
+          reasons?: string[]
+        }>
+        next_action?: string | null
+      }
+      daily_evidence_audit?: {
+        status?: string
+        collection_summary?: {
+          checked?: number
+          fetched?: number
+          written?: number
+          writer_quarantined?: number
+          windows_written?: Record<string, number>
+        }
         next_action?: string | null
       }
       frontend_review_panel?: {
@@ -681,6 +726,8 @@ interface DailyCryptoBriefData {
           fetched_windows?: string[]
           status?: string | null
           basis?: string | null
+          trust_label?: string | null
+          confidence_score?: number | null
         }>
       }
       workbench_auto_refresh?: {
@@ -5240,6 +5287,9 @@ function DailyCryptoBriefPanel({
     const replayRecalculation = replayMaturation.replay_recalculation ?? {}
     const replayPolicyImpact = replayMaturation.policy_impact_preview ?? {}
     const replayReviewPanel = replayMaturation.frontend_review_panel ?? {}
+    const replayTrustMeter = replayMaturation.outcome_trust_meter ?? {}
+    const replayQuarantine = replayMaturation.bad_outcome_quarantine ?? {}
+    const replayEvidenceAudit = replayMaturation.daily_evidence_audit ?? {}
     const watchdog = data.data_watchdog ?? {}
     const freshnessSla = data.freshness_sla ?? {}
     const providerReliability = data.provider_reliability ?? {}
@@ -5667,6 +5717,23 @@ function DailyCryptoBriefPanel({
               {replayPolicyImpact.label
                 ? `${replayPolicyImpact.label} · benefit ${replayPolicyImpact.benefit_n ?? 0} · harm ${replayPolicyImpact.harm_n ?? 0}`
                 : replayReviewPanel.policy_next_action || 'Collector stays paper-only until manual review.'}
+            </div>
+          </div>
+
+          <div style={{ border: `1px solid ${(replayQuarantine.quarantined_count ?? 0) ? 'rgba(239,68,68,0.22)' : 'rgba(0,212,138,0.18)'}`, borderRadius: 10, padding: 10, background: (replayQuarantine.quarantined_count ?? 0) ? 'rgba(239,68,68,0.035)' : 'rgba(0,212,138,0.025)' }}>
+            <span style={{ ...MONO, fontSize: 8, color: (replayQuarantine.quarantined_count ?? 0) ? '#ef4444' : '#00d48a', fontWeight: 900, letterSpacing: '0.14em' }}>
+              EVIDENCE TRUST
+            </span>
+            <div style={{ ...MONO, fontSize: 10, color: '#d7e1ea', marginTop: 7, lineHeight: 1.45 }}>
+              trusted {replayTrustMeter.trusted_count ?? 0} · partial {replayTrustMeter.partial_count ?? 0} · quarantine {replayTrustMeter.quarantined_count ?? 0}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              weighted {fmtFixed(replayTrustMeter.weighted_sample, 1)} / raw {replayTrustMeter.raw_count ?? 0} · score {fmtFixed(replayTrustMeter.avg_confidence_score, 0)}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#9db7ce', marginTop: 5, lineHeight: 1.45 }}>
+              {replayQuarantine.items?.[0]?.symbol
+                ? `${replayQuarantine.items[0].symbol} quarantined · ${(replayQuarantine.items[0].reasons || ['source check']).slice(0, 1).join(', ')}`
+                : replayEvidenceAudit.next_action || 'Trusted evidence can influence weighted replay scoring.'}
             </div>
           </div>
 

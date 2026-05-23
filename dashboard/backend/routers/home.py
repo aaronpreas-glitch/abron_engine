@@ -14495,6 +14495,111 @@ def _replay_row_metrics(row: dict) -> dict:
     return metrics
 
 
+def _replay_outcome_trust_from_values(
+    *,
+    ret_1h,
+    ret_4h,
+    ret_24h,
+    max_return,
+    max_drawdown,
+    resolution_status: str | None,
+    matched_signal_count: int,
+    best_signal_status: str | None,
+    best_signal_scanned_at: str | None,
+    known_then: dict | None = None,
+    basis: str | None = None,
+    source: str | None = None,
+) -> dict:
+    """Score whether replay evidence is clean enough to influence policy."""
+    known_then = dict(known_then or {})
+    score = 0.0
+    reasons: list[str] = []
+    windows = {
+        "1h": ret_1h,
+        "4h": ret_4h,
+        "24h": ret_24h,
+    }
+    ready_windows = [window for window, value in windows.items() if value is not None]
+    if ret_24h is not None:
+        score += 35.0
+        reasons.append("24h_window_ready")
+    if ret_4h is not None:
+        score += 22.0
+        reasons.append("4h_window_ready")
+    if ret_1h is not None:
+        score += 14.0
+        reasons.append("1h_window_ready")
+    if matched_signal_count:
+        score += min(18.0, matched_signal_count * 6.0)
+        reasons.append("signal_outcome_match")
+    if str(best_signal_status or "").upper() == "COMPLETE":
+        score += 16.0
+        reasons.append("complete_signal_outcome")
+    if str(resolution_status or "").upper() == "RESOLVED":
+        score += 14.0
+        reasons.append("journal_resolved")
+    elif str(resolution_status or "").upper() in {"OBSERVED_4H", "OBSERVED_1H"}:
+        score += 5.0
+        reasons.append("interim_observation")
+    freshness = str(known_then.get("data_freshness") or "").upper()
+    confidence = str(known_then.get("data_confidence") or "").upper()
+    if freshness in {"LIVE", "RECENT"}:
+        score += 8.0
+        reasons.append("fresh_known_then")
+    elif freshness == "STALE":
+        score -= 12.0
+        reasons.append("stale_known_then")
+    if confidence == "HIGH":
+        score += 8.0
+        reasons.append("high_confidence_known_then")
+    elif confidence == "LOW":
+        score -= 14.0
+        reasons.append("low_confidence_known_then")
+    if str(basis or "").lower() == "marketcap":
+        score -= 8.0
+        reasons.append("marketcap_fallback")
+    if source and str(source).lower().startswith("token_intelligence"):
+        score += 6.0
+        reasons.append("local_snapshot_source")
+    if best_signal_scanned_at:
+        reasons.append("has_signal_timestamp")
+
+    quarantine_reasons: list[str] = []
+    if not ready_windows:
+        quarantine_reasons.append("no_forward_windows")
+    if freshness == "STALE" and confidence == "LOW" and ret_24h is None:
+        quarantine_reasons.append("stale_low_confidence_without_24h")
+    for value in (ret_1h, ret_4h, ret_24h, max_return, max_drawdown):
+        if value is not None and abs(_gb_float(value)) >= 500.0:
+            quarantine_reasons.append("extreme_return_outlier")
+            break
+
+    score = max(0.0, min(100.0, round(score, 1)))
+    if quarantine_reasons:
+        label = "QUARANTINED"
+        weight = 0.0
+    elif score >= 72.0:
+        label = "TRUSTED"
+        weight = 1.0
+    elif score >= 38.0:
+        label = "PARTIAL"
+        weight = 0.5
+    else:
+        label = "QUARANTINED"
+        weight = 0.0
+        quarantine_reasons.append("source_confidence_below_threshold")
+    return {
+        "label": label,
+        "score": score,
+        "policy_weight": weight,
+        "ready_windows": ready_windows,
+        "reasons": reasons[:8],
+        "quarantine_reasons": list(dict.fromkeys(quarantine_reasons))[:8],
+        "source": source or ("memecoin_signal_outcomes" if matched_signal_count else "decision_journal"),
+        "basis": basis or ("signal" if matched_signal_count else "journal"),
+    }
+
+
 def _replay_outcome_payload(row: dict, signal_matches: list[dict]) -> dict:
     best_signal = signal_matches[0] if signal_matches else {}
     ret_1h = _nullable_float(row.get("outcome_1h_pct"))
@@ -14517,6 +14622,18 @@ def _replay_outcome_payload(row: dict, signal_matches: list[dict]) -> dict:
             label = "GOOD_RUNNER" if _gb_float(max_return) >= 25 else "GOOD_BUY" if _gb_float(ret_24h) > 0 else "WEAK_BUY"
     bullish = bool(label in _BUY_DECISION_BULLISH_LABELS or _gb_float(max_return) >= 25.0 or _gb_float(ret_4h) >= 12.0)
     weak = bool(label in {"BAD_BUY", "WEAK_BUY", "FLAT"} or (_gb_float(max_return) < 5.0 and _gb_float(ret_4h) <= 0.0))
+    quality = _replay_outcome_trust_from_values(
+        ret_1h=ret_1h,
+        ret_4h=ret_4h,
+        ret_24h=ret_24h,
+        max_return=max_return,
+        max_drawdown=max_drawdown,
+        resolution_status=str(row.get("resolution_status") or ""),
+        matched_signal_count=len(signal_matches),
+        best_signal_status=best_signal.get("status"),
+        best_signal_scanned_at=best_signal.get("scanned_at"),
+        known_then=_replay_row_metrics(row),
+    )
     return {
         "outcome_label": label,
         "return_15m_pct": None,
@@ -14531,6 +14648,10 @@ def _replay_outcome_payload(row: dict, signal_matches: list[dict]) -> dict:
         "matched_signal_count": len(signal_matches),
         "best_signal_status": best_signal.get("status"),
         "best_signal_scanned_at": best_signal.get("scanned_at"),
+        "source_confidence": quality,
+        "trust_label": quality.get("label"),
+        "policy_weight": quality.get("policy_weight"),
+        "quarantined": quality.get("label") == "QUARANTINED",
     }
 
 
@@ -14591,9 +14712,14 @@ def _build_replay_forward_outcome_windows(decision_timeline: dict) -> dict:
         "with_24h": 0,
         "bullish_count": 0,
         "weak_count": 0,
+        "trusted_count": 0,
+        "partial_count": 0,
+        "quarantined_count": 0,
+        "weighted_sample": 0.0,
     }
     for item in list((decision_timeline or {}).get("items") or []):
         outcome = dict(item.get("outcome") or {})
+        trust_label = str(outcome.get("trust_label") or "").upper()
         if outcome.get("return_1h_pct") is not None:
             summary["with_1h"] += 1
         if outcome.get("return_4h_pct") is not None:
@@ -14604,6 +14730,13 @@ def _build_replay_forward_outcome_windows(decision_timeline: dict) -> dict:
             summary["bullish_count"] += 1
         if outcome.get("weak"):
             summary["weak_count"] += 1
+        if trust_label == "TRUSTED":
+            summary["trusted_count"] += 1
+        elif trust_label == "PARTIAL":
+            summary["partial_count"] += 1
+        elif trust_label == "QUARANTINED":
+            summary["quarantined_count"] += 1
+        summary["weighted_sample"] = round(_gb_float(summary.get("weighted_sample")) + _gb_float(outcome.get("policy_weight")), 2)
         items.append({
             "decision_id": item.get("decision_id"),
             "symbol": item.get("symbol"),
@@ -14621,6 +14754,9 @@ def _build_replay_forward_outcome_windows(decision_timeline: dict) -> dict:
             "max_drawdown_pct": outcome.get("max_drawdown_pct"),
             "bullish": outcome.get("bullish"),
             "weak": outcome.get("weak"),
+            "trust_label": outcome.get("trust_label"),
+            "policy_weight": outcome.get("policy_weight"),
+            "quarantined": outcome.get("quarantined"),
         })
     return {
         "status": "READY" if items else "EMPTY",
@@ -14715,6 +14851,8 @@ def _replay_rule_example(item: dict, rule: dict, category: str) -> dict:
         "return_24h_pct": outcome.get("return_24h_pct"),
         "max_return_pct": outcome.get("max_return_pct"),
         "max_drawdown_pct": outcome.get("max_drawdown_pct"),
+        "trust_label": outcome.get("trust_label"),
+        "policy_weight": outcome.get("policy_weight"),
         "primary_blocker": item.get("primary_blocker"),
         "known_then": {
             "data_freshness": metrics.get("data_freshness"),
@@ -14732,14 +14870,23 @@ def _replay_rule_example(item: dict, rule: dict, category: str) -> dict:
 
 
 def _simulate_replay_lab_rules(decision_timeline: dict) -> dict:
-    rows = [dict(item) for item in list((decision_timeline or {}).get("items") or []) if item.get("replay_ready")]
+    all_ready_rows = [dict(item) for item in list((decision_timeline or {}).get("items") or []) if item.get("replay_ready")]
+    rows = [
+        item for item in all_ready_rows
+        if _gb_float((item.get("outcome") or {}).get("policy_weight")) > 0
+    ]
     simulations = []
     for rule in _replay_rule_definitions():
         touched = 0
-        saved_weak = 0
-        damaged_good = 0
-        rescued_missed = 0
-        false_positive = 0
+        touched_weight = 0.0
+        saved_weak = 0.0
+        damaged_good = 0.0
+        rescued_missed = 0.0
+        false_positive = 0.0
+        raw_saved_weak = 0
+        raw_damaged_good = 0
+        raw_rescued_missed = 0
+        raw_false_positive = 0
         saved_examples = []
         damaged_examples = []
         rescued_examples = []
@@ -14753,27 +14900,33 @@ def _simulate_replay_lab_rules(decision_timeline: dict) -> dict:
             if not applies:
                 continue
             touched += 1
+            outcome = dict(item.get("outcome") or {})
+            weight = max(0.0, min(1.0, _gb_float(outcome.get("policy_weight"))))
+            touched_weight += weight
             original_buy = str(item.get("recommended_action") or "").upper() == "BUY"
             proposed_buy = str(rule.get("proposed_action") or "").upper() == "BUY"
-            outcome = dict(item.get("outcome") or {})
             bullish = bool(outcome.get("bullish"))
             weak = bool(outcome.get("weak"))
             if original_buy and not proposed_buy:
                 if weak:
-                    saved_weak += 1
+                    saved_weak += weight
+                    raw_saved_weak += 1
                     if len(saved_examples) < 8:
                         saved_examples.append(_replay_rule_example(item, rule, "SAVED_WEAK_BUY"))
                 elif bullish:
-                    damaged_good += 1
+                    damaged_good += weight
+                    raw_damaged_good += 1
                     if len(damaged_examples) < 8:
                         damaged_examples.append(_replay_rule_example(item, rule, "DAMAGED_GOOD_BUY"))
             elif not original_buy and proposed_buy:
                 if bullish:
-                    rescued_missed += 1
+                    rescued_missed += weight
+                    raw_rescued_missed += 1
                     if len(rescued_examples) < 8:
                         rescued_examples.append(_replay_rule_example(item, rule, "RESCUED_MISSED_RUNNER"))
                 elif weak:
-                    false_positive += 1
+                    false_positive += weight
+                    raw_false_positive += 1
                     if len(false_positive_examples) < 8:
                         false_positive_examples.append(_replay_rule_example(item, rule, "FALSE_POSITIVE_BUY"))
             if len(sample_examples) < 8:
@@ -14781,20 +14934,33 @@ def _simulate_replay_lab_rules(decision_timeline: dict) -> dict:
         benefit = saved_weak + rescued_missed
         harm = damaged_good + false_positive
         net = saved_weak * 2 + rescued_missed * 3 - damaged_good * 4 - false_positive * 3
+        raw_benefit = raw_saved_weak + raw_rescued_missed
+        raw_harm = raw_damaged_good + raw_false_positive
+        raw_net = raw_saved_weak * 2 + raw_rescued_missed * 3 - raw_damaged_good * 4 - raw_false_positive * 3
         simulations.append({
             "key": rule["key"],
             "label": rule["label"],
             "direction": rule["direction"],
             "proposed_action": rule["proposed_action"],
-            "sample_n": touched,
+            "sample_n": round(touched_weight, 2),
             "touched_count": touched,
-            "saved_weak_buy_n": saved_weak,
-            "damaged_good_buy_n": damaged_good,
-            "rescued_missed_runner_n": rescued_missed,
-            "false_positive_buy_n": false_positive,
-            "benefit_n": benefit,
-            "harm_n": harm,
-            "net_score": net,
+            "weighted_touched_count": round(touched_weight, 2),
+            "saved_weak_buy_n": round(saved_weak, 2),
+            "damaged_good_buy_n": round(damaged_good, 2),
+            "rescued_missed_runner_n": round(rescued_missed, 2),
+            "false_positive_buy_n": round(false_positive, 2),
+            "benefit_n": round(benefit, 2),
+            "harm_n": round(harm, 2),
+            "net_score": round(net, 2),
+            "raw_counts": {
+                "saved_weak_buy_n": raw_saved_weak,
+                "damaged_good_buy_n": raw_damaged_good,
+                "rescued_missed_runner_n": raw_rescued_missed,
+                "false_positive_buy_n": raw_false_positive,
+                "benefit_n": raw_benefit,
+                "harm_n": raw_harm,
+                "net_score": raw_net,
+            },
             "examples": {
                 "saved_weak_buys": saved_examples,
                 "rescued_missed_runners": rescued_examples,
@@ -14814,13 +14980,20 @@ def _simulate_replay_lab_rules(decision_timeline: dict) -> dict:
             ],
         })
     simulations.sort(key=lambda item: (int(item.get("net_score") or 0), int(item.get("benefit_n") or 0)), reverse=True)
+    quarantined_rows = [
+        item for item in all_ready_rows
+        if str(((item.get("outcome") or {}).get("trust_label") or "")).upper() == "QUARANTINED"
+    ]
     return {
-        "status": "READY" if rows else "NO_REPLAY_ROWS",
-        "sample_n": len(rows),
+        "status": "READY" if rows else "NO_TRUSTED_REPLAY_ROWS" if all_ready_rows else "NO_REPLAY_ROWS",
+        "sample_n": round(sum(_gb_float((item.get("outcome") or {}).get("policy_weight")) for item in rows), 2),
+        "raw_sample_n": len(all_ready_rows),
+        "weighted_sample_n": round(sum(_gb_float((item.get("outcome") or {}).get("policy_weight")) for item in rows), 2),
+        "quarantined_sample_n": len(quarantined_rows),
         "rules_tested": len(simulations),
         "top_candidate": simulations[0] if simulations else None,
         "items": simulations,
-        "next_action": "Inspect the false positive/negative ledger before considering promotion.",
+        "next_action": "Inspect weighted evidence and quarantined rows before considering promotion.",
     }
 
 
@@ -15317,6 +15490,35 @@ def _build_replay_due_outcome_runner(maturation_queue: dict) -> dict:
     }
 
 
+def _score_fetched_replay_outcome(item: dict) -> dict:
+    metrics = dict(item.get("outcome_metrics") or {})
+    state = dict(item.get("current_market_state") or {})
+    known_then = {
+        "data_freshness": state.get("data_freshness"),
+        "data_confidence": state.get("data_confidence"),
+    }
+    trust = _replay_outcome_trust_from_values(
+        ret_1h=metrics.get("outcome_1h_pct"),
+        ret_4h=metrics.get("outcome_4h_pct"),
+        ret_24h=metrics.get("outcome_24h_pct"),
+        max_return=metrics.get("max_return_pct"),
+        max_drawdown=metrics.get("max_drawdown_pct"),
+        resolution_status=metrics.get("resolution_status"),
+        matched_signal_count=0,
+        best_signal_status=None,
+        best_signal_scanned_at=None,
+        known_then=known_then,
+        basis=metrics.get("basis"),
+        source=metrics.get("source"),
+    )
+    if not item.get("fetched_windows"):
+        trust = dict(trust)
+        trust["label"] = "QUARANTINED"
+        trust["policy_weight"] = 0.0
+        trust["quarantine_reasons"] = list(dict.fromkeys(list(trust.get("quarantine_reasons") or []) + ["no_new_due_window"]))
+    return trust
+
+
 def _replay_current_market_state(conn, *, symbol: str | None, mint: str | None) -> dict | None:
     try:
         table = conn.execute(
@@ -15408,7 +15610,7 @@ def _build_replay_outcome_fetcher(maturation_queue: dict, limit: int = 30) -> di
                     symbol=row["symbol"],
                     mint=row["mint"] if "mint" in row.keys() else None,
                 )
-                items.append({
+                fetch_item = {
                     "decision_id": decision_id,
                     "symbol": row["symbol"],
                     "mint": row["mint"] if "mint" in row.keys() else None,
@@ -15420,7 +15622,9 @@ def _build_replay_outcome_fetcher(maturation_queue: dict, limit: int = 30) -> di
                     "basis": (metrics or {}).get("basis"),
                     "outcome_metrics": metrics or {},
                     "current_market_state": current_state or {},
-                })
+                }
+                fetch_item["source_confidence"] = _score_fetched_replay_outcome(fetch_item)
+                items.append(fetch_item)
         finally:
             conn.close()
     except Exception as exc:
@@ -15437,6 +15641,9 @@ def _build_replay_outcome_fetcher(maturation_queue: dict, limit: int = 30) -> di
         "status": "FETCHED" if fetched_count else "NO_DATA",
         "checked_count": len(queue_items),
         "fetched_count": fetched_count,
+        "trusted_count": sum(1 for item in items if str(((item.get("source_confidence") or {}).get("label") or "")).upper() == "TRUSTED"),
+        "partial_count": sum(1 for item in items if str(((item.get("source_confidence") or {}).get("label") or "")).upper() == "PARTIAL"),
+        "quarantined_count": sum(1 for item in items if str(((item.get("source_confidence") or {}).get("label") or "")).upper() == "QUARANTINED"),
         "items": items,
         "generated_at": generated_at,
         "next_action": (
@@ -15452,12 +15659,20 @@ def _apply_replay_outcome_writer(outcome_fetcher: dict) -> dict:
     fetch_items = [
         dict(item) for item in list((outcome_fetcher or {}).get("items") or [])
         if item.get("fetched_windows")
+        and str(((item.get("source_confidence") or {}).get("label") or "")).upper() != "QUARANTINED"
+    ]
+    quarantined_items = [
+        dict(item) for item in list((outcome_fetcher or {}).get("items") or [])
+        if item.get("fetched_windows")
+        and str(((item.get("source_confidence") or {}).get("label") or "")).upper() == "QUARANTINED"
     ]
     if not fetch_items:
         return {
             "status": "NO_WRITES",
             "updated_count": 0,
             "windows_written": {},
+            "quarantined_count": len(quarantined_items),
+            "quarantined_decision_ids": [item.get("decision_id") for item in quarantined_items[:20]],
             "read_only_execution": True,
             "next_action": "No fetched replay windows were ready to write.",
         }
@@ -15522,6 +15737,8 @@ def _apply_replay_outcome_writer(outcome_fetcher: dict) -> dict:
         "updated_count": updated,
         "windows_written": windows_written,
         "written_decision_ids": written_ids[:30],
+        "quarantined_count": len(quarantined_items),
+        "quarantined_decision_ids": [item.get("decision_id") for item in quarantined_items[:20]],
         "read_only_execution": True,
         "generated_at": now_iso,
         "next_action": (
@@ -15593,6 +15810,7 @@ def _build_replay_recalculation(before_lab: dict | None, after_lab: dict, outcom
 def _build_replay_policy_impact_preview(replay_lab: dict, recalculation: dict) -> dict:
     gate = dict((replay_lab or {}).get("promotion_gate") or {})
     simulation = dict((replay_lab or {}).get("rule_simulation_engine") or {})
+    windows = dict(((replay_lab or {}).get("forward_outcome_windows") or {}).get("summary") or {})
     top = dict(simulation.get("top_candidate") or {})
     ready = str(gate.get("status") or "").upper() == "READY_FOR_MANUAL_REVIEW"
     return {
@@ -15605,6 +15823,12 @@ def _build_replay_policy_impact_preview(replay_lab: dict, recalculation: dict) -
         "net_score": top.get("net_score"),
         "benefit_n": top.get("benefit_n"),
         "harm_n": top.get("harm_n"),
+        "raw_sample_n": simulation.get("raw_sample_n"),
+        "weighted_sample_n": simulation.get("weighted_sample_n"),
+        "quarantined_sample_n": simulation.get("quarantined_sample_n"),
+        "trusted_evidence_n": windows.get("trusted_count"),
+        "partial_evidence_n": windows.get("partial_count"),
+        "quarantined_evidence_n": windows.get("quarantined_count"),
         "gate_status": gate.get("status"),
         "gate_blockers": list(gate.get("blockers") or []),
         "recalculation_status": recalculation.get("status"),
@@ -15614,6 +15838,130 @@ def _build_replay_policy_impact_preview(replay_lab: dict, recalculation: dict) -
             else "Keep collecting outcomes until the manual gate clears."
         ),
     }
+
+
+def _build_replay_outcome_trust_meter(replay_lab: dict) -> dict:
+    items = list(((replay_lab or {}).get("decision_timeline") or {}).get("items") or [])
+    counts = {"TRUSTED": 0, "PARTIAL": 0, "QUARANTINED": 0, "UNKNOWN": 0}
+    score_sum = 0.0
+    scored = 0
+    weighted_sample = 0.0
+    for item in items:
+        outcome = dict(item.get("outcome") or {})
+        quality = dict(outcome.get("source_confidence") or {})
+        label = str(quality.get("label") or outcome.get("trust_label") or "UNKNOWN").upper()
+        if label not in counts:
+            label = "UNKNOWN"
+        counts[label] += 1
+        if quality.get("score") is not None:
+            score_sum += _gb_float(quality.get("score"))
+            scored += 1
+        weighted_sample += _gb_float(outcome.get("policy_weight"))
+    return {
+        "status": "READY" if items else "EMPTY",
+        "trusted_count": counts["TRUSTED"],
+        "partial_count": counts["PARTIAL"],
+        "quarantined_count": counts["QUARANTINED"],
+        "unknown_count": counts["UNKNOWN"],
+        "raw_count": len(items),
+        "weighted_sample": round(weighted_sample, 2),
+        "avg_confidence_score": round(score_sum / scored, 1) if scored else None,
+        "next_action": (
+            "Use trusted and partial weighted evidence only; quarantined rows stay out of policy scoring."
+            if items
+            else "Wait for replay evidence before scoring trust."
+        ),
+    }
+
+
+def _build_replay_bad_outcome_quarantine(replay_lab: dict) -> dict:
+    rows = []
+    for item in list(((replay_lab or {}).get("decision_timeline") or {}).get("items") or []):
+        outcome = dict(item.get("outcome") or {})
+        quality = dict(outcome.get("source_confidence") or {})
+        if str(quality.get("label") or outcome.get("trust_label") or "").upper() != "QUARANTINED":
+            continue
+        rows.append({
+            "decision_id": item.get("decision_id"),
+            "symbol": item.get("symbol"),
+            "mint": item.get("mint"),
+            "ts": item.get("ts"),
+            "outcome_label": outcome.get("outcome_label"),
+            "max_return_pct": outcome.get("max_return_pct"),
+            "score": quality.get("score"),
+            "reasons": list(quality.get("quarantine_reasons") or []),
+            "source": quality.get("source"),
+            "basis": quality.get("basis"),
+        })
+    rows.sort(key=lambda row: (_gb_float(row.get("max_return_pct")), _gb_float(row.get("score"))), reverse=True)
+    return {
+        "status": "HAS_QUARANTINE" if rows else "CLEAR",
+        "quarantined_count": len(rows),
+        "items": rows[:20],
+        "next_action": (
+            "Do not let quarantined replay outcomes promote policy; inspect source quality first."
+            if rows
+            else "No replay outcomes are quarantined."
+        ),
+    }
+
+
+def _persist_replay_daily_evidence_audit(audit: dict) -> None:
+    path = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "..", "data_storage", "replay_evidence_audit.json")
+    )
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(audit, fh, separators=(",", ":"))
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def _build_replay_daily_evidence_audit(replay_lab: dict, outcome_collection: dict | None, now: datetime) -> dict:
+    trust = _build_replay_outcome_trust_meter(replay_lab)
+    quarantine = _build_replay_bad_outcome_quarantine(replay_lab)
+    fetcher = dict((outcome_collection or {}).get("outcome_fetcher") or {})
+    writer = dict((outcome_collection or {}).get("outcome_writer") or {})
+    fetched_items = []
+    for item in list(fetcher.get("items") or [])[:20]:
+        confidence = dict(item.get("source_confidence") or {})
+        fetched_items.append({
+            "decision_id": item.get("decision_id"),
+            "symbol": item.get("symbol"),
+            "status": item.get("status"),
+            "fetched_windows": item.get("fetched_windows") or [],
+            "trust_label": confidence.get("label"),
+            "confidence_score": confidence.get("score"),
+            "policy_weight": confidence.get("policy_weight"),
+            "quarantine_reasons": confidence.get("quarantine_reasons") or [],
+        })
+    audit = {
+        "generated_at": now.isoformat(),
+        "status": "HAS_QUARANTINE" if int(trust.get("quarantined_count") or 0) else "CLEAN",
+        "trust_summary": trust,
+        "quarantine_summary": {
+            "quarantined_count": quarantine.get("quarantined_count"),
+            "items": list(quarantine.get("items") or [])[:10],
+        },
+        "collection_summary": {
+            "checked": fetcher.get("checked_count"),
+            "fetched": fetcher.get("fetched_count"),
+            "written": writer.get("updated_count"),
+            "writer_quarantined": writer.get("quarantined_count"),
+            "windows_written": writer.get("windows_written") or {},
+        },
+        "fetched_items": fetched_items,
+        "next_action": (
+            "Review quarantined outcome evidence before trusting policy suggestions."
+            if int(trust.get("quarantined_count") or 0)
+            else "Evidence quality is clean enough for weighted replay scoring."
+        ),
+    }
+    _persist_replay_daily_evidence_audit(audit)
+    return audit
 
 
 def _build_replay_frontend_review_panel(outcome_collection: dict | None, recalculation: dict, policy_preview: dict) -> dict:
@@ -15627,6 +15975,8 @@ def _build_replay_frontend_review_panel(outcome_collection: dict | None, recalcu
             "fetched_windows": item.get("fetched_windows") or [],
             "status": item.get("status"),
             "basis": item.get("basis"),
+            "trust_label": ((item.get("source_confidence") or {}).get("label")),
+            "confidence_score": ((item.get("source_confidence") or {}).get("score")),
         }
         for item in fetched_items
         if item.get("fetched_windows") or str(item.get("status") or "").upper() not in {"NO_MARKET_HISTORY"}
@@ -15744,6 +16094,9 @@ def _attach_replay_evidence_maturation(
     daily_delta = _build_replay_daily_evidence_delta(previous, current)
     recalculation = _build_replay_recalculation(before_collection_lab, replay_lab, outcome_collection)
     policy_preview = _build_replay_policy_impact_preview(replay_lab, recalculation)
+    trust_meter = _build_replay_outcome_trust_meter(replay_lab)
+    quarantine = _build_replay_bad_outcome_quarantine(replay_lab)
+    daily_audit = _build_replay_daily_evidence_audit(replay_lab, outcome_collection, now)
     review_panel = _build_replay_frontend_review_panel(outcome_collection, recalculation, policy_preview)
     out = dict(replay_lab or {})
     out["evidence_maturation"] = {
@@ -15758,6 +16111,9 @@ def _attach_replay_evidence_maturation(
         },
         "replay_recalculation": recalculation,
         "policy_impact_preview": policy_preview,
+        "outcome_trust_meter": trust_meter,
+        "bad_outcome_quarantine": quarantine,
+        "daily_evidence_audit": daily_audit,
         "frontend_review_panel": review_panel,
         "workbench_auto_refresh": auto_refresh,
         "daily_evidence_delta": daily_delta,
