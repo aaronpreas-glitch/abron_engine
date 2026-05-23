@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import sys
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -97,6 +98,8 @@ DASHBOARD_AUTHORITY_REFRESH_LOOP_ENABLED = _env_bool("DASHBOARD_AUTHORITY_REFRES
 DASHBOARD_WHALE_WATCH_LOOP_ENABLED = _env_bool("DASHBOARD_WHALE_WATCH_LOOP_ENABLED", False)
 DASHBOARD_STARTUP_DB_MAINTENANCE_ENABLED = _env_bool("DASHBOARD_STARTUP_DB_MAINTENANCE_ENABLED", False)
 DASHBOARD_SNAPSHOT_BACKGROUND_REFRESH_ENABLED = _env_bool("DASHBOARD_SNAPSHOT_BACKGROUND_REFRESH_ENABLED", True)
+DASHBOARD_TOKEN_INTELLIGENCE_LOOP_ENABLED = _env_bool("DASHBOARD_TOKEN_INTELLIGENCE_LOOP_ENABLED", True)
+DASHBOARD_TOKEN_INTELLIGENCE_INTERVAL_SECONDS = max(120, int(os.getenv("DASHBOARD_TOKEN_INTELLIGENCE_INTERVAL_SECONDS", "300")))
 
 
 async def _startup_db_task(label: str, fn, *, retries: int = 4, sleep_s: float = 1.5):
@@ -782,6 +785,30 @@ async def _dashboard_snapshot_refresh_loop() -> None:
         await asyncio.sleep(45)
 
 
+async def _token_intelligence_loop() -> None:
+    """Background provider repair/intelligence loop; read-only for execution."""
+    root = _engine_root()
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    await asyncio.sleep(25)
+    while True:
+        try:
+            from utils.token_intelligence import token_intelligence_step  # type: ignore
+
+            payload = await asyncio.to_thread(token_intelligence_step)
+            repair = dict(payload.get("provider_repair") or {}) if isinstance(payload, dict) else {}
+            log.info(
+                "Token intelligence loop: status=%s live=%s repaired=%s/%s",
+                payload.get("status") if isinstance(payload, dict) else "UNKNOWN",
+                payload.get("live_count") if isinstance(payload, dict) else None,
+                repair.get("live_repaired_count"),
+                repair.get("candidate_count"),
+            )
+        except Exception as exc:
+            log.debug("Token intelligence loop failed: %s", exc)
+        await asyncio.sleep(DASHBOARD_TOKEN_INTELLIGENCE_INTERVAL_SECONDS)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # ── Patch 244: run schema migrations before any background task starts ────
@@ -872,6 +899,10 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(_dashboard_snapshot_refresh_loop())
         if DASHBOARD_SNAPSHOT_BACKGROUND_REFRESH_ENABLED else None
     )
+    task_token_intelligence = (
+        asyncio.create_task(_token_intelligence_loop())
+        if DASHBOARD_TOKEN_INTELLIGENCE_LOOP_ENABLED else None
+    )
     log.info("Dashboard started — API/control plane active; runtime loops are partially headless-owned.")
     yield
     all_tasks = tuple(
@@ -880,6 +911,7 @@ async def lifespan(app: FastAPI):
             task_scalp_mon, task_scalp_scan, task_spot_mon, task_spot_scan,
             task_memecoin_scan, task_research, task_whale_watch,
             task_memecoin_discovery, task_authority_refresh, task_snapshot_prewarm, task_snapshot_refresh,
+            task_token_intelligence,
         )
         if t is not None
     )

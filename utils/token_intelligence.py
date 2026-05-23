@@ -12,6 +12,7 @@ import requests
 TOKEN_INTEL_MAX_TOKENS = max(5, int(os.getenv("TOKEN_INTEL_MAX_TOKENS", "60")))
 TOKEN_INTEL_LIVE_MARKET_LIMIT = max(0, int(os.getenv("TOKEN_INTEL_LIVE_MARKET_LIMIT", "28")))
 TOKEN_INTEL_CONFIRMATION_LIMIT = max(0, int(os.getenv("TOKEN_INTEL_CONFIRMATION_LIMIT", "12")))
+TOKEN_INTEL_PROVIDER_REPAIR_LIMIT = max(0, int(os.getenv("TOKEN_INTEL_PROVIDER_REPAIR_LIMIT", "10")))
 TOKEN_INTEL_RPC_HOLDER_LIMIT = max(0, int(os.getenv("TOKEN_INTEL_RPC_HOLDER_LIMIT", "12")))
 TOKEN_INTEL_MIN_INTERVAL_SECONDS = max(60, int(os.getenv("TOKEN_INTEL_MIN_INTERVAL_SECONDS", "300")))
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com").strip()
@@ -144,6 +145,42 @@ def _ensure_tables(conn) -> None:
             reasons_json TEXT,
             raw_json TEXT
         )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS token_provider_repair_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts_utc TEXT NOT NULL,
+            mint TEXT NOT NULL,
+            symbol TEXT,
+            previous_source TEXT,
+            previous_freshness TEXT,
+            previous_confidence TEXT,
+            previous_quality REAL,
+            previous_pressure REAL,
+            repair_status TEXT NOT NULL,
+            new_source TEXT,
+            new_freshness TEXT,
+            new_confidence TEXT,
+            new_quality REAL,
+            new_pressure REAL,
+            latency_ms INTEGER,
+            unresolved_count INTEGER,
+            reason TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_token_provider_repair_events_ts
+        ON token_provider_repair_events(ts_utc)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_token_provider_repair_events_mint_ts
+        ON token_provider_repair_events(mint, ts_utc)
         """
     )
 
@@ -725,32 +762,117 @@ def _live_confirmation_candidates(limit: int = TOKEN_INTEL_CONFIRMATION_LIMIT) -
 
     items: list[dict] = []
     for row in rows:
-        raw = dict(row)
-        items.append(
-            {
-                "mint": raw.get("mint"),
-                "symbol": raw.get("symbol"),
-                "sources": ["live_confirmation"],
-                "raw_inputs": [
-                    {
-                        "symbol": raw.get("symbol"),
-                        "mint": raw.get("mint"),
-                        "price": raw.get("price"),
-                        "liquidity": raw.get("liquidity"),
-                        "market_cap": raw.get("marketcap"),
-                        "fdv": raw.get("fdv"),
-                        "volume_1h_usd": raw.get("volume_1h_usd"),
-                        "volume_24h_usd": raw.get("volume_24h_usd"),
-                        "change_1h": raw.get("price_change_1h_percent"),
-                        "change_24h": raw.get("price_change_24h_percent"),
-                        "buy_pressure_1h": raw.get("buy_pressure_1h"),
-                        "trade_1h": raw.get("trade_1h"),
-                        "provider_source": raw.get("market_source") or "token_intelligence_current",
-                    }
-                ],
-            }
-        )
+        items.append(_current_row_to_item(dict(row), source="live_confirmation"))
     return items
+
+
+def _current_row_to_item(raw: dict, *, source: str) -> dict:
+    return {
+        "mint": raw.get("mint"),
+        "symbol": raw.get("symbol"),
+        "sources": [source],
+        "raw_inputs": [
+            {
+                "symbol": raw.get("symbol"),
+                "mint": raw.get("mint"),
+                "price": raw.get("price"),
+                "liquidity": raw.get("liquidity"),
+                "market_cap": raw.get("marketcap"),
+                "fdv": raw.get("fdv"),
+                "volume_1h_usd": raw.get("volume_1h_usd"),
+                "volume_24h_usd": raw.get("volume_24h_usd"),
+                "change_1h": raw.get("price_change_1h_percent"),
+                "change_24h": raw.get("price_change_24h_percent"),
+                "buy_pressure_1h": raw.get("buy_pressure_1h"),
+                "trade_1h": raw.get("trade_1h"),
+                "provider_source": raw.get("market_source") or "token_intelligence_current",
+            }
+        ],
+        "_previous": raw,
+    }
+
+
+def _provider_repair_candidates(limit: int = TOKEN_INTEL_PROVIDER_REPAIR_LIMIT) -> list[dict]:
+    if limit <= 0:
+        return []
+    try:
+        with _get_conn() as conn:
+            _ensure_tables(conn)
+            rows = conn.execute(
+                """
+                SELECT c.*,
+                       COALESCE((
+                         SELECT COUNT(*)
+                         FROM token_provider_repair_events e
+                         WHERE e.mint=c.mint
+                           AND e.repair_status IN ('UNRESOLVED','RETIRED_UNRESOLVED')
+                       ), 0) AS unresolved_count
+                FROM token_intelligence_current c
+                WHERE c.mint IS NOT NULL AND TRIM(c.mint) != ''
+                  AND c.symbol IS NOT NULL AND TRIM(c.symbol) != ''
+                  AND (
+                    UPPER(COALESCE(c.data_freshness, ''))='STALE'
+                    OR UPPER(COALESCE(c.data_confidence, ''))='LOW'
+                    OR LOWER(COALESCE(c.market_source, '')) LIKE 'cache%'
+                  )
+                  AND COALESCE(c.identity_status, '') IN ('RESOLVED','ASSERTED')
+                ORDER BY
+                  CASE WHEN COALESCE(c.quality_score,0) >= 72 OR COALESCE(c.pressure_score,0) >= 60 THEN 1 ELSE 0 END DESC,
+                  COALESCE(unresolved_count, 0) ASC,
+                  COALESCE(c.quality_score,0) DESC,
+                  COALESCE(c.pressure_score,0) DESC,
+                  c.updated_at ASC
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+    except Exception:
+        return []
+    return [_current_row_to_item(dict(row), source="provider_repair") for row in rows]
+
+
+def _record_provider_repair_events(events: list[dict]) -> int:
+    if not events:
+        return 0
+    inserted = 0
+    try:
+        with _get_conn() as conn:
+            _ensure_tables(conn)
+            for event in events:
+                conn.execute(
+                    """
+                    INSERT INTO token_provider_repair_events (
+                        ts_utc, mint, symbol, previous_source, previous_freshness,
+                        previous_confidence, previous_quality, previous_pressure,
+                        repair_status, new_source, new_freshness, new_confidence,
+                        new_quality, new_pressure, latency_ms, unresolved_count, reason
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event.get("ts_utc"),
+                        event.get("mint"),
+                        event.get("symbol"),
+                        event.get("previous_source"),
+                        event.get("previous_freshness"),
+                        event.get("previous_confidence"),
+                        _f(event.get("previous_quality")),
+                        _f(event.get("previous_pressure")),
+                        event.get("repair_status"),
+                        event.get("new_source"),
+                        event.get("new_freshness"),
+                        event.get("new_confidence"),
+                        _f(event.get("new_quality")),
+                        _f(event.get("new_pressure")),
+                        _i(event.get("latency_ms")),
+                        _i(event.get("unresolved_count")),
+                        event.get("reason"),
+                    ),
+                )
+                inserted += 1
+    except Exception:
+        return inserted
+    return inserted
 
 
 def _record_live_confirmation_status(payload: dict) -> None:
@@ -807,8 +929,66 @@ def token_intelligence_step(*, force: bool = False) -> dict:
     if confirmation_rows:
         rows.extend(confirmation_rows)
 
+    repair_rows: list[dict] = []
+    repair_events: list[dict] = []
+    repair_items = _provider_repair_candidates(TOKEN_INTEL_PROVIDER_REPAIR_LIMIT)
+    for item in repair_items:
+        previous = dict(item.get("_previous") or {})
+        started = time.time()
+        snapshot: dict | None = None
+        try:
+            snapshot = _build_snapshot(
+                item,
+                live_enabled=True,
+                holder_enabled=False,
+                reserve_market=True,
+            )
+        except Exception:
+            snapshot = None
+        latency_ms = int(max(0.0, (time.time() - started) * 1000.0))
+        previous_unresolved = _i(previous.get("unresolved_count"))
+        live_repaired = bool(
+            snapshot
+            and str(snapshot.get("data_freshness") or "").upper() == "LIVE"
+            and str(snapshot.get("data_confidence") or "").upper() == "HIGH"
+        )
+        if live_repaired and snapshot:
+            repair_status = "LIVE_REPAIRED"
+            reason = "live_provider_returned_high_confidence_market_data"
+            repair_rows.append(snapshot)
+        elif previous_unresolved >= 2 and _f(previous.get("quality_score")) < 65 and _f(previous.get("pressure_score")) < 58:
+            repair_status = "RETIRED_UNRESOLVED"
+            reason = "repeated_provider_miss_low_priority_cache_row"
+        else:
+            repair_status = "UNRESOLVED"
+            reason = "live_provider_missing_or_incomplete"
+        repair_events.append(
+            {
+                "ts_utc": _now_iso(),
+                "mint": previous.get("mint") or item.get("mint"),
+                "symbol": previous.get("symbol") or item.get("symbol"),
+                "previous_source": previous.get("market_source"),
+                "previous_freshness": previous.get("data_freshness"),
+                "previous_confidence": previous.get("data_confidence"),
+                "previous_quality": previous.get("quality_score"),
+                "previous_pressure": previous.get("pressure_score"),
+                "repair_status": repair_status,
+                "new_source": (snapshot or {}).get("market_source"),
+                "new_freshness": (snapshot or {}).get("data_freshness"),
+                "new_confidence": (snapshot or {}).get("data_confidence"),
+                "new_quality": (snapshot or {}).get("quality_score"),
+                "new_pressure": (snapshot or {}).get("pressure_score"),
+                "latency_ms": latency_ms,
+                "unresolved_count": previous_unresolved + (0 if live_repaired else 1),
+                "reason": reason,
+            }
+        )
+    if repair_rows:
+        rows.extend(repair_rows)
+
     inserted = _record_snapshots(rows)
     token_stats_inserted = _backfill_token_stats(rows)
+    repair_events_inserted = _record_provider_repair_events(repair_events)
     conflicts = len([r for r in rows if str(r.get("identity_status") or "").upper() in {"QUARANTINED", "MISMATCH"}])
     live = len([r for r in rows if str(r.get("data_freshness") or "").upper() == "LIVE"])
     high_conf = len([r for r in rows if str(r.get("data_confidence") or "").upper() == "HIGH"])
@@ -820,6 +1000,7 @@ def token_intelligence_step(*, force: bool = False) -> dict:
         "tracked_count": len(tokens),
         "snapshot_count": inserted,
         "token_stats_inserted": token_stats_inserted,
+        "provider_repair_events_inserted": repair_events_inserted,
         "live_count": live,
         "high_confidence_count": high_conf,
         "identity_conflicts": conflicts,
@@ -828,6 +1009,14 @@ def token_intelligence_step(*, force: bool = False) -> dict:
             "snapshot_count": len(confirmation_rows),
             "live_count": len([r for r in confirmation_rows if str(r.get("data_freshness") or "").upper() == "LIVE"]),
             "symbols": [r.get("symbol") for r in confirmation_rows[:10] if r.get("symbol")],
+        },
+        "provider_repair": {
+            "candidate_count": len(repair_items),
+            "event_count": repair_events_inserted,
+            "live_repaired_count": len([e for e in repair_events if e.get("repair_status") == "LIVE_REPAIRED"]),
+            "unresolved_count": len([e for e in repair_events if e.get("repair_status") == "UNRESOLVED"]),
+            "retired_count": len([e for e in repair_events if e.get("repair_status") == "RETIRED_UNRESOLVED"]),
+            "symbols": [e.get("symbol") for e in repair_events[:10] if e.get("symbol")],
         },
         "top_symbols": [r.get("symbol") for r in rows[:10] if r.get("symbol")],
         "detail": f"Independent token intelligence refreshed {inserted}/{len(tokens)} focused token(s).",

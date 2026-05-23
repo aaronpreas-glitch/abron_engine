@@ -14557,7 +14557,258 @@ def _build_data_quality_watchdog(intelligence_rows: list[dict], autopsy: dict | 
     }
 
 
-def _build_daily_build_hooks(autopsy: dict, simulator: dict, watchdog: dict, lock_ok: bool) -> dict:
+def _build_freshness_sla(intelligence_rows: list[dict], snapshot_rows: list[dict], repair_rows: list[dict]) -> dict:
+    rows = list(intelligence_rows or [])
+    total = max(1, len(rows))
+    live = len([r for r in rows if str(r.get("data_freshness") or "").upper() == "LIVE"])
+    recent = len([r for r in rows if str(r.get("data_freshness") or "").upper() == "RECENT"])
+    stale = len([r for r in rows if str(r.get("data_freshness") or "").upper() == "STALE"])
+    low_conf = len([r for r in rows if str(r.get("data_confidence") or "").upper() == "LOW"])
+    repaired = len([r for r in repair_rows if str(r.get("repair_status") or "").upper() == "LIVE_REPAIRED"])
+    unresolved = len([r for r in repair_rows if str(r.get("repair_status") or "").upper() == "UNRESOLVED"])
+    retired = len([r for r in repair_rows if str(r.get("repair_status") or "").upper() == "RETIRED_UNRESOLVED"])
+    live_recent_pct = round(((live + recent) / total) * 100.0, 1)
+    stale_pct = round((stale / total) * 100.0, 1)
+    low_conf_pct = round((low_conf / total) * 100.0, 1)
+    repair_attempts = repaired + unresolved + retired
+    repair_success_pct = round((repaired / max(1, repair_attempts)) * 100.0, 1) if repair_attempts else None
+    score = max(0.0, min(100.0, live_recent_pct - stale_pct * 0.25 - low_conf_pct * 0.20 + min(12.0, repaired * 1.5) - min(10.0, unresolved * 0.4)))
+    status = "OK" if score >= 72 and stale_pct <= 30 else "WATCH" if score >= 55 else "DEGRADED"
+    hourly: dict[str, dict] = {}
+    for row in list(snapshot_rows or []):
+        ts = _gb_parse_ts(row.get("ts_utc"))
+        if not ts:
+            continue
+        key = ts.strftime("%Y-%m-%dT%H:00Z")
+        bucket = hourly.setdefault(key, {"hour": key, "live": 0, "recent": 0, "stale": 0, "low_confidence": 0, "rows": 0})
+        bucket["rows"] += 1
+        freshness = str(row.get("data_freshness") or "UNKNOWN").upper()
+        confidence = str(row.get("data_confidence") or "UNKNOWN").upper()
+        if freshness == "LIVE":
+            bucket["live"] += 1
+        elif freshness == "RECENT":
+            bucket["recent"] += 1
+        elif freshness == "STALE":
+            bucket["stale"] += 1
+        if confidence == "LOW":
+            bucket["low_confidence"] += 1
+    trend = sorted(hourly.values(), key=lambda x: str(x.get("hour") or ""))[-12:]
+    return {
+        "status": status,
+        "score": round(score, 1),
+        "live_recent_pct": live_recent_pct,
+        "stale_pct": stale_pct,
+        "low_confidence_pct": low_conf_pct,
+        "repair_attempts_24h": repair_attempts,
+        "repair_success_pct": repair_success_pct,
+        "live_repaired_24h": repaired,
+        "unresolved_24h": unresolved,
+        "retired_24h": retired,
+        "trend": trend,
+        "next_action": (
+            "Keep live/recent coverage above stale coverage before promoting rule patches."
+            if status != "OK"
+            else "Freshness SLA is good enough for cautious rule review."
+        ),
+    }
+
+
+def _build_rule_promotion_gate(simulator: dict, watchdog: dict, freshness_sla: dict) -> dict:
+    top = dict((simulator or {}).get("top_candidate") or {})
+    data_status = str((watchdog or {}).get("status") or "").upper()
+    sla_status = str((freshness_sla or {}).get("status") or "").upper()
+    score = _gb_float((freshness_sla or {}).get("score"))
+    if not top:
+        status = "NO_RULE"
+        reason = "No simulator candidate has enough outcome evidence."
+    elif data_status in {"PATCH_QUEUE", "DEGRADED"} or sla_status == "DEGRADED" or score < 55:
+        status = "BLOCKED_DATA"
+        reason = "Provider freshness is not strong enough to promote a rule change."
+    elif int(top.get("net_score") or 0) < 8:
+        status = "OBSERVE"
+        reason = "Top rule edge is not large enough to promote."
+    else:
+        status = "READY_REVIEW"
+        reason = "Data quality is acceptable; review the rule manually before coding."
+    return {
+        "status": status,
+        "candidate": top or None,
+        "reason": reason,
+        "requirements": {
+            "freshness_score_min": 55,
+            "rule_net_score_min": 8,
+            "data_status": data_status or "UNKNOWN",
+            "freshness_sla_status": sla_status or "UNKNOWN",
+        },
+    }
+
+
+def _build_missed_runner_clusters(journal_rows: list[dict]) -> dict:
+    clusters: dict[str, dict] = {}
+    for row in journal_rows:
+        action = str(row.get("recommended_action") or "").upper()
+        label = str(row.get("outcome_label") or "").upper()
+        if action == "BUY" or label not in _BUY_DECISION_BULLISH_LABELS:
+            continue
+        snapshot = _decision_snapshot(row)
+        primary = _primary_blocker_from_row(row, snapshot) or {}
+        category = str(primary.get("category") or "unknown").lower()
+        key = f"{category}:{str(primary.get('key') or 'unknown').lower()}"
+        cluster = clusters.setdefault(key, {
+            "key": key,
+            "category": category,
+            "label": primary.get("label") or key.replace("_", " "),
+            "count": 0,
+            "avg_max_return_pct": None,
+            "total_return": 0.0,
+            "examples": [],
+        })
+        cluster["count"] += 1
+        cluster["total_return"] += _gb_float(row.get("max_return_pct"))
+        if len(cluster["examples"]) < 4:
+            cluster["examples"].append({
+                "symbol": row.get("symbol"),
+                "surface": row.get("source_surface"),
+                "max_return_pct": _nullable_float(row.get("max_return_pct")),
+                "decision_state": _decision_state_from_row(row, snapshot),
+                "blocker": primary.get("label") or primary.get("key"),
+            })
+    out = []
+    for cluster in clusters.values():
+        count = max(1, int(cluster.get("count") or 0))
+        cluster["avg_max_return_pct"] = round(_gb_float(cluster.get("total_return")) / count, 2)
+        cluster.pop("total_return", None)
+        out.append(cluster)
+    out.sort(key=lambda x: (int(x.get("count") or 0), _gb_float(x.get("avg_max_return_pct"))), reverse=True)
+    return {
+        "status": "READY" if out else "NO_MISSED_RUNNERS",
+        "clusters": out[:8],
+        "top_cluster": out[0] if out else None,
+    }
+
+
+def _build_catalyst_context(kv_rows: dict[str, str], confluence_rows: list[dict], journal_rows: list[dict]) -> dict:
+    narrative = {}
+    try:
+        narrative = json.loads(kv_rows.get("narrative_trending") or "{}")
+    except Exception:
+        narrative = {}
+    cg_symbols = [str(x or "").upper() for x in list(narrative.get("cg_symbols") or [])[:12] if x]
+    dex_symbols = [str(x or "").upper() for x in list(narrative.get("dex_symbols") or [])[:12] if x]
+    journal_symbols = {
+        str(row.get("symbol") or "").upper()
+        for row in journal_rows
+        if str(row.get("symbol") or "").strip()
+    }
+    overlaps = sorted((set(cg_symbols) | set(dex_symbols)) & journal_symbols)
+    confluence = [
+        {
+            "symbol": row.get("token_symbol"),
+            "mint": row.get("token_mint"),
+            "type": row.get("confluence_type"),
+            "score": _nullable_float(row.get("confluence_score")),
+            "ts": row.get("ts_utc"),
+        }
+        for row in list(confluence_rows or [])[:8]
+    ]
+    status = "ACTIVE" if cg_symbols or dex_symbols or confluence else "NO_FEED"
+    return {
+        "status": status,
+        "updated_at": narrative.get("updated_at"),
+        "sources": {
+            "coingecko_symbols": cg_symbols,
+            "dexscreener_symbols": dex_symbols,
+            "recent_confluence_count": len(confluence),
+        },
+        "decision_overlap_symbols": overlaps[:10],
+        "recent_confluence": confluence,
+        "next_action": "Use catalyst overlap as context, not as an execution trigger.",
+    }
+
+
+def _build_paper_to_pilot_gate(paper_rows: list[dict], lock_ok: bool, freshness_sla: dict, decision_quality: dict) -> dict:
+    sample = len(paper_rows)
+    wins = len([r for r in paper_rows if str(r.get("outcome_label") or "").upper() in {"BIG_RUNNER", "GOOD_RUNNER", "GOOD_BUY"}])
+    weak = len([r for r in paper_rows if str(r.get("outcome_label") or "").upper() in {"BAD_BUY", "WEAK_BUY"}])
+    avg_4h = _avg([_nullable_float(r.get("return_4h_pct")) for r in paper_rows])
+    avg_max = _avg([_nullable_float(r.get("max_return_pct")) for r in paper_rows])
+    win_rate = round((wins / max(1, sample)) * 100.0, 1) if sample else 0.0
+    blockers = []
+    if not lock_ok:
+        blockers.append("execution_lock_review")
+    if str((freshness_sla or {}).get("status") or "").upper() != "OK":
+        blockers.append("freshness_sla_not_ok")
+    if sample < 30:
+        blockers.append("paper_sample_below_30")
+    if win_rate < 45:
+        blockers.append("paper_win_rate_below_45")
+    if avg_4h is None or avg_4h < 0:
+        blockers.append("paper_avg_4h_not_positive")
+    if int((decision_quality or {}).get("missed_runner_count") or 0) > 3:
+        blockers.append("missed_runner_count_high")
+    status = "READY_FOR_DISCUSSION" if not blockers else "LOCKED" if not lock_ok else "NOT_READY"
+    return {
+        "status": status,
+        "sample_n": sample,
+        "win_rate_pct": win_rate,
+        "weak_count": weak,
+        "avg_4h_pct": avg_4h,
+        "avg_max_return_pct": avg_max,
+        "blockers": blockers,
+        "note": "Read-only gate only; requires separate explicit re-arm discussion even if ready.",
+    }
+
+
+def _build_daily_build_score(
+    lock_ok: bool,
+    freshness_sla: dict,
+    decision_quality: dict,
+    watchdog: dict,
+    rule_gate: dict,
+    catalyst_context: dict,
+    paper_gate: dict,
+) -> dict:
+    data_score = _gb_float((freshness_sla or {}).get("score"))
+    rule_score = 70.0 if str((rule_gate or {}).get("status") or "") == "READY_REVIEW" else 45.0 if (rule_gate or {}).get("candidate") else 25.0
+    research_score = 70.0 if str((catalyst_context or {}).get("status") or "") == "ACTIVE" else 35.0
+    execution_score = 100.0 if lock_ok else 15.0
+    paper_score = 75.0 if str((paper_gate or {}).get("status") or "") == "READY_FOR_DISCUSSION" else 45.0 if int((paper_gate or {}).get("sample_n") or 0) >= 20 else 25.0
+    components = {
+        "data": round(data_score, 1),
+        "rules": round(rule_score, 1),
+        "research": round(research_score, 1),
+        "execution_safety": round(execution_score, 1),
+        "paper": round(paper_score, 1),
+    }
+    if str((watchdog or {}).get("status") or "").upper() in {"DEGRADED", "PATCH_QUEUE"} or data_score < 65:
+        focus = "DATA"
+    elif int((decision_quality or {}).get("missed_runner_count") or 0) > 3:
+        focus = "MISSED_RUNNERS"
+    elif str((rule_gate or {}).get("status") or "") == "READY_REVIEW":
+        focus = "RULES"
+    elif str((catalyst_context or {}).get("status") or "") != "ACTIVE":
+        focus = "CATALYSTS"
+    elif str((paper_gate or {}).get("status") or "") == "READY_FOR_DISCUSSION":
+        focus = "PAPER_TO_PILOT_REVIEW"
+    else:
+        focus = "OBSERVE"
+    overall = round(sum(components.values()) / max(1, len(components)), 1)
+    return {
+        "score": overall,
+        "focus": focus,
+        "components": components,
+        "next_action": {
+            "DATA": "Keep repairing stale provider coverage before rule changes.",
+            "MISSED_RUNNERS": "Cluster missed-runner blockers and promote scout timing fixes only after data is fresh.",
+            "RULES": "Manually review the simulator candidate; do not auto-promote.",
+            "CATALYSTS": "Refresh narrative and confluence context.",
+            "PAPER_TO_PILOT_REVIEW": "Prepare a separate explicit re-arm discussion, not an automatic re-arm.",
+            "OBSERVE": "Keep collecting outcomes.",
+        }.get(focus, "Keep collecting outcomes."),
+    }
+
+
+def _build_daily_build_hooks(autopsy: dict, simulator: dict, watchdog: dict, lock_ok: bool, rule_gate: dict | None = None) -> dict:
     top_rule = (autopsy or {}).get("top_rule_to_review") or {}
     top_sim = (simulator or {}).get("top_candidate") or {}
     if not lock_ok:
@@ -14566,6 +14817,9 @@ def _build_daily_build_hooks(autopsy: dict, simulator: dict, watchdog: dict, loc
     elif str((watchdog or {}).get("status") or "").upper() in {"PATCH_QUEUE", "DEGRADED"}:
         status = "DATA_FIRST"
         next_patch = str((watchdog or {}).get("action") or "Patch data quality before rule changes.")
+    elif str((rule_gate or {}).get("status") or "").upper() == "BLOCKED_DATA":
+        status = "DATA_FIRST"
+        next_patch = str((rule_gate or {}).get("reason") or "Patch data quality before rule changes.")
     elif top_rule:
         status = "RULE_REVIEW"
         next_patch = f"Review {top_rule.get('label') or top_rule.get('key')} with {top_rule.get('recommendation') or 'simulation'}."
@@ -14585,6 +14839,9 @@ def _build_daily_build_hooks(autopsy: dict, simulator: dict, watchdog: dict, loc
             "outcome autopsy",
             "rule impact simulator",
             "data quality watchdog",
+            "provider repair automation",
+            "freshness SLA",
+            "paper-to-pilot gate",
         ],
     }
 
@@ -14659,6 +14916,64 @@ def _build_daily_crypto_brief(lookback_hours: int = 24) -> dict:
                     """
                 ).fetchall()
             ]
+            try:
+                token_snapshot_rows = [
+                    dict(r) for r in conn.execute(
+                        """
+                        SELECT ts_utc, data_freshness, data_confidence, market_source
+                        FROM token_intelligence_snapshots
+                        WHERE ts_utc >= ?
+                        ORDER BY ts_utc DESC
+                        LIMIT 3000
+                        """,
+                        (since.isoformat(),),
+                    ).fetchall()
+                ]
+            except Exception:
+                token_snapshot_rows = []
+            try:
+                repair_rows = [
+                    dict(r) for r in conn.execute(
+                        """
+                        SELECT ts_utc, mint, symbol, previous_source, previous_freshness,
+                               previous_confidence, previous_quality, previous_pressure,
+                               repair_status, new_source, new_freshness, new_confidence,
+                               new_quality, new_pressure, latency_ms, unresolved_count, reason
+                        FROM token_provider_repair_events
+                        WHERE ts_utc >= ?
+                        ORDER BY id DESC
+                        LIMIT 800
+                        """,
+                        (since.isoformat(),),
+                    ).fetchall()
+                ]
+            except Exception:
+                repair_rows = []
+            try:
+                kv_rows = {
+                    str(r["key"]): str(r["value"] or "")
+                    for r in conn.execute(
+                        "SELECT key, value FROM kv_store WHERE key IN ('narrative_trending')"
+                    ).fetchall()
+                }
+            except Exception:
+                kv_rows = {}
+            try:
+                confluence_rows = [
+                    dict(r) for r in conn.execute(
+                        """
+                        SELECT ts_utc, token_symbol, token_mint, confluence_type,
+                               confluence_score, source_count, sources
+                        FROM confluence_events
+                        WHERE ts_utc >= ?
+                        ORDER BY ts_utc DESC
+                        LIMIT 80
+                        """,
+                        (since.isoformat(),),
+                    ).fetchall()
+                ]
+            except Exception:
+                confluence_rows = []
             open_trade_count = int(conn.execute(
                 "SELECT COUNT(*) FROM memecoin_trades WHERE UPPER(COALESCE(status, ''))='OPEN'"
             ).fetchone()[0] or 0)
@@ -14770,9 +15085,32 @@ def _build_daily_crypto_brief(lookback_hours: int = 24) -> dict:
     rule_simulator = _simulate_daily_rule_impacts(journal_24h, outcome_autopsy)
     candidate_replay_timeline = _build_candidate_replay_timeline(journal_rows, outcome_autopsy)
     data_watchdog = _build_data_quality_watchdog(intelligence_rows, outcome_autopsy)
-    daily_build_hooks = _build_daily_build_hooks(outcome_autopsy, rule_simulator, data_watchdog, lock_ok)
+    freshness_sla = _build_freshness_sla(intelligence_rows, token_snapshot_rows, repair_rows)
+    rule_promotion_gate = _build_rule_promotion_gate(rule_simulator, data_watchdog, freshness_sla)
+    missed_runner_clusters = _build_missed_runner_clusters(journal_24h)
+    catalyst_context = _build_catalyst_context(kv_rows, confluence_rows, journal_24h)
     missed_count = len(missed)
     weak_count = len(weak_buys)
+    decision_quality_payload = {
+        "journal_count": len(journal_24h),
+        "surface_counts": surface_counts,
+        "action_counts": action_counts,
+        "outcome_counts": outcome_counts,
+        "avg_max_return_pct": _avg_key(journal_24h, "max_return_pct"),
+        "missed_runner_count": missed_count,
+        "weak_buy_count": weak_count,
+    }
+    paper_gate = _build_paper_to_pilot_gate(paper_24h, lock_ok, freshness_sla, decision_quality_payload)
+    daily_build_score = _build_daily_build_score(
+        lock_ok,
+        freshness_sla,
+        decision_quality_payload,
+        data_watchdog,
+        rule_promotion_gate,
+        catalyst_context,
+        paper_gate,
+    )
+    daily_build_hooks = _build_daily_build_hooks(outcome_autopsy, rule_simulator, data_watchdog, lock_ok, rule_promotion_gate)
     if lock_ok and data_ok and missed_count <= 3:
         status = "WATCH"
         headline = "Daily crypto brief is stable; keep improving missed-runner timing before any re-arm talk."
@@ -14790,6 +15128,8 @@ def _build_daily_crypto_brief(lookback_hours: int = 24) -> dict:
         next_actions.append("Refresh stale high-quality token intelligence rows first.")
     if daily_build_hooks.get("next_patch"):
         next_actions.append(str(daily_build_hooks.get("next_patch")))
+    if daily_build_score.get("next_action"):
+        next_actions.append(str(daily_build_score.get("next_action")))
     if missed_count:
         next_actions.append("Review missed-runner blockers and scout-only timing.")
     if weak_count:
@@ -14818,15 +15158,7 @@ def _build_daily_crypto_brief(lookback_hours: int = 24) -> dict:
             "confidence_counts": confidence_counts,
             "stale_high_quality": stale_high_quality,
         },
-        "decision_quality": {
-            "journal_count": len(journal_24h),
-            "surface_counts": surface_counts,
-            "action_counts": action_counts,
-            "outcome_counts": outcome_counts,
-            "avg_max_return_pct": _avg_key(journal_24h, "max_return_pct"),
-            "missed_runner_count": missed_count,
-            "weak_buy_count": weak_count,
-        },
+        "decision_quality": decision_quality_payload,
         "paper_pilot": {
             "opened_count": len(paper_24h),
             "status_counts": paper_status,
@@ -14842,6 +15174,12 @@ def _build_daily_crypto_brief(lookback_hours: int = 24) -> dict:
         "rule_simulator": rule_simulator,
         "candidate_replay_timeline": candidate_replay_timeline,
         "data_watchdog": data_watchdog,
+        "freshness_sla": freshness_sla,
+        "rule_promotion_gate": rule_promotion_gate,
+        "missed_runner_clusters": missed_runner_clusters,
+        "catalyst_context": catalyst_context,
+        "daily_build_score": daily_build_score,
+        "paper_to_pilot_gate": paper_gate,
         "daily_build_hooks": daily_build_hooks,
         "next_actions": next_actions[:5],
     }

@@ -270,6 +270,71 @@ interface DailyCryptoBriefData {
     repair_plan?: string | null
     action?: string | null
   }
+  freshness_sla?: {
+    status?: string
+    score?: number | null
+    live_recent_pct?: number | null
+    stale_pct?: number | null
+    low_confidence_pct?: number | null
+    repair_attempts_24h?: number
+    repair_success_pct?: number | null
+    live_repaired_24h?: number
+    unresolved_24h?: number
+    retired_24h?: number
+    next_action?: string | null
+  }
+  rule_promotion_gate?: {
+    status?: string
+    reason?: string | null
+    candidate?: {
+      key?: string | null
+      label?: string | null
+      net_score?: number | null
+    } | null
+  }
+  missed_runner_clusters?: {
+    status?: string
+    top_cluster?: {
+      key?: string
+      category?: string
+      label?: string
+      count?: number
+      avg_max_return_pct?: number | null
+    } | null
+    clusters?: Array<{
+      key?: string
+      category?: string
+      label?: string
+      count?: number
+      avg_max_return_pct?: number | null
+    }>
+  }
+  catalyst_context?: {
+    status?: string
+    updated_at?: string | null
+    decision_overlap_symbols?: string[]
+    sources?: {
+      coingecko_symbols?: string[]
+      dexscreener_symbols?: string[]
+      recent_confluence_count?: number
+    }
+    next_action?: string | null
+  }
+  daily_build_score?: {
+    score?: number | null
+    focus?: string
+    components?: Record<string, number>
+    next_action?: string | null
+  }
+  paper_to_pilot_gate?: {
+    status?: string
+    sample_n?: number
+    win_rate_pct?: number | null
+    avg_4h_pct?: number | null
+    avg_max_return_pct?: number | null
+    blockers?: string[]
+    note?: string | null
+  }
   daily_build_hooks?: {
     status?: string
     next_patch?: string | null
@@ -4348,6 +4413,12 @@ function DailyCryptoBriefPanel({ data, loading }: { data?: DailyCryptoBriefData;
     const replay = data.candidate_replay_timeline ?? {}
     const replayEvents = replay.events ?? []
     const watchdog = data.data_watchdog ?? {}
+    const freshnessSla = data.freshness_sla ?? {}
+    const ruleGate = data.rule_promotion_gate ?? {}
+    const missedClusters = data.missed_runner_clusters ?? {}
+    const catalystContext = data.catalyst_context ?? {}
+    const buildScore = data.daily_build_score ?? {}
+    const pilotGate = data.paper_to_pilot_gate ?? {}
     const providerRows = watchdog.by_source ?? []
     const refreshTargets = watchdog.refresh_priority ?? []
     const topRefreshTarget = refreshTargets[0]
@@ -4528,6 +4599,80 @@ function DailyCryptoBriefPanel({ data, loading }: { data?: DailyCryptoBriefData;
               {topRefreshTarget
                 ? `${String(topRefreshTarget.market_source || 'source').toLowerCase()} · ${String(topRefreshTarget.data_freshness || 'unknown').toLowerCase()}/${String(topRefreshTarget.data_confidence || 'unknown').toLowerCase()} · q ${fmtFixed(topRefreshTarget.quality_score, 0)}`
                 : watchdog.action || 'No provider repair target queued.'}
+            </div>
+          </div>
+
+          <div style={{ border: '1px solid rgba(45,212,191,0.18)', borderRadius: 10, padding: 10, background: 'rgba(45,212,191,0.03)' }}>
+            <span style={{ ...MONO, fontSize: 8, color: '#2dd4bf', fontWeight: 900, letterSpacing: '0.14em' }}>
+              FRESHNESS SLA
+            </span>
+            <div style={{ ...MONO, fontSize: 10, color: '#d7e1ea', marginTop: 7, lineHeight: 1.45 }}>
+              {freshnessSla.status || 'UNKNOWN'} · {fmtFixed(freshnessSla.score, 0)}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              live/recent {fmtFixed(freshnessSla.live_recent_pct, 0)}% · repaired {freshnessSla.live_repaired_24h ?? 0}/{freshnessSla.repair_attempts_24h ?? 0}
+            </div>
+          </div>
+
+          <div style={{ border: '1px solid rgba(167,139,250,0.18)', borderRadius: 10, padding: 10, background: 'rgba(167,139,250,0.03)' }}>
+            <span style={{ ...MONO, fontSize: 8, color: '#a78bfa', fontWeight: 900, letterSpacing: '0.14em' }}>
+              RULE GATE
+            </span>
+            <div style={{ ...MONO, fontSize: 10, color: '#d7e1ea', marginTop: 7, lineHeight: 1.45 }}>
+              {ruleGate.status || 'NO_RULE'}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              {ruleGate.candidate?.label || ruleGate.reason || 'Waiting for simulator evidence.'}
+            </div>
+          </div>
+
+          <div style={{ border: '1px solid rgba(239,68,68,0.18)', borderRadius: 10, padding: 10, background: 'rgba(239,68,68,0.025)' }}>
+            <span style={{ ...MONO, fontSize: 8, color: '#ef4444', fontWeight: 900, letterSpacing: '0.14em' }}>
+              MISS CLUSTERS
+            </span>
+            <div style={{ ...MONO, fontSize: 10, color: '#d7e1ea', marginTop: 7, lineHeight: 1.45 }}>
+              {missedClusters.top_cluster?.label || missedClusters.status || 'NO_MISSES'}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              {missedClusters.top_cluster
+                ? `${missedClusters.top_cluster.count ?? 0} misses · avg ${fmtPct(missedClusters.top_cluster.avg_max_return_pct)}`
+                : 'No bullish missed-runner cluster in this window.'}
+            </div>
+          </div>
+
+          <div style={{ border: '1px solid rgba(96,165,250,0.18)', borderRadius: 10, padding: 10, background: 'rgba(96,165,250,0.025)' }}>
+            <span style={{ ...MONO, fontSize: 8, color: '#60a5fa', fontWeight: 900, letterSpacing: '0.14em' }}>
+              CATALYSTS
+            </span>
+            <div style={{ ...MONO, fontSize: 10, color: '#d7e1ea', marginTop: 7, lineHeight: 1.45 }}>
+              {catalystContext.status || 'NO_FEED'} · confluence {catalystContext.sources?.recent_confluence_count ?? 0}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              {(catalystContext.decision_overlap_symbols ?? []).slice(0, 5).join(', ') || 'No narrative overlap with current decisions.'}
+            </div>
+          </div>
+
+          <div style={{ border: '1px solid rgba(0,212,138,0.18)', borderRadius: 10, padding: 10, background: 'rgba(0,212,138,0.025)' }}>
+            <span style={{ ...MONO, fontSize: 8, color: '#00d48a', fontWeight: 900, letterSpacing: '0.14em' }}>
+              BUILD SCORE
+            </span>
+            <div style={{ ...MONO, fontSize: 10, color: '#d7e1ea', marginTop: 7, lineHeight: 1.45 }}>
+              {fmtFixed(buildScore.score, 0)} · {(buildScore.focus || 'OBSERVE').replace(/_/g, ' ')}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              {buildScore.next_action || 'Keep collecting outcomes.'}
+            </div>
+          </div>
+
+          <div style={{ border: '1px solid rgba(245,158,11,0.18)', borderRadius: 10, padding: 10, background: 'rgba(245,158,11,0.025)' }}>
+            <span style={{ ...MONO, fontSize: 8, color: '#f59e0b', fontWeight: 900, letterSpacing: '0.14em' }}>
+              PILOT GATE
+            </span>
+            <div style={{ ...MONO, fontSize: 10, color: '#d7e1ea', marginTop: 7, lineHeight: 1.45 }}>
+              {pilotGate.status || 'NOT_READY'} · sample {pilotGate.sample_n ?? 0}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              win {fmtFixed(pilotGate.win_rate_pct, 0)}% · 4h {fmtPct(pilotGate.avg_4h_pct)} · {(pilotGate.blockers ?? []).slice(0, 2).join(', ') || 'discussion only'}
             </div>
           </div>
         </div>
