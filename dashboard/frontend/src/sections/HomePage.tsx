@@ -4770,6 +4770,20 @@ function DailyCryptoBriefPanel({
     const topEscalationPatch = escalationPatchPlans.top_plan ?? escalationPatchPlans.items?.[0]
     const topEscalationWorkOrder = escalationWorkOrders.top_work_order ?? escalationWorkOrders.items?.[0]
     const topEscalationExecutionPack = escalationExecutionPacks.top_pack ?? escalationExecutionPacks.items?.[0]
+    const executionPackEvidence = topEscalationExecutionPack?.evidence_bundle ?? {}
+    const executionPackRecipe = topEscalationExecutionPack?.replay_test_recipe ?? []
+    const executionPackTargets = topEscalationExecutionPack?.target_code_map ?? []
+    const executionPackCriteria = topEscalationExecutionPack?.completion_criteria ?? []
+    const executionPackTone =
+      topEscalationExecutionPack?.state === 'ACTIVE' ? '#00d48a'
+      : topEscalationExecutionPack ? '#f59e0b'
+      : '#60a5fa'
+    const executionPackState =
+      topEscalationExecutionPack?.state === 'ACTIVE' ? 'IMPLEMENTING'
+      : topEscalationExecutionPack?.state === 'READY' ? 'READY TO START'
+      : 'WAITING'
+    const executionPackTarget = executionPackTargets[0]
+    const executionPackRecipeStep = executionPackRecipe[0]
     const buildHooks = data.daily_build_hooks ?? {}
     const countText = (counts: Record<string, number>, keys: string[]) =>
       keys.map(key => `${key.toLowerCase()} ${counts[key] ?? 0}`).join(' · ')
@@ -4839,6 +4853,12 @@ function DailyCryptoBriefPanel({
         </div>
       )
     }
+    const WorkbenchItem = ({ label, value, tone: itemTone = '#d7e1ea' }: { label: string; value: string; tone?: string }) => (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 }}>
+        <span style={{ ...MONO, fontSize: 7, color: '#7f95a8', letterSpacing: '0.14em' }}>{label}</span>
+        <span style={{ ...MONO, fontSize: 10, color: itemTone, fontWeight: 900, lineHeight: 1.35, overflowWrap: 'anywhere' }}>{value}</span>
+      </div>
+    )
 
   return (
     <div style={{
@@ -4885,6 +4905,130 @@ function DailyCryptoBriefPanel({
           <Metric label="DECISIONS" value={`${decision.journal_count} · ${fmtPct(decision.avg_max_return_pct)}`} />
           <Metric label="MISSED/WEAK" value={`${decision.missed_runner_count}/${decision.weak_buy_count}`} valueTone={decision.missed_runner_count || decision.weak_buy_count ? '#f59e0b' : '#00d48a'} />
           <Metric label="PAPER" value={`${paper.opened_count} · max ${fmtPct(paper.avg_max_return_pct)}`} valueTone="#a78bfa" />
+        </div>
+
+        <div style={{
+          border: `1px solid ${executionPackTone}28`,
+          borderLeft: `3px solid ${executionPackTone}`,
+          borderRadius: 10,
+          padding: 12,
+          background: topEscalationExecutionPack ? `${executionPackTone}08` : 'rgba(96,165,250,0.018)',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 12,
+        }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'flex-start', flexWrap: 'wrap' }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 5, minWidth: 260, flex: 1 }}>
+              <div style={{ display: 'flex', gap: 7, alignItems: 'center', flexWrap: 'wrap' }}>
+                <span style={{ ...MONO, fontSize: 8, color: executionPackTone, fontWeight: 900, letterSpacing: '0.14em' }}>
+                  OPERATOR WORKBENCH
+                </span>
+                <span style={{ ...MONO, fontSize: 8, color: executionPackTone, background: `${executionPackTone}12`, border: `1px solid ${executionPackTone}28`, borderRadius: 999, padding: '2px 8px' }}>
+                  {executionPackState}
+                </span>
+                <span style={{ ...MONO, fontSize: 8, color: '#7f95a8' }}>
+                  packs {escalationExecutionPacks.pack_count ?? 0} · active {escalationExecutionPacks.active_count ?? 0}
+                </span>
+              </div>
+              <span style={{ ...MONO, fontSize: 11, color: '#d7e1ea', lineHeight: 1.45, fontWeight: 900 }}>
+                {topEscalationExecutionPack
+                  ? topEscalationExecutionPack.next_action || 'Use this pack as the implementation handoff.'
+                  : escalationExecutionPacks.next_action || 'Start a ready work order to activate an execution pack.'}
+              </span>
+              <span style={{ ...MONO, fontSize: 8, color: '#8ca0b3', lineHeight: 1.5 }}>
+                {topEscalationExecutionPack
+                  ? executionPackEvidence.why_it_matters || 'Pack is carrying evidence, target map, replay test, and completion criteria.'
+                  : 'No pack is active yet. Promote a patch plan into a work order, then start the work order here.'}
+              </span>
+            </div>
+            {topEscalationExecutionPack && onEscalationWorkOrderAction && (
+              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                {([
+                  ['STARTED', 'START'],
+                  ['BLOCKED', 'BLOCK'],
+                  ['COMPLETE', 'READY FOR REVIEW'],
+                ] as Array<[ProviderEscalationWorkOrderState, string]>).map(([state, label]) => (
+                  <button
+                    key={`execution-pack-workbench-${state}`}
+                    type="button"
+                    className="mini-btn"
+                    disabled={pendingEscalationWorkOrderKey === topEscalationExecutionPack.group_key}
+                    onClick={() => onEscalationWorkOrderAction(topEscalationWorkOrder ?? { group_key: topEscalationExecutionPack.group_key }, state)}
+                    style={{ fontSize: 7, padding: '5px 8px' }}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {topEscalationExecutionPack ? (
+            <>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))', gap: 10 }}>
+                <WorkbenchItem label="TARGET" value={`${topEscalationExecutionPack.target_subsystem || 'subsystem'} · ${String(topEscalationExecutionPack.risk_label || 'risk').replace(/_/g, ' ').toLowerCase()}`} tone={executionPackTone} />
+                <WorkbenchItem label="EVIDENCE" value={`${(executionPackEvidence.symbols ?? []).slice(0, 3).join(', ') || 'system'} · max ${fmtPct(executionPackEvidence.max_return_pct)} · conf ${fmtFixed(executionPackEvidence.confidence_score, 0)}`} />
+                <WorkbenchItem label="BENEFIT/RISK" value={`${executionPackEvidence.simulated_benefit_n ?? 0} / ${executionPackEvidence.weak_buy_risk_n ?? 0} · ${executionPackEvidence.gate_status || 'gate unknown'}`} />
+                <WorkbenchItem label="PATCH TARGET" value={executionPackTarget ? `${executionPackTarget.file || 'file'} · ${executionPackTarget.function || 'function'}` : 'target map pending'} />
+              </div>
+
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 12 }}>
+                <div style={{ minWidth: 0 }}>
+                  <span style={{ ...MONO, fontSize: 8, color: '#60a5fa', fontWeight: 900, letterSpacing: '0.14em' }}>
+                    REPLAY TEST
+                  </span>
+                  <div style={{ ...MONO, fontSize: 9, color: '#d7e1ea', marginTop: 6, lineHeight: 1.45 }}>
+                    {executionPackRecipeStep?.label || 'Replay recipe pending.'}
+                  </div>
+                  <pre style={{
+                    ...MONO,
+                    margin: '8px 0 0',
+                    padding: 9,
+                    border: '1px solid rgba(96,165,250,0.18)',
+                    borderRadius: 8,
+                    background: 'rgba(0,0,0,0.2)',
+                    color: '#9db7ce',
+                    fontSize: 8,
+                    lineHeight: 1.45,
+                    whiteSpace: 'pre-wrap',
+                    overflowWrap: 'anywhere',
+                  }}>
+                    {executionPackRecipeStep?.command || 'No command published yet.'}
+                  </pre>
+                </div>
+                <div style={{ minWidth: 0 }}>
+                  <span style={{ ...MONO, fontSize: 8, color: '#00d48a', fontWeight: 900, letterSpacing: '0.14em' }}>
+                    COMPLETION CRITERIA
+                  </span>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 7 }}>
+                    {executionPackCriteria.slice(0, 4).map((criterion, i) => (
+                      <div key={`execution-pack-criterion-${i}`} style={{ display: 'grid', gridTemplateColumns: '12px 1fr', gap: 6, alignItems: 'start' }}>
+                        <span style={{ ...MONO, color: executionPackTone, fontSize: 9, lineHeight: 1.45 }}>{i + 1}</span>
+                        <span style={{ ...MONO, color: '#8ca0b3', fontSize: 8, lineHeight: 1.45 }}>{criterion}</span>
+                      </div>
+                    ))}
+                    {executionPackCriteria.length === 0 && (
+                      <span style={{ ...MONO, color: '#7f95a8', fontSize: 8 }}>criteria pending</span>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {executionPackTargets.length > 1 && (
+                <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                  {executionPackTargets.slice(1, 5).map((target, i) => (
+                    <span key={`execution-pack-target-${target.file}-${target.function}-${i}`} style={{ ...MONO, fontSize: 8, color: '#8ca0b3', border: '1px solid rgba(255,255,255,0.08)', borderRadius: 999, padding: '3px 8px', background: 'rgba(255,255,255,0.025)' }}>
+                      {target.file || 'file'} · {target.function || 'function'}
+                    </span>
+                  ))}
+                </div>
+              )}
+            </>
+          ) : (
+            <div style={{ ...MONO, fontSize: 8, color: '#7f95a8', lineHeight: 1.5 }}>
+              Workbench is idle. The next pack appears here after a work order is ready or started.
+            </div>
+          )}
         </div>
 
         <div style={{
