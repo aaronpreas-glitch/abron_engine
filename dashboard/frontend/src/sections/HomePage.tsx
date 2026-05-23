@@ -239,7 +239,35 @@ interface DailyCryptoBriefData {
       live_recent_rows?: number
       stale_rows?: number
       low_confidence_rows?: number
+      sources?: Record<string, number>
     }
+    by_source?: Array<{
+      source?: string | null
+      rows?: number
+      live?: number
+      recent?: number
+      stale?: number
+      high_confidence?: number
+      low_confidence?: number
+      avg_quality?: number | null
+      avg_pressure?: number | null
+      stale_pct?: number | null
+      low_confidence_pct?: number | null
+      status?: string | null
+    }>
+    refresh_priority?: Array<{
+      symbol?: string | null
+      mint?: string | null
+      market_source?: string | null
+      data_freshness?: string | null
+      data_confidence?: string | null
+      quality_score?: number | null
+      pressure_score?: number | null
+      priority_score?: number | null
+      reasons?: string[]
+    }>
+    provider_alerts?: string[]
+    repair_plan?: string | null
     action?: string | null
   }
   daily_build_hooks?: {
@@ -4320,6 +4348,12 @@ function DailyCryptoBriefPanel({ data, loading }: { data?: DailyCryptoBriefData;
     const replay = data.candidate_replay_timeline ?? {}
     const replayEvents = replay.events ?? []
     const watchdog = data.data_watchdog ?? {}
+    const providerRows = watchdog.by_source ?? []
+    const refreshTargets = watchdog.refresh_priority ?? []
+    const topRefreshTarget = refreshTargets[0]
+    const providerLine = providerRows.slice(0, 3)
+      .map(row => `${String(row.source || 'unknown').toLowerCase()} ${row.live ?? 0}/${row.stale ?? 0} stale`)
+      .join(' · ')
     const buildHooks = data.daily_build_hooks ?? {}
     const countText = (counts: Record<string, number>, keys: string[]) =>
       keys.map(key => `${key.toLowerCase()} ${counts[key] ?? 0}`).join(' · ')
@@ -4479,7 +4513,21 @@ function DailyCryptoBriefPanel({ data, loading }: { data?: DailyCryptoBriefData;
               {buildHooks.status || watchdog.status || 'OBSERVE'}
             </div>
             <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
-              data {watchdog.summary?.live_recent_rows ?? 0}/{watchdog.summary?.stale_rows ?? 0} stale · rearm {buildHooks.safe_to_rearm_discussion ? 'separate discussion allowed' : 'locked'}
+              {providerLine || `data ${watchdog.summary?.live_recent_rows ?? 0}/${watchdog.summary?.stale_rows ?? 0} stale`} · rearm {buildHooks.safe_to_rearm_discussion ? 'separate discussion allowed' : 'locked'}
+            </div>
+          </div>
+
+          <div style={{ border: '1px solid rgba(245,158,11,0.18)', borderRadius: 10, padding: 10, background: 'rgba(245,158,11,0.03)' }}>
+            <span style={{ ...MONO, fontSize: 8, color: '#f59e0b', fontWeight: 900, letterSpacing: '0.14em' }}>
+              PROVIDER WATCH
+            </span>
+            <div style={{ ...MONO, fontSize: 10, color: '#d7e1ea', marginTop: 7, lineHeight: 1.45 }}>
+              {topRefreshTarget?.symbol || watchdog.status || 'Coverage normal'}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              {topRefreshTarget
+                ? `${String(topRefreshTarget.market_source || 'source').toLowerCase()} · ${String(topRefreshTarget.data_freshness || 'unknown').toLowerCase()}/${String(topRefreshTarget.data_confidence || 'unknown').toLowerCase()} · q ${fmtFixed(topRefreshTarget.quality_score, 0)}`
+                : watchdog.action || 'No provider repair target queued.'}
             </div>
           </div>
         </div>
@@ -7207,10 +7255,23 @@ export function HomePage() {
   const queryClient = useQueryClient()
   const [pendingRunnerMint, setPendingRunnerMint] = React.useState<string | null>(null)
   const [pendingManualMint, setPendingManualMint] = React.useState<string | null>(null)
+  const [homeQueryStage, setHomeQueryStage] = React.useState(0)
+
+  React.useEffect(() => {
+    setHomeQueryStage(0)
+    const timers = [
+      window.setTimeout(() => setHomeQueryStage(1), 900),
+      window.setTimeout(() => setHomeQueryStage(2), 2200),
+      window.setTimeout(() => setHomeQueryStage(3), 4200),
+      window.setTimeout(() => setHomeQueryStage(4), 6500),
+    ]
+    return () => timers.forEach(timer => window.clearTimeout(timer))
+  }, [])
 
   const bestActionQ = useQuery<BestActionData>({
     queryKey: ['home-best-action'],
     queryFn:  () => api.get('/home/best-action').then(r => r.data),
+    retry: 1,
     refetchInterval: liveBudgetedInterval(45_000),
     staleTime: 20_000,
   })
@@ -7218,6 +7279,8 @@ export function HomePage() {
   const summary = useQuery<HomeSummary>({
     queryKey: ['home-summary'],
     queryFn:  () => api.get('/home/summary').then(r => r.data),
+    enabled: homeQueryStage >= 1,
+    retry: 1,
     refetchInterval: liveBudgetedInterval(60_000),
     staleTime: 30_000,
   })
@@ -7226,6 +7289,7 @@ export function HomePage() {
   const actionBoardQ = useQuery<ActionBoardData>({
     queryKey: ['home-action-board'],
     queryFn:  () => api.get('/home/action-board').then(r => r.data),
+    retry: 1,
     refetchInterval: liveBudgetedInterval(45_000),
     staleTime: 20_000,
   })
@@ -7233,6 +7297,7 @@ export function HomePage() {
   const dailyBriefQ = useQuery<DailyCryptoBriefData>({
     queryKey: ['home-daily-crypto-brief'],
     queryFn: () => api.get('/home/daily-crypto-brief?lookback_hours=24').then(r => r.data),
+    retry: 1,
     refetchInterval: slowBudgetedInterval(180_000),
     staleTime: 60_000,
   })
@@ -7240,6 +7305,8 @@ export function HomePage() {
   const earlyRunnersQ = useQuery<EarlyRunnersData>({
     queryKey: ['home-early-runners'],
     queryFn: () => api.get('/home/early-runners?limit=8&lookback_hours=24').then(r => r.data),
+    enabled: homeQueryStage >= 2,
+    retry: 1,
     refetchInterval: liveBudgetedInterval(45_000),
     staleTime: 10_000,
   })
@@ -7247,6 +7314,8 @@ export function HomePage() {
   const convictionRecoveryQ = useQuery<ConvictionRecoveryData>({
     queryKey: ['home-conviction-recovery'],
     queryFn: () => api.get('/home/conviction-recovery?limit=10').then(r => r.data),
+    enabled: homeQueryStage >= 3,
+    retry: 1,
     refetchInterval: slowBudgetedInterval(120_000),
     staleTime: 30_000,
   })
@@ -7254,6 +7323,8 @@ export function HomePage() {
   const runnerReviewQ = useQuery<RunnerReviewData>({
     queryKey: ['home-runner-review'],
     queryFn: () => api.get('/home/runner-review?limit=8').then(r => r.data),
+    enabled: homeQueryStage >= 2,
+    retry: 1,
     refetchInterval: liveBudgetedInterval(45_000),
     staleTime: 15_000,
   })
@@ -7261,6 +7332,8 @@ export function HomePage() {
   const memecoinResearchQ = useQuery<MemecoinResearchData>({
     queryKey: ['home-memecoin-research'],
     queryFn: () => api.get('/home/memecoin-research?limit=10').then(r => r.data),
+    enabled: homeQueryStage >= 3,
+    retry: 1,
     refetchInterval: slowBudgetedInterval(180_000),
     staleTime: 60_000,
   })
@@ -7328,6 +7401,8 @@ export function HomePage() {
   }>({
     queryKey: ['confluence-reinforcement'],
     queryFn:  () => api.get('/confluence/reinforcement').then(r => r.data),
+    enabled: homeQueryStage >= 1,
+    retry: 1,
     refetchInterval: liveBudgetedInterval(60_000),
     staleTime: 30_000,
   })
@@ -7336,24 +7411,32 @@ export function HomePage() {
   const scannerDiagQ = useQuery<HomeScannerDiag>({
     queryKey:        ['scanner-diagnostics'],
     queryFn:         () => api.get('/memecoins/scanner-diagnostics').then(r => r.data),
+    enabled:         homeQueryStage >= 3,
+    retry:           1,
     refetchInterval: slowBudgetedInterval(120_000),
     staleTime:       60_000,
   })
   const speculationHeatQ = useQuery<SpeculationHeatData>({
     queryKey: ['home-speculation-heat'],
     queryFn: () => api.get('/home/speculation-heat').then(r => r.data),
+    enabled: homeQueryStage >= 3,
+    retry: 1,
     refetchInterval: slowBudgetedInterval(120_000),
     staleTime: 60_000,
   })
   const aiAnalystQ = useQuery<AIAnalystData>({
     queryKey: ['home-ai-analyst'],
     queryFn: () => api.get('/home/ai-analyst').then(r => r.data),
+    enabled: homeQueryStage >= 4,
+    retry: 1,
     refetchInterval: slowBudgetedInterval(300_000),
     staleTime: 120_000,
   })
   const systemAuditQ = useQuery<SystemAuditData>({
     queryKey: ['home-system-audit-confidence'],
     queryFn: () => api.get('/system/audit').then(r => r.data),
+    enabled: homeQueryStage >= 4,
+    retry: 1,
     refetchInterval: slowBudgetedInterval(120_000),
     staleTime: 30_000,
   })

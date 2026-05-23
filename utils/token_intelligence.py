@@ -709,10 +709,13 @@ def _live_confirmation_candidates(limit: int = TOKEN_INTEL_CONFIRMATION_LIMIT) -
                   AND liquidity >= 75000
                   AND volume_24h_usd >= 75000
                 ORDER BY
+                  CASE WHEN data_freshness='STALE' OR data_confidence='LOW' THEN 1 ELSE 0 END DESC,
+                  CASE WHEN data_freshness!='LIVE' THEN 1 ELSE 0 END DESC,
                   CASE WHEN identity_status='RESOLVED' THEN 1 ELSE 0 END DESC,
+                  CASE WHEN market_source LIKE 'cache%' THEN 1 ELSE 0 END DESC,
                   quality_score DESC,
                   pressure_score DESC,
-                  updated_at DESC
+                  updated_at ASC
                 LIMIT ?
                 """,
                 (int(limit),),

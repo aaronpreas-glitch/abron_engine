@@ -12935,7 +12935,8 @@ def _good_buy_gate(row: dict, provider_context: dict, memory_index: dict[str, di
             warnings.append("meme_pullback_not_confirmed")
         if change_1h >= 4 and buy_pressure < 55:
             warnings.append("spike_without_buy_pressure")
-        if pressure < 72 and buy_pressure < 62:
+        thin_short_term_flow = volume_1h <= 0 or volume_1h < 50_000 or vol_liq < 0.35 or (trade_1h > 0 and trade_1h < 20)
+        if pressure < 72 and buy_pressure < 62 and thin_short_term_flow:
             warnings.append("thin_momentum_confirmation")
 
     memory = {}
@@ -13992,7 +13993,8 @@ def _autopsy_candidate_metrics(snapshot: dict) -> dict:
         "quality_score": _nullable_float(metrics.get("quality_score")),
         "risk_score": _nullable_float(metrics.get("risk_score")),
         "pressure_score": _nullable_float(metrics.get("pressure_score")),
-        "buy_pressure": _nullable_float(metrics.get("buy_pressure")),
+        "buy_pressure": _nullable_float(metrics.get("buy_pressure") if metrics.get("buy_pressure") is not None else metrics.get("buy_pressure_1h")),
+        "trade_1h": _nullable_float(metrics.get("trade_1h")),
         "change_1h_pct": _nullable_float(metrics.get("change_1h_pct")),
         "change_24h_pct": _nullable_float(metrics.get("change_24h_pct")),
         "data_freshness": data.get("data_freshness"),
@@ -14215,6 +14217,13 @@ def _build_outcome_autopsy_from_rows(journal_rows: list[dict], lookback_hours: i
 
 def _simulate_daily_rule_impacts(journal_rows: list[dict], autopsy: dict) -> dict:
     """Lightweight replay simulator for proposed rule patches from the same outcome rows."""
+    def _thin_momentum_not_confirmed(m: dict) -> bool:
+        volume_1h = _gb_float(m.get("volume_1h_usd"))
+        vol_liq = _gb_float(m.get("vol_liq_ratio"))
+        trade_1h = _gb_float(m.get("trade_1h"))
+        thin_flow = volume_1h <= 0 or volume_1h < 50_000 or vol_liq < 0.35 or (trade_1h > 0 and trade_1h < 20)
+        return _gb_float(m.get("pressure_score")) < 72 and _gb_float(m.get("buy_pressure")) < 62 and thin_flow
+
     rule_defs = [
         {
             "key": "spot_rotation_needs_confirmation",
@@ -14247,7 +14256,7 @@ def _simulate_daily_rule_impacts(journal_rows: list[dict], autopsy: dict) -> dic
             "key": "thin_momentum_confirmation",
             "label": "Thin momentum confirmation",
             "direction": "TIGHTEN",
-            "predicate": lambda m: _gb_float(m.get("pressure_score")) < 72 and _gb_float(m.get("buy_pressure")) < 62,
+            "predicate": _thin_momentum_not_confirmed,
         },
     ]
     rows = [row for row in journal_rows if str(row.get("outcome_label") or "").strip()]
@@ -14369,21 +14378,133 @@ def _build_candidate_replay_timeline(journal_rows: list[dict], autopsy: dict, li
     }
 
 
-def _build_data_quality_watchdog(intelligence_rows: list[dict]) -> dict:
+def _provider_refresh_priority_targets(intelligence_rows: list[dict], autopsy: dict | None = None, limit: int = 18) -> list[dict]:
+    rows = list(intelligence_rows or [])
+    autopsy_symbols = {
+        str(item.get("symbol") or "").strip().upper()
+        for item in list((autopsy or {}).get("examples") or [])
+        if str(item.get("classification") or "").upper() in {"MISSED_RUNNER", "WEAK_BUY"}
+    }
+    autopsy_mints = {
+        str(item.get("mint") or "").strip()
+        for item in list((autopsy or {}).get("examples") or [])
+        if str(item.get("classification") or "").upper() in {"MISSED_RUNNER", "WEAK_BUY"}
+    }
+    targets = []
+    for row in rows:
+        freshness = str(row.get("data_freshness") or "UNKNOWN").upper()
+        confidence = str(row.get("data_confidence") or "UNKNOWN").upper()
+        source = str(row.get("market_source") or "UNKNOWN").lower()
+        symbol = str(row.get("symbol") or "").strip().upper()
+        mint = str(row.get("mint") or "").strip()
+        if freshness == "LIVE" and confidence == "HIGH":
+            continue
+        score = 0.0
+        reasons = []
+        quality = _gb_float(row.get("quality_score"))
+        pressure = _gb_float(row.get("pressure_score"))
+        liquidity = _gb_float(row.get("liquidity"))
+        volume = _gb_float(row.get("volume_24h_usd"))
+        if freshness == "STALE":
+            score += 40
+            reasons.append("stale")
+        elif freshness != "LIVE":
+            score += 16
+            reasons.append("not_live")
+        if confidence == "LOW":
+            score += 28
+            reasons.append("low_confidence")
+        elif confidence != "HIGH":
+            score += 10
+            reasons.append("confidence_gap")
+        if quality >= 75:
+            score += 22
+            reasons.append("high_quality")
+        elif quality >= 68:
+            score += 10
+            reasons.append("near_quality")
+        if pressure >= 60:
+            score += 12
+            reasons.append("pressure_ready")
+        if liquidity >= 75_000:
+            score += 8
+            reasons.append("liquid_enough")
+        if volume >= 75_000:
+            score += 8
+            reasons.append("volume_enough")
+        if symbol and symbol in autopsy_symbols:
+            score += 18
+            reasons.append("outcome_autopsy")
+        if mint and mint in autopsy_mints:
+            score += 18
+            reasons.append("mint_autopsy")
+        if source.startswith("cache"):
+            score += 8
+            reasons.append("cache_source")
+        if score <= 0:
+            continue
+        targets.append({
+            "symbol": row.get("symbol"),
+            "mint": row.get("mint"),
+            "market_source": row.get("market_source"),
+            "data_freshness": row.get("data_freshness"),
+            "data_confidence": row.get("data_confidence"),
+            "quality_score": row.get("quality_score"),
+            "pressure_score": row.get("pressure_score"),
+            "liquidity": row.get("liquidity"),
+            "volume_24h_usd": row.get("volume_24h_usd"),
+            "priority_score": round(score, 1),
+            "reasons": reasons[:5],
+        })
+    targets.sort(key=lambda x: (_gb_float(x.get("priority_score")), _gb_float(x.get("quality_score")), _gb_float(x.get("pressure_score"))), reverse=True)
+    return targets[: max(0, int(limit or 0))]
+
+
+def _build_data_quality_watchdog(intelligence_rows: list[dict], autopsy: dict | None = None) -> dict:
     rows = list(intelligence_rows or [])
     freshness_counts: dict[str, int] = {}
     confidence_counts: dict[str, int] = {}
     source_counts: dict[str, int] = {}
+    source_rows: dict[str, list[dict]] = {}
     for row in rows:
-        freshness_counts[str(row.get("data_freshness") or "UNKNOWN").upper()] = freshness_counts.get(str(row.get("data_freshness") or "UNKNOWN").upper(), 0) + 1
-        confidence_counts[str(row.get("data_confidence") or "UNKNOWN").upper()] = confidence_counts.get(str(row.get("data_confidence") or "UNKNOWN").upper(), 0) + 1
-        source_counts[str(row.get("market_source") or "UNKNOWN").upper()] = source_counts.get(str(row.get("market_source") or "UNKNOWN").upper(), 0) + 1
+        freshness = str(row.get("data_freshness") or "UNKNOWN").upper()
+        confidence = str(row.get("data_confidence") or "UNKNOWN").upper()
+        source = str(row.get("market_source") or "UNKNOWN").upper()
+        freshness_counts[freshness] = freshness_counts.get(freshness, 0) + 1
+        confidence_counts[confidence] = confidence_counts.get(confidence, 0) + 1
+        source_counts[source] = source_counts.get(source, 0) + 1
+        source_rows.setdefault(source, []).append(row)
     live_recent = int(freshness_counts.get("LIVE", 0)) + int(freshness_counts.get("RECENT", 0))
     stale = int(freshness_counts.get("STALE", 0))
     low_conf = int(confidence_counts.get("LOW", 0))
+    by_source = []
+    for source, items in source_rows.items():
+        item_fresh: dict[str, int] = {}
+        item_conf: dict[str, int] = {}
+        for item in items:
+            item_fresh[str(item.get("data_freshness") or "UNKNOWN").upper()] = item_fresh.get(str(item.get("data_freshness") or "UNKNOWN").upper(), 0) + 1
+            item_conf[str(item.get("data_confidence") or "UNKNOWN").upper()] = item_conf.get(str(item.get("data_confidence") or "UNKNOWN").upper(), 0) + 1
+        item_stale = int(item_fresh.get("STALE", 0))
+        item_low = int(item_conf.get("LOW", 0))
+        by_source.append({
+            "source": source,
+            "rows": len(items),
+            "live": int(item_fresh.get("LIVE", 0)),
+            "recent": int(item_fresh.get("RECENT", 0)),
+            "stale": item_stale,
+            "high_confidence": int(item_conf.get("HIGH", 0)),
+            "low_confidence": item_low,
+            "avg_quality": _avg([_nullable_float(item.get("quality_score")) for item in items]),
+            "avg_pressure": _avg([_nullable_float(item.get("pressure_score")) for item in items]),
+            "stale_pct": round((item_stale / max(1, len(items))) * 100.0, 1),
+            "low_confidence_pct": round((item_low / max(1, len(items))) * 100.0, 1),
+            "status": "DEGRADED" if item_stale > max(4, len(items) * 0.35) or item_low > max(4, len(items) * 0.25) else "OK",
+        })
+    by_source.sort(key=lambda x: (str(x.get("status")) != "DEGRADED", -int(x.get("rows") or 0), str(x.get("source") or "")))
     stale_quality = [
         {
             "symbol": row.get("symbol"),
+            "mint": row.get("mint"),
             "market_source": row.get("market_source"),
             "data_freshness": row.get("data_freshness"),
             "data_confidence": row.get("data_confidence"),
@@ -14396,13 +14517,23 @@ def _build_data_quality_watchdog(intelligence_rows: list[dict]) -> dict:
         if str(row.get("data_freshness") or "").upper() == "STALE"
         and _gb_float(row.get("quality_score")) >= 75
     ][:8]
+    refresh_priority = _provider_refresh_priority_targets(rows, autopsy, limit=18)
     status = "OK"
     if low_conf > max(8, len(rows) * 0.15) or stale > live_recent:
         status = "DEGRADED"
-    if stale_quality:
+    if stale_quality or refresh_priority:
         status = "PATCH_QUEUE"
+    provider_alerts = []
+    degraded_sources = [str(item.get("source") or "").lower() for item in by_source if str(item.get("status") or "") == "DEGRADED"]
+    if degraded_sources:
+        provider_alerts.append(f"Degraded source coverage: {', '.join(degraded_sources[:4])}.")
+    if refresh_priority:
+        lead = refresh_priority[0]
+        provider_alerts.append(f"Refresh priority: {lead.get('symbol') or 'UNKNOWN'} from {lead.get('market_source') or 'unknown'} ({lead.get('data_freshness')}/{lead.get('data_confidence')}).")
     if stale_quality:
         action = "Refresh stale high-quality intelligence before trusting buy decisions."
+    elif refresh_priority:
+        action = "Use live confirmation budget on non-live high-priority intelligence rows before tuning signal rules."
     elif status == "DEGRADED":
         action = "Improve stale or low-confidence provider coverage before tuning signal rules."
     else:
@@ -14416,7 +14547,11 @@ def _build_data_quality_watchdog(intelligence_rows: list[dict]) -> dict:
             "low_confidence_rows": low_conf,
             "sources": source_counts,
         },
+        "by_source": by_source,
         "stale_high_quality": stale_quality,
+        "refresh_priority": refresh_priority,
+        "provider_alerts": provider_alerts,
+        "repair_plan": "Prioritize top refresh targets in live confirmation, then re-run the outcome simulator with fresh rows.",
         "action": action,
     }
 
@@ -14478,9 +14613,9 @@ def _build_daily_crypto_brief(lookback_hours: int = 24) -> dict:
             intelligence_rows = [
                 dict(r) for r in conn.execute(
                     """
-                    SELECT symbol, updated_at, data_freshness, data_confidence,
+                    SELECT mint, symbol, updated_at, data_freshness, data_confidence,
                            market_source, quality_score, risk_score, pressure_score,
-                           volume_24h_usd, liquidity
+                           volume_24h_usd, liquidity, marketcap
                     FROM token_intelligence_current
                     WHERE mint IS NOT NULL AND TRIM(mint) != ''
                     ORDER BY updated_at DESC
@@ -14633,7 +14768,7 @@ def _build_daily_crypto_brief(lookback_hours: int = 24) -> dict:
     outcome_autopsy = _build_outcome_autopsy_from_rows(journal_24h, lookback_hours)
     rule_simulator = _simulate_daily_rule_impacts(journal_24h, outcome_autopsy)
     candidate_replay_timeline = _build_candidate_replay_timeline(journal_rows, outcome_autopsy)
-    data_watchdog = _build_data_quality_watchdog(intelligence_rows)
+    data_watchdog = _build_data_quality_watchdog(intelligence_rows, outcome_autopsy)
     daily_build_hooks = _build_daily_build_hooks(outcome_autopsy, rule_simulator, data_watchdog, lock_ok)
     missed_count = len(missed)
     weak_count = len(weak_buys)
