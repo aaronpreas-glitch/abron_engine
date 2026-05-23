@@ -26,7 +26,7 @@ _STORE_LIVE_BUILDS_ENABLED = os.getenv("DASHBOARD_SNAPSHOT_STORE_LIVE_BUILDS_ENA
     "true",
     "yes",
 )
-_SCHEDULE_REFRESH_ENABLED = os.getenv("DASHBOARD_SNAPSHOT_SCHEDULE_REFRESH_ENABLED", "false").lower() in (
+_SCHEDULE_REFRESH_ENABLED = os.getenv("DASHBOARD_SNAPSHOT_SCHEDULE_REFRESH_ENABLED", "true").lower() in (
     "1",
     "true",
     "yes",

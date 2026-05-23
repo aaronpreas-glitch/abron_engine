@@ -96,7 +96,7 @@ DASHBOARD_MEMECOIN_DISCOVERY_LOOP_ENABLED = _env_bool("DASHBOARD_MEMECOIN_DISCOV
 DASHBOARD_AUTHORITY_REFRESH_LOOP_ENABLED = _env_bool("DASHBOARD_AUTHORITY_REFRESH_LOOP_ENABLED", False)
 DASHBOARD_WHALE_WATCH_LOOP_ENABLED = _env_bool("DASHBOARD_WHALE_WATCH_LOOP_ENABLED", False)
 DASHBOARD_STARTUP_DB_MAINTENANCE_ENABLED = _env_bool("DASHBOARD_STARTUP_DB_MAINTENANCE_ENABLED", False)
-DASHBOARD_SNAPSHOT_BACKGROUND_REFRESH_ENABLED = _env_bool("DASHBOARD_SNAPSHOT_BACKGROUND_REFRESH_ENABLED", False)
+DASHBOARD_SNAPSHOT_BACKGROUND_REFRESH_ENABLED = _env_bool("DASHBOARD_SNAPSHOT_BACKGROUND_REFRESH_ENABLED", True)
 
 
 async def _startup_db_task(label: str, fn, *, retries: int = 4, sleep_s: float = 1.5):
@@ -669,6 +669,7 @@ async def _dashboard_snapshot_prewarm_once() -> None:
             ("home:runner-review:8", lambda: home_router._build_runner_review_payload(8)),
             ("home:early-runners:8:24", lambda: home_router._build_early_runner_radar(8, 24)),
             ("home:conviction-recovery:8", lambda: home_router._build_conviction_recovery(8)),
+            ("home:daily-crypto-brief:24", lambda: home_router._build_daily_crypto_brief(24)),
         ]
 
         # The posture builder is scoped inside the endpoint, so use the route's cache
@@ -767,6 +768,7 @@ async def _dashboard_snapshot_refresh_loop() -> None:
                 ("home:runner-review:8", lambda: home_router._build_runner_review_payload(8), 300),
                 ("home:early-runners:8:24", lambda: home_router._build_early_runner_radar(8, 24), 300),
                 ("home:conviction-recovery:8", lambda: home_router._build_conviction_recovery(8), 300),
+                ("home:daily-crypto-brief:24", lambda: home_router._build_daily_crypto_brief(24), 300),
                 ("system:audit", get_system_audit_data, 1800),
             ]
             now = time.monotonic()
