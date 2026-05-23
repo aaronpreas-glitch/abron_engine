@@ -861,6 +861,62 @@ interface DailyCryptoBriefData {
     retired_24h?: number
     next_action?: string | null
   }
+  freshness_sla_repair_loop?: {
+    status?: string
+    freshness_sla_audit?: {
+      status?: string
+      score?: number
+      blockers?: string[]
+      summary?: {
+        stale_rows?: number
+        low_confidence_rows?: number
+        stale_high_quality_rows?: number
+        degraded_source_count?: number
+        unresolved_repair_count?: number
+      }
+    }
+    provider_repair_priority_queue?: {
+      status?: string
+      queued_count?: number
+      items?: Array<{
+        symbol?: string | null
+        mint?: string | null
+        market_source?: string | null
+        data_freshness?: string | null
+        data_confidence?: string | null
+        priority_score?: number | null
+        impact_flags?: string[]
+      }>
+    }
+    targeted_refresh_runner?: {
+      status?: string
+      ran?: boolean
+      target_count?: number
+      event_count?: number
+      live_repaired_count?: number
+      fallback_repaired_count?: number
+      unresolved_count?: number
+      symbols?: string[]
+    }
+    sla_recheck?: {
+      status?: string
+      freshness_sla?: {
+        status?: string
+        score?: number
+        stale_pct?: number
+        low_confidence_pct?: number
+      }
+    }
+    dashboard_freshness_drilldown?: {
+      status?: string
+      top_blockers?: string[]
+      score_before?: number
+      score_after?: number
+      sla_after?: string
+      next_action?: string | null
+    }
+    next_action?: string | null
+  }
   provider_reliability?: {
     status?: string
     attempts_24h?: number
@@ -5363,6 +5419,12 @@ function DailyCryptoBriefPanel({
     const replayEvidenceAudit = replayMaturation.daily_evidence_audit ?? {}
     const watchdog = data.data_watchdog ?? {}
     const freshnessSla = data.freshness_sla ?? {}
+    const freshnessRepairLoop = data.freshness_sla_repair_loop ?? {}
+    const freshnessRepairAudit = freshnessRepairLoop.freshness_sla_audit ?? {}
+    const freshnessRepairQueue = freshnessRepairLoop.provider_repair_priority_queue ?? {}
+    const freshnessRepairRunner = freshnessRepairLoop.targeted_refresh_runner ?? {}
+    const freshnessRepairDrilldown = freshnessRepairLoop.dashboard_freshness_drilldown ?? {}
+    const freshnessRepairTopTarget = freshnessRepairQueue.items?.[0]
     const providerReliability = data.provider_reliability ?? {}
     const providerDrilldown = data.provider_failure_drilldown ?? {}
     const escalationQueue = data.provider_escalation_queue ?? {}
@@ -5823,6 +5885,23 @@ function DailyCryptoBriefPanel({
               {replayQuarantine.items?.[0]?.symbol
                 ? `${replayQuarantine.items[0].symbol} quarantined · ${(replayQuarantine.items[0].reasons || ['source check']).slice(0, 1).join(', ')}`
                 : replayEvidenceAudit.next_action || 'Trusted evidence can influence weighted replay scoring.'}
+            </div>
+          </div>
+
+          <div style={{ border: `1px solid ${freshnessRepairLoop.status === 'CLEAR' ? 'rgba(0,212,138,0.18)' : 'rgba(245,158,11,0.22)'}`, borderRadius: 10, padding: 10, background: freshnessRepairLoop.status === 'CLEAR' ? 'rgba(0,212,138,0.025)' : 'rgba(245,158,11,0.035)' }}>
+            <span style={{ ...MONO, fontSize: 8, color: freshnessRepairLoop.status === 'CLEAR' ? '#00d48a' : '#f59e0b', fontWeight: 900, letterSpacing: '0.14em' }}>
+              FRESHNESS REPAIR
+            </span>
+            <div style={{ ...MONO, fontSize: 10, color: '#d7e1ea', marginTop: 7, lineHeight: 1.45 }}>
+              {freshnessRepairLoop.status || freshnessSla.status || 'WATCH'} · score {fmtFixed(freshnessRepairDrilldown.score_after ?? freshnessRepairAudit.score ?? freshnessSla.score, 1)}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              queue {freshnessRepairQueue.queued_count ?? 0} · runner {String(freshnessRepairRunner.status || 'waiting').replace(/_/g, ' ').toLowerCase()} · events {freshnessRepairRunner.event_count ?? 0}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#9db7ce', marginTop: 5, lineHeight: 1.45 }}>
+              {freshnessRepairTopTarget?.symbol
+                ? `${freshnessRepairTopTarget.symbol} · ${freshnessRepairTopTarget.data_freshness || 'freshness'} / ${freshnessRepairTopTarget.data_confidence || 'confidence'} · ${fmtFixed(freshnessRepairTopTarget.priority_score, 0)}`
+                : freshnessRepairDrilldown.next_action || freshnessRepairLoop.next_action || 'Freshness drilldown waiting.'}
             </div>
           </div>
 

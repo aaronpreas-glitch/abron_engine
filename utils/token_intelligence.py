@@ -2101,6 +2101,149 @@ def token_intelligence_step(*, force: bool = False) -> dict:
     return payload
 
 
+def token_intelligence_targeted_repair_step(targets: list[dict], *, limit: int = 6) -> dict:
+    """Run a small provider repair pass for specific high-impact freshness targets."""
+    selected = []
+    seen: set[str] = set()
+    for target in list(targets or []):
+        mint = str(target.get("mint") or "").strip()
+        symbol = str(target.get("symbol") or "").strip().upper()
+        key = mint or f"symbol:{symbol}"
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        selected.append({"mint": mint, "symbol": symbol, "target": dict(target)})
+        if len(selected) >= max(1, int(limit or 6)):
+            break
+    if not selected:
+        return {
+            "status": "NO_TARGETS",
+            "checked_at": _now_iso(),
+            "target_count": 0,
+            "event_count": 0,
+            "live_repaired_count": 0,
+            "fallback_repaired_count": 0,
+            "unresolved_count": 0,
+            "retired_count": 0,
+            "symbols": [],
+        }
+
+    rows = []
+    try:
+        with _get_conn() as conn:
+            _ensure_tables(conn)
+            for target in selected:
+                row = None
+                if target.get("mint"):
+                    row = conn.execute(
+                        "SELECT * FROM token_intelligence_current WHERE mint=? LIMIT 1",
+                        (target["mint"],),
+                    ).fetchone()
+                if row is None and target.get("symbol"):
+                    row = conn.execute(
+                        "SELECT * FROM token_intelligence_current WHERE UPPER(symbol)=? ORDER BY updated_at DESC LIMIT 1",
+                        (target["symbol"],),
+                    ).fetchone()
+                if row:
+                    raw = dict(row)
+                    raw["repair_score"] = _f(target["target"].get("priority_score"))
+                    rows.append((raw, target["target"]))
+    except Exception as exc:
+        return {
+            "status": "ERROR",
+            "checked_at": _now_iso(),
+            "target_count": len(selected),
+            "event_count": 0,
+            "error": str(exc)[:180],
+            "symbols": [x.get("symbol") for x in selected if x.get("symbol")],
+        }
+
+    repair_rows: list[dict] = []
+    repair_events: list[dict] = []
+    for raw, target in rows:
+        item = _current_row_to_item(raw, source="targeted_sla_repair")
+        item["_repair_score"] = _f(target.get("priority_score"), _f(raw.get("repair_score")))
+        flags = set(item.get("_queue_flags") or [])
+        flags.update(str(x) for x in list(target.get("impact_flags") or []) if str(x))
+        flags.add("freshness_sla")
+        item["_queue_flags"] = sorted(flags)
+        previous = dict(item.get("_previous") or {})
+        started = time.time()
+        snapshot: dict | None = None
+        repair_status = "UNRESOLVED"
+        reason = "targeted_live_provider_missing_or_incomplete"
+        failure_class = "provider_miss"
+        provider_path: list[str] = []
+        try:
+            snapshot, repair_status, reason, failure_class, provider_path = _build_provider_repair_snapshot(item)
+        except Exception as exc:
+            reason = f"targeted_repair_exception:{str(exc)[:80]}"
+            failure_class = "temporary_error"
+        latency_ms = int(max(0.0, (time.time() - started) * 1000.0))
+        previous_unresolved = _i(previous.get("unresolved_count"))
+        repaired = bool(
+            snapshot
+            and repair_status in {"LIVE_REPAIRED", "FALLBACK_REPAIRED"}
+            and str(snapshot.get("data_confidence") or "").upper() != "LOW"
+        )
+        if repaired and snapshot:
+            repair_rows.append(snapshot)
+        repair_events.append(
+            {
+                "ts_utc": _now_iso(),
+                "mint": previous.get("mint") or item.get("mint"),
+                "symbol": previous.get("symbol") or item.get("symbol"),
+                "previous_source": previous.get("market_source"),
+                "previous_freshness": previous.get("data_freshness"),
+                "previous_confidence": previous.get("data_confidence"),
+                "previous_quality": previous.get("quality_score"),
+                "previous_pressure": previous.get("pressure_score"),
+                "repair_status": repair_status,
+                "new_source": (snapshot or {}).get("market_source"),
+                "new_freshness": (snapshot or {}).get("data_freshness"),
+                "new_confidence": (snapshot or {}).get("data_confidence"),
+                "new_quality": (snapshot or {}).get("quality_score"),
+                "new_pressure": (snapshot or {}).get("pressure_score"),
+                "latency_ms": latency_ms,
+                "unresolved_count": previous_unresolved + (0 if repaired else 1),
+                "reason": reason,
+                "failure_class": failure_class,
+                "provider_path": "->".join(provider_path),
+                "repair_score": _f(item.get("_repair_score")),
+                "queue_flags": list(item.get("_queue_flags") or []),
+            }
+        )
+
+    inserted = _record_snapshots(repair_rows) if repair_rows else 0
+    token_stats_inserted = _backfill_token_stats(repair_rows) if repair_rows else 0
+    events_inserted = _record_provider_repair_events(repair_events)
+    payload = {
+        "status": "RAN" if repair_events else "NO_ROWS",
+        "checked_at": _now_iso(),
+        "target_count": len(selected),
+        "matched_current_rows": len(rows),
+        "snapshot_count": inserted,
+        "token_stats_inserted": token_stats_inserted,
+        "event_count": events_inserted,
+        "live_repaired_count": len([e for e in repair_events if e.get("repair_status") == "LIVE_REPAIRED"]),
+        "fallback_repaired_count": len([e for e in repair_events if e.get("repair_status") == "FALLBACK_REPAIRED"]),
+        "unresolved_count": len([e for e in repair_events if e.get("repair_status") == "UNRESOLVED"]),
+        "retired_count": len([e for e in repair_events if e.get("repair_status") == "RETIRED_UNRESOLVED"]),
+        "failure_classes": sorted({str(e.get("failure_class") or "unknown") for e in repair_events}),
+        "symbols": [e.get("symbol") for e in repair_events[:10] if e.get("symbol")],
+        "events": repair_events[:10],
+    }
+    try:
+        with _get_conn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO kv_store (key, value) VALUES (?, ?)",
+                ("freshness_targeted_refresh_status", json.dumps(payload, separators=(",", ":"))),
+            )
+    except Exception:
+        pass
+    return payload
+
+
 def get_token_intelligence_summary(limit: int = 12) -> dict:
     try:
         with _get_conn() as conn:

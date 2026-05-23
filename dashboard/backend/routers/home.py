@@ -16713,6 +16713,318 @@ def _build_freshness_sla(intelligence_rows: list[dict], snapshot_rows: list[dict
     }
 
 
+def _build_freshness_sla_audit(freshness_sla: dict, data_watchdog: dict, intelligence_rows: list[dict], repair_rows: list[dict]) -> dict:
+    rows = list(intelligence_rows or [])
+    by_source = list((data_watchdog or {}).get("by_source") or [])
+    degraded_sources = [item for item in by_source if str(item.get("status") or "").upper() == "DEGRADED"]
+    stale_high_quality = list((data_watchdog or {}).get("stale_high_quality") or [])
+    low_conf_rows = [
+        row for row in rows
+        if str(row.get("data_confidence") or "").upper() == "LOW"
+    ]
+    stale_rows = [
+        row for row in rows
+        if str(row.get("data_freshness") or "").upper() == "STALE"
+    ]
+    unresolved_repairs = [
+        row for row in list(repair_rows or [])
+        if str(row.get("repair_status") or "").upper() in {"UNRESOLVED", "RETIRED_UNRESOLVED"}
+    ]
+    blockers = []
+    if str((freshness_sla or {}).get("status") or "").upper() not in {"OK", "HEALTHY", "GOOD"}:
+        blockers.append("freshness_sla_not_ok")
+    if _gb_float((freshness_sla or {}).get("score")) < 72:
+        blockers.append("freshness_score_below_72")
+    if _gb_float((freshness_sla or {}).get("stale_pct")) > 30:
+        blockers.append("stale_pct_above_30")
+    if _gb_float((freshness_sla or {}).get("low_confidence_pct")) > 15:
+        blockers.append("low_confidence_pct_above_15")
+    if stale_high_quality:
+        blockers.append("stale_high_quality_rows")
+    if unresolved_repairs:
+        blockers.append("unresolved_provider_repairs")
+    return {
+        "status": "BLOCKED" if blockers else "OK",
+        "sla_status": freshness_sla.get("status"),
+        "score": freshness_sla.get("score"),
+        "blockers": list(dict.fromkeys(blockers)),
+        "summary": {
+            "rows": len(rows),
+            "stale_rows": len(stale_rows),
+            "low_confidence_rows": len(low_conf_rows),
+            "stale_high_quality_rows": len(stale_high_quality),
+            "degraded_source_count": len(degraded_sources),
+            "unresolved_repair_count": len(unresolved_repairs),
+        },
+        "degraded_sources": degraded_sources[:8],
+        "stale_high_quality": stale_high_quality[:8],
+        "unresolved_repairs": unresolved_repairs[:8],
+        "next_action": (
+            "Prioritize targeted provider repairs for stale or low-confidence high-impact rows."
+            if blockers
+            else "Freshness SLA is clean enough for policy review."
+        ),
+    }
+
+
+def _build_provider_repair_priority_queue(
+    intelligence_rows: list[dict],
+    data_watchdog: dict,
+    replay_lab: dict | None = None,
+    limit: int = 12,
+) -> dict:
+    rows = list(intelligence_rows or [])
+    base_targets = _provider_refresh_priority_targets(rows, None, limit=80)
+    replay_ids: set[str] = set()
+    replay_symbols: set[str] = set()
+    if replay_lab:
+        candidate = (((replay_lab.get("rule_simulation_engine") or {}).get("top_candidate") or {}).get("examples") or {})
+        for bucket in ("saved_weak_buys", "rescued_missed_runners", "damaged_good_buys", "false_positive_buys", "touched"):
+            for item in list(candidate.get(bucket) or []):
+                mint = str(item.get("mint") or "").strip()
+                symbol = str(item.get("symbol") or "").strip().upper()
+                if mint:
+                    replay_ids.add(mint)
+                if symbol:
+                    replay_symbols.add(symbol)
+    high_quality = {
+        str(item.get("mint") or item.get("symbol") or "").strip()
+        for item in list((data_watchdog or {}).get("stale_high_quality") or [])
+    }
+    queued = []
+    for target in base_targets:
+        mint = str(target.get("mint") or "").strip()
+        symbol = str(target.get("symbol") or "").strip().upper()
+        score = _gb_float(target.get("priority_score"))
+        flags = []
+        if mint in replay_ids or symbol in replay_symbols:
+            score += 35
+            flags.append("promotion_candidate")
+        if mint in high_quality or str(target.get("symbol") or "").strip() in high_quality:
+            score += 18
+            flags.append("high_quality_stale")
+        if _gb_float(target.get("quality_score")) >= 75:
+            flags.append("good_buy_candidate")
+        if str(target.get("data_freshness") or "").upper() == "STALE":
+            flags.append("stale")
+        if str(target.get("data_confidence") or "").upper() == "LOW":
+            flags.append("low_confidence")
+        row = dict(target)
+        row["priority_score"] = round(score, 1)
+        row["impact_flags"] = list(dict.fromkeys(flags + list(target.get("reasons") or [])))[:8]
+        row["repair_reason"] = "Targeted refresh can clear freshness SLA for replay/promotion review."
+        queued.append(row)
+    queued.sort(key=lambda item: (_gb_float(item.get("priority_score")), _gb_float(item.get("quality_score")), _gb_float(item.get("pressure_score"))), reverse=True)
+    by_reason: dict[str, int] = {}
+    for item in queued:
+        for reason in list(item.get("impact_flags") or []):
+            by_reason[reason] = by_reason.get(reason, 0) + 1
+    return {
+        "status": "READY" if queued else "EMPTY",
+        "queued_count": len(queued),
+        "by_reason": by_reason,
+        "items": queued[: max(0, int(limit or 0))],
+        "next_action": (
+            "Run targeted freshness refresh for the highest-impact rows."
+            if queued
+            else "No high-impact provider repair targets are queued."
+        ),
+    }
+
+
+def _run_targeted_freshness_refresh(queue: dict, now: datetime, min_interval_minutes: int = 10) -> dict:
+    items = list((queue or {}).get("items") or [])[:6]
+    if not items:
+        return {
+            "status": "NO_TARGETS",
+            "ran": False,
+            "target_count": 0,
+            "next_action": "No targeted refresh is due.",
+        }
+    meta_key = "freshness_targeted_refresh_autorun"
+    try:
+        conn = _dj_conn()
+        try:
+            conn.execute("CREATE TABLE IF NOT EXISTS kv_store (key TEXT PRIMARY KEY, value TEXT)")
+            row = conn.execute("SELECT value FROM kv_store WHERE key=?", (meta_key,)).fetchone()
+            previous = json.loads(row["value"] or "{}") if row and row["value"] else {}
+        finally:
+            conn.close()
+    except Exception:
+        previous = {}
+    last_ts = _gb_parse_ts((previous or {}).get("checked_at"))
+    if last_ts and (now - last_ts).total_seconds() < max(60, min_interval_minutes * 60):
+        return {
+            "status": "THROTTLED",
+            "ran": False,
+            "target_count": len(items),
+            "last_checked_at": previous.get("checked_at"),
+            "previous": previous,
+            "next_action": "Targeted freshness refresh was recently run; wait for the throttle window.",
+        }
+    try:
+        from utils.token_intelligence import token_intelligence_targeted_repair_step  # type: ignore
+        result = token_intelligence_targeted_repair_step(items, limit=6)
+    except Exception as exc:
+        result = {
+            "status": "ERROR",
+            "checked_at": now.isoformat(),
+            "target_count": len(items),
+            "error": str(exc)[:180],
+        }
+    result = dict(result or {})
+    result["ran"] = str(result.get("status") or "").upper() not in {"NO_TARGETS", "ERROR"} or bool(result.get("event_count"))
+    result["requested_targets"] = [
+        {
+            "symbol": item.get("symbol"),
+            "mint": item.get("mint"),
+            "priority_score": item.get("priority_score"),
+            "impact_flags": item.get("impact_flags"),
+        }
+        for item in items
+    ]
+    try:
+        conn = _dj_conn()
+        try:
+            conn.execute("CREATE TABLE IF NOT EXISTS kv_store (key TEXT PRIMARY KEY, value TEXT)")
+            conn.execute(
+                "INSERT OR REPLACE INTO kv_store (key, value) VALUES (?, ?)",
+                (meta_key, json.dumps(result, separators=(",", ":"))),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass
+    result["next_action"] = (
+        "Recheck freshness SLA after targeted repairs."
+        if int(result.get("event_count") or 0)
+        else "No provider repair events were produced; inspect the queued target paths."
+    )
+    return result
+
+
+def _read_freshness_sla_recheck(lookback_hours: int, since: datetime) -> dict:
+    try:
+        conn = _dj_conn()
+        try:
+            intelligence = [
+                dict(r) for r in conn.execute(
+                    """
+                    SELECT mint, symbol, updated_at, data_freshness, data_confidence,
+                           market_source, quality_score, risk_score, pressure_score,
+                           volume_24h_usd, liquidity, marketcap
+                    FROM token_intelligence_current
+                    WHERE mint IS NOT NULL AND TRIM(mint) != ''
+                    ORDER BY updated_at DESC
+                    LIMIT 600
+                    """
+                ).fetchall()
+            ]
+            snapshots = [
+                dict(r) for r in conn.execute(
+                    """
+                    SELECT ts_utc, data_freshness, data_confidence, market_source
+                    FROM token_intelligence_snapshots
+                    WHERE ts_utc >= ?
+                    ORDER BY ts_utc DESC
+                    LIMIT 3000
+                    """,
+                    (since.isoformat(),),
+                ).fetchall()
+            ]
+            repairs = [
+                dict(r) for r in conn.execute(
+                    """
+                    SELECT ts_utc, mint, symbol, previous_source, previous_freshness,
+                           previous_confidence, previous_quality, previous_pressure,
+                           repair_status, new_source, new_freshness, new_confidence,
+                           new_quality, new_pressure, latency_ms, unresolved_count, reason,
+                           failure_class, provider_path, repair_score, queue_flags_json
+                    FROM token_provider_repair_events
+                    WHERE ts_utc >= ?
+                    ORDER BY id DESC
+                    LIMIT 800
+                    """,
+                    (since.isoformat(),),
+                ).fetchall()
+            ]
+        finally:
+            conn.close()
+    except Exception as exc:
+        return {
+            "status": "ERROR",
+            "error": str(exc)[:180],
+            "next_action": "Could not re-read freshness tables after targeted repair.",
+        }
+    sla = _build_freshness_sla(intelligence, snapshots, repairs)
+    watchdog = _build_data_quality_watchdog(intelligence, None)
+    return {
+        "status": "OK" if str(sla.get("status") or "").upper() in {"OK", "HEALTHY", "GOOD"} else "STILL_BLOCKED",
+        "lookback_hours": lookback_hours,
+        "freshness_sla": sla,
+        "data_watchdog": {
+            "status": watchdog.get("status"),
+            "summary": watchdog.get("summary"),
+            "degraded_sources": [x for x in list(watchdog.get("by_source") or []) if str(x.get("status") or "").upper() == "DEGRADED"][:8],
+        },
+        "next_action": (
+            "Freshness SLA is healthy enough for policy review."
+            if str(sla.get("status") or "").upper() in {"OK", "HEALTHY", "GOOD"}
+            else "Keep targeted repairs focused on the remaining stale/low-confidence blockers."
+        ),
+    }
+
+
+def _build_freshness_repair_drilldown(audit: dict, queue: dict, runner: dict, recheck: dict) -> dict:
+    recheck_sla = dict((recheck or {}).get("freshness_sla") or {})
+    return {
+        "status": "CLEAR" if str((recheck or {}).get("status") or "").upper() == "OK" else "BLOCKED",
+        "audit_status": audit.get("status"),
+        "queue_status": queue.get("status"),
+        "runner_status": runner.get("status"),
+        "recheck_status": recheck.get("status"),
+        "top_blockers": list(audit.get("blockers") or [])[:8],
+        "top_targets": list(queue.get("items") or [])[:6],
+        "repair_events": list(runner.get("events") or [])[:6],
+        "score_before": audit.get("score"),
+        "score_after": recheck_sla.get("score"),
+        "sla_after": recheck_sla.get("status"),
+        "next_action": recheck.get("next_action") or runner.get("next_action") or queue.get("next_action"),
+    }
+
+
+def _build_freshness_sla_repair_loop(
+    freshness_sla: dict,
+    data_watchdog: dict,
+    intelligence_rows: list[dict],
+    repair_rows: list[dict],
+    replay_lab: dict,
+    now: datetime,
+    lookback_hours: int,
+    since: datetime,
+) -> dict:
+    audit = _build_freshness_sla_audit(freshness_sla, data_watchdog, intelligence_rows, repair_rows)
+    queue = _build_provider_repair_priority_queue(intelligence_rows, data_watchdog, replay_lab, limit=12)
+    runner = _run_targeted_freshness_refresh(queue, now) if str(audit.get("status") or "").upper() == "BLOCKED" else {
+        "status": "NOT_NEEDED",
+        "ran": False,
+        "target_count": 0,
+        "next_action": "Freshness SLA is already clean.",
+    }
+    recheck = _read_freshness_sla_recheck(lookback_hours, since)
+    drilldown = _build_freshness_repair_drilldown(audit, queue, runner, recheck)
+    return {
+        "status": drilldown.get("status"),
+        "freshness_sla_audit": audit,
+        "provider_repair_priority_queue": queue,
+        "targeted_refresh_runner": runner,
+        "sla_recheck": recheck,
+        "dashboard_freshness_drilldown": drilldown,
+        "next_action": drilldown.get("next_action"),
+    }
+
+
 def _build_provider_reliability_scorecard(repair_rows: list[dict]) -> dict:
     rows = list(repair_rows or [])
     provider_map: dict[str, dict] = {}
@@ -19726,6 +20038,16 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
         outcome_collection=replay_outcome_collection,
         before_collection_lab=replay_outcome_lab_before_collection,
     )
+    freshness_sla_repair_loop = _build_freshness_sla_repair_loop(
+        freshness_sla,
+        data_watchdog,
+        intelligence_rows,
+        repair_rows,
+        replay_outcome_lab,
+        now,
+        lookback_hours,
+        since,
+    )
     provider_reliability = _build_provider_reliability_scorecard(repair_rows)
     provider_failure_drilldown = _build_provider_failure_drilldown(repair_rows)
     provider_escalation_queue = _build_provider_escalation_queue(escalation_rows, now)
@@ -19878,6 +20200,8 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
         next_actions.append("Review execution lock before changing signal rules.")
     if not flags_ok:
         next_actions.append(str(safety_flag_contract.get("next_action") or "Patch mixed execution flags to locked-safe values."))
+    if str((freshness_sla_repair_loop or {}).get("status") or "").upper() == "BLOCKED":
+        next_actions.append(str(freshness_sla_repair_loop.get("next_action") or "Continue targeted freshness repairs."))
     if stale_high_quality:
         next_actions.append("Refresh stale high-quality token intelligence rows first.")
     if daily_build_hooks.get("next_patch"):
@@ -19964,6 +20288,7 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
         "replay_outcome_lab": replay_outcome_lab,
         "data_watchdog": data_watchdog,
         "freshness_sla": freshness_sla,
+        "freshness_sla_repair_loop": freshness_sla_repair_loop,
         "provider_reliability": provider_reliability,
         "provider_failure_drilldown": provider_failure_drilldown,
         "provider_escalation_queue": provider_escalation_queue,
