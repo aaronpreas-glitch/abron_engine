@@ -125,7 +125,12 @@ def store_snapshot(name: str, data: Any, *, status: str = "OK", error: str | Non
             if "database is locked" not in str(exc).lower() and "database table is locked" not in str(exc).lower():
                 break
             time.sleep(0.2 * (2 ** attempt))
-    if last_exc is not None:
+    if last_exc is not None and (
+        "database is locked" in str(last_exc).lower()
+        or "database table is locked" in str(last_exc).lower()
+    ):
+        log.debug("snapshot store deferred for %s after %d attempt(s): %s", name, _WRITE_RETRIES, last_exc)
+    elif last_exc is not None:
         log.warning("snapshot store failed for %s after %d attempt(s): %s", name, _WRITE_RETRIES, last_exc)
     return payload
 
