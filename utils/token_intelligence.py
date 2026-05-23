@@ -255,6 +255,17 @@ def _ensure_tables(conn) -> None:
             ("blocker_correctness", "TEXT"),
             ("confidence_impact", "REAL"),
             ("outcome_reason", "TEXT"),
+            ("outcome_1h_status", "TEXT"),
+            ("outcome_1h_check_ts", "TEXT"),
+            ("outcome_1h_correctness", "TEXT"),
+            ("outcome_4h_status", "TEXT"),
+            ("outcome_4h_check_ts", "TEXT"),
+            ("outcome_4h_correctness", "TEXT"),
+            ("outcome_24h_status", "TEXT"),
+            ("outcome_24h_check_ts", "TEXT"),
+            ("outcome_24h_correctness", "TEXT"),
+            ("next_outcome_check_ts", "TEXT"),
+            ("next_outcome_horizon", "TEXT"),
         ]:
             if col not in cols:
                 conn.execute(f"ALTER TABLE provider_repair_escalations ADD COLUMN {col} {col_type}")
@@ -1564,6 +1575,107 @@ def _classify_escalation_correctness(escalation: dict, outcome: dict, now: datet
     }
 
 
+def _escalation_horizon_due_ts(row: dict, hours: int) -> datetime:
+    anchor = (
+        _parse_iso(row.get("last_action_ts"))
+        or _parse_iso(row.get("updated_ts"))
+        or _parse_iso(row.get("created_ts"))
+        or datetime.now(timezone.utc)
+    )
+    return anchor + timedelta(hours=hours)
+
+
+def _classify_escalation_horizon(row: dict, outcome: dict, now: datetime, horizon: int) -> dict:
+    status = str(row.get("escalation_status") or "").upper()
+    lane = str(row.get("escalation_lane") or "").upper()
+    failure = str(row.get("failure_class") or "").lower()
+    out_row = dict(outcome.get("row") or {})
+    label = str(out_row.get("outcome_label") or "").upper()
+    ret_key = f"return_{horizon}h_pct"
+    ret_h = _f(out_row.get(ret_key))
+    max_return = _f(out_row.get("max_return_pct"))
+    marketcap = _f(out_row.get("marketcap"))
+    is_suppression = status == "SUPPRESSED" or lane == "RETIRE_OR_SUPPRESS"
+    bullish_labels = {"BIG_RUNNER", "GOOD_RUNNER", "GOOD_BUY", "WIN", "PROFIT"}
+    weak_labels = {"BAD_BUY", "WEAK_BUY", "FLAT", "LOSS"}
+    missed_threshold = 25.0 if horizon == 1 else 35.0
+    if status == "RESOLVED_REPAIRED":
+        return {"status": "REPAIR_RESOLVED", "correctness": "REPAIR_RESOLVED", "impact": 0.0}
+    if label in bullish_labels or max(max_return, ret_h) >= missed_threshold:
+        return {
+            "status": "MISSED_RUNNER",
+            "correctness": "SUPPRESSION_TOO_AGGRESSIVE" if is_suppression else "BLOCK_MISSED_RUNNER",
+            "impact": -12.0 if is_suppression else -15.0,
+        }
+    if label in weak_labels or max(max_return, ret_h) <= 10.0 or (
+        marketcap <= 0 and failure in {"no_market_data", "bad_ca_or_pair_mismatch", "provider_miss"}
+    ):
+        return {
+            "status": "CORRECT",
+            "correctness": "SUPPRESSION_CORRECT" if is_suppression else "BLOCK_CORRECT",
+            "impact": 5.0 if failure in {"no_market_data", "bad_ca_or_pair_mismatch", "provider_miss"} else 3.0,
+        }
+    return {"status": "CHECKED_NEUTRAL", "correctness": "PENDING_OUTCOME", "impact": 0.0}
+
+
+def _apply_escalation_horizon_schedule(row: dict, outcome: dict, now: datetime) -> dict:
+    updates: dict[str, Any] = {}
+    due: dict[int, datetime] = {
+        1: _escalation_horizon_due_ts(row, 1),
+        4: _escalation_horizon_due_ts(row, 4),
+        24: _escalation_horizon_due_ts(row, 24),
+    }
+    for horizon in (1, 4, 24):
+        prefix = f"outcome_{horizon}h"
+        current = str(row.get(f"{prefix}_status") or "").upper()
+        if current and current not in {"WAITING", "PENDING"}:
+            continue
+        if now < due[horizon]:
+            updates[f"{prefix}_status"] = "WAITING"
+            continue
+        classified = _classify_escalation_horizon(row, outcome, now, horizon)
+        updates[f"{prefix}_status"] = classified.get("status")
+        updates[f"{prefix}_check_ts"] = now.isoformat()
+        updates[f"{prefix}_correctness"] = classified.get("correctness")
+
+    final_correctness = (
+        updates.get("outcome_24h_correctness")
+        or row.get("outcome_24h_correctness")
+        or updates.get("outcome_4h_correctness")
+        or row.get("outcome_4h_correctness")
+        or updates.get("outcome_1h_correctness")
+        or row.get("outcome_1h_correctness")
+        or "PENDING_OUTCOME"
+    )
+    final_status = "COMPLETE" if (
+        updates.get("outcome_24h_status")
+        or row.get("outcome_24h_status")
+    ) not in {None, "", "WAITING", "PENDING"} else "PENDING"
+    if final_correctness in {"BLOCK_MISSED_RUNNER", "SUPPRESSION_TOO_AGGRESSIVE"}:
+        final_status = "PENDING" if str(updates.get("outcome_24h_status") or row.get("outcome_24h_status") or "").upper() in {"", "WAITING", "PENDING"} else "COMPLETE"
+    next_horizon = None
+    next_ts = None
+    for horizon in (1, 4, 24):
+        status = str(updates.get(f"outcome_{horizon}h_status") or row.get(f"outcome_{horizon}h_status") or "").upper()
+        if status in {"", "WAITING", "PENDING"}:
+            if now < due[horizon]:
+                next_horizon = f"{horizon}h"
+                next_ts = due[horizon].isoformat()
+                break
+    updates["next_outcome_horizon"] = next_horizon
+    updates["next_outcome_check_ts"] = next_ts
+    updates["outcome_status"] = final_status
+    updates["blocker_correctness"] = final_correctness
+    updates["confidence_impact"] = _f(
+        _classify_escalation_horizon(row, outcome, now, 24 if final_status == "COMPLETE" else 4).get("impact")
+    ) if final_correctness != "PENDING_OUTCOME" else 0.0
+    horizon_note = next_horizon or "final"
+    updates["outcome_reason"] = (
+        f"Escalation outcome schedule updated through {horizon_note}; latest correctness {final_correctness}."
+    )
+    return updates
+
+
 def evaluate_provider_escalation_outcomes(limit: int = 120) -> dict:
     """Backtest reviewed provider escalations against later market outcomes."""
     now = datetime.now(timezone.utc)
@@ -1600,8 +1712,9 @@ def evaluate_provider_escalation_outcomes(limit: int = 120) -> dict:
                 checked += 1
                 outcome = _latest_escalation_outcome(conn, row)
                 classification = _classify_escalation_correctness(row, outcome, now)
+                horizon_updates = _apply_escalation_horizon_schedule(row, outcome, now)
                 out_row = dict(outcome.get("row") or {})
-                correctness = classification.get("blocker_correctness") or "PENDING_OUTCOME"
+                correctness = horizon_updates.get("blocker_correctness") or classification.get("blocker_correctness") or "PENDING_OUTCOME"
                 counts[str(correctness)] = counts.get(str(correctness), 0) + 1
                 conn.execute(
                     """
@@ -1616,12 +1729,23 @@ def evaluate_provider_escalation_outcomes(limit: int = 120) -> dict:
                            outcome_max_drawdown_pct=?,
                            blocker_correctness=?,
                            confidence_impact=?,
-                           outcome_reason=?
+                           outcome_reason=?,
+                           outcome_1h_status=?,
+                           outcome_1h_check_ts=?,
+                           outcome_1h_correctness=?,
+                           outcome_4h_status=?,
+                           outcome_4h_check_ts=?,
+                           outcome_4h_correctness=?,
+                           outcome_24h_status=?,
+                           outcome_24h_check_ts=?,
+                           outcome_24h_correctness=?,
+                           next_outcome_check_ts=?,
+                           next_outcome_horizon=?
                      WHERE id=?
                     """,
                     (
                         now.isoformat(),
-                        classification.get("outcome_status"),
+                        horizon_updates.get("outcome_status") or classification.get("outcome_status"),
                         outcome.get("source"),
                         _f(out_row.get("return_1h_pct")) if out_row.get("return_1h_pct") is not None else None,
                         _f(out_row.get("return_4h_pct")) if out_row.get("return_4h_pct") is not None else None,
@@ -1629,8 +1753,19 @@ def evaluate_provider_escalation_outcomes(limit: int = 120) -> dict:
                         _f(out_row.get("max_return_pct")) if out_row.get("max_return_pct") is not None else None,
                         _f(out_row.get("max_drawdown_pct")) if out_row.get("max_drawdown_pct") is not None else None,
                         correctness,
-                        _f(classification.get("confidence_impact")),
-                        str(classification.get("reason") or "")[:500],
+                        _f(horizon_updates.get("confidence_impact"), _f(classification.get("confidence_impact"))),
+                        str(horizon_updates.get("outcome_reason") or classification.get("reason") or "")[:500],
+                        horizon_updates.get("outcome_1h_status", row.get("outcome_1h_status")),
+                        horizon_updates.get("outcome_1h_check_ts", row.get("outcome_1h_check_ts")),
+                        horizon_updates.get("outcome_1h_correctness", row.get("outcome_1h_correctness")),
+                        horizon_updates.get("outcome_4h_status", row.get("outcome_4h_status")),
+                        horizon_updates.get("outcome_4h_check_ts", row.get("outcome_4h_check_ts")),
+                        horizon_updates.get("outcome_4h_correctness", row.get("outcome_4h_correctness")),
+                        horizon_updates.get("outcome_24h_status", row.get("outcome_24h_status")),
+                        horizon_updates.get("outcome_24h_check_ts", row.get("outcome_24h_check_ts")),
+                        horizon_updates.get("outcome_24h_correctness", row.get("outcome_24h_correctness")),
+                        horizon_updates.get("next_outcome_check_ts"),
+                        horizon_updates.get("next_outcome_horizon"),
                         int(row.get("id") or 0),
                     ),
                 )

@@ -371,6 +371,24 @@ interface DailyCryptoBriefData {
     }>
     next_action?: string | null
   }
+  provider_escalation_maturity?: {
+    status?: string
+    tracked_count?: number
+    pending_count?: number
+    due_now_count?: number
+    overdue_count?: number
+    next_check_ts?: string | null
+    minutes_until_next_check?: number | null
+    by_horizon?: Record<string, { waiting?: number; checked?: number; due?: number }>
+    next_due?: Array<{
+      symbol?: string | null
+      mint?: string | null
+      horizon?: string | null
+      next_check_ts?: string | null
+      correctness?: string | null
+    }>
+    next_action?: string | null
+  }
   rule_promotion_gate?: {
     status?: string
     reason?: string | null
@@ -4516,6 +4534,7 @@ function DailyCryptoBriefPanel({
     const providerDrilldown = data.provider_failure_drilldown ?? {}
     const escalationQueue = data.provider_escalation_queue ?? {}
     const escalationAccuracy = data.provider_escalation_accuracy ?? {}
+    const escalationMaturity = data.provider_escalation_maturity ?? {}
     const ruleGate = data.rule_promotion_gate ?? {}
     const missedClusters = data.missed_runner_clusters ?? {}
     const catalystContext = data.catalyst_context ?? {}
@@ -4531,6 +4550,7 @@ function DailyCryptoBriefPanel({
     const topProviderDrilldown = providerDrilldown.items?.[0]
     const topEscalation = escalationQueue.items?.[0]
     const topEscalationMiss = escalationAccuracy.missed_examples?.[0]
+    const nextEscalationDue = escalationMaturity.next_due?.[0]
     const buildHooks = data.daily_build_hooks ?? {}
     const countText = (counts: Record<string, number>, keys: string[]) =>
       keys.map(key => `${key.toLowerCase()} ${counts[key] ?? 0}`).join(' · ')
@@ -4761,6 +4781,20 @@ function DailyCryptoBriefPanel({
               {topEscalationMiss
                 ? `${topEscalationMiss.symbol || 'UNKNOWN'} · ${String(topEscalationMiss.correctness || 'missed').replace(/_/g, ' ').toLowerCase()} · max ${fmtPct(topEscalationMiss.max_return_pct)}`
                 : `correct ${escalationAccuracy.correct_n ?? 0} · missed ${escalationAccuracy.missed_n ?? 0} · pending ${escalationAccuracy.pending_n ?? 0}`}
+            </div>
+          </div>
+
+          <div style={{ border: `1px solid ${(escalationMaturity.overdue_count ?? 0) ? 'rgba(239,68,68,0.24)' : (escalationMaturity.due_now_count ?? 0) ? 'rgba(245,158,11,0.24)' : 'rgba(96,165,250,0.18)'}`, borderRadius: 10, padding: 10, background: (escalationMaturity.overdue_count ?? 0) ? 'rgba(239,68,68,0.03)' : (escalationMaturity.due_now_count ?? 0) ? 'rgba(245,158,11,0.03)' : 'rgba(96,165,250,0.025)' }}>
+            <span style={{ ...MONO, fontSize: 8, color: (escalationMaturity.overdue_count ?? 0) ? '#ef4444' : (escalationMaturity.due_now_count ?? 0) ? '#f59e0b' : '#60a5fa', fontWeight: 900, letterSpacing: '0.14em' }}>
+              OUTCOME CLOCK
+            </span>
+            <div style={{ ...MONO, fontSize: 10, color: '#d7e1ea', marginTop: 7, lineHeight: 1.45 }}>
+              {escalationMaturity.status || 'CLEAR'} · pending {escalationMaturity.pending_count ?? 0} · due {escalationMaturity.due_now_count ?? 0}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              {nextEscalationDue
+                ? `${nextEscalationDue.symbol || 'UNKNOWN'} · ${nextEscalationDue.horizon || 'next'} · ${fmtAge(nextEscalationDue.next_check_ts || null)}`
+                : escalationMaturity.next_action || 'No pending escalation outcome checks.'}
             </div>
           </div>
 

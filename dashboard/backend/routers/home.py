@@ -14863,6 +14863,76 @@ def _build_provider_escalation_accuracy(escalation_rows: list[dict]) -> dict:
     }
 
 
+def _build_provider_escalation_maturity(escalation_rows: list[dict], now: datetime | None = None) -> dict:
+    now = now or datetime.now(timezone.utc)
+    tracked = [
+        dict(row) for row in escalation_rows or []
+        if str(row.get("escalation_status") or "").upper() in {
+            "REVIEW_COMPLETE_STILL_BLOCKED",
+            "SUPPRESSED",
+            "RESOLVED_REPAIRED",
+        }
+    ]
+    pending = []
+    due_now = []
+    overdue = []
+    next_due_ts: datetime | None = None
+    by_horizon: dict[str, dict] = {
+        "1h": {"waiting": 0, "checked": 0, "due": 0},
+        "4h": {"waiting": 0, "checked": 0, "due": 0},
+        "24h": {"waiting": 0, "checked": 0, "due": 0},
+    }
+    for row in tracked:
+        next_h = str(row.get("next_outcome_horizon") or "").lower()
+        next_ts = _gb_parse_ts(row.get("next_outcome_check_ts"))
+        for horizon in ("1h", "4h", "24h"):
+            status = str(row.get(f"outcome_{horizon}_status") or "").upper()
+            if status in {"", "WAITING", "PENDING"}:
+                by_horizon[horizon]["waiting"] += 1
+            else:
+                by_horizon[horizon]["checked"] += 1
+        if next_h and next_ts:
+            pending.append(row)
+            if next_ts <= now:
+                due_now.append(row)
+                by_horizon.setdefault(next_h, {"waiting": 0, "checked": 0, "due": 0})["due"] += 1
+                if (now - next_ts).total_seconds() > 30 * 60:
+                    overdue.append(row)
+            if next_due_ts is None or next_ts < next_due_ts:
+                next_due_ts = next_ts
+    minutes_until_next = None
+    if next_due_ts:
+        minutes_until_next = round((next_due_ts - now).total_seconds() / 60.0, 1)
+    status = "OVERDUE" if overdue else "DUE_NOW" if due_now else "WAITING" if pending else "CLEAR"
+    return {
+        "status": status,
+        "tracked_count": len(tracked),
+        "pending_count": len(pending),
+        "due_now_count": len(due_now),
+        "overdue_count": len(overdue),
+        "next_check_ts": next_due_ts.isoformat() if next_due_ts else None,
+        "minutes_until_next_check": minutes_until_next,
+        "by_horizon": by_horizon,
+        "next_due": [
+            {
+                "symbol": row.get("symbol"),
+                "mint": row.get("mint"),
+                "horizon": row.get("next_outcome_horizon"),
+                "next_check_ts": row.get("next_outcome_check_ts"),
+                "correctness": row.get("blocker_correctness"),
+            }
+            for row in sorted(pending, key=lambda r: str(r.get("next_outcome_check_ts") or ""))[:6]
+        ],
+        "next_action": (
+            "Run due escalation outcome checks now."
+            if due_now
+            else f"Next escalation outcome check in {minutes_until_next}m."
+            if minutes_until_next is not None
+            else "No pending escalation outcome checks."
+        ),
+    }
+
+
 def _build_rule_promotion_gate(
     simulator: dict,
     watchdog: dict,
@@ -15265,7 +15335,11 @@ def _build_daily_crypto_brief(lookback_hours: int = 24) -> dict:
                                outcome_return_1h_pct, outcome_return_4h_pct,
                                outcome_return_24h_pct, outcome_max_return_pct,
                                outcome_max_drawdown_pct, blocker_correctness,
-                               confidence_impact, outcome_reason
+                               confidence_impact, outcome_reason,
+                               outcome_1h_status, outcome_1h_check_ts, outcome_1h_correctness,
+                               outcome_4h_status, outcome_4h_check_ts, outcome_4h_correctness,
+                               outcome_24h_status, outcome_24h_check_ts, outcome_24h_correctness,
+                               next_outcome_check_ts, next_outcome_horizon
                         FROM provider_repair_escalations
                         WHERE created_ts >= ?
                            OR updated_ts >= ?
@@ -15419,6 +15493,7 @@ def _build_daily_crypto_brief(lookback_hours: int = 24) -> dict:
     provider_failure_drilldown = _build_provider_failure_drilldown(repair_rows)
     provider_escalation_queue = _build_provider_escalation_queue(escalation_rows, now)
     provider_escalation_accuracy = _build_provider_escalation_accuracy(escalation_rows)
+    provider_escalation_maturity = _build_provider_escalation_maturity(escalation_rows, now)
     rule_promotion_gate = _build_rule_promotion_gate(
         rule_simulator,
         data_watchdog,
@@ -15475,6 +15550,8 @@ def _build_daily_crypto_brief(lookback_hours: int = 24) -> dict:
         next_actions.append(str(provider_escalation_queue.get("next_action") or "Work the provider escalation queue."))
     if int(provider_escalation_accuracy.get("missed_n") or 0):
         next_actions.append(str(provider_escalation_accuracy.get("next_action") or "Review missed escalation outcomes."))
+    if int(provider_escalation_maturity.get("due_now_count") or 0):
+        next_actions.append(str(provider_escalation_maturity.get("next_action") or "Run due escalation outcome checks."))
     if missed_count:
         next_actions.append("Review missed-runner blockers and scout-only timing.")
     if weak_count:
@@ -15524,6 +15601,7 @@ def _build_daily_crypto_brief(lookback_hours: int = 24) -> dict:
         "provider_failure_drilldown": provider_failure_drilldown,
         "provider_escalation_queue": provider_escalation_queue,
         "provider_escalation_accuracy": provider_escalation_accuracy,
+        "provider_escalation_maturity": provider_escalation_maturity,
         "rule_promotion_gate": rule_promotion_gate,
         "missed_runner_clusters": missed_runner_clusters,
         "catalyst_context": catalyst_context,
