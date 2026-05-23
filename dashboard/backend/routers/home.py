@@ -15309,6 +15309,258 @@ def _build_replay_patch_workbench(replay_lab: dict) -> dict:
     }
 
 
+def _replay_promotion_score(item: dict) -> float:
+    net = _gb_float(item.get("net_score"))
+    benefit = _gb_float(item.get("benefit_n"))
+    harm = _gb_float(item.get("harm_n"))
+    weighted = _gb_float(item.get("weighted_touched_count") or item.get("sample_n"))
+    raw = dict(item.get("raw_counts") or {})
+    raw_net = _gb_float(raw.get("net_score"))
+    return round(net * 4.0 + benefit * 2.0 - harm * 5.0 + min(weighted, 40.0) * 0.25 + raw_net * 0.35, 2)
+
+
+def _build_replay_promotion_candidate_ranking(replay_lab: dict) -> dict:
+    simulation = dict((replay_lab or {}).get("rule_simulation_engine") or {})
+    gate = dict((replay_lab or {}).get("promotion_gate") or {})
+    rows = []
+    for item in list(simulation.get("items") or []):
+        candidate = dict(item)
+        raw = dict(candidate.get("raw_counts") or {})
+        candidate["promotion_score"] = _replay_promotion_score(candidate)
+        candidate["weighted_sample_n"] = candidate.get("weighted_touched_count") or candidate.get("sample_n")
+        candidate["raw_net_score"] = raw.get("net_score")
+        candidate["gate_status"] = gate.get("status") if candidate.get("key") == ((simulation.get("top_candidate") or {}).get("key")) else "RANKED"
+        rows.append(candidate)
+    rows.sort(
+        key=lambda row: (
+            _gb_float(row.get("promotion_score")),
+            _gb_float(row.get("net_score")),
+            _gb_float(row.get("benefit_n")) - _gb_float(row.get("harm_n")),
+        ),
+        reverse=True,
+    )
+    return {
+        "status": "READY" if rows else "NO_CANDIDATES",
+        "ranked_count": len(rows),
+        "top_candidate": rows[0] if rows else None,
+        "items": rows[:8],
+        "ranking_basis": "weighted trusted evidence: net, benefit, harm, touched sample, and raw cross-check",
+        "next_action": (
+            "Open the top ranked candidate risk ledger before writing any patch."
+            if rows
+            else "Keep collecting trusted replay evidence before ranking promotion candidates."
+        ),
+    }
+
+
+def _build_replay_patch_risk_ledger(replay_lab: dict, ranking: dict) -> dict:
+    top = dict((ranking or {}).get("top_candidate") or {})
+    if not top:
+        return {
+            "status": "NO_CANDIDATE",
+            "next_action": "No promotion candidate is ranked yet.",
+        }
+    examples = dict(top.get("examples") or {})
+    quarantine = dict((replay_lab or {}).get("evidence_maturation", {}).get("bad_outcome_quarantine") or {})
+    if not quarantine:
+        quarantine = _build_replay_bad_outcome_quarantine(replay_lab)
+    quarantined = list(quarantine.get("items") or [])
+    risk_score = round(
+        _gb_float(top.get("harm_n")) * 4.0
+        + _gb_float(top.get("false_positive_buy_n")) * 3.0
+        + _gb_float(top.get("damaged_good_buy_n")) * 5.0,
+        2,
+    )
+    upside_score = round(
+        _gb_float(top.get("benefit_n")) * 3.0
+        + _gb_float(top.get("rescued_missed_runner_n")) * 4.0
+        + _gb_float(top.get("saved_weak_buy_n")) * 2.0,
+        2,
+    )
+    return {
+        "status": "READY",
+        "rule_key": top.get("key"),
+        "label": top.get("label"),
+        "weighted": {
+            "saved_weak_buys": top.get("saved_weak_buy_n"),
+            "rescued_missed_runners": top.get("rescued_missed_runner_n"),
+            "damaged_good_buys": top.get("damaged_good_buy_n"),
+            "false_positive_buys": top.get("false_positive_buy_n"),
+            "benefit": top.get("benefit_n"),
+            "harm": top.get("harm_n"),
+            "net_score": top.get("net_score"),
+            "promotion_score": top.get("promotion_score"),
+        },
+        "raw_counts": dict(top.get("raw_counts") or {}),
+        "upside_score": upside_score,
+        "risk_score": risk_score,
+        "saved_wins": list(examples.get("saved_weak_buys") or [])[:6],
+        "rescued_misses": list(examples.get("rescued_missed_runners") or [])[:6],
+        "damaged_good_buys": list(examples.get("damaged_good_buys") or [])[:6],
+        "false_positives": list(examples.get("false_positive_buys") or [])[:6],
+        "quarantined_rows": quarantined[:6],
+        "next_action": "Review upside, harm, and quarantined rows before approving a manual patch packet.",
+    }
+
+
+def _build_replay_before_after_policy_diff(candidate: dict) -> dict:
+    key = str((candidate or {}).get("key") or "").strip()
+    label = str((candidate or {}).get("label") or key.replace("_", " ")).strip()
+    direction = str((candidate or {}).get("direction") or "").upper()
+    proposed = str((candidate or {}).get("proposed_action") or "").upper()
+    before = "Current production policy remains unchanged; this workbench only simulates rule behavior."
+    if not key:
+        return {
+            "status": "NO_DIFF",
+            "before": before,
+            "after": None,
+            "expected_behavior_changes": [],
+            "next_action": "No ranked candidate is available for a before/after diff.",
+        }
+    if direction == "TIGHTEN":
+        after = f"Would add/strengthen {label.lower()} so matching BUY rows move toward WAIT review."
+        changes = [
+            "Weak buy rows matching the rule become blocked or wait-only in simulation.",
+            "Good buy rows matching the rule are counted as damaged good buys.",
+            "Policy cannot change until a separate code patch is manually approved.",
+        ]
+    elif direction == "LOOSEN_OR_SCOUT":
+        after = f"Would add/strengthen {label.lower()} so matching WAIT rows move toward scout/buy review."
+        changes = [
+            "Missed runner rows matching the rule become rescued candidates in simulation.",
+            "Weak rows matching the rule are counted as false-positive buys.",
+            "Policy cannot change until a separate code patch is manually approved.",
+        ]
+    else:
+        after = f"Would evaluate {label.lower()} against replay rows without changing live behavior."
+        changes = [
+            "Replay behavior changes are simulated only.",
+            "Manual code review is required before policy changes.",
+        ]
+    return {
+        "status": "READY",
+        "rule_key": key,
+        "label": label,
+        "direction": direction or None,
+        "proposed_action": proposed or None,
+        "before": before,
+        "after": after,
+        "expected_behavior_changes": changes,
+        "next_action": "Compare expected behavior changes with the risk ledger before patch approval.",
+    }
+
+
+def _build_replay_no_auto_promote_guard(lock_ok: bool) -> dict:
+    live_confirmed = str(os.getenv("MEMECOIN_LIVE_EXECUTION_CONFIRMED") or "").strip().lower() == "true"
+    auto_buy = str(os.getenv("MEMECOIN_AUTO_BUY") or "").strip().lower() == "true"
+    executor_enabled = str(os.getenv("EXECUTOR_ENABLED") or "").strip().lower() == "true"
+    violations = []
+    if live_confirmed:
+        violations.append("live_execution_confirmed_true")
+    if auto_buy:
+        violations.append("memecoin_auto_buy_true")
+    if executor_enabled:
+        violations.append("executor_enabled_true")
+    if not lock_ok:
+        violations.append("daily_lock_context_not_clean")
+    return {
+        "status": "PASS" if not violations else "BLOCKED",
+        "manual_patch_required": True,
+        "auto_promote_allowed": False,
+        "can_modify_live_rules": False,
+        "execution_mutation_allowed": False,
+        "requires_separate_rearm_discussion": True,
+        "violations": violations,
+        "proof": (
+            "Workbench v2 only returns review packets; it does not write production policy, execution flags, or trades."
+            if not violations
+            else "Safety context has blockers; keep policy promotion locked."
+        ),
+    }
+
+
+def _build_replay_manual_approval_packet(
+    ranking: dict,
+    risk_ledger: dict,
+    policy_diff: dict,
+    replay_lab: dict,
+    guard: dict,
+) -> dict:
+    candidate = dict((ranking or {}).get("top_candidate") or {})
+    if not candidate:
+        return {
+            "status": "NO_PACKET",
+            "manual_only": True,
+            "next_action": "No ranked replay candidate is ready for an approval packet.",
+        }
+    hypothesis = {
+        "rule_key": candidate.get("key"),
+        "label": candidate.get("label"),
+        "blockers": list(((replay_lab or {}).get("promotion_gate") or {}).get("blockers") or []),
+    }
+    target_map = _build_replay_target_code_map(hypothesis)
+    test_recipe = _build_replay_test_recipe(hypothesis, target_map)
+    gate = dict((replay_lab or {}).get("promotion_gate") or {})
+    trust = _build_replay_outcome_trust_meter(replay_lab)
+    blockers = list(gate.get("blockers") or [])
+    if str((guard or {}).get("status") or "").upper() != "PASS":
+        blockers.extend([f"guard:{x}" for x in list((guard or {}).get("violations") or [])])
+    status = "READY_FOR_HUMAN_APPROVAL" if not blockers else "COLLECT_MORE_EVIDENCE"
+    return {
+        "status": status,
+        "manual_only": True,
+        "rule_key": candidate.get("key"),
+        "title": f"Review replay policy patch: {candidate.get('label') or candidate.get('key')}",
+        "candidate": {
+            "rank": 1,
+            "promotion_score": candidate.get("promotion_score"),
+            "net_score": candidate.get("net_score"),
+            "benefit_n": candidate.get("benefit_n"),
+            "harm_n": candidate.get("harm_n"),
+            "weighted_sample_n": candidate.get("weighted_sample_n"),
+            "raw_counts": candidate.get("raw_counts"),
+        },
+        "evidence": {
+            "trust_meter": trust,
+            "risk_ledger": risk_ledger,
+            "policy_diff": policy_diff,
+        },
+        "target_code_map": target_map,
+        "replay_test_recipe": test_recipe,
+        "no_auto_promote_guard": guard,
+        "blockers": list(dict.fromkeys(blockers)),
+        "next_action": (
+            "Human may open a separate small patch using this packet."
+            if status == "READY_FOR_HUMAN_APPROVAL"
+            else "Keep collecting trusted weighted evidence before opening a rule patch."
+        ),
+    }
+
+
+def _build_replay_policy_promotion_workbench_v2(replay_lab: dict, lock_ok: bool) -> dict:
+    ranking = _build_replay_promotion_candidate_ranking(replay_lab)
+    risk_ledger = _build_replay_patch_risk_ledger(replay_lab, ranking)
+    candidate = dict((ranking or {}).get("top_candidate") or {})
+    policy_diff = _build_replay_before_after_policy_diff(candidate)
+    guard = _build_replay_no_auto_promote_guard(lock_ok)
+    approval_packet = _build_replay_manual_approval_packet(
+        ranking,
+        risk_ledger,
+        policy_diff,
+        replay_lab,
+        guard,
+    )
+    return {
+        "status": "READY" if candidate else "NO_CANDIDATE",
+        "promotion_candidate_ranking": ranking,
+        "patch_risk_ledger": risk_ledger,
+        "before_after_policy_diff": policy_diff,
+        "manual_approval_packet": approval_packet,
+        "no_auto_promote_guard": guard,
+        "next_action": approval_packet.get("next_action") or ranking.get("next_action"),
+    }
+
+
 def _replay_evidence_snapshot(raw_value: str | None) -> dict:
     if not raw_value:
         path = os.path.abspath(
@@ -16147,6 +16399,7 @@ def _build_replay_outcome_lab(
         "next_action": promotion.get("next_action") or simulation.get("next_action"),
     }
     out["patch_workbench"] = _build_replay_patch_workbench(out)
+    out["policy_promotion_workbench_v2"] = _build_replay_policy_promotion_workbench_v2(out, lock_ok)
     return out
 
 

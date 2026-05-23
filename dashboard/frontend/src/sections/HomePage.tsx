@@ -607,6 +607,62 @@ interface DailyCryptoBriefData {
       }
       next_action?: string | null
     }
+    policy_promotion_workbench_v2?: {
+      status?: string
+      promotion_candidate_ranking?: {
+        status?: string
+        ranked_count?: number
+        top_candidate?: {
+          key?: string | null
+          label?: string | null
+          promotion_score?: number | null
+          net_score?: number | null
+          benefit_n?: number
+          harm_n?: number
+          weighted_sample_n?: number
+        } | null
+      }
+      patch_risk_ledger?: {
+        status?: string
+        risk_score?: number | null
+        upside_score?: number | null
+        weighted?: {
+          benefit?: number
+          harm?: number
+          net_score?: number
+          promotion_score?: number
+          saved_weak_buys?: number
+          rescued_missed_runners?: number
+          damaged_good_buys?: number
+          false_positive_buys?: number
+        }
+        quarantined_rows?: unknown[]
+      }
+      before_after_policy_diff?: {
+        status?: string
+        before?: string | null
+        after?: string | null
+        expected_behavior_changes?: string[]
+      }
+      manual_approval_packet?: {
+        status?: string
+        title?: string | null
+        manual_only?: boolean
+        blockers?: string[]
+        next_action?: string | null
+      }
+      no_auto_promote_guard?: {
+        status?: string
+        manual_patch_required?: boolean
+        auto_promote_allowed?: boolean
+        can_modify_live_rules?: boolean
+        execution_mutation_allowed?: boolean
+        requires_separate_rearm_discussion?: boolean
+        violations?: string[]
+        proof?: string | null
+      }
+      next_action?: string | null
+    }
     evidence_maturation?: {
       status?: string
       blocker_breakdown?: {
@@ -5275,6 +5331,13 @@ function DailyCryptoBriefPanel({
     const replayWorkbenchOrder = replayWorkbench.manual_work_order ?? {}
     const replayWorkbenchTarget = replayWorkbench.target_code_map?.items?.[0]
     const replayWorkbenchRecipe = replayWorkbench.replay_test_recipe?.commands?.[0]
+    const replayPromotionV2 = replayLab.policy_promotion_workbench_v2 ?? {}
+    const replayPromotionRanking = replayPromotionV2.promotion_candidate_ranking ?? {}
+    const replayPromotionCandidate = replayPromotionRanking.top_candidate
+    const replayPatchRisk = replayPromotionV2.patch_risk_ledger ?? {}
+    const replayPolicyDiff = replayPromotionV2.before_after_policy_diff ?? {}
+    const replayApprovalPacket = replayPromotionV2.manual_approval_packet ?? {}
+    const replayNoAutoGuard = replayPromotionV2.no_auto_promote_guard ?? {}
     const replayMaturation = replayLab.evidence_maturation ?? {}
     const replayMaturationBlocker = replayMaturation.blocker_breakdown?.items?.[0]
     const replayMaturationQueue = replayMaturation.maturation_queue ?? {}
@@ -5684,6 +5747,23 @@ function DailyCryptoBriefPanel({
               {replayWorkbenchTarget
                 ? `${replayWorkbenchTarget.file || 'file'} · ${replayWorkbenchTarget.function || 'function'}`
                 : replayWorkbenchRecipe?.label || replayWorkbench.next_action || 'No target map yet.'}
+            </div>
+          </div>
+
+          <div style={{ border: `1px solid ${replayNoAutoGuard.status === 'PASS' ? 'rgba(96,165,250,0.2)' : 'rgba(239,68,68,0.22)'}`, borderRadius: 10, padding: 10, background: replayNoAutoGuard.status === 'PASS' ? 'rgba(96,165,250,0.03)' : 'rgba(239,68,68,0.035)' }}>
+            <span style={{ ...MONO, fontSize: 8, color: replayNoAutoGuard.status === 'PASS' ? '#60a5fa' : '#ef4444', fontWeight: 900, letterSpacing: '0.14em' }}>
+              PROMOTION V2
+            </span>
+            <div style={{ ...MONO, fontSize: 10, color: '#d7e1ea', marginTop: 7, lineHeight: 1.45 }}>
+              {replayPromotionCandidate?.label || replayPromotionV2.status || 'NO_CANDIDATE'} · score {fmtFixed(replayPromotionCandidate?.promotion_score, 1)}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              risk {fmtFixed(replayPatchRisk.risk_score, 1)} · upside {fmtFixed(replayPatchRisk.upside_score, 1)} · packet {String(replayApprovalPacket.status || 'waiting').replace(/_/g, ' ').toLowerCase()}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#9db7ce', marginTop: 5, lineHeight: 1.45 }}>
+              {replayPolicyDiff.after
+                ? `${String(replayPolicyDiff.after).slice(0, 120)}`
+                : replayNoAutoGuard.proof || replayPromotionV2.next_action || 'Manual approval packet pending.'}
             </div>
           </div>
 
