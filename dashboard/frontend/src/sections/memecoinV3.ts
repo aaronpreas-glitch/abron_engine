@@ -35,6 +35,73 @@ export interface V3ReinforcementDebug {
   }
 }
 
+export interface V3ScoreBreakdown {
+  readiness: number | null
+  support: number | null
+  safety: number | null
+  timing: number | null
+  market: number | null
+  profit_room: number | null
+}
+
+export interface V3TradeQuality {
+  verdict: string
+  reasons: V3Reason[]
+}
+
+export interface V3ProfitRoom {
+  label: string
+  confidence: number | null
+  reasons: string[]
+}
+
+export interface V3ExitReview {
+  id: number
+  ts_utc: string
+  trade_id: number
+  mint: string
+  symbol: string
+  scanner_regime: string | null
+  current_price: number | null
+  current_return_pct: number | null
+  age_hours: number | null
+  entry_proof_score: number | null
+  current_proof_score: number | null
+  proof_score_delta: number | null
+  current_proof_reason: string | null
+  review_state: string
+  review_state_label?: string | null
+  recommended_action: string
+  recommended_pct: number | null
+  exit_reason: string | null
+  exit_reason_label?: string | null
+  current_readiness_score?: number | null
+  current_readiness_level?: string | null
+  readiness_delta?: number | null
+  should_exit: number
+  auto_exit_enabled: number
+  executed: number
+  intent_id: number | null
+  notes: string | null
+}
+
+export interface V3ExitReviewHistoryItem {
+  id: number
+  ts_utc: string
+  trade_id: number
+  mint: string
+  symbol: string
+  current_return_pct: number | null
+  proof_score_delta: number | null
+  review_state: string
+  review_state_label?: string | null
+  recommended_action: string
+  recommended_pct: number | null
+  exit_reason: string | null
+  exit_reason_label?: string | null
+  executed: number
+}
+
 export interface V3Candidate {
   id: number
   symbol: string
@@ -89,6 +156,9 @@ export interface V3Candidate {
     }
     debug?: V3ReinforcementDebug
   }
+  scores: V3ScoreBreakdown
+  trade_quality: V3TradeQuality
+  profit_room: V3ProfitRoom | null
   proof: {
     route: string
     stage: string
@@ -223,6 +293,8 @@ export interface V3ProofTrade {
   proof_status: string
   proof_reason: string
   proof_score: number
+  readiness_score?: number | null
+  readiness_level?: string | null
   scanner_regime: string
   scanner_relaxation_reason: string
   trust_label: string
@@ -232,44 +304,8 @@ export interface V3ProofTrade {
   source_return_24h_pct: number | null
   support_signals?: V3Reason[]
   age_hours: number | null
-  exit_review?: {
-    id: number
-    ts_utc: string
-    trade_id: number
-    mint: string
-    symbol: string
-    scanner_regime: string | null
-    current_price: number | null
-    current_return_pct: number | null
-    age_hours: number | null
-    entry_proof_score: number | null
-    current_proof_score: number | null
-    proof_score_delta: number | null
-    current_proof_reason: string | null
-    review_state: string
-    recommended_action: string
-    recommended_pct: number | null
-    exit_reason: string | null
-    should_exit: number
-    auto_exit_enabled: number
-    executed: number
-    intent_id: number | null
-    notes: string | null
-  } | null
-  exit_history?: Array<{
-    id: number
-    ts_utc: string
-    trade_id: number
-    mint: string
-    symbol: string
-    current_return_pct: number | null
-    proof_score_delta: number | null
-    review_state: string
-    recommended_action: string
-    recommended_pct: number | null
-    exit_reason: string | null
-    executed: number
-  }>
+  exit_review?: V3ExitReview | null
+  exit_history?: V3ExitReviewHistoryItem[]
 }
 
 export interface V3CandidateDetailResponse {
@@ -286,6 +322,8 @@ export interface V3CandidateDetailResponse {
     mint: string
     score: number | null
     proof_score: number | null
+    readiness_score?: number | null
+    readiness_level?: string | null
     proof_reason: string | null
     return_4h_pct: number | null
     return_24h_pct: number | null
@@ -310,6 +348,8 @@ export interface V3CandidateDetailResponse {
       return_24h_pct: number | null
       proof_reason: string | null
       proof_score: number
+      readiness_score?: number | null
+      readiness_level?: string | null
       support_signals?: V3Reason[]
       has_support: boolean
       route: 'NORMAL' | 'RELAXED'
@@ -336,6 +376,8 @@ export interface V3ProofWorkspaceResponse {
     return_4h_pct: number | null
     return_24h_pct: number | null
     proof_score: number | null
+    readiness_score?: number | null
+    readiness_level?: string | null
     proof_reason: string | null
     has_support: boolean
     support_signals?: V3Reason[]
