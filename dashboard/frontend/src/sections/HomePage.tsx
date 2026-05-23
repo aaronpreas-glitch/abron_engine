@@ -128,6 +128,7 @@ type ProviderEscalationAction = 'DISMISS' | 'KEEP_WATCHING' | 'FORCE_REFRESH'
 type ProviderEscalationReviewState = 'ACKNOWLEDGED' | 'RULE_PATCH_NEEDED' | 'DATA_PATCH_NEEDED' | 'FALSE_ALARM' | 'RESOLVED'
 type ProviderEscalationPatchState = 'WATCH' | 'NEEDS_MORE_DATA' | 'READY_FOR_IMPLEMENTATION'
 type ProviderEscalationWorkOrderState = 'READY' | 'STARTED' | 'BLOCKED' | 'COMPLETE'
+type LiveContextMissionState = 'NEW' | 'INVESTIGATING' | 'RESOLVED_COVERED' | 'RESOLVED_IGNORED' | 'NEEDS_SOURCE'
 
 interface ProviderEscalationItem {
   id?: number | null
@@ -299,6 +300,10 @@ interface LiveOpportunityGap {
   symbol?: string | null
   mint?: string | null
   source?: string | null
+  mission_state?: string | null
+  mission_state_updated_at?: string | null
+  scope?: string | null
+  scope_reason?: string | null
   heat_score?: number | null
   gap_score?: number | null
   data_freshness?: string | null
@@ -756,6 +761,35 @@ interface DailyCryptoBriefData {
     by_type?: Record<string, number>
     top_gap?: LiveOpportunityGap | null
     items?: LiveOpportunityGap[]
+    next_action?: string | null
+  }
+  live_context_mission_dossier?: {
+    status?: string
+    mission_key?: string
+    state?: string | null
+    state_updated_at?: string | null
+    operator_note?: string | null
+    source?: string | null
+    symbol?: string | null
+    mint?: string | null
+    name?: string | null
+    gap_type?: string | null
+    gap_score?: number | null
+    heat_score?: number | null
+    reason?: string | null
+    scope?: {
+      scope?: string | null
+      reason?: string | null
+      manual_only?: boolean
+    }
+    next_action?: string | null
+  }
+  live_context_blind_spot_resolution?: {
+    status?: string
+    mission_key?: string
+    scope?: string | null
+    recommended_state?: LiveContextMissionState | string | null
+    action?: string | null
     next_action?: string | null
   }
   live_context_generated_mission?: DailyTopMission
@@ -4808,10 +4842,12 @@ function DailyCryptoBriefPanel({
   onEscalationReviewAction,
   onEscalationPatchAction,
   onEscalationWorkOrderAction,
+  onLiveContextMissionAction,
   pendingEscalationId,
   pendingEscalationReviewKey,
   pendingEscalationPatchKey,
   pendingEscalationWorkOrderKey,
+  pendingLiveContextMissionKey,
 }: {
   data?: DailyCryptoBriefData
   loading: boolean
@@ -4819,10 +4855,12 @@ function DailyCryptoBriefPanel({
   onEscalationReviewAction?: (item: ProviderEscalationReviewGroup, state: ProviderEscalationReviewState) => void
   onEscalationPatchAction?: (item: ProviderEscalationPatchPlan, state: ProviderEscalationPatchState) => void
   onEscalationWorkOrderAction?: (item: ProviderEscalationWorkOrder, state: ProviderEscalationWorkOrderState) => void
+  onLiveContextMissionAction?: (item: DailyTopMission | LiveOpportunityGap, state: LiveContextMissionState) => void
   pendingEscalationId?: number | null
   pendingEscalationReviewKey?: string | null
   pendingEscalationPatchKey?: string | null
   pendingEscalationWorkOrderKey?: string | null
+  pendingLiveContextMissionKey?: string | null
 }) {
   if (loading && !data) {
     return (
@@ -4896,6 +4934,8 @@ function DailyCryptoBriefPanel({
     const catalystContext = data.catalyst_context ?? {}
     const liveIntake = data.live_market_narrative_intake ?? {}
     const liveGaps = data.live_opportunity_gaps ?? {}
+    const liveDossier = data.live_context_mission_dossier ?? {}
+    const liveResolution = data.live_context_blind_spot_resolution ?? {}
     const liveMission = data.live_context_generated_mission ?? {}
     const liveEvidence = data.live_context_evidence_requirements ?? {}
     const liveOutcomeLoop = data.live_context_outcome_loop ?? {}
@@ -4939,6 +4979,7 @@ function DailyCryptoBriefPanel({
     const topRegression = regressionGuard.items?.[0]
     const topLiveItem = liveIntake.items?.[0]
     const topLiveGap = liveGaps.top_gap ?? liveGaps.items?.[0]
+    const liveMissionActionItem = liveMission.group_key ? liveMission : topLiveGap
     const topEvidenceRequirement = liveEvidence.requirements?.[0]
     const buildHooks = data.daily_build_hooks ?? {}
     const countText = (counts: Record<string, number>, keys: string[]) =>
@@ -5597,10 +5638,43 @@ function DailyCryptoBriefPanel({
               MARKET MISSION
             </span>
             <div style={{ ...MONO, fontSize: 10, color: '#d7e1ea', marginTop: 7, lineHeight: 1.45 }}>
-              {String(liveMission.mission_type || 'LIVE_CONTEXT_OBSERVE').replace(/_/g, ' ')} · {fmtFixed(liveMission.priority_score, 0)}
+              {String(liveMission.mission_type || 'LIVE_CONTEXT_OBSERVE').replace(/_/g, ' ')} · {fmtFixed(liveMission.priority_score, 0)} · {String(liveDossier.state || 'NEW').replace(/_/g, ' ')}
             </div>
             <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
               {liveMission.headline || liveMission.next_action || 'No generated live-context mission yet.'}
+            </div>
+            {liveMissionActionItem && onLiveContextMissionAction && (
+              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 8 }}>
+                {([
+                  ['INVESTIGATING', 'INVESTIGATE'],
+                  ['RESOLVED_COVERED', 'COVER'],
+                  ['RESOLVED_IGNORED', 'IGNORE'],
+                  ['NEEDS_SOURCE', 'SOURCE'],
+                ] as Array<[LiveContextMissionState, string]>).map(([state, label]) => (
+                  <button
+                    key={`live-context-mission-${state}`}
+                    type="button"
+                    className="mini-btn"
+                    disabled={pendingLiveContextMissionKey === (liveDossier.mission_key || liveMission.group_key || topLiveGap?.gap_key)}
+                    onClick={() => onLiveContextMissionAction(liveMissionActionItem, state)}
+                    style={{ fontSize: 7, padding: '4px 7px' }}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div style={{ border: `1px solid ${liveResolution.status === 'RECOMMEND_IGNORE' ? 'rgba(239,68,68,0.22)' : liveResolution.status === 'RECOMMEND_COVERAGE' ? 'rgba(0,212,138,0.2)' : 'rgba(96,165,250,0.16)'}`, borderRadius: 10, padding: 10, background: liveResolution.status === 'RECOMMEND_IGNORE' ? 'rgba(239,68,68,0.025)' : liveResolution.status === 'RECOMMEND_COVERAGE' ? 'rgba(0,212,138,0.025)' : 'rgba(96,165,250,0.02)' }}>
+            <span style={{ ...MONO, fontSize: 8, color: liveResolution.status === 'RECOMMEND_IGNORE' ? '#ef4444' : liveResolution.status === 'RECOMMEND_COVERAGE' ? '#00d48a' : '#60a5fa', fontWeight: 900, letterSpacing: '0.14em' }}>
+              SCOPE DOSSIER
+            </span>
+            <div style={{ ...MONO, fontSize: 10, color: '#d7e1ea', marginTop: 7, lineHeight: 1.45 }}>
+              {liveDossier.symbol || liveDossier.mint || 'market'} · {String(liveDossier.scope?.scope || liveResolution.scope || 'NEEDS_SOURCE').replace(/_/g, ' ')}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              {liveDossier.scope?.reason || liveResolution.next_action || liveDossier.next_action || 'Classify this mission before resolving it.'}
             </div>
           </div>
 
@@ -8380,6 +8454,7 @@ export function HomePage() {
   const [pendingEscalationReviewKey, setPendingEscalationReviewKey] = React.useState<string | null>(null)
   const [pendingEscalationPatchKey, setPendingEscalationPatchKey] = React.useState<string | null>(null)
   const [pendingEscalationWorkOrderKey, setPendingEscalationWorkOrderKey] = React.useState<string | null>(null)
+  const [pendingLiveContextMissionKey, setPendingLiveContextMissionKey] = React.useState<string | null>(null)
   const [homeQueryStage, setHomeQueryStage] = React.useState(0)
 
   React.useEffect(() => {
@@ -8641,6 +8716,51 @@ export function HomePage() {
     })
   }
 
+  const liveContextMissionMutation = useMutation({
+    mutationFn: (payload: {
+      mission_key?: string
+      gap_key?: string
+      group_key?: string | null
+      symbol?: string | null
+      mint?: string | null
+      gap_type?: string | null
+      scope?: string | null
+      state: LiveContextMissionState
+      operator_note?: string
+    }) => api.post('/home/live-context-mission/decision', payload).then(r => r.data),
+    onMutate: (payload) => {
+      setPendingLiveContextMissionKey(payload.mission_key || payload.gap_key || payload.group_key || null)
+    },
+    onSettled: async () => {
+      setPendingLiveContextMissionKey(null)
+      await queryClient.invalidateQueries({ queryKey: ['home-daily-crypto-brief'] })
+      await queryClient.invalidateQueries({ queryKey: ['home-action-board'] })
+      await queryClient.invalidateQueries({ queryKey: ['home-system-audit-confidence'] })
+    },
+  })
+
+  const recordLiveContextMissionDecision = (item: DailyTopMission | LiveOpportunityGap, state: LiveContextMissionState) => {
+    const isMission = 'mission_type' in item || 'source_gap' in item
+    const mission = isMission ? item as DailyTopMission : null
+    const gap = isMission ? mission?.source_gap : item as LiveOpportunityGap
+    const missionKey = (isMission ? mission?.group_key : gap?.gap_key) || gap?.gap_key || undefined
+    liveContextMissionMutation.mutate({
+      mission_key: missionKey,
+      gap_key: gap?.gap_key,
+      group_key: mission?.group_key,
+      symbol: gap?.symbol,
+      mint: gap?.mint,
+      gap_type: gap?.gap_type,
+      scope: gap?.scope,
+      state,
+      operator_note:
+        state === 'INVESTIGATING' ? 'Operator started live-context mission investigation.'
+        : state === 'RESOLVED_COVERED' ? 'Operator marked live-context mission covered by Abrons.'
+        : state === 'RESOLVED_IGNORED' ? 'Operator marked live-context mission ignored/out of scope.'
+        : 'Operator marked live-context mission as needing more source identity.',
+    })
+  }
+
   // Confluence reinforcement — annotates MEMECOINS entries on the Action Board
   const confluenceReinQ = useQuery<{
     top_candidates: Array<{ symbol: string; reinforcement_level: string }>
@@ -8773,10 +8893,12 @@ export function HomePage() {
           onEscalationReviewAction={recordProviderEscalationReviewDecision}
           onEscalationPatchAction={recordProviderEscalationPatchDecision}
           onEscalationWorkOrderAction={recordProviderEscalationWorkOrderDecision}
+          onLiveContextMissionAction={recordLiveContextMissionDecision}
           pendingEscalationId={pendingEscalationId}
           pendingEscalationReviewKey={pendingEscalationReviewKey}
           pendingEscalationPatchKey={pendingEscalationPatchKey}
           pendingEscalationWorkOrderKey={pendingEscalationWorkOrderKey}
+          pendingLiveContextMissionKey={pendingLiveContextMissionKey}
         />
       </div>
 

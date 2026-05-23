@@ -39,6 +39,7 @@ _DAILY_BRIEF_OUTCOME_AUTORUN_MIN_SECONDS = max(
 _PROVIDER_ESCALATION_REVIEW_STATES_KEY = "provider_escalation_review_states"
 _PROVIDER_ESCALATION_PATCH_STATES_KEY = "provider_escalation_patch_states"
 _PROVIDER_ESCALATION_WORK_ORDER_STATES_KEY = "provider_escalation_work_order_states"
+_LIVE_CONTEXT_MISSION_STATES_KEY = "live_context_mission_states"
 _PROVIDER_ESCALATION_REVIEW_OPEN_STATES = {
     "OPEN",
     "ACKNOWLEDGED",
@@ -48,6 +49,13 @@ _PROVIDER_ESCALATION_REVIEW_OPEN_STATES = {
 _PROVIDER_ESCALATION_REVIEW_CLOSED_STATES = {"FALSE_ALARM", "RESOLVED"}
 _PROVIDER_ESCALATION_PATCH_STATES = {"WATCH", "NEEDS_MORE_DATA", "READY_FOR_IMPLEMENTATION"}
 _PROVIDER_ESCALATION_WORK_ORDER_STATES = {"READY", "STARTED", "BLOCKED", "COMPLETE"}
+_LIVE_CONTEXT_MISSION_STATES = {
+    "NEW",
+    "INVESTIGATING",
+    "RESOLVED_COVERED",
+    "RESOLVED_IGNORED",
+    "NEEDS_SOURCE",
+}
 _home_short_cache: dict[str, tuple[float, object]] = {}
 
 
@@ -16076,10 +16084,149 @@ def _build_live_market_narrative_intake(kv_rows: dict[str, str], confluence_rows
     }
 
 
+def _live_context_mission_state_map(raw_value: str | None) -> dict[str, dict]:
+    try:
+        payload = json.loads(raw_value or "{}")
+        if not isinstance(payload, dict):
+            return {}
+        out: dict[str, dict] = {}
+        for key, value in payload.items():
+            if isinstance(value, dict):
+                out[str(key)] = dict(value)
+        return out
+    except Exception:
+        return {}
+
+
+def _live_context_mission_key(item_or_gap: dict) -> str:
+    gap_type = str(item_or_gap.get("gap_type") or "MARKET_CONTEXT").upper()
+    identity = str(item_or_gap.get("mint") or item_or_gap.get("symbol") or item_or_gap.get("source") or "unknown").strip()
+    return f"{gap_type}:{identity}".upper()
+
+
+def _classify_live_context_scope(item_or_gap: dict) -> dict:
+    source = str(item_or_gap.get("source") or "").lower()
+    symbol = str(item_or_gap.get("symbol") or "").strip().upper()
+    mint = str(item_or_gap.get("mint") or "").strip()
+    name = str(item_or_gap.get("name") or "").strip().lower()
+    meme_terms = {"dog", "cat", "pepe", "inu", "bonk", "wif", "frog", "meme", "shib", "floki", "trencher"}
+    sol_spot = {"SOL", "JUP", "JTO", "PYTH", "WIF", "BONK", "RAY", "ORCA", "HNT", "MOBILE", "IO", "DRIFT"}
+    major_or_l1 = {
+        "BTC", "ETH", "BNB", "XRP", "ADA", "DOGE", "TRX", "TON", "AVAX", "DOT", "MATIC", "POL",
+        "BCH", "LTC", "ETC", "XMR", "ATOM", "NEAR", "APT", "SUI", "SEI", "ARB", "OP", "FIL",
+        "ICP", "HBAR", "VET", "ALGO", "EGLD", "XTZ", "EOS", "IOTA", "KAS", "TAO", "ERG",
+    }
+    if mint:
+        scope = "IN_SCOPE_SOLANA"
+        reason = "Mint/address is present, so Abrons can attempt Solana-style coverage or explicit chain verification."
+    elif source == "dexscreener":
+        scope = "IN_SCOPE_SOLANA"
+        reason = "DexScreener boosted context is treated as scanner-relevant unless later chain checks reject it."
+    elif symbol in sol_spot:
+        scope = "SPOT_ONLY"
+        reason = "Symbol is Solana ecosystem context, but not automatically a memecoin execution target."
+    elif symbol in major_or_l1:
+        scope = "OUT_OF_SCOPE_L1"
+        reason = "CoinGecko trend appears to be a standalone L1/major asset, not a memecoin scanner target."
+    elif any(term in name or term in symbol.lower() for term in meme_terms):
+        scope = "IN_SCOPE_MEME"
+        reason = "Name/symbol has meme-like terms and deserves scanner coverage review."
+    elif source == "coingecko":
+        scope = "SPOT_ONLY"
+        reason = "CoinGecko-only trend without a mint is broad market context until a tradable memecoin target exists."
+    else:
+        scope = "NEEDS_SOURCE"
+        reason = "More source detail is needed before classifying this market item."
+    return {
+        "scope": scope,
+        "reason": reason,
+        "manual_only": True,
+    }
+
+
+def _build_live_context_mission_dossier(gap: dict, live_intake: dict, mission_states: dict) -> dict:
+    if not gap:
+        return {"status": "NO_DOSSIER", "next_action": "No live-context gap needs a dossier."}
+    mission_key = _live_context_mission_key(gap)
+    source_item = None
+    for item in list((live_intake or {}).get("items") or []):
+        if str(item.get("mint") or "") and str(item.get("mint") or "") == str(gap.get("mint") or ""):
+            source_item = dict(item)
+            break
+        if str(item.get("symbol") or "").upper() and str(item.get("symbol") or "").upper() == str(gap.get("symbol") or "").upper():
+            source_item = dict(item)
+            break
+    state_row = dict(mission_states.get(mission_key) or {})
+    state = str(state_row.get("state") or "NEW").upper()
+    if state not in _LIVE_CONTEXT_MISSION_STATES:
+        state = "NEW"
+    scope = _classify_live_context_scope({**(source_item or {}), **gap})
+    return {
+        "status": "READY",
+        "mission_key": mission_key,
+        "state": state,
+        "state_updated_at": state_row.get("updated_at"),
+        "operator_note": state_row.get("note"),
+        "source": gap.get("source"),
+        "symbol": gap.get("symbol"),
+        "mint": gap.get("mint"),
+        "name": (source_item or {}).get("name"),
+        "gap_type": gap.get("gap_type"),
+        "gap_score": gap.get("gap_score"),
+        "heat_score": gap.get("heat_score"),
+        "reason": gap.get("reason"),
+        "source_item": source_item,
+        "scope": scope,
+        "next_action": (
+            "Resolve this market mission as covered or ignored."
+            if state == "INVESTIGATING"
+            else "Mission resolved; feedback is applied to future gap detection."
+            if state in {"RESOLVED_COVERED", "RESOLVED_IGNORED"}
+            else "Classify whether this live market item belongs in Abrons coverage."
+        ),
+    }
+
+
+def _build_live_context_blind_spot_resolution(dossier: dict) -> dict:
+    if not dossier or dossier.get("status") == "NO_DOSSIER":
+        return {"status": "NO_ACTION", "next_action": "No blind spot requires resolution."}
+    state = str(dossier.get("state") or "NEW").upper()
+    scope = str(((dossier.get("scope") or {}).get("scope")) or "NEEDS_SOURCE").upper()
+    if state == "RESOLVED_IGNORED":
+        status = "IGNORED"
+        action = "Do not generate future missions for this item unless the source identity changes."
+    elif state == "RESOLVED_COVERED":
+        status = "COVERED"
+        action = "Keep this item in normal coverage and let outcomes decide whether it mattered."
+    elif scope in {"OUT_OF_SCOPE_L1", "SPOT_ONLY", "IGNORE_NO_ACTION"}:
+        status = "RECOMMEND_IGNORE"
+        action = "Mark ignored if this is not a memecoin/Solana coverage target."
+    elif scope == "NEEDS_SOURCE":
+        status = "NEEDS_SOURCE"
+        action = "Request more source identity before adding scanner coverage."
+    else:
+        status = "RECOMMEND_COVERAGE"
+        action = "Create or verify token intelligence/watch coverage, then mark covered."
+    return {
+        "status": status,
+        "mission_key": dossier.get("mission_key"),
+        "scope": scope,
+        "recommended_state": (
+            "RESOLVED_IGNORED" if status == "RECOMMEND_IGNORE"
+            else "NEEDS_SOURCE" if status == "NEEDS_SOURCE"
+            else "RESOLVED_COVERED" if status == "RECOMMEND_COVERAGE"
+            else state
+        ),
+        "action": action,
+        "next_action": action,
+    }
+
+
 def _build_live_opportunity_gap_detector(
     live_intake: dict,
     intelligence_rows: list[dict],
     journal_rows: list[dict],
+    mission_states: dict | None = None,
 ) -> dict:
     by_symbol: dict[str, dict] = {}
     by_mint: dict[str, dict] = {}
@@ -16145,12 +16292,28 @@ def _build_live_opportunity_gap_detector(
             score += 8.0
         if str(item.get("source") or "") == "confluence":
             score += 10.0
-        gaps.append({
-            "gap_key": f"{gap_type}:{mint or symbol or item.get('source')}",
+        candidate_gap = {
             "gap_type": gap_type,
             "symbol": symbol or None,
             "mint": mint or None,
             "source": item.get("source"),
+        }
+        mission_key = _live_context_mission_key(candidate_gap)
+        state_row = dict((mission_states or {}).get(mission_key) or {})
+        state = str(state_row.get("state") or "NEW").upper()
+        if state in {"RESOLVED_IGNORED", "RESOLVED_COVERED"}:
+            continue
+        scope = _classify_live_context_scope({**item, **candidate_gap})
+        gaps.append({
+            "gap_key": mission_key,
+            "gap_type": gap_type,
+            "symbol": symbol or None,
+            "mint": mint or None,
+            "source": item.get("source"),
+            "mission_state": state if state in _LIVE_CONTEXT_MISSION_STATES else "NEW",
+            "mission_state_updated_at": state_row.get("updated_at"),
+            "scope": scope.get("scope"),
+            "scope_reason": scope.get("reason"),
             "heat_score": _nullable_float(heat),
             "gap_score": round(min(100.0, score), 1),
             "data_freshness": freshness or None,
@@ -16747,7 +16910,7 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
                 kv_rows = {
                     str(r["key"]): str(r["value"] or "")
                     for r in conn.execute(
-                        "SELECT key, value FROM kv_store WHERE key IN ('narrative_trending','provider_escalation_outcome_alerts','provider_escalation_outcome_autorun','provider_escalation_review_states','provider_escalation_patch_states','provider_escalation_work_order_states')"
+                        "SELECT key, value FROM kv_store WHERE key IN ('narrative_trending','provider_escalation_outcome_alerts','provider_escalation_outcome_autorun','provider_escalation_review_states','provider_escalation_patch_states','provider_escalation_work_order_states','live_context_mission_states')"
                     ).fetchall()
                 }
             except Exception:
@@ -16913,11 +17076,19 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
     missed_runner_clusters = _build_missed_runner_clusters(journal_24h)
     catalyst_context = _build_catalyst_context(kv_rows, confluence_rows, journal_24h)
     live_market_narrative_intake = _build_live_market_narrative_intake(kv_rows, confluence_rows)
+    live_context_mission_states = _live_context_mission_state_map(kv_rows.get(_LIVE_CONTEXT_MISSION_STATES_KEY))
     live_opportunity_gaps = _build_live_opportunity_gap_detector(
         live_market_narrative_intake,
         intelligence_rows,
         journal_24h,
+        live_context_mission_states,
     )
+    live_context_mission_dossier = _build_live_context_mission_dossier(
+        dict(live_opportunity_gaps.get("top_gap") or {}),
+        live_market_narrative_intake,
+        live_context_mission_states,
+    )
+    live_context_blind_spot_resolution = _build_live_context_blind_spot_resolution(live_context_mission_dossier)
     live_context_generated_mission = _build_live_context_generated_mission(
         live_opportunity_gaps,
         live_market_narrative_intake,
@@ -17077,6 +17248,8 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
         "catalyst_context": catalyst_context,
         "live_market_narrative_intake": live_market_narrative_intake,
         "live_opportunity_gaps": live_opportunity_gaps,
+        "live_context_mission_dossier": live_context_mission_dossier,
+        "live_context_blind_spot_resolution": live_context_blind_spot_resolution,
         "live_context_generated_mission": live_context_generated_mission,
         "live_context_evidence_requirements": live_context_evidence_requirements,
         "live_context_outcome_loop": live_context_outcome_loop,
@@ -19670,6 +19843,75 @@ async def home_provider_escalation_work_order_decision(
             "ok": True,
             "group_key": group_key,
             "state": state,
+            "updated_at": now,
+            "operator_note": note,
+            "manual_only": True,
+        }
+
+    try:
+        return await _aio.to_thread(_run)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post("/live-context-mission/decision")
+async def home_live_context_mission_decision(
+    body: dict,
+    _: str = Depends(get_current_user),
+):
+    import asyncio as _aio
+
+    state = str(body.get("state") or body.get("action") or "").strip().upper()
+    aliases = {
+        "IGNORE": "RESOLVED_IGNORED",
+        "IGNORED": "RESOLVED_IGNORED",
+        "COVERED": "RESOLVED_COVERED",
+        "RESOLVED": "RESOLVED_COVERED",
+        "SOURCE": "NEEDS_SOURCE",
+    }
+    state = aliases.get(state, state)
+    if state not in _LIVE_CONTEXT_MISSION_STATES:
+        raise HTTPException(status_code=422, detail=f"state must be one of {sorted(_LIVE_CONTEXT_MISSION_STATES)}")
+    mission_key = str(body.get("mission_key") or body.get("gap_key") or body.get("group_key") or "").strip().upper()
+    if not mission_key:
+        symbol = str(body.get("symbol") or "").strip().upper()
+        mint = str(body.get("mint") or "").strip()
+        gap_type = str(body.get("gap_type") or "MARKET_CONTEXT").strip().upper()
+        if symbol or mint:
+            mission_key = f"{gap_type}:{mint or symbol}".upper()
+    if not mission_key:
+        raise HTTPException(status_code=422, detail="mission_key or gap identity is required")
+    note = str(body.get("operator_note") or body.get("note") or "").strip()[:500] or None
+    scope = str(body.get("scope") or "").strip().upper() or None
+
+    def _run() -> dict:
+        now = datetime.now(timezone.utc).isoformat()
+        conn = _dj_conn()
+        try:
+            conn.execute("CREATE TABLE IF NOT EXISTS kv_store (key TEXT PRIMARY KEY, value TEXT)")
+            row = conn.execute(
+                "SELECT value FROM kv_store WHERE key=?",
+                (_LIVE_CONTEXT_MISSION_STATES_KEY,),
+            ).fetchone()
+            states = _live_context_mission_state_map(row["value"] if row else None)
+            states[mission_key] = {
+                "state": state,
+                "updated_at": now,
+                "note": note,
+                "scope": scope,
+            }
+            conn.execute(
+                "INSERT OR REPLACE INTO kv_store (key, value) VALUES (?, ?)",
+                (_LIVE_CONTEXT_MISSION_STATES_KEY, json.dumps(states, separators=(",", ":"))),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return {
+            "ok": True,
+            "mission_key": mission_key,
+            "state": state,
+            "scope": scope,
             "updated_at": now,
             "operator_note": note,
             "manual_only": True,
