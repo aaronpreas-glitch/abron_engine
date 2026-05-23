@@ -633,6 +633,56 @@ interface DailyCryptoBriefData {
         due_24h?: number
         next_action?: string | null
       }
+      outcome_collection?: {
+        status?: string
+        outcome_fetcher?: {
+          status?: string
+          checked_count?: number
+          fetched_count?: number
+        }
+        outcome_writer?: {
+          status?: string
+          updated_count?: number
+          windows_written?: Record<string, number>
+          read_only_execution?: boolean
+        }
+      }
+      replay_recalculation?: {
+        status?: string
+        updated_decision_rows?: number
+        delta?: Record<string, number>
+        top_rule_changed?: boolean
+        gate_changed?: boolean
+      }
+      policy_impact_preview?: {
+        status?: string
+        would_change_policy?: boolean
+        manual_only?: boolean
+        label?: string | null
+        net_score?: number | null
+        benefit_n?: number
+        harm_n?: number
+        gate_status?: string | null
+        next_action?: string | null
+      }
+      frontend_review_panel?: {
+        status?: string
+        headline?: string | null
+        checked_count?: number
+        fetched_count?: number
+        written_count?: number
+        windows_written?: Record<string, number>
+        recalculation_status?: string
+        policy_status?: string
+        policy_next_action?: string | null
+        items?: Array<{
+          decision_id?: number | string | null
+          symbol?: string | null
+          fetched_windows?: string[]
+          status?: string | null
+          basis?: string | null
+        }>
+      }
       workbench_auto_refresh?: {
         status?: string
         previous_gate_status?: string | null
@@ -5184,6 +5234,12 @@ function DailyCryptoBriefPanel({
     const replayMaturationRunner = replayMaturation.due_outcome_runner ?? {}
     const replayMaturationDelta = replayMaturation.daily_evidence_delta ?? {}
     const replayDeltaChanges = replayMaturationDelta.changes ?? {}
+    const replayCollection = replayMaturation.outcome_collection ?? {}
+    const replayOutcomeFetcher = replayCollection.outcome_fetcher ?? {}
+    const replayOutcomeWriter = replayCollection.outcome_writer ?? {}
+    const replayRecalculation = replayMaturation.replay_recalculation ?? {}
+    const replayPolicyImpact = replayMaturation.policy_impact_preview ?? {}
+    const replayReviewPanel = replayMaturation.frontend_review_panel ?? {}
     const watchdog = data.data_watchdog ?? {}
     const freshnessSla = data.freshness_sla ?? {}
     const providerReliability = data.provider_reliability ?? {}
@@ -5586,14 +5642,31 @@ function DailyCryptoBriefPanel({
               EVIDENCE MATURATION
             </span>
             <div style={{ ...MONO, fontSize: 10, color: '#d7e1ea', marginTop: 7, lineHeight: 1.45 }}>
-              {replayMaturation.status || 'WATCHING'} · due {replayMaturationRunner.due_count ?? 0} · blockers {replayMaturation.blocker_breakdown?.blocker_count ?? 0}
+              {replayMaturation.status || 'WATCHING'} · due {replayMaturationRunner.due_count ?? 0} · wrote {replayOutcomeWriter.updated_count ?? 0}
             </div>
             <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
-              1h {replayMaturationRunner.due_1h ?? 0} · 4h {replayMaturationRunner.due_4h ?? 0} · 24h {replayMaturationRunner.due_24h ?? 0} · {String(replayMaturation.workbench_auto_refresh?.status || 'baseline').replace(/_/g, ' ').toLowerCase()}
+              1h {replayMaturationRunner.due_1h ?? 0} · 4h {replayMaturationRunner.due_4h ?? 0} · 24h {replayMaturationRunner.due_24h ?? 0} · fetched {replayOutcomeFetcher.fetched_count ?? 0}/{replayOutcomeFetcher.checked_count ?? 0}
             </div>
             <div style={{ ...MONO, fontSize: 8, color: '#9db7ce', marginTop: 5, lineHeight: 1.45 }}>
               {replayMaturationBlocker?.detail
                 || `delta ready ${String(replayDeltaChanges.replay_ready_count ?? 0)} · 24h ${String(replayDeltaChanges.with_24h ?? 0)} · net ${String(replayDeltaChanges.net_score ?? 0)}`}
+            </div>
+          </div>
+
+          <div style={{ border: `1px solid ${(replayOutcomeWriter.updated_count ?? 0) ? 'rgba(0,212,138,0.22)' : 'rgba(167,139,250,0.16)'}`, borderRadius: 10, padding: 10, background: (replayOutcomeWriter.updated_count ?? 0) ? 'rgba(0,212,138,0.03)' : 'rgba(167,139,250,0.025)' }}>
+            <span style={{ ...MONO, fontSize: 8, color: (replayOutcomeWriter.updated_count ?? 0) ? '#00d48a' : '#a78bfa', fontWeight: 900, letterSpacing: '0.14em' }}>
+              OUTCOME COLLECTOR
+            </span>
+            <div style={{ ...MONO, fontSize: 10, color: '#d7e1ea', marginTop: 7, lineHeight: 1.45 }}>
+              {replayReviewPanel.headline || replayCollection.status || 'Watching replay outcomes'}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              calc {String(replayRecalculation.status || 'unchanged').replace(/_/g, ' ').toLowerCase()} · policy {String(replayPolicyImpact.gate_status || replayPolicyImpact.status || 'waiting').replace(/_/g, ' ').toLowerCase()} · net {fmtFixed(replayPolicyImpact.net_score, 0)}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#9db7ce', marginTop: 5, lineHeight: 1.45 }}>
+              {replayPolicyImpact.label
+                ? `${replayPolicyImpact.label} · benefit ${replayPolicyImpact.benefit_n ?? 0} · harm ${replayPolicyImpact.harm_n ?? 0}`
+                : replayReviewPanel.policy_next_action || 'Collector stays paper-only until manual review.'}
             </div>
           </div>
 

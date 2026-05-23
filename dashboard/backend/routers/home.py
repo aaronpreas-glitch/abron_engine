@@ -8412,9 +8412,12 @@ def _dj_conn():
         "ALTER TABLE decision_journal ADD COLUMN surface_count INTEGER NOT NULL DEFAULT 1",
         "ALTER TABLE decision_journal ADD COLUMN outcome_1h_pct REAL",
         "ALTER TABLE decision_journal ADD COLUMN outcome_4h_pct REAL",
+        "ALTER TABLE decision_journal ADD COLUMN outcome_24h_pct REAL",
         "ALTER TABLE decision_journal ADD COLUMN max_return_pct REAL",
         "ALTER TABLE decision_journal ADD COLUMN max_drawdown_pct REAL",
         "ALTER TABLE decision_journal ADD COLUMN outcome_label TEXT",
+        "ALTER TABLE decision_journal ADD COLUMN resolved_ts TEXT",
+        "ALTER TABLE decision_journal ADD COLUMN verdict TEXT",
     ):
         try:
             c.execute(ddl)
@@ -8564,6 +8567,27 @@ def _dj_snapshot_entry_price(snapshot: dict) -> float | None:
     return None
 
 
+def _dj_snapshot_entry_marketcap(snapshot: dict) -> float | None:
+    try:
+        candidate = dict(snapshot.get("candidate") or {})
+        metrics = dict(candidate.get("metrics") or snapshot.get("metrics") or {})
+        data = dict(candidate.get("data") or snapshot.get("data") or {})
+        for value in (
+            metrics.get("marketcap_usd"),
+            metrics.get("market_cap_usd"),
+            metrics.get("marketcap"),
+            metrics.get("mcap"),
+            data.get("marketcap"),
+            data.get("market_cap"),
+        ):
+            marketcap = _fl(value)
+            if marketcap > 0:
+                return marketcap
+    except Exception:
+        pass
+    return None
+
+
 def _dj_lookup_token_intelligence_outcome(conn, *, created_ts: str, symbol: str | None, mint: str | None, snapshot: dict | None = None) -> dict | None:
     """Compute interim/final decision returns from token_intelligence_snapshots.
 
@@ -8599,8 +8623,10 @@ def _dj_lookup_token_intelligence_outcome(conn, *, created_ts: str, symbol: str 
             WHERE {key_col}=?
               AND ts_utc >= ?
               AND ts_utc <= ?
-              AND price IS NOT NULL
-              AND price > 0
+              AND (
+                    (price IS NOT NULL AND price > 0)
+                 OR (marketcap IS NOT NULL AND marketcap > 0)
+              )
             ORDER BY ts_utc ASC
             LIMIT 2000
             """,
@@ -8609,21 +8635,35 @@ def _dj_lookup_token_intelligence_outcome(conn, *, created_ts: str, symbol: str 
     except Exception:
         return None
 
-    parsed: list[tuple[datetime, float]] = []
+    parsed: list[tuple[datetime, float | None, float | None]] = []
     for row in rows:
         ts = _dj_parse_dt(row["ts_utc"])
         price = _fl(row["price"])
-        if ts is not None and price > 0:
-            parsed.append((ts, price))
+        marketcap = _fl(row["marketcap"])
+        if ts is not None and (price > 0 or marketcap > 0):
+            parsed.append((ts, price if price > 0 else None, marketcap if marketcap > 0 else None))
     if not parsed:
         return None
 
     entry_price = _dj_snapshot_entry_price(snapshot or {})
-    if not entry_price:
-        near = min(parsed, key=lambda x: abs((x[0] - created).total_seconds()))
+    entry_marketcap = _dj_snapshot_entry_marketcap(snapshot or {})
+    value_index = 1
+    entry_value = entry_price
+    if not entry_value and entry_marketcap:
+        value_index = 2
+        entry_value = entry_marketcap
+    if not entry_value:
+        price_near = [x for x in parsed if x[1] is not None]
+        marketcap_near = [x for x in parsed if x[2] is not None]
+        near = min(price_near or marketcap_near, key=lambda x: abs((x[0] - created).total_seconds()))
         if abs((near[0] - created).total_seconds()) <= 20 * 60:
-            entry_price = near[1]
-    if not entry_price:
+            if near[1] is not None:
+                value_index = 1
+                entry_value = near[1]
+            elif near[2] is not None:
+                value_index = 2
+                entry_value = near[2]
+    if not entry_value:
         return None
 
     def _nearest_return(hours: float, lower_minutes: int, upper_minutes: int) -> float | None:
@@ -8632,11 +8672,11 @@ def _dj_lookup_token_intelligence_outcome(conn, *, created_ts: str, symbol: str 
         if now < lower:
             return None
         target = created + timedelta(hours=hours)
-        options = [(ts, price) for ts, price in parsed if lower <= ts <= upper]
+        options = [(ts, values[value_index]) for values in parsed for ts in (values[0],) if lower <= ts <= upper and values[value_index] is not None]
         if not options:
             return None
         future = min(options, key=lambda x: abs((x[0] - target).total_seconds()))
-        return _dj_pct(entry_price, future[1])
+        return _dj_pct(entry_value, future[1])
 
     r1 = _nearest_return(1.0, 45, 90)
     r4 = _nearest_return(4.0, 210, 300)
@@ -8655,6 +8695,7 @@ def _dj_lookup_token_intelligence_outcome(conn, *, created_ts: str, symbol: str 
         "outcome_label": _dj_outcome_label(max_return, max_drawdown, r24),
         "resolution_status": "RESOLVED" if r24 is not None else ("OBSERVED_4H" if r4 is not None else "OBSERVED_1H"),
         "source": "token_intelligence_snapshots",
+        "basis": "price" if value_index == 1 else "marketcap",
     }
 
 
@@ -15276,6 +15317,338 @@ def _build_replay_due_outcome_runner(maturation_queue: dict) -> dict:
     }
 
 
+def _replay_current_market_state(conn, *, symbol: str | None, mint: str | None) -> dict | None:
+    try:
+        table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='token_intelligence_current'"
+        ).fetchone()
+        if not table:
+            return None
+        if mint:
+            row = conn.execute(
+                """
+                SELECT mint, symbol, updated_at, data_freshness, data_confidence,
+                       market_source, quality_score, risk_score, pressure_score,
+                       volume_24h_usd, liquidity, marketcap
+                FROM token_intelligence_current
+                WHERE mint=?
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (mint,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                """
+                SELECT mint, symbol, updated_at, data_freshness, data_confidence,
+                       market_source, quality_score, risk_score, pressure_score,
+                       volume_24h_usd, liquidity, marketcap
+                FROM token_intelligence_current
+                WHERE UPPER(symbol)=?
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (str(symbol or "").strip().upper(),),
+            ).fetchone()
+        return dict(row) if row else None
+    except Exception:
+        return None
+
+
+def _build_replay_outcome_fetcher(maturation_queue: dict, limit: int = 30) -> dict:
+    """Fetch due replay outcome windows from local market evidence only."""
+    queue_items = list((maturation_queue or {}).get("items") or [])[: max(1, int(limit or 30))]
+    if not queue_items:
+        return {
+            "status": "NOT_DUE",
+            "checked_count": 0,
+            "fetched_count": 0,
+            "items": [],
+            "next_action": "No due replay outcome rows to fetch.",
+        }
+    generated_at = datetime.now(timezone.utc).isoformat()
+    fetched_count = 0
+    items: list[dict] = []
+    try:
+        conn = _dj_conn()
+        try:
+            for queue_item in queue_items:
+                decision_id = queue_item.get("decision_id")
+                row = conn.execute("SELECT * FROM decision_journal WHERE id=?", (decision_id,)).fetchone()
+                if not row:
+                    items.append({
+                        "decision_id": decision_id,
+                        "status": "MISSING_DECISION_ROW",
+                        "due_windows": list(queue_item.get("due_windows") or []),
+                    })
+                    continue
+                snapshot = {}
+                try:
+                    parsed = json.loads(row["snapshot_json"] or "{}")
+                    snapshot = parsed if isinstance(parsed, dict) else {}
+                except Exception:
+                    snapshot = {}
+                metrics = _dj_lookup_token_intelligence_outcome(
+                    conn,
+                    created_ts=row["created_ts"],
+                    symbol=row["symbol"],
+                    mint=row["mint"] if "mint" in row.keys() else None,
+                    snapshot=snapshot,
+                )
+                due_windows = list(queue_item.get("due_windows") or [])
+                fetched_windows = []
+                if metrics:
+                    for window, col in (("1h", "outcome_1h_pct"), ("4h", "outcome_4h_pct"), ("24h", "outcome_24h_pct")):
+                        if window in due_windows and row[col] is None and metrics.get(col) is not None:
+                            fetched_windows.append(window)
+                if fetched_windows:
+                    fetched_count += 1
+                current_state = _replay_current_market_state(
+                    conn,
+                    symbol=row["symbol"],
+                    mint=row["mint"] if "mint" in row.keys() else None,
+                )
+                items.append({
+                    "decision_id": decision_id,
+                    "symbol": row["symbol"],
+                    "mint": row["mint"] if "mint" in row.keys() else None,
+                    "created_ts": row["created_ts"],
+                    "due_windows": due_windows,
+                    "fetched_windows": fetched_windows,
+                    "status": "FETCHED" if fetched_windows else "NO_WINDOW_DATA" if metrics else "NO_MARKET_HISTORY",
+                    "source": (metrics or {}).get("source"),
+                    "basis": (metrics or {}).get("basis"),
+                    "outcome_metrics": metrics or {},
+                    "current_market_state": current_state or {},
+                })
+        finally:
+            conn.close()
+    except Exception as exc:
+        return {
+            "status": "ERROR",
+            "checked_count": 0,
+            "fetched_count": 0,
+            "items": [],
+            "error": str(exc)[:180],
+            "generated_at": generated_at,
+            "next_action": "Fix replay outcome fetcher before trusting new evidence.",
+        }
+    return {
+        "status": "FETCHED" if fetched_count else "NO_DATA",
+        "checked_count": len(queue_items),
+        "fetched_count": fetched_count,
+        "items": items,
+        "generated_at": generated_at,
+        "next_action": (
+            "Persist fetched replay windows into the decision journal."
+            if fetched_count
+            else "Keep waiting for token snapshot history to cover due windows."
+        ),
+    }
+
+
+def _apply_replay_outcome_writer(outcome_fetcher: dict) -> dict:
+    """Persist fetched replay outcomes. This never changes execution authority."""
+    fetch_items = [
+        dict(item) for item in list((outcome_fetcher or {}).get("items") or [])
+        if item.get("fetched_windows")
+    ]
+    if not fetch_items:
+        return {
+            "status": "NO_WRITES",
+            "updated_count": 0,
+            "windows_written": {},
+            "read_only_execution": True,
+            "next_action": "No fetched replay windows were ready to write.",
+        }
+    now_iso = datetime.now(timezone.utc).isoformat()
+    updated = 0
+    windows_written: dict[str, int] = {}
+    written_ids: list[int] = []
+    try:
+        conn = _dj_conn()
+        try:
+            for item in fetch_items:
+                row = conn.execute("SELECT * FROM decision_journal WHERE id=?", (item.get("decision_id"),)).fetchone()
+                if not row:
+                    continue
+                metrics = dict(item.get("outcome_metrics") or {})
+                r1 = metrics.get("outcome_1h_pct") if metrics.get("outcome_1h_pct") is not None else row["outcome_1h_pct"]
+                r4 = metrics.get("outcome_4h_pct") if metrics.get("outcome_4h_pct") is not None else row["outcome_4h_pct"]
+                r24 = metrics.get("outcome_24h_pct") if metrics.get("outcome_24h_pct") is not None else row["outcome_24h_pct"]
+                values = [float(v) for v in (r1, r4, r24) if v is not None]
+                if not values:
+                    continue
+                max_return = max(values)
+                max_drawdown = min(values)
+                label = _dj_outcome_label(max_return, max_drawdown, r24)
+                status = "RESOLVED" if r24 is not None else ("OBSERVED_4H" if r4 is not None else "OBSERVED_1H")
+                verdict = _dj_surface_verdict(row, label)
+                conn.execute(
+                    """
+                    UPDATE decision_journal
+                       SET outcome_1h_pct=?,
+                           outcome_4h_pct=?,
+                           outcome_24h_pct=?,
+                           max_return_pct=?,
+                           max_drawdown_pct=?,
+                           outcome_label=?,
+                           resolution_status=?,
+                           verdict=?,
+                           resolved_ts=?
+                     WHERE id=?
+                    """,
+                    (r1, r4, r24, max_return, max_drawdown, label, status, verdict, now_iso, row["id"]),
+                )
+                updated += 1
+                written_ids.append(int(row["id"]))
+                for window in item.get("fetched_windows") or []:
+                    windows_written[window] = windows_written.get(window, 0) + 1
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as exc:
+        return {
+            "status": "ERROR",
+            "updated_count": updated,
+            "windows_written": windows_written,
+            "written_decision_ids": written_ids,
+            "read_only_execution": True,
+            "error": str(exc)[:180],
+            "next_action": "Fix replay outcome writer before recalculating policy impact.",
+        }
+    return {
+        "status": "WROTE" if updated else "NO_WRITES",
+        "updated_count": updated,
+        "windows_written": windows_written,
+        "written_decision_ids": written_ids[:30],
+        "read_only_execution": True,
+        "generated_at": now_iso,
+        "next_action": (
+            "Recalculate Replay Lab against the newly persisted outcomes."
+            if updated
+            else "No decision rows changed."
+        ),
+    }
+
+
+def _run_replay_outcome_collection(maturation_queue: dict) -> dict:
+    fetcher = _build_replay_outcome_fetcher(maturation_queue)
+    writer = _apply_replay_outcome_writer(fetcher)
+    return {
+        "status": "UPDATED" if int(writer.get("updated_count") or 0) else str(fetcher.get("status") or "NOT_DUE"),
+        "outcome_fetcher": fetcher,
+        "outcome_writer": writer,
+        "next_action": writer.get("next_action") or fetcher.get("next_action"),
+    }
+
+
+def _replay_lab_summary_for_recalc(replay_lab: dict) -> dict:
+    timeline = dict((replay_lab or {}).get("decision_timeline") or {})
+    windows = dict(((replay_lab or {}).get("forward_outcome_windows") or {}).get("summary") or {})
+    simulation = dict((replay_lab or {}).get("rule_simulation_engine") or {})
+    top = dict(simulation.get("top_candidate") or {})
+    gate = dict((replay_lab or {}).get("promotion_gate") or {})
+    return {
+        "decision_count": int(timeline.get("decision_count") or 0),
+        "replay_ready_count": int(timeline.get("replay_ready_count") or 0),
+        "with_1h": int(windows.get("with_1h") or 0),
+        "with_4h": int(windows.get("with_4h") or 0),
+        "with_24h": int(windows.get("with_24h") or 0),
+        "sample_n": int(simulation.get("sample_n") or 0),
+        "top_rule_key": top.get("key"),
+        "top_rule_label": top.get("label"),
+        "benefit_n": int(top.get("benefit_n") or 0),
+        "harm_n": int(top.get("harm_n") or 0),
+        "net_score": int(top.get("net_score") or 0),
+        "gate_status": gate.get("status"),
+        "gate_blockers": list(gate.get("blockers") or []),
+    }
+
+
+def _build_replay_recalculation(before_lab: dict | None, after_lab: dict, outcome_collection: dict | None) -> dict:
+    before = _replay_lab_summary_for_recalc(before_lab or {})
+    after = _replay_lab_summary_for_recalc(after_lab or {})
+    numeric = ["replay_ready_count", "with_1h", "with_4h", "with_24h", "sample_n", "benefit_n", "harm_n", "net_score"]
+    delta = {key: int(after.get(key) or 0) - int(before.get(key) or 0) for key in numeric}
+    writer = dict((outcome_collection or {}).get("outcome_writer") or {})
+    updated = int(writer.get("updated_count") or 0)
+    changed = updated > 0 or any(delta.values()) or before.get("top_rule_key") != after.get("top_rule_key") or before.get("gate_status") != after.get("gate_status")
+    return {
+        "status": "UPDATED" if changed else "UNCHANGED",
+        "updated_decision_rows": updated,
+        "before": before,
+        "after": after,
+        "delta": delta,
+        "top_rule_changed": before.get("top_rule_key") != after.get("top_rule_key"),
+        "gate_changed": before.get("gate_status") != after.get("gate_status"),
+        "next_action": (
+            "Review policy impact preview before any rule patch."
+            if changed
+            else "Replay stats did not move after the outcome collection pass."
+        ),
+    }
+
+
+def _build_replay_policy_impact_preview(replay_lab: dict, recalculation: dict) -> dict:
+    gate = dict((replay_lab or {}).get("promotion_gate") or {})
+    simulation = dict((replay_lab or {}).get("rule_simulation_engine") or {})
+    top = dict(simulation.get("top_candidate") or {})
+    ready = str(gate.get("status") or "").upper() == "READY_FOR_MANUAL_REVIEW"
+    return {
+        "status": "READY_FOR_REVIEW" if top else "NO_POLICY_CANDIDATE",
+        "manual_only": True,
+        "would_change_policy": bool(ready),
+        "rule_key": top.get("key"),
+        "label": top.get("label"),
+        "direction": top.get("direction"),
+        "net_score": top.get("net_score"),
+        "benefit_n": top.get("benefit_n"),
+        "harm_n": top.get("harm_n"),
+        "gate_status": gate.get("status"),
+        "gate_blockers": list(gate.get("blockers") or []),
+        "recalculation_status": recalculation.get("status"),
+        "next_action": (
+            "Open a separate explicit patch/re-arm discussion; do not auto-promote."
+            if ready
+            else "Keep collecting outcomes until the manual gate clears."
+        ),
+    }
+
+
+def _build_replay_frontend_review_panel(outcome_collection: dict | None, recalculation: dict, policy_preview: dict) -> dict:
+    fetcher = dict((outcome_collection or {}).get("outcome_fetcher") or {})
+    writer = dict((outcome_collection or {}).get("outcome_writer") or {})
+    fetched_items = list(fetcher.get("items") or [])
+    reviewed = [
+        {
+            "decision_id": item.get("decision_id"),
+            "symbol": item.get("symbol"),
+            "fetched_windows": item.get("fetched_windows") or [],
+            "status": item.get("status"),
+            "basis": item.get("basis"),
+        }
+        for item in fetched_items
+        if item.get("fetched_windows") or str(item.get("status") or "").upper() not in {"NO_MARKET_HISTORY"}
+    ][:8]
+    return {
+        "status": "UPDATED" if int(writer.get("updated_count") or 0) else str(fetcher.get("status") or "WATCHING"),
+        "headline": (
+            f"Collected {int(writer.get('updated_count') or 0)} replay outcome row(s)."
+            if int(writer.get("updated_count") or 0)
+            else "Replay outcome collector is watching due rows."
+        ),
+        "checked_count": int(fetcher.get("checked_count") or 0),
+        "fetched_count": int(fetcher.get("fetched_count") or 0),
+        "written_count": int(writer.get("updated_count") or 0),
+        "windows_written": dict(writer.get("windows_written") or {}),
+        "recalculation_status": recalculation.get("status"),
+        "policy_status": policy_preview.get("status"),
+        "policy_next_action": policy_preview.get("next_action"),
+        "items": reviewed,
+    }
+
+
 def _build_replay_workbench_auto_refresh(replay_lab: dict, previous_snapshot: dict, current_snapshot: dict) -> dict:
     previous_state = previous_snapshot.get("work_order_state")
     current_state = current_snapshot.get("work_order_state")
@@ -15355,7 +15728,13 @@ def _persist_replay_evidence_snapshot(snapshot: dict) -> None:
         return
 
 
-def _attach_replay_evidence_maturation(replay_lab: dict, raw_previous_snapshot: str | None, now: datetime) -> dict:
+def _attach_replay_evidence_maturation(
+    replay_lab: dict,
+    raw_previous_snapshot: str | None,
+    now: datetime,
+    outcome_collection: dict | None = None,
+    before_collection_lab: dict | None = None,
+) -> dict:
     previous = _replay_evidence_snapshot(raw_previous_snapshot)
     current = _current_replay_evidence_snapshot(replay_lab, now)
     blocker_breakdown = _build_replay_evidence_blocker_breakdown(replay_lab)
@@ -15363,16 +15742,27 @@ def _attach_replay_evidence_maturation(replay_lab: dict, raw_previous_snapshot: 
     due_runner = _build_replay_due_outcome_runner(maturation_queue)
     auto_refresh = _build_replay_workbench_auto_refresh(replay_lab, previous, current)
     daily_delta = _build_replay_daily_evidence_delta(previous, current)
+    recalculation = _build_replay_recalculation(before_collection_lab, replay_lab, outcome_collection)
+    policy_preview = _build_replay_policy_impact_preview(replay_lab, recalculation)
+    review_panel = _build_replay_frontend_review_panel(outcome_collection, recalculation, policy_preview)
     out = dict(replay_lab or {})
     out["evidence_maturation"] = {
         "status": "DUE" if int(maturation_queue.get("queued_count") or 0) else "WATCHING",
         "blocker_breakdown": blocker_breakdown,
         "maturation_queue": maturation_queue,
         "due_outcome_runner": due_runner,
+        "outcome_collection": outcome_collection or {
+            "status": "NOT_RUN",
+            "outcome_fetcher": {"status": "NOT_RUN", "checked_count": 0, "fetched_count": 0, "items": []},
+            "outcome_writer": {"status": "NOT_RUN", "updated_count": 0, "windows_written": {}, "read_only_execution": True},
+        },
+        "replay_recalculation": recalculation,
+        "policy_impact_preview": policy_preview,
+        "frontend_review_panel": review_panel,
         "workbench_auto_refresh": auto_refresh,
         "daily_evidence_delta": daily_delta,
         "current_snapshot": current,
-        "next_action": due_runner.get("next_action") or blocker_breakdown.get("next_action"),
+        "next_action": review_panel.get("policy_next_action") or due_runner.get("next_action") or blocker_breakdown.get("next_action"),
     }
     _persist_replay_evidence_snapshot(current)
     return out
@@ -18617,10 +19007,44 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
         lock_ok,
         lookback_hours,
     )
+    replay_outcome_lab_before_collection = replay_outcome_lab
+    replay_initial_queue = _build_replay_maturation_queue(replay_outcome_lab, now)
+    replay_outcome_collection = _run_replay_outcome_collection(replay_initial_queue)
+    if int(((replay_outcome_collection.get("outcome_writer") or {}).get("updated_count") or 0)):
+        try:
+            conn = _dj_conn()
+            try:
+                journal_rows = [
+                    dict(r) for r in conn.execute(
+                        """
+                            SELECT id, created_ts, source_surface, symbol, mint, recommended_action,
+                                   priority, reason, blockers_json, snapshot_json, resolution_status,
+                                   outcome_label, outcome_1h_pct, outcome_4h_pct, outcome_24h_pct,
+                                   max_return_pct, max_drawdown_pct
+                        FROM decision_journal
+                        ORDER BY id DESC
+                        LIMIT 1800
+                        """
+                    ).fetchall()
+                ]
+            finally:
+                conn.close()
+            journal_24h = [r for r in journal_rows if _in_window(r.get("created_ts"))]
+            replay_outcome_lab = _build_replay_outcome_lab(
+                journal_rows,
+                signal_outcome_rows,
+                freshness_sla,
+                lock_ok,
+                lookback_hours,
+            )
+        except Exception as exc:
+            replay_outcome_collection["replay_requery_error"] = str(exc)[:180]
     replay_outcome_lab = _attach_replay_evidence_maturation(
         replay_outcome_lab,
         kv_rows.get(_REPLAY_EVIDENCE_SNAPSHOT_KEY),
         now,
+        outcome_collection=replay_outcome_collection,
+        before_collection_lab=replay_outcome_lab_before_collection,
     )
     provider_reliability = _build_provider_reliability_scorecard(repair_rows)
     provider_failure_drilldown = _build_provider_failure_drilldown(repair_rows)
