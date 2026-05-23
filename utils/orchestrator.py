@@ -13,13 +13,15 @@ from __future__ import annotations
 import threading
 import time
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 ENGINE_ROOT: Path = Path(__file__).resolve().parent.parent
-MEMORY_FILE: Path = ENGINE_ROOT / "MEMORY.md"
-RESEARCH_FILE: Path = ENGINE_ROOT / "RESEARCH.md"
+RUNTIME_ROOT: Path = Path(os.getenv("ABRON_RUNTIME_DIR", str(ENGINE_ROOT / "data_storage")))
+MEMORY_FILE: Path = Path(os.getenv("ABRON_MEMORY_FILE", str(RUNTIME_ROOT / "MEMORY.md")))
+RESEARCH_FILE: Path = Path(os.getenv("ABRON_RESEARCH_FILE", str(RUNTIME_ROOT / "RESEARCH.md")))
 CONFIG_FILE: Path = ENGINE_ROOT / "orchestrator_config.json"
 
 MAX_MEMORY_LINES: int = 5000   # trim tail when file exceeds this
@@ -141,6 +143,7 @@ def append_memory(agent: str, msg: str) -> None:
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     entry = f"\n## [{ts}] {agent.upper()}\n{msg}\n"
     with _mem_lock:
+        MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(MEMORY_FILE, "a", encoding="utf-8") as fh:
             fh.write(entry)
         # Trim if file has grown too large
@@ -168,6 +171,7 @@ def read_memory(lines: int = 50) -> str:
 def write_research(content: str) -> None:
     """Overwrite RESEARCH.md with new research digest content."""
     try:
+        RESEARCH_FILE.parent.mkdir(parents=True, exist_ok=True)
         RESEARCH_FILE.write_text(content, encoding="utf-8")
     except Exception:
         pass

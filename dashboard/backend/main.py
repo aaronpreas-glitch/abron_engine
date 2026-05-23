@@ -919,6 +919,7 @@ class _CacheMiddleware(BaseHTTPMiddleware):
         if (
             lower_path.startswith("/.")
             or lower_path.endswith((".env", ".ini", ".sql", ".bak", ".log"))
+            or path in {"/_profiler", "/actuator/health", "/server-status"}
             or any(part in lower_path for part in ("/wp-", "/phpmyadmin", "/_next/", "/cgi-bin"))
         ):
             return JSONResponse(status_code=404, content={"detail": "not_found"})

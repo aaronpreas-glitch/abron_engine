@@ -27,6 +27,9 @@ data_storage/*.session-journal
 data_storage/*.db
 data_storage/*.db-shm
 data_storage/*.db-wal
+data_storage/*.md
+MEMORY.md
+RESEARCH.md
 logs/
 *.log
 engine_state.json
