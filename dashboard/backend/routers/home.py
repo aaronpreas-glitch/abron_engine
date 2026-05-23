@@ -14714,6 +14714,78 @@ def _build_provider_failure_drilldown(repair_rows: list[dict]) -> dict:
     }
 
 
+def _build_provider_escalation_queue(escalation_rows: list[dict], now: datetime | None = None) -> dict:
+    now = now or datetime.now(timezone.utc)
+    active_statuses = {"QUEUED", "WATCHING", "FORCE_REFRESH_REQUESTED", "STALE_REVIEW"}
+    active = []
+    by_lane: dict[str, int] = {}
+    by_status: dict[str, int] = {}
+    sla_breached = 0
+    for row in escalation_rows or []:
+        lane = str(row.get("escalation_lane") or "UNKNOWN").upper()
+        status = str(row.get("escalation_status") or "UNKNOWN").upper()
+        by_lane[lane] = by_lane.get(lane, 0) + 1
+        by_status[status] = by_status.get(status, 0) + 1
+        if status not in active_statuses:
+            continue
+        created = _gb_parse_ts(row.get("created_ts") or row.get("updated_ts"))
+        updated = _gb_parse_ts(row.get("updated_ts") or row.get("created_ts"))
+        due = _gb_parse_ts(row.get("sla_due_ts"))
+        age_minutes = round(max(0.0, (now - created).total_seconds() / 60.0), 1) if created else None
+        stale_minutes = round(max(0.0, (now - updated).total_seconds() / 60.0), 1) if updated else None
+        breached = bool(due and due <= now)
+        if breached:
+            sla_breached += 1
+        try:
+            flags = json.loads(str(row.get("queue_flags_json") or "[]"))
+            if not isinstance(flags, list):
+                flags = []
+        except Exception:
+            flags = []
+        active.append({
+            "id": row.get("id"),
+            "symbol": row.get("symbol"),
+            "mint": row.get("mint"),
+            "lane": lane,
+            "status": status,
+            "failure_class": row.get("failure_class"),
+            "repair_status": row.get("repair_status"),
+            "priority_score": _nullable_float(row.get("priority_score")),
+            "queue_flags": flags,
+            "provider_path": row.get("provider_path"),
+            "reason": row.get("reason"),
+            "age_minutes": age_minutes,
+            "stale_minutes": stale_minutes,
+            "sla_due_ts": row.get("sla_due_ts"),
+            "sla_breached": breached,
+            "operator_decision": row.get("operator_decision"),
+            "outcome_label": row.get("outcome_label"),
+        })
+    active.sort(
+        key=lambda x: (
+            1 if x.get("sla_breached") else 0,
+            _gb_float(x.get("priority_score")),
+            _gb_float(x.get("age_minutes")),
+        ),
+        reverse=True,
+    )
+    return {
+        "status": "SLA_BREACH" if sla_breached else "ACTIVE" if active else "CLEAR",
+        "active_count": len(active),
+        "sla_breached_count": sla_breached,
+        "by_lane": by_lane,
+        "by_status": by_status,
+        "items": active[:12],
+        "next_action": (
+            "Resolve breached provider escalations before new rule work."
+            if sla_breached
+            else "Clear queued provider escalations before promoting candidates."
+            if active
+            else "No active provider escalations."
+        ),
+    }
+
+
 def _build_rule_promotion_gate(simulator: dict, watchdog: dict, freshness_sla: dict, provider_reliability: dict | None = None) -> dict:
     top = dict((simulator or {}).get("top_candidate") or {})
     data_status = str((watchdog or {}).get("status") or "").upper()
@@ -14883,21 +14955,30 @@ def _build_daily_build_score(
     rule_gate: dict,
     catalyst_context: dict,
     paper_gate: dict,
+    escalation_queue: dict | None = None,
 ) -> dict:
     data_score = _gb_float((freshness_sla or {}).get("score"))
     rule_score = 70.0 if str((rule_gate or {}).get("status") or "") == "READY_REVIEW" else 45.0 if (rule_gate or {}).get("candidate") else 25.0
     research_score = 70.0 if str((catalyst_context or {}).get("status") or "") == "ACTIVE" else 35.0
     execution_score = 100.0 if lock_ok else 15.0
     paper_score = 75.0 if str((paper_gate or {}).get("status") or "") == "READY_FOR_DISCUSSION" else 45.0 if int((paper_gate or {}).get("sample_n") or 0) >= 20 else 25.0
+    active_escalations = int((escalation_queue or {}).get("active_count") or 0)
+    sla_breaches = int((escalation_queue or {}).get("sla_breached_count") or 0)
+    escalation_score = max(10.0, 100.0 - (active_escalations * 8.0) - (sla_breaches * 20.0))
     components = {
         "data": round(data_score, 1),
         "rules": round(rule_score, 1),
         "research": round(research_score, 1),
+        "escalations": round(escalation_score, 1),
         "execution_safety": round(execution_score, 1),
         "paper": round(paper_score, 1),
     }
     if str((watchdog or {}).get("status") or "").upper() in {"DEGRADED", "PATCH_QUEUE"} or data_score < 65:
         focus = "DATA"
+    elif sla_breaches:
+        focus = "ESCALATION_SLA"
+    elif active_escalations:
+        focus = "ESCALATIONS"
     elif int((decision_quality or {}).get("missed_runner_count") or 0) > 3:
         focus = "MISSED_RUNNERS"
     elif str((rule_gate or {}).get("status") or "") == "READY_REVIEW":
@@ -14915,6 +14996,8 @@ def _build_daily_build_score(
         "components": components,
         "next_action": {
             "DATA": "Keep repairing stale provider coverage before rule changes.",
+            "ESCALATION_SLA": "Clear breached provider escalations before new tuning work.",
+            "ESCALATIONS": "Work the provider escalation queue before promoting candidates.",
             "MISSED_RUNNERS": "Cluster missed-runner blockers and promote scout timing fixes only after data is fresh.",
             "RULES": "Manually review the simulator candidate; do not auto-promote.",
             "CATALYSTS": "Refresh narrative and confluence context.",
@@ -15067,6 +15150,27 @@ def _build_daily_crypto_brief(lookback_hours: int = 24) -> dict:
             except Exception:
                 repair_rows = []
             try:
+                escalation_rows = [
+                    dict(r) for r in conn.execute(
+                        """
+                        SELECT id, created_ts, updated_ts, mint, symbol, failure_class,
+                               repair_status, escalation_lane, escalation_status,
+                               priority_score, queue_flags_json, provider_path, reason,
+                               source_event_id, operator_decision, operator_note,
+                               outcome_label, last_action_ts, sla_due_ts
+                        FROM provider_repair_escalations
+                        WHERE created_ts >= ?
+                           OR updated_ts >= ?
+                           OR escalation_status IN ('QUEUED','WATCHING','FORCE_REFRESH_REQUESTED','STALE_REVIEW')
+                        ORDER BY priority_score DESC, updated_ts DESC
+                        LIMIT 500
+                        """,
+                        (since.isoformat(), since.isoformat()),
+                    ).fetchall()
+                ]
+            except Exception:
+                escalation_rows = []
+            try:
                 kv_rows = {
                     str(r["key"]): str(r["value"] or "")
                     for r in conn.execute(
@@ -15205,6 +15309,7 @@ def _build_daily_crypto_brief(lookback_hours: int = 24) -> dict:
     freshness_sla = _build_freshness_sla(intelligence_rows, token_snapshot_rows, repair_rows)
     provider_reliability = _build_provider_reliability_scorecard(repair_rows)
     provider_failure_drilldown = _build_provider_failure_drilldown(repair_rows)
+    provider_escalation_queue = _build_provider_escalation_queue(escalation_rows, now)
     rule_promotion_gate = _build_rule_promotion_gate(rule_simulator, data_watchdog, freshness_sla, provider_reliability)
     missed_runner_clusters = _build_missed_runner_clusters(journal_24h)
     catalyst_context = _build_catalyst_context(kv_rows, confluence_rows, journal_24h)
@@ -15228,6 +15333,7 @@ def _build_daily_crypto_brief(lookback_hours: int = 24) -> dict:
         rule_promotion_gate,
         catalyst_context,
         paper_gate,
+        provider_escalation_queue,
     )
     daily_build_hooks = _build_daily_build_hooks(outcome_autopsy, rule_simulator, data_watchdog, lock_ok, rule_promotion_gate)
     if lock_ok and data_ok and missed_count <= 3:
@@ -15249,6 +15355,8 @@ def _build_daily_crypto_brief(lookback_hours: int = 24) -> dict:
         next_actions.append(str(daily_build_hooks.get("next_patch")))
     if daily_build_score.get("next_action"):
         next_actions.append(str(daily_build_score.get("next_action")))
+    if int(provider_escalation_queue.get("active_count") or 0):
+        next_actions.append(str(provider_escalation_queue.get("next_action") or "Work the provider escalation queue."))
     if missed_count:
         next_actions.append("Review missed-runner blockers and scout-only timing.")
     if weak_count:
@@ -15296,6 +15404,7 @@ def _build_daily_crypto_brief(lookback_hours: int = 24) -> dict:
         "freshness_sla": freshness_sla,
         "provider_reliability": provider_reliability,
         "provider_failure_drilldown": provider_failure_drilldown,
+        "provider_escalation_queue": provider_escalation_queue,
         "rule_promotion_gate": rule_promotion_gate,
         "missed_runner_clusters": missed_runner_clusters,
         "catalyst_context": catalyst_context,
@@ -15655,11 +15764,24 @@ def _build_good_buy_board_v2(limit: int = 8) -> dict:
         }
 
     memory_index = _good_buy_memory_index()
+    suppressed_provider_unresolved = 0
     for raw in rows:
         row = dict(raw)
         gate = _good_buy_gate(row, provider_context, memory_index)
         lane_sources = [s for s in str(row.get("lane_sources") or "").split(",") if s]
         source_text = ",".join(lane_sources).lower()
+        provider_status = str(row.get("provider_repair_status") or "").upper()
+        provider_failure = str(row.get("provider_repair_failure_class") or "").lower()
+        if (
+            provider_status == "RETIRED_UNRESOLVED"
+            and provider_failure in {"provider_miss", "no_market_data", "dexscreener_no_pair", "dead_or_inactive_token", "low_liquidity"}
+            and _gb_float(row.get("quality_score")) < 68
+            and _gb_float(row.get("pressure_score")) < 62
+            and "memecoin_research" not in source_text
+            and "watch_to_entry" not in source_text
+        ):
+            suppressed_provider_unresolved += 1
+            continue
         lane = "SPOT" if "spot_basket" in source_text else "MEMECOINS"
         item = {
             "symbol": str(row.get("symbol") or "").strip().upper(),
@@ -15712,6 +15834,7 @@ def _build_good_buy_board_v2(limit: int = 8) -> dict:
             "wait": len(wait),
             "blocked": len(blocked),
             "total": len(items),
+            "suppressed_provider_unresolved": suppressed_provider_unresolved,
             "provider_warning": provider_context.get("hard_block"),
         },
         "enrichment": enrichment_summary,
@@ -17596,6 +17719,91 @@ async def home_memecoin_research_decision(
         from utils.memecoin_research import record_memecoin_manual_review_decision  # type: ignore
 
         return record_memecoin_manual_review_decision(dict(body))
+
+    try:
+        return await _aio.to_thread(_run)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post("/provider-escalation/decision")
+async def home_provider_escalation_decision(
+    body: dict,
+    _: str = Depends(get_current_user),
+):
+    import asyncio as _aio
+
+    action = str(body.get("action") or body.get("decision") or "").strip().upper()
+    valid = {"DISMISS", "KEEP_WATCHING", "FORCE_REFRESH"}
+    if action not in valid:
+        raise HTTPException(status_code=422, detail=f"action must be one of {sorted(valid)}")
+    escalation_id = int(_gb_float(body.get("id"))) if body.get("id") not in (None, "") else None
+    mint = str(body.get("mint") or "").strip()
+    lane = str(body.get("lane") or body.get("escalation_lane") or "").strip().upper()
+    if not escalation_id and not (mint and lane):
+        raise HTTPException(status_code=422, detail="id or mint+lane is required")
+
+    def _run() -> dict:
+        from utils.db import get_conn  # type: ignore
+        from utils.token_intelligence import _ensure_tables  # type: ignore
+
+        now = datetime.now(timezone.utc).isoformat()
+        status = {
+            "DISMISS": "DISMISSED",
+            "KEEP_WATCHING": "WATCHING",
+            "FORCE_REFRESH": "FORCE_REFRESH_REQUESTED",
+        }[action]
+        outcome = {
+            "DISMISS": "OPERATOR_DISMISSED",
+            "KEEP_WATCHING": "OPERATOR_WATCHING",
+            "FORCE_REFRESH": "OPERATOR_FORCE_REFRESH",
+        }[action]
+        note = str(body.get("operator_note") or body.get("note") or "").strip()[:500] or None
+        with get_conn() as conn:
+            _ensure_tables(conn)
+            if escalation_id:
+                row = conn.execute(
+                    "SELECT id, mint, escalation_lane FROM provider_repair_escalations WHERE id=?",
+                    (escalation_id,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """
+                    SELECT id, mint, escalation_lane
+                    FROM provider_repair_escalations
+                    WHERE mint=? AND escalation_lane=?
+                    """,
+                    (mint, lane),
+                ).fetchone()
+            if not row:
+                raise RuntimeError("provider escalation not found")
+            conn.execute(
+                """
+                UPDATE provider_repair_escalations
+                   SET updated_ts=?,
+                       escalation_status=?,
+                       operator_decision=?,
+                       operator_note=?,
+                       outcome_label=?,
+                       last_action_ts=?
+                 WHERE id=?
+                """,
+                (now, status, action, note, outcome, now, int(row["id"])),
+            )
+            target = {"id": int(row["id"]), "mint": row["mint"], "lane": row["escalation_lane"]}
+
+        refresh_result = None
+        if action == "FORCE_REFRESH":
+            from utils.token_intelligence import token_intelligence_step  # type: ignore
+
+            refresh_result = token_intelligence_step(force=True)
+        return {
+            "ok": True,
+            "action": action,
+            "status": status,
+            "target": target,
+            "refresh_result": refresh_result,
+        }
 
     try:
         return await _aio.to_thread(_run)

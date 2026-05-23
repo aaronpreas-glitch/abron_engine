@@ -124,6 +124,28 @@ interface DailyBriefAutopsyExample {
   } | null
 }
 
+type ProviderEscalationAction = 'DISMISS' | 'KEEP_WATCHING' | 'FORCE_REFRESH'
+
+interface ProviderEscalationItem {
+  id?: number | null
+  symbol?: string | null
+  mint?: string | null
+  lane?: string | null
+  status?: string | null
+  failure_class?: string | null
+  repair_status?: string | null
+  priority_score?: number | null
+  queue_flags?: string[]
+  provider_path?: string | null
+  reason?: string | null
+  age_minutes?: number | null
+  stale_minutes?: number | null
+  sla_due_ts?: string | null
+  sla_breached?: boolean
+  operator_decision?: string | null
+  outcome_label?: string | null
+}
+
 interface DailyCryptoBriefData {
   generated_at: string
   lookback_hours: number
@@ -317,6 +339,15 @@ interface DailyCryptoBriefData {
       latency_ms?: number | null
       reason?: string | null
     }>
+  }
+  provider_escalation_queue?: {
+    status?: string
+    active_count?: number
+    sla_breached_count?: number
+    by_lane?: Record<string, number>
+    by_status?: Record<string, number>
+    items?: ProviderEscalationItem[]
+    next_action?: string | null
   }
   rule_promotion_gate?: {
     status?: string
@@ -4394,7 +4425,17 @@ function GoodBuyBoardPanel({ board }: { board: GoodBuyBoardV2 | undefined }) {
   )
 }
 
-function DailyCryptoBriefPanel({ data, loading }: { data?: DailyCryptoBriefData; loading: boolean }) {
+function DailyCryptoBriefPanel({
+  data,
+  loading,
+  onEscalationAction,
+  pendingEscalationId,
+}: {
+  data?: DailyCryptoBriefData
+  loading: boolean
+  onEscalationAction?: (item: ProviderEscalationItem, action: ProviderEscalationAction) => void
+  pendingEscalationId?: number | null
+}) {
   if (loading && !data) {
     return (
       <div style={{ ...MONO, fontSize: 8, color: 'var(--chrome)', padding: '8px 0' }}>
@@ -4451,6 +4492,7 @@ function DailyCryptoBriefPanel({ data, loading }: { data?: DailyCryptoBriefData;
     const freshnessSla = data.freshness_sla ?? {}
     const providerReliability = data.provider_reliability ?? {}
     const providerDrilldown = data.provider_failure_drilldown ?? {}
+    const escalationQueue = data.provider_escalation_queue ?? {}
     const ruleGate = data.rule_promotion_gate ?? {}
     const missedClusters = data.missed_runner_clusters ?? {}
     const catalystContext = data.catalyst_context ?? {}
@@ -4464,6 +4506,7 @@ function DailyCryptoBriefPanel({ data, loading }: { data?: DailyCryptoBriefData;
       .join(' · ')
     const topProviderFailure = providerReliability.top_failures?.[0]
     const topProviderDrilldown = providerDrilldown.items?.[0]
+    const topEscalation = escalationQueue.items?.[0]
     const buildHooks = data.daily_build_hooks ?? {}
     const countText = (counts: Record<string, number>, keys: string[]) =>
       keys.map(key => `${key.toLowerCase()} ${counts[key] ?? 0}`).join(' · ')
@@ -4651,6 +4694,36 @@ function DailyCryptoBriefPanel({ data, loading }: { data?: DailyCryptoBriefData;
             <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
               {topProviderFailure ? `${String(topProviderFailure.failure_class || 'unknown').replace(/_/g, ' ')} · ${topProviderFailure.count ?? 0}` : 'No repair failures in this window.'}
             </div>
+          </div>
+
+          <div style={{ border: `1px solid ${(escalationQueue.sla_breached_count ?? 0) ? 'rgba(239,68,68,0.24)' : 'rgba(245,158,11,0.18)'}`, borderRadius: 10, padding: 10, background: (escalationQueue.sla_breached_count ?? 0) ? 'rgba(239,68,68,0.035)' : 'rgba(245,158,11,0.025)' }}>
+            <span style={{ ...MONO, fontSize: 8, color: (escalationQueue.sla_breached_count ?? 0) ? '#ef4444' : '#f59e0b', fontWeight: 900, letterSpacing: '0.14em' }}>
+              ESCALATION QUEUE
+            </span>
+            <div style={{ ...MONO, fontSize: 10, color: '#d7e1ea', marginTop: 7, lineHeight: 1.45 }}>
+              {escalationQueue.status || 'CLEAR'} · active {escalationQueue.active_count ?? 0} · SLA {escalationQueue.sla_breached_count ?? 0}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              {topEscalation
+                ? `${topEscalation.symbol || 'UNKNOWN'} · ${String(topEscalation.lane || 'review').replace(/_/g, ' ').toLowerCase()} · ${String(topEscalation.failure_class || 'unknown').replace(/_/g, ' ')}`
+                : escalationQueue.next_action || 'No active provider escalations.'}
+            </div>
+            {topEscalation && onEscalationAction && (
+              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 8 }}>
+                {(['KEEP_WATCHING', 'FORCE_REFRESH', 'DISMISS'] as ProviderEscalationAction[]).map(action => (
+                  <button
+                    key={`provider-escalation-${action}`}
+                    type="button"
+                    className="mini-btn"
+                    disabled={pendingEscalationId === topEscalation.id}
+                    onClick={() => onEscalationAction(topEscalation, action)}
+                    style={{ fontSize: 7, padding: '4px 7px' }}
+                  >
+                    {action === 'KEEP_WATCHING' ? 'WATCH' : action === 'FORCE_REFRESH' ? 'REFRESH' : 'DISMISS'}
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
 
           <div style={{ border: '1px solid rgba(239,68,68,0.18)', borderRadius: 10, padding: 10, background: 'rgba(239,68,68,0.025)' }}>
@@ -7465,6 +7538,7 @@ export function HomePage() {
   const queryClient = useQueryClient()
   const [pendingRunnerMint, setPendingRunnerMint] = React.useState<string | null>(null)
   const [pendingManualMint, setPendingManualMint] = React.useState<string | null>(null)
+  const [pendingEscalationId, setPendingEscalationId] = React.useState<number | null>(null)
   const [homeQueryStage, setHomeQueryStage] = React.useState(0)
 
   React.useEffect(() => {
@@ -7605,6 +7679,38 @@ export function HomePage() {
     })
   }
 
+  const providerEscalationDecisionMutation = useMutation({
+    mutationFn: (payload: {
+      id?: number | null
+      mint?: string | null
+      lane?: string | null
+      action: ProviderEscalationAction
+      operator_note?: string
+    }) => api.post('/home/provider-escalation/decision', payload).then(r => r.data),
+    onMutate: (payload) => {
+      setPendingEscalationId(payload.id ?? null)
+    },
+    onSettled: async () => {
+      setPendingEscalationId(null)
+      await queryClient.invalidateQueries({ queryKey: ['home-daily-crypto-brief'] })
+      await queryClient.invalidateQueries({ queryKey: ['home-action-board'] })
+      await queryClient.invalidateQueries({ queryKey: ['home-system-audit-confidence'] })
+    },
+  })
+
+  const recordProviderEscalationDecision = (item: ProviderEscalationItem, action: ProviderEscalationAction) => {
+    providerEscalationDecisionMutation.mutate({
+      id: item.id,
+      mint: item.mint,
+      lane: item.lane,
+      action,
+      operator_note:
+        action === 'FORCE_REFRESH' ? 'Operator requested a provider repair refresh from Daily Brief.'
+        : action === 'KEEP_WATCHING' ? 'Operator kept this provider escalation on watch.'
+        : 'Operator dismissed this provider escalation from Daily Brief.',
+    })
+  }
+
   // Confluence reinforcement — annotates MEMECOINS entries on the Action Board
   const confluenceReinQ = useQuery<{
     top_candidates: Array<{ symbol: string; reinforcement_level: string }>
@@ -7730,7 +7836,12 @@ export function HomePage() {
         <span style={{ ...MONO, fontSize: 8, color: '#2dd4bf', letterSpacing: '0.16em', fontWeight: 900 }}>
           1 · DAILY CRYPTO BRIEF
         </span>
-        <DailyCryptoBriefPanel data={dailyBriefQ.data} loading={dailyBriefQ.isLoading} />
+        <DailyCryptoBriefPanel
+          data={dailyBriefQ.data}
+          loading={dailyBriefQ.isLoading}
+          onEscalationAction={recordProviderEscalationDecision}
+          pendingEscalationId={pendingEscalationId}
+        />
       </div>
 
       <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import requests
@@ -205,6 +205,60 @@ def _ensure_tables(conn) -> None:
         """
         CREATE INDEX IF NOT EXISTS idx_token_provider_repair_events_mint_ts
         ON token_provider_repair_events(mint, ts_utc)
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS provider_repair_escalations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_ts TEXT NOT NULL,
+            updated_ts TEXT NOT NULL,
+            mint TEXT NOT NULL,
+            symbol TEXT,
+            failure_class TEXT,
+            repair_status TEXT,
+            escalation_lane TEXT NOT NULL,
+            escalation_status TEXT NOT NULL,
+            priority_score REAL,
+            queue_flags_json TEXT,
+            provider_path TEXT,
+            reason TEXT,
+            source_event_id INTEGER,
+            operator_decision TEXT,
+            operator_note TEXT,
+            outcome_label TEXT,
+            last_action_ts TEXT,
+            sla_due_ts TEXT,
+            raw_json TEXT
+        )
+        """
+    )
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(provider_repair_escalations)").fetchall()}
+        for col, col_type in [
+            ("failure_class", "TEXT"),
+            ("repair_status", "TEXT"),
+            ("operator_decision", "TEXT"),
+            ("operator_note", "TEXT"),
+            ("outcome_label", "TEXT"),
+            ("last_action_ts", "TEXT"),
+            ("sla_due_ts", "TEXT"),
+            ("raw_json", "TEXT"),
+        ]:
+            if col not in cols:
+                conn.execute(f"ALTER TABLE provider_repair_escalations ADD COLUMN {col} {col_type}")
+    except Exception:
+        pass
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_provider_repair_escalations_mint_lane
+        ON provider_repair_escalations(mint, escalation_lane)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_provider_repair_escalations_status_due
+        ON provider_repair_escalations(escalation_status, sla_due_ts)
         """
     )
 
@@ -1146,6 +1200,123 @@ def _provider_repair_candidates(limit: int = TOKEN_INTEL_PROVIDER_REPAIR_LIMIT) 
     return [_current_row_to_item(dict(row), source="provider_repair") for row in rows]
 
 
+def _repair_escalation_lane(event: dict) -> tuple[str, str, int] | None:
+    status = str(event.get("repair_status") or "").upper()
+    failure = str(event.get("failure_class") or "").strip().lower()
+    flags = {str(x).strip().lower() for x in list(event.get("queue_flags") or []) if str(x).strip()}
+    score = _f(event.get("repair_score"))
+    high_priority = score >= 90 or bool(flags & {"missed_runner", "research", "paper", "catalyst", "watch_to_entry"})
+
+    if status in {"LIVE_REPAIRED", "FALLBACK_REPAIRED"}:
+        return None
+    if status == "RETIRED_UNRESOLVED" and not high_priority:
+        return ("RETIRE_OR_SUPPRESS", "SUPPRESSED", 24)
+    if failure in {"bad_ca_or_pair_mismatch", "identity_mismatch"}:
+        return ("IDENTITY_RESEARCH", "QUEUED", 4)
+    if failure in {"provider_budget_or_rate_limit", "temporary_error", "provider_error"}:
+        return ("RETRY_PROVIDER", "QUEUED", 2)
+    if failure in {"provider_miss", "no_market_data", "dexscreener_no_pair"}:
+        if high_priority:
+            return ("RESEARCH_CATALYST_REFRESH", "QUEUED", 4)
+        return ("RETIRE_OR_SUPPRESS", "SUPPRESSED", 24)
+    if failure in {"low_liquidity"}:
+        return ("MANUAL_REVIEW", "QUEUED" if high_priority else "WATCHING", 12)
+    if high_priority:
+        return ("MANUAL_REVIEW", "QUEUED", 8)
+    return ("RETIRE_OR_SUPPRESS", "SUPPRESSED", 24)
+
+
+def _route_repair_escalation(conn, event: dict, event_id: int | None) -> None:
+    mint = str(event.get("mint") or "").strip()
+    if not mint:
+        return
+    now = str(event.get("ts_utc") or _now_iso())
+    status = str(event.get("repair_status") or "").upper()
+    if status in {"LIVE_REPAIRED", "FALLBACK_REPAIRED"}:
+        conn.execute(
+            """
+            UPDATE provider_repair_escalations
+               SET updated_ts=?,
+                   repair_status=?,
+                   escalation_status='RESOLVED_REPAIRED',
+                   outcome_label='HELPED_REPAIR',
+                   last_action_ts=?,
+                   source_event_id=COALESCE(?, source_event_id),
+                   raw_json=?
+             WHERE mint=?
+               AND escalation_status IN ('QUEUED','WATCHING','FORCE_REFRESH_REQUESTED','STALE_REVIEW')
+            """,
+            (now, status, now, event_id, json.dumps(event, separators=(",", ":")), mint),
+        )
+        return
+
+    route = _repair_escalation_lane(event)
+    if not route:
+        return
+    lane, escalation_status, sla_hours = route
+    flags_json = json.dumps(list(event.get("queue_flags") or []), separators=(",", ":"))
+    raw_json = json.dumps(event, separators=(",", ":"))
+    sla_due = (datetime.now(timezone.utc) + timedelta(hours=sla_hours)).isoformat()
+    operator_decision = "AUTO_SUPPRESS" if escalation_status == "SUPPRESSED" else "PENDING"
+    outcome_label = "LOW_VALUE_SUPPRESSED" if escalation_status == "SUPPRESSED" else None
+    conn.execute(
+        """
+        INSERT INTO provider_repair_escalations (
+            created_ts, updated_ts, mint, symbol, failure_class, repair_status,
+            escalation_lane, escalation_status, priority_score, queue_flags_json,
+            provider_path, reason, source_event_id, operator_decision, operator_note,
+            outcome_label, last_action_ts, sla_due_ts, raw_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
+        ON CONFLICT(mint, escalation_lane) DO UPDATE SET
+            updated_ts=excluded.updated_ts,
+            symbol=excluded.symbol,
+            failure_class=excluded.failure_class,
+            repair_status=excluded.repair_status,
+            escalation_status=CASE
+                WHEN provider_repair_escalations.escalation_status IN ('DISMISSED','RESOLVED_REPAIRED') THEN provider_repair_escalations.escalation_status
+                ELSE excluded.escalation_status
+            END,
+            priority_score=MAX(COALESCE(provider_repair_escalations.priority_score, 0), COALESCE(excluded.priority_score, 0)),
+            queue_flags_json=excluded.queue_flags_json,
+            provider_path=excluded.provider_path,
+            reason=excluded.reason,
+            source_event_id=excluded.source_event_id,
+            operator_decision=CASE
+                WHEN provider_repair_escalations.escalation_status IN ('DISMISSED','RESOLVED_REPAIRED') THEN provider_repair_escalations.operator_decision
+                ELSE excluded.operator_decision
+            END,
+            outcome_label=CASE
+                WHEN provider_repair_escalations.escalation_status IN ('DISMISSED','RESOLVED_REPAIRED') THEN provider_repair_escalations.outcome_label
+                ELSE excluded.outcome_label
+            END,
+            last_action_ts=excluded.last_action_ts,
+            sla_due_ts=excluded.sla_due_ts,
+            raw_json=excluded.raw_json
+        """,
+        (
+            now,
+            now,
+            mint,
+            event.get("symbol"),
+            event.get("failure_class"),
+            status,
+            lane,
+            escalation_status,
+            _f(event.get("repair_score")),
+            flags_json,
+            event.get("provider_path"),
+            event.get("reason"),
+            event_id,
+            operator_decision,
+            outcome_label,
+            now,
+            sla_due,
+            raw_json,
+        ),
+    )
+
+
 def _record_provider_repair_events(events: list[dict]) -> int:
     if not events:
         return 0
@@ -1154,7 +1325,7 @@ def _record_provider_repair_events(events: list[dict]) -> int:
         with _get_conn() as conn:
             _ensure_tables(conn)
             for event in events:
-                conn.execute(
+                cur = conn.execute(
                     """
                     INSERT INTO token_provider_repair_events (
                         ts_utc, mint, symbol, previous_source, previous_freshness,
@@ -1189,6 +1360,10 @@ def _record_provider_repair_events(events: list[dict]) -> int:
                         json.dumps(list(event.get("queue_flags") or []), separators=(",", ":")),
                     ),
                 )
+                try:
+                    _route_repair_escalation(conn, event, int(cur.lastrowid or 0) or None)
+                except Exception:
+                    pass
                 if event.get("mint"):
                     retired_until = None
                     if str(event.get("repair_status") or "").upper() == "RETIRED_UNRESOLVED":
