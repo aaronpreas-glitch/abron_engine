@@ -36,6 +36,14 @@ _DAILY_BRIEF_OUTCOME_AUTORUN_MIN_SECONDS = max(
     30,
     int(os.getenv("DAILY_BRIEF_OUTCOME_AUTORUN_MIN_SECONDS", "60")),
 )
+_PROVIDER_ESCALATION_REVIEW_STATES_KEY = "provider_escalation_review_states"
+_PROVIDER_ESCALATION_REVIEW_OPEN_STATES = {
+    "OPEN",
+    "ACKNOWLEDGED",
+    "RULE_PATCH_NEEDED",
+    "DATA_PATCH_NEEDED",
+}
+_PROVIDER_ESCALATION_REVIEW_CLOSED_STATES = {"FALSE_ALARM", "RESOLVED"}
 _home_short_cache: dict[str, tuple[float, object]] = {}
 
 
@@ -14987,12 +14995,145 @@ def _build_provider_escalation_alerts(raw_value: str | None) -> dict:
     }
 
 
+def _review_state_map(raw_value: str | None) -> dict[str, dict]:
+    try:
+        payload = json.loads(raw_value or "{}")
+        if not isinstance(payload, dict):
+            return {}
+        out: dict[str, dict] = {}
+        for key, value in payload.items():
+            if isinstance(value, dict):
+                out[str(key)] = dict(value)
+        return out
+    except Exception:
+        return {}
+
+
+def _build_provider_escalation_review_queue(alerts: dict, escalation_rows: list[dict], raw_states: str | None) -> dict:
+    rows_by_id = {
+        int(row.get("id") or 0): dict(row)
+        for row in escalation_rows or []
+        if row.get("id") not in (None, "")
+    }
+    states = _review_state_map(raw_states)
+    groups: dict[str, dict] = {}
+    for alert in list((alerts or {}).get("items") or []):
+        if not isinstance(alert, dict):
+            continue
+        row = rows_by_id.get(int(_gb_float(alert.get("row_id")))) or {}
+        data = dict(alert.get("data") or {})
+        failure = str(data.get("failure_class") or row.get("failure_class") or "unknown").strip().lower() or "unknown"
+        lane = str(data.get("lane") or row.get("escalation_lane") or "UNKNOWN").strip().upper() or "UNKNOWN"
+        group_key = f"{failure}:{lane}"
+        state_row = dict(states.get(group_key) or {})
+        state = str(state_row.get("state") or "OPEN").strip().upper()
+        if state not in (_PROVIDER_ESCALATION_REVIEW_OPEN_STATES | _PROVIDER_ESCALATION_REVIEW_CLOSED_STATES):
+            state = "OPEN"
+        group = groups.setdefault(group_key, {
+            "group_key": group_key,
+            "state": state,
+            "state_updated_at": state_row.get("updated_at"),
+            "operator_note": state_row.get("note"),
+            "failure_class": failure,
+            "lane": lane,
+            "alert_count": 0,
+            "kind_counts": {},
+            "symbols": [],
+            "latest_alert_ts": None,
+            "max_return_pct": None,
+            "evidence": [],
+        })
+        kind = str(alert.get("kind") or "ESCALATION_ALERT").upper()
+        group["alert_count"] = int(group.get("alert_count") or 0) + 1
+        group["kind_counts"][kind] = int(group["kind_counts"].get(kind) or 0) + 1
+        symbol = str(alert.get("symbol") or row.get("symbol") or "").strip().upper()
+        if symbol and symbol not in group["symbols"]:
+            group["symbols"].append(symbol)
+        ts = str(alert.get("ts_utc") or row.get("outcome_alert_ts") or "")
+        if ts and (not group.get("latest_alert_ts") or ts > str(group.get("latest_alert_ts"))):
+            group["latest_alert_ts"] = ts
+        max_ret = _nullable_float(data.get("max_return_pct"))
+        if max_ret is None:
+            max_ret = _nullable_float(row.get("outcome_max_return_pct"))
+        if max_ret is not None and (group.get("max_return_pct") is None or max_ret > _gb_float(group.get("max_return_pct"))):
+            group["max_return_pct"] = max_ret
+        if len(group["evidence"]) < 6:
+            group["evidence"].append({
+                "symbol": symbol or alert.get("symbol") or row.get("symbol"),
+                "mint": alert.get("mint") or row.get("mint"),
+                "kind": kind,
+                "alert_ts": ts or None,
+                "message": alert.get("message"),
+                "row_id": alert.get("row_id"),
+                "failure_class": failure,
+                "lane": lane,
+                "correctness": row.get("blocker_correctness"),
+                "outcome_source": row.get("outcome_source"),
+                "max_return_pct": max_ret,
+                "return_1h_pct": _nullable_float(data.get("return_1h_pct") if data.get("return_1h_pct") is not None else row.get("outcome_return_1h_pct")),
+                "return_4h_pct": _nullable_float(data.get("return_4h_pct") if data.get("return_4h_pct") is not None else row.get("outcome_return_4h_pct")),
+                "return_24h_pct": _nullable_float(data.get("return_24h_pct") if data.get("return_24h_pct") is not None else row.get("outcome_return_24h_pct")),
+                "outcome_1h_status": row.get("outcome_1h_status"),
+                "outcome_4h_status": row.get("outcome_4h_status"),
+                "outcome_24h_status": row.get("outcome_24h_status"),
+                "outcome_reason": row.get("outcome_reason"),
+            })
+
+    items = []
+    for group in groups.values():
+        state = str(group.get("state") or "OPEN").upper()
+        unresolved = state in _PROVIDER_ESCALATION_REVIEW_OPEN_STATES
+        failure = str(group.get("failure_class") or "unknown").lower()
+        recommended = (
+            "DATA_PATCH_NEEDED"
+            if failure in {"provider_miss", "no_market_data", "bad_ca_or_pair_mismatch"}
+            else "RULE_PATCH_NEEDED"
+        )
+        group["unresolved"] = unresolved
+        group["frozen"] = unresolved
+        group["recommended_state"] = recommended
+        group["next_action"] = (
+            "Resolve or classify this alert group before promoting related rules."
+            if unresolved
+            else "Review group closed; promotion freeze removed for this group."
+        )
+        items.append(group)
+    items.sort(
+        key=lambda x: (
+            1 if x.get("unresolved") else 0,
+            _gb_float(x.get("max_return_pct")),
+            int(x.get("alert_count") or 0),
+            str(x.get("latest_alert_ts") or ""),
+        ),
+        reverse=True,
+    )
+    state_counts: dict[str, int] = {}
+    for item in items:
+        state_counts[str(item.get("state") or "OPEN").upper()] = state_counts.get(str(item.get("state") or "OPEN").upper(), 0) + 1
+    unresolved_items = [item for item in items if item.get("unresolved")]
+    return {
+        "status": "ACTIVE" if unresolved_items else "CLEAR" if items else "NO_ALERTS",
+        "group_count": len(items),
+        "unresolved_count": len(unresolved_items),
+        "state_counts": state_counts,
+        "frozen_failure_classes": sorted({str(item.get("failure_class") or "unknown").lower() for item in unresolved_items}),
+        "frozen_lanes": sorted({str(item.get("lane") or "UNKNOWN").upper() for item in unresolved_items}),
+        "items": items[:10],
+        "next_action": (
+            "Classify open escalation alert groups before rule promotion."
+            if unresolved_items
+            else "No unresolved escalation alert groups."
+        ),
+    }
+
+
 def _build_rule_promotion_gate(
     simulator: dict,
     watchdog: dict,
     freshness_sla: dict,
     provider_reliability: dict | None = None,
     escalation_accuracy: dict | None = None,
+    escalation_review_queue: dict | None = None,
 ) -> dict:
     top = dict((simulator or {}).get("top_candidate") or {})
     data_status = str((watchdog or {}).get("status") or "").upper()
@@ -15005,16 +15146,22 @@ def _build_rule_promotion_gate(
     escalation_missed = int((escalation_accuracy or {}).get("missed_n") or 0)
     frozen_failures = list((escalation_accuracy or {}).get("frozen_failure_classes") or [])
     frozen_lanes = list((escalation_accuracy or {}).get("frozen_lanes") or [])
+    unresolved_reviews = int((escalation_review_queue or {}).get("unresolved_count") or 0)
+    review_frozen_failures = list((escalation_review_queue or {}).get("frozen_failure_classes") or [])
+    review_frozen_lanes = list((escalation_review_queue or {}).get("frozen_lanes") or [])
     if not top:
         status = "NO_RULE"
         reason = "No simulator candidate has enough outcome evidence."
+    elif unresolved_reviews > 0:
+        status = "BLOCKED_ESCALATION_REVIEW"
+        reason = "Unresolved escalation alert groups are frozen until reviewed."
     elif data_status in {"PATCH_QUEUE", "DEGRADED"} or sla_status == "DEGRADED" or score < 55:
         status = "BLOCKED_DATA"
         reason = "Provider freshness is not strong enough to promote a rule change."
     elif provider_hit_rate < 35 and int((provider_reliability or {}).get("attempts_24h") or 0) >= 8:
         status = "BLOCKED_PROVIDER_REPAIR"
         reason = "Provider repair hit rate is too weak to trust rule promotion."
-    elif escalation_missed > 0:
+    elif escalation_missed > 0 and escalation_review_queue is None:
         status = "BLOCKED_ESCALATION_MISS"
         reason = "A provider escalation blocker missed a runner; freeze this blocker class until reviewed."
     elif escalation_sample >= 5 and escalation_accuracy_pct < 70:
@@ -15039,8 +15186,9 @@ def _build_rule_promotion_gate(
             "provider_repair_hit_rate_pct": provider_hit_rate,
             "escalation_accuracy_pct": _nullable_float(escalation_accuracy_raw),
             "escalation_sample_n": escalation_sample,
-            "frozen_failure_classes": frozen_failures,
-            "frozen_lanes": frozen_lanes,
+            "escalation_review_unresolved_count": unresolved_reviews,
+            "frozen_failure_classes": sorted(set(frozen_failures + review_frozen_failures)),
+            "frozen_lanes": sorted(set(frozen_lanes + review_frozen_lanes)),
         },
     }
 
@@ -15560,7 +15708,7 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
                 kv_rows = {
                     str(r["key"]): str(r["value"] or "")
                     for r in conn.execute(
-                        "SELECT key, value FROM kv_store WHERE key IN ('narrative_trending','provider_escalation_outcome_alerts','provider_escalation_outcome_autorun')"
+                        "SELECT key, value FROM kv_store WHERE key IN ('narrative_trending','provider_escalation_outcome_alerts','provider_escalation_outcome_autorun','provider_escalation_review_states')"
                     ).fetchall()
                 }
             except Exception:
@@ -15699,12 +15847,18 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
     provider_escalation_accuracy = _build_provider_escalation_accuracy(escalation_rows)
     provider_escalation_maturity = _build_provider_escalation_maturity(escalation_rows, now)
     provider_escalation_alerts = _build_provider_escalation_alerts(kv_rows.get("provider_escalation_outcome_alerts"))
+    provider_escalation_review_queue = _build_provider_escalation_review_queue(
+        provider_escalation_alerts,
+        escalation_rows,
+        kv_rows.get(_PROVIDER_ESCALATION_REVIEW_STATES_KEY),
+    )
     rule_promotion_gate = _build_rule_promotion_gate(
         rule_simulator,
         data_watchdog,
         freshness_sla,
         provider_reliability,
         provider_escalation_accuracy,
+        provider_escalation_review_queue,
     )
     missed_runner_clusters = _build_missed_runner_clusters(journal_24h)
     catalyst_context = _build_catalyst_context(kv_rows, confluence_rows, journal_24h)
@@ -15755,6 +15909,8 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
         next_actions.append(str(provider_escalation_queue.get("next_action") or "Work the provider escalation queue."))
     if str((outcome_autorun or {}).get("status") or "").upper() in {"ERROR", "UNAVAILABLE"}:
         next_actions.append("Fix escalation outcome auto-run before trusting the Daily Brief.")
+    if int(provider_escalation_review_queue.get("unresolved_count") or 0):
+        next_actions.append(str(provider_escalation_review_queue.get("next_action") or "Review escalation alert groups."))
     if int(provider_escalation_accuracy.get("missed_n") or 0):
         next_actions.append(str(provider_escalation_accuracy.get("next_action") or "Review missed escalation outcomes."))
     if int(provider_escalation_maturity.get("due_now_count") or 0):
@@ -15812,6 +15968,7 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
         "provider_escalation_accuracy": provider_escalation_accuracy,
         "provider_escalation_maturity": provider_escalation_maturity,
         "provider_escalation_alerts": provider_escalation_alerts,
+        "provider_escalation_review_queue": provider_escalation_review_queue,
         "provider_escalation_outcome_autorun": outcome_autorun,
         "rule_promotion_gate": rule_promotion_gate,
         "missed_runner_clusters": missed_runner_clusters,
@@ -18231,6 +18388,67 @@ async def home_provider_escalation_decision(
             "status": status,
             "target": target,
             "refresh_result": refresh_result,
+        }
+
+    try:
+        return await _aio.to_thread(_run)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post("/provider-escalation-review/decision")
+async def home_provider_escalation_review_decision(
+    body: dict,
+    _: str = Depends(get_current_user),
+):
+    import asyncio as _aio
+
+    aliases = {
+        "ACK": "ACKNOWLEDGED",
+        "RULE": "RULE_PATCH_NEEDED",
+        "DATA": "DATA_PATCH_NEEDED",
+        "FALSE": "FALSE_ALARM",
+        "RESOLVE": "RESOLVED",
+    }
+    state = str(body.get("state") or body.get("review_state") or body.get("action") or "").strip().upper()
+    state = aliases.get(state, state)
+    valid = _PROVIDER_ESCALATION_REVIEW_OPEN_STATES | _PROVIDER_ESCALATION_REVIEW_CLOSED_STATES
+    if state not in valid:
+        raise HTTPException(status_code=422, detail=f"state must be one of {sorted(valid)}")
+    group_key = str(body.get("group_key") or "").strip()
+    if not group_key:
+        raise HTTPException(status_code=422, detail="group_key is required")
+    note = str(body.get("operator_note") or body.get("note") or "").strip()[:500] or None
+
+    def _run() -> dict:
+        now = datetime.now(timezone.utc).isoformat()
+        conn = _dj_conn()
+        try:
+            conn.execute("CREATE TABLE IF NOT EXISTS kv_store (key TEXT PRIMARY KEY, value TEXT)")
+            row = conn.execute(
+                "SELECT value FROM kv_store WHERE key=?",
+                (_PROVIDER_ESCALATION_REVIEW_STATES_KEY,),
+            ).fetchone()
+            states = _review_state_map(row["value"] if row else None)
+            states[group_key] = {
+                "state": state,
+                "updated_at": now,
+                "note": note,
+            }
+            conn.execute(
+                "INSERT OR REPLACE INTO kv_store (key, value) VALUES (?, ?)",
+                (_PROVIDER_ESCALATION_REVIEW_STATES_KEY, json.dumps(states, separators=(",", ":"))),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return {
+            "ok": True,
+            "group_key": group_key,
+            "state": state,
+            "updated_at": now,
+            "operator_note": note,
+            "frozen": state in _PROVIDER_ESCALATION_REVIEW_OPEN_STATES,
         }
 
     try:

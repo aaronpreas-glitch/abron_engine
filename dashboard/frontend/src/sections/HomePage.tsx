@@ -125,6 +125,7 @@ interface DailyBriefAutopsyExample {
 }
 
 type ProviderEscalationAction = 'DISMISS' | 'KEEP_WATCHING' | 'FORCE_REFRESH'
+type ProviderEscalationReviewState = 'ACKNOWLEDGED' | 'RULE_PATCH_NEEDED' | 'DATA_PATCH_NEEDED' | 'FALSE_ALARM' | 'RESOLVED'
 
 interface ProviderEscalationItem {
   id?: number | null
@@ -144,6 +145,41 @@ interface ProviderEscalationItem {
   sla_breached?: boolean
   operator_decision?: string | null
   outcome_label?: string | null
+}
+
+interface ProviderEscalationReviewGroup {
+  group_key?: string
+  state?: string
+  state_updated_at?: string | null
+  operator_note?: string | null
+  failure_class?: string | null
+  lane?: string | null
+  alert_count?: number
+  kind_counts?: Record<string, number>
+  symbols?: string[]
+  latest_alert_ts?: string | null
+  max_return_pct?: number | null
+  unresolved?: boolean
+  frozen?: boolean
+  recommended_state?: string | null
+  next_action?: string | null
+  evidence?: Array<{
+    symbol?: string | null
+    mint?: string | null
+    kind?: string | null
+    alert_ts?: string | null
+    message?: string | null
+    row_id?: number | null
+    failure_class?: string | null
+    lane?: string | null
+    correctness?: string | null
+    outcome_source?: string | null
+    max_return_pct?: number | null
+    return_1h_pct?: number | null
+    return_4h_pct?: number | null
+    return_24h_pct?: number | null
+    outcome_reason?: string | null
+  }>
 }
 
 interface DailyCryptoBriefData {
@@ -413,6 +449,16 @@ interface DailyCryptoBriefData {
       row_id?: number | null
       data?: Record<string, unknown>
     }>
+  }
+  provider_escalation_review_queue?: {
+    status?: string
+    group_count?: number
+    unresolved_count?: number
+    state_counts?: Record<string, number>
+    frozen_failure_classes?: string[]
+    frozen_lanes?: string[]
+    items?: ProviderEscalationReviewGroup[]
+    next_action?: string | null
   }
   provider_escalation_outcome_autorun?: {
     status?: string
@@ -4511,12 +4557,16 @@ function DailyCryptoBriefPanel({
   data,
   loading,
   onEscalationAction,
+  onEscalationReviewAction,
   pendingEscalationId,
+  pendingEscalationReviewKey,
 }: {
   data?: DailyCryptoBriefData
   loading: boolean
   onEscalationAction?: (item: ProviderEscalationItem, action: ProviderEscalationAction) => void
+  onEscalationReviewAction?: (item: ProviderEscalationReviewGroup, state: ProviderEscalationReviewState) => void
   pendingEscalationId?: number | null
+  pendingEscalationReviewKey?: string | null
 }) {
   if (loading && !data) {
     return (
@@ -4578,6 +4628,7 @@ function DailyCryptoBriefPanel({
     const escalationAccuracy = data.provider_escalation_accuracy ?? {}
     const escalationMaturity = data.provider_escalation_maturity ?? {}
     const escalationAlerts = data.provider_escalation_alerts ?? {}
+    const escalationReviewQueue = data.provider_escalation_review_queue ?? {}
     const escalationAutorun = data.provider_escalation_outcome_autorun ?? {}
     const ruleGate = data.rule_promotion_gate ?? {}
     const missedClusters = data.missed_runner_clusters ?? {}
@@ -4596,6 +4647,7 @@ function DailyCryptoBriefPanel({
     const topEscalationMiss = escalationAccuracy.missed_examples?.[0]
     const nextEscalationDue = escalationMaturity.next_due?.[0]
     const topEscalationAlert = escalationAlerts.items?.[0]
+    const topEscalationReview = escalationReviewQueue.items?.[0]
     const buildHooks = data.daily_build_hooks ?? {}
     const countText = (counts: Record<string, number>, keys: string[]) =>
       keys.map(key => `${key.toLowerCase()} ${counts[key] ?? 0}`).join(' · ')
@@ -4841,6 +4893,42 @@ function DailyCryptoBriefPanel({
                 ? `${topEscalationAlert.symbol || 'SYSTEM'} · ${String(topEscalationAlert.kind || 'alert').replace(/_/g, ' ').toLowerCase()} · ${fmtAge(topEscalationAlert.ts_utc || null)}`
                 : `freeze ${(escalationAccuracy.frozen_failure_classes ?? []).slice(0, 2).join(', ') || 'none'}`}
             </div>
+          </div>
+
+          <div style={{ border: `1px solid ${(escalationReviewQueue.unresolved_count ?? 0) ? 'rgba(239,68,68,0.24)' : 'rgba(0,212,138,0.16)'}`, borderRadius: 10, padding: 10, background: (escalationReviewQueue.unresolved_count ?? 0) ? 'rgba(239,68,68,0.03)' : 'rgba(0,212,138,0.02)' }}>
+            <span style={{ ...MONO, fontSize: 8, color: (escalationReviewQueue.unresolved_count ?? 0) ? '#ef4444' : '#00d48a', fontWeight: 900, letterSpacing: '0.14em' }}>
+              REVIEW QUEUE
+            </span>
+            <div style={{ ...MONO, fontSize: 10, color: '#d7e1ea', marginTop: 7, lineHeight: 1.45 }}>
+              {escalationReviewQueue.status || 'NO_ALERTS'} · open {escalationReviewQueue.unresolved_count ?? 0} · groups {escalationReviewQueue.group_count ?? 0}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              {topEscalationReview
+                ? `${String(topEscalationReview.failure_class || 'unknown').replace(/_/g, ' ')} · ${String(topEscalationReview.lane || 'lane').replace(/_/g, ' ').toLowerCase()} · max ${fmtPct(topEscalationReview.max_return_pct)}`
+                : escalationReviewQueue.next_action || 'No unresolved escalation alert groups.'}
+            </div>
+            {topEscalationReview && onEscalationReviewAction && (
+              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 8 }}>
+                {([
+                  ['ACKNOWLEDGED', 'ACK'],
+                  ['RULE_PATCH_NEEDED', 'RULE'],
+                  ['DATA_PATCH_NEEDED', 'DATA'],
+                  ['FALSE_ALARM', 'FALSE'],
+                  ['RESOLVED', 'DONE'],
+                ] as Array<[ProviderEscalationReviewState, string]>).map(([state, label]) => (
+                  <button
+                    key={`escalation-review-${state}`}
+                    type="button"
+                    className="mini-btn"
+                    disabled={pendingEscalationReviewKey === topEscalationReview.group_key}
+                    onClick={() => onEscalationReviewAction(topEscalationReview, state)}
+                    style={{ fontSize: 7, padding: '4px 7px' }}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
 
           <div style={{ border: `1px solid ${(escalationMaturity.overdue_count ?? 0) ? 'rgba(239,68,68,0.24)' : (escalationMaturity.due_now_count ?? 0) ? 'rgba(245,158,11,0.24)' : 'rgba(96,165,250,0.18)'}`, borderRadius: 10, padding: 10, background: (escalationMaturity.overdue_count ?? 0) ? 'rgba(239,68,68,0.03)' : (escalationMaturity.due_now_count ?? 0) ? 'rgba(245,158,11,0.03)' : 'rgba(96,165,250,0.025)' }}>
@@ -7672,6 +7760,7 @@ export function HomePage() {
   const [pendingRunnerMint, setPendingRunnerMint] = React.useState<string | null>(null)
   const [pendingManualMint, setPendingManualMint] = React.useState<string | null>(null)
   const [pendingEscalationId, setPendingEscalationId] = React.useState<number | null>(null)
+  const [pendingEscalationReviewKey, setPendingEscalationReviewKey] = React.useState<string | null>(null)
   const [homeQueryStage, setHomeQueryStage] = React.useState(0)
 
   React.useEffect(() => {
@@ -7844,6 +7933,36 @@ export function HomePage() {
     })
   }
 
+  const providerEscalationReviewMutation = useMutation({
+    mutationFn: (payload: {
+      group_key?: string
+      state: ProviderEscalationReviewState
+      operator_note?: string
+    }) => api.post('/home/provider-escalation-review/decision', payload).then(r => r.data),
+    onMutate: (payload) => {
+      setPendingEscalationReviewKey(payload.group_key ?? null)
+    },
+    onSettled: async () => {
+      setPendingEscalationReviewKey(null)
+      await queryClient.invalidateQueries({ queryKey: ['home-daily-crypto-brief'] })
+      await queryClient.invalidateQueries({ queryKey: ['home-action-board'] })
+      await queryClient.invalidateQueries({ queryKey: ['home-system-audit-confidence'] })
+    },
+  })
+
+  const recordProviderEscalationReviewDecision = (item: ProviderEscalationReviewGroup, state: ProviderEscalationReviewState) => {
+    providerEscalationReviewMutation.mutate({
+      group_key: item.group_key,
+      state,
+      operator_note:
+        state === 'RULE_PATCH_NEEDED' ? 'Operator marked this escalation alert group for rule patch review.'
+        : state === 'DATA_PATCH_NEEDED' ? 'Operator marked this escalation alert group for data/provider repair.'
+        : state === 'FALSE_ALARM' ? 'Operator marked this escalation alert group as a false alarm.'
+        : state === 'RESOLVED' ? 'Operator resolved this escalation alert group.'
+        : 'Operator acknowledged this escalation alert group.',
+    })
+  }
+
   // Confluence reinforcement — annotates MEMECOINS entries on the Action Board
   const confluenceReinQ = useQuery<{
     top_candidates: Array<{ symbol: string; reinforcement_level: string }>
@@ -7973,7 +8092,9 @@ export function HomePage() {
           data={dailyBriefQ.data}
           loading={dailyBriefQ.isLoading}
           onEscalationAction={recordProviderEscalationDecision}
+          onEscalationReviewAction={recordProviderEscalationReviewDecision}
           pendingEscalationId={pendingEscalationId}
+          pendingEscalationReviewKey={pendingEscalationReviewKey}
         />
       </div>
 
