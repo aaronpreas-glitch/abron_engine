@@ -37,6 +37,7 @@ _DAILY_BRIEF_OUTCOME_AUTORUN_MIN_SECONDS = max(
     int(os.getenv("DAILY_BRIEF_OUTCOME_AUTORUN_MIN_SECONDS", "60")),
 )
 _PROVIDER_ESCALATION_REVIEW_STATES_KEY = "provider_escalation_review_states"
+_PROVIDER_ESCALATION_PATCH_STATES_KEY = "provider_escalation_patch_states"
 _PROVIDER_ESCALATION_REVIEW_OPEN_STATES = {
     "OPEN",
     "ACKNOWLEDGED",
@@ -44,6 +45,7 @@ _PROVIDER_ESCALATION_REVIEW_OPEN_STATES = {
     "DATA_PATCH_NEEDED",
 }
 _PROVIDER_ESCALATION_REVIEW_CLOSED_STATES = {"FALSE_ALARM", "RESOLVED"}
+_PROVIDER_ESCALATION_PATCH_STATES = {"WATCH", "NEEDS_MORE_DATA", "READY_FOR_IMPLEMENTATION"}
 _home_short_cache: dict[str, tuple[float, object]] = {}
 
 
@@ -15127,6 +15129,158 @@ def _build_provider_escalation_review_queue(alerts: dict, escalation_rows: list[
     }
 
 
+def _patch_state_map(raw_value: str | None) -> dict[str, dict]:
+    try:
+        payload = json.loads(raw_value or "{}")
+        if not isinstance(payload, dict):
+            return {}
+        out: dict[str, dict] = {}
+        for key, value in payload.items():
+            if isinstance(value, dict):
+                out[str(key)] = dict(value)
+        return out
+    except Exception:
+        return {}
+
+
+def _build_provider_escalation_patch_plans(
+    review_queue: dict,
+    rule_simulator: dict,
+    escalation_accuracy: dict,
+    raw_patch_states: str | None,
+) -> dict:
+    patch_states = _patch_state_map(raw_patch_states)
+    items = []
+    for group in list((review_queue or {}).get("items") or []):
+        if not isinstance(group, dict):
+            continue
+        group_key = str(group.get("group_key") or "").strip()
+        if not group_key:
+            continue
+        state = str(group.get("state") or "OPEN").upper()
+        if state in _PROVIDER_ESCALATION_REVIEW_CLOSED_STATES:
+            continue
+        failure = str(group.get("failure_class") or "unknown").lower()
+        lane = str(group.get("lane") or "UNKNOWN").upper()
+        evidence = [dict(item) for item in list(group.get("evidence") or []) if isinstance(item, dict)]
+        alert_count = int(group.get("alert_count") or len(evidence) or 0)
+        max_return = _gb_float(group.get("max_return_pct"))
+        avg_1h = _avg([_nullable_float(item.get("return_1h_pct")) for item in evidence])
+        avg_4h = _avg([_nullable_float(item.get("return_4h_pct")) for item in evidence])
+        state_row = dict(patch_states.get(group_key) or {})
+        manual_state = str(state_row.get("state") or "WATCH").upper()
+        if manual_state not in _PROVIDER_ESCALATION_PATCH_STATES:
+            manual_state = "WATCH"
+        if state == "DATA_PATCH_NEEDED" or failure in {"provider_miss", "no_market_data", "bad_ca_or_pair_mismatch"}:
+            plan_type = "DATA_PROVIDER_REPAIR"
+            proposed_fix = (
+                "Strengthen provider repair before this blocker can suppress candidates: force fresh market reads, "
+                "fallback source confirmation, and identity re-check for this failure class."
+            )
+            simulated_benefit = alert_count
+            weak_buy_risk = 0
+            expected_effect = "Recover market/identity context for names that were blocked by provider gaps."
+        elif state == "RULE_PATCH_NEEDED":
+            plan_type = "BLOCKER_RULE_PATCH"
+            proposed_fix = (
+                "Replay this blocker as scout-only instead of full suppression when early return evidence is strong."
+            )
+            sim_top = dict((rule_simulator or {}).get("top_candidate") or {})
+            simulated_benefit = alert_count + max(0, int(sim_top.get("missed_runner_still_blocked_n") or 0))
+            weak_buy_risk = max(0, int(sim_top.get("would_block_good_buy_n") or 0))
+            expected_effect = "Reduce missed runners hidden by this blocker while preserving clean-buy gates."
+        else:
+            plan_type = str(group.get("recommended_state") or "DATA_PATCH_NEEDED").replace("_NEEDED", "")
+            proposed_fix = "Classify this review group as data or rule work before implementation planning."
+            simulated_benefit = alert_count
+            weak_buy_risk = 1 if plan_type == "RULE_PATCH" else 0
+            expected_effect = "No implementation until the review state is explicit."
+
+        sample_n = max(alert_count, len(evidence))
+        confidence_score = 0.0
+        confidence_score += min(45.0, sample_n * 15.0)
+        confidence_score += min(35.0, max_return)
+        confidence_score += 15.0 if plan_type == "DATA_PROVIDER_REPAIR" else 0.0
+        confidence_score -= weak_buy_risk * 12.0
+        confidence_score = round(max(0.0, min(100.0, confidence_score)), 1)
+        if state in {"OPEN", "ACKNOWLEDGED"}:
+            gate_status = "NEEDS_CLASSIFICATION"
+            gate_reason = "Review group must be marked as rule or data patch needed first."
+        elif sample_n < 1:
+            gate_status = "NEEDS_MORE_DATA"
+            gate_reason = "No alert evidence attached to this group yet."
+        elif weak_buy_risk > simulated_benefit:
+            gate_status = "REJECT_RISK"
+            gate_reason = "Replay risk is larger than expected missed-runner benefit."
+        elif confidence_score >= 55 and simulated_benefit > weak_buy_risk:
+            gate_status = "READY_FOR_MANUAL_REVIEW"
+            gate_reason = "Evidence suggests benefit exceeds risk; manual implementation review is allowed."
+        else:
+            gate_status = "NEEDS_MORE_DATA"
+            gate_reason = "Collect more outcome evidence before implementation."
+
+        if manual_state == "READY_FOR_IMPLEMENTATION" and gate_status != "READY_FOR_MANUAL_REVIEW":
+            manual_state = "WATCH"
+        items.append({
+            "group_key": group_key,
+            "plan_key": f"patch:{group_key}",
+            "review_state": state,
+            "manual_state": manual_state,
+            "manual_state_updated_at": state_row.get("updated_at"),
+            "operator_note": state_row.get("note"),
+            "plan_type": plan_type,
+            "failure_class": failure,
+            "lane": lane,
+            "proposed_fix": proposed_fix,
+            "expected_effect": expected_effect,
+            "sample_n": sample_n,
+            "alert_count": alert_count,
+            "max_return_pct": _nullable_float(max_return),
+            "avg_1h_pct": avg_1h,
+            "avg_4h_pct": avg_4h,
+            "simulated_benefit_n": simulated_benefit,
+            "weak_buy_risk_n": weak_buy_risk,
+            "confidence_score": confidence_score,
+            "gate_status": gate_status,
+            "gate_reason": gate_reason,
+            "ready_for_implementation": manual_state == "READY_FOR_IMPLEMENTATION",
+            "evidence": evidence[:4],
+        })
+    items.sort(
+        key=lambda x: (
+            1 if x.get("gate_status") == "READY_FOR_MANUAL_REVIEW" else 0,
+            1 if x.get("manual_state") == "READY_FOR_IMPLEMENTATION" else 0,
+            _gb_float(x.get("confidence_score")),
+            _gb_float(x.get("max_return_pct")),
+        ),
+        reverse=True,
+    )
+    ready = [item for item in items if item.get("gate_status") == "READY_FOR_MANUAL_REVIEW"]
+    implementation_ready = [item for item in items if item.get("ready_for_implementation")]
+    state_counts: dict[str, int] = {}
+    for item in items:
+        key = str(item.get("gate_status") or "UNKNOWN").upper()
+        state_counts[key] = state_counts.get(key, 0) + 1
+    return {
+        "status": "IMPLEMENTATION_READY" if implementation_ready else "READY_REVIEW" if ready else "WATCH" if items else "NO_PLANS",
+        "plan_count": len(items),
+        "ready_count": len(ready),
+        "implementation_ready_count": len(implementation_ready),
+        "state_counts": state_counts,
+        "top_plan": items[0] if items else None,
+        "items": items[:10],
+        "next_action": (
+            "Implement only manually reviewed ready patch plans; do not auto-change live rules."
+            if implementation_ready
+            else "Review the top patch plan and mark ready only after human approval."
+            if ready
+            else "Classify review groups or collect more outcome evidence before patching."
+            if items
+            else "No escalation patch plans."
+        ),
+    }
+
+
 def _build_rule_promotion_gate(
     simulator: dict,
     watchdog: dict,
@@ -15710,7 +15864,7 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
                 kv_rows = {
                     str(r["key"]): str(r["value"] or "")
                     for r in conn.execute(
-                        "SELECT key, value FROM kv_store WHERE key IN ('narrative_trending','provider_escalation_outcome_alerts','provider_escalation_outcome_autorun','provider_escalation_review_states')"
+                        "SELECT key, value FROM kv_store WHERE key IN ('narrative_trending','provider_escalation_outcome_alerts','provider_escalation_outcome_autorun','provider_escalation_review_states','provider_escalation_patch_states')"
                     ).fetchall()
                 }
             except Exception:
@@ -15854,6 +16008,12 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
         escalation_rows,
         kv_rows.get(_PROVIDER_ESCALATION_REVIEW_STATES_KEY),
     )
+    provider_escalation_patch_plans = _build_provider_escalation_patch_plans(
+        provider_escalation_review_queue,
+        rule_simulator,
+        provider_escalation_accuracy,
+        kv_rows.get(_PROVIDER_ESCALATION_PATCH_STATES_KEY),
+    )
     rule_promotion_gate = _build_rule_promotion_gate(
         rule_simulator,
         data_watchdog,
@@ -15913,6 +16073,8 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
         next_actions.append("Fix escalation outcome auto-run before trusting the Daily Brief.")
     if int(provider_escalation_review_queue.get("unresolved_count") or 0):
         next_actions.append(str(provider_escalation_review_queue.get("next_action") or "Review escalation alert groups."))
+    if int(provider_escalation_patch_plans.get("ready_count") or 0):
+        next_actions.append(str(provider_escalation_patch_plans.get("next_action") or "Review escalation patch plans."))
     if int(provider_escalation_accuracy.get("missed_n") or 0):
         next_actions.append(str(provider_escalation_accuracy.get("next_action") or "Review missed escalation outcomes."))
     if int(provider_escalation_maturity.get("due_now_count") or 0):
@@ -15971,6 +16133,7 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
         "provider_escalation_maturity": provider_escalation_maturity,
         "provider_escalation_alerts": provider_escalation_alerts,
         "provider_escalation_review_queue": provider_escalation_review_queue,
+        "provider_escalation_patch_plans": provider_escalation_patch_plans,
         "provider_escalation_outcome_autorun": outcome_autorun,
         "rule_promotion_gate": rule_promotion_gate,
         "missed_runner_clusters": missed_runner_clusters,
@@ -18451,6 +18614,68 @@ async def home_provider_escalation_review_decision(
             "updated_at": now,
             "operator_note": note,
             "frozen": state in _PROVIDER_ESCALATION_REVIEW_OPEN_STATES,
+        }
+
+    try:
+        return await _aio.to_thread(_run)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post("/provider-escalation-patch/decision")
+async def home_provider_escalation_patch_decision(
+    body: dict,
+    _: str = Depends(get_current_user),
+):
+    import asyncio as _aio
+
+    state = str(body.get("state") or body.get("patch_state") or body.get("action") or "").strip().upper()
+    aliases = {
+        "READY": "READY_FOR_IMPLEMENTATION",
+        "HOLD": "NEEDS_MORE_DATA",
+        "WATCHING": "WATCH",
+    }
+    state = aliases.get(state, state)
+    if state not in _PROVIDER_ESCALATION_PATCH_STATES:
+        raise HTTPException(status_code=422, detail=f"state must be one of {sorted(_PROVIDER_ESCALATION_PATCH_STATES)}")
+    group_key = str(body.get("group_key") or "").strip()
+    if not group_key:
+        raise HTTPException(status_code=422, detail="group_key is required")
+    gate_status = str(body.get("gate_status") or "").strip().upper()
+    if state == "READY_FOR_IMPLEMENTATION" and gate_status and gate_status != "READY_FOR_MANUAL_REVIEW":
+        raise HTTPException(status_code=422, detail="patch must pass READY_FOR_MANUAL_REVIEW gate first")
+    note = str(body.get("operator_note") or body.get("note") or "").strip()[:500] or None
+
+    def _run() -> dict:
+        now = datetime.now(timezone.utc).isoformat()
+        conn = _dj_conn()
+        try:
+            conn.execute("CREATE TABLE IF NOT EXISTS kv_store (key TEXT PRIMARY KEY, value TEXT)")
+            row = conn.execute(
+                "SELECT value FROM kv_store WHERE key=?",
+                (_PROVIDER_ESCALATION_PATCH_STATES_KEY,),
+            ).fetchone()
+            states = _patch_state_map(row["value"] if row else None)
+            states[group_key] = {
+                "state": state,
+                "updated_at": now,
+                "note": note,
+                "gate_status": gate_status or None,
+            }
+            conn.execute(
+                "INSERT OR REPLACE INTO kv_store (key, value) VALUES (?, ?)",
+                (_PROVIDER_ESCALATION_PATCH_STATES_KEY, json.dumps(states, separators=(",", ":"))),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return {
+            "ok": True,
+            "group_key": group_key,
+            "state": state,
+            "updated_at": now,
+            "operator_note": note,
+            "manual_only": True,
         }
 
     try:
