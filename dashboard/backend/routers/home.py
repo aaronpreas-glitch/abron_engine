@@ -13962,6 +13962,488 @@ def _build_buy_decision_learning(current_decision: dict | None = None) -> dict:
     }
 
 
+def _autopsy_row_classification(row: dict, decision_state: str, outcome_label: str) -> str:
+    action = str(row.get("recommended_action") or "").strip().upper()
+    bullish = outcome_label in _BUY_DECISION_BULLISH_LABELS
+    weak = outcome_label in {"BAD_BUY", "WEAK_BUY", "FLAT"}
+    if action == "BUY" and bullish:
+        return "GOOD_BUY_CONFIRMED"
+    if action == "BUY" and weak:
+        return "WEAK_BUY"
+    if action != "BUY" and bullish:
+        return "MISSED_RUNNER"
+    if action != "BUY" and weak:
+        return "PROTECTED"
+    if decision_state == "BUY_NOW":
+        return "BUY_PENDING"
+    return "WAIT_PENDING"
+
+
+def _autopsy_candidate_metrics(snapshot: dict) -> dict:
+    candidate = dict(snapshot.get("candidate") or {})
+    metrics = dict(candidate.get("metrics") or snapshot.get("metrics") or {})
+    data = dict(candidate.get("data") or snapshot.get("data") or {})
+    return {
+        "marketcap_usd": _nullable_float(metrics.get("marketcap_usd")),
+        "liquidity_usd": _nullable_float(metrics.get("liquidity_usd")),
+        "volume_24h_usd": _nullable_float(metrics.get("volume_24h_usd")),
+        "volume_1h_usd": _nullable_float(metrics.get("volume_1h_usd")),
+        "vol_liq_ratio": _nullable_float(metrics.get("vol_liq_ratio")),
+        "quality_score": _nullable_float(metrics.get("quality_score")),
+        "risk_score": _nullable_float(metrics.get("risk_score")),
+        "pressure_score": _nullable_float(metrics.get("pressure_score")),
+        "buy_pressure": _nullable_float(metrics.get("buy_pressure")),
+        "change_1h_pct": _nullable_float(metrics.get("change_1h_pct")),
+        "change_24h_pct": _nullable_float(metrics.get("change_24h_pct")),
+        "data_freshness": data.get("data_freshness"),
+        "data_confidence": data.get("data_confidence"),
+        "identity_status": data.get("identity_status"),
+    }
+
+
+def _autopsy_direction(classification: str, primary: dict | None, max_return) -> str:
+    category = str((primary or {}).get("category") or "").strip().lower()
+    if classification == "MISSED_RUNNER":
+        if category in {"identity", "quality"}:
+            return "SURFACE"
+        if _gb_float(max_return) >= 25:
+            return "LOOSEN_OR_SCOUT"
+        return "SIMULATE_LOOSENING"
+    if classification == "WEAK_BUY":
+        return "TIGHTEN"
+    if classification == "PROTECTED":
+        return "KEEP"
+    if classification == "GOOD_BUY_CONFIRMED":
+        return "KEEP"
+    return "WAIT_FOR_OUTCOME"
+
+
+def _autopsy_text(symbol: str | None, classification: str, primary: dict | None, max_return) -> tuple[str, str, str]:
+    name = symbol or "Token"
+    blocker = str((primary or {}).get("label") or "no primary blocker").replace("_", " ").lower()
+    max_txt = f"{round(_gb_float(max_return), 1)}%"
+    if classification == "MISSED_RUNNER":
+        return (
+            f"{name} ran up to {max_txt} after the system said wait.",
+            f"Primary wait reason was {blocker}; this is the rule to replay before relaxing anything.",
+            "Replay the blocker as scout-only, wait-only, and full-entry thresholds before patching.",
+        )
+    if classification == "WEAK_BUY":
+        return (
+            f"{name} was a buy call but did not reward clean-entry risk.",
+            "This is where the engine should find the missing confirmation that would have downgraded it to wait.",
+            "Test stricter momentum, depth, and data-freshness gates against this row.",
+        )
+    if classification == "PROTECTED":
+        return (
+            f"{name} stayed weak after the system blocked it.",
+            f"{blocker} appears protective in this sample.",
+            "Keep the blocker unless broader replay shows it also hides runners.",
+        )
+    if classification == "GOOD_BUY_CONFIRMED":
+        return (
+            f"{name} rewarded the buy call with up to {max_txt}.",
+            "This row is positive evidence for the current clean-buy stack.",
+            "Preserve the checks that were present at entry.",
+        )
+    return (
+        f"{name} is still waiting for enough outcome data.",
+        "Keep collecting 1h/4h/24h evidence before changing rules from this row.",
+        "No rule change from this row yet.",
+    )
+
+
+def _build_outcome_autopsy_from_rows(journal_rows: list[dict], lookback_hours: int) -> dict:
+    """Explain what the last decision outcomes imply for tomorrow's rule work."""
+    now = datetime.now(timezone.utc).isoformat()
+    resolved_rows = [
+        row for row in journal_rows
+        if str(row.get("outcome_label") or "").strip()
+    ]
+    items: list[dict] = []
+    blocker_stats: dict[str, dict] = {}
+    class_counts: dict[str, int] = {}
+
+    for row in resolved_rows:
+        snapshot = _decision_snapshot(row)
+        decision_state = _decision_state_from_row(row, snapshot)
+        label = str(row.get("outcome_label") or "").strip().upper()
+        classification = _autopsy_row_classification(row, decision_state, label)
+        class_counts[classification] = class_counts.get(classification, 0) + 1
+        primary = _primary_blocker_from_row(row, snapshot)
+        primary_key = str((primary or {}).get("key") or "no_primary_blocker").strip()
+        max_return = _nullable_float(row.get("max_return_pct"))
+        ret_1h = _nullable_float(row.get("outcome_1h_pct"))
+        ret_4h = _nullable_float(row.get("outcome_4h_pct"))
+        ret_24h = _nullable_float(row.get("outcome_24h_pct"))
+        symbol = row.get("symbol")
+        what, why, review = _autopsy_text(symbol, classification, primary, max_return)
+        direction = _autopsy_direction(classification, primary, max_return)
+        item = {
+            "symbol": symbol,
+            "mint": row.get("mint"),
+            "surface": row.get("source_surface"),
+            "created_ts": row.get("created_ts"),
+            "decision_state": decision_state,
+            "recommended_action": str(row.get("recommended_action") or "").strip().upper() or None,
+            "priority": row.get("priority"),
+            "outcome_label": label,
+            "classification": classification,
+            "max_return_pct": max_return,
+            "outcome_1h_pct": ret_1h,
+            "outcome_4h_pct": ret_4h,
+            "outcome_24h_pct": ret_24h,
+            "primary_blocker": primary,
+            "direction": direction,
+            "confidence": "FINAL" if str(row.get("resolution_status") or "").upper() == "RESOLVED" else "OBSERVED",
+            "metrics": _autopsy_candidate_metrics(snapshot),
+            "what_happened": what,
+            "why_it_matters": why,
+            "rule_review": review,
+        }
+        items.append(item)
+
+        if primary_key and classification in {"MISSED_RUNNER", "PROTECTED", "WEAK_BUY"}:
+            stat = blocker_stats.setdefault(primary_key, {
+                "key": primary_key,
+                "label": str((primary or {}).get("label") or primary_key.replace("_", " ").title()),
+                "category": str((primary or {}).get("category") or "other"),
+                "sample_n": 0,
+                "missed_runner_n": 0,
+                "protected_n": 0,
+                "weak_buy_n": 0,
+                "missed_return_values": [],
+                "protected_return_values": [],
+                "weak_return_values": [],
+            })
+            stat["sample_n"] += 1
+            if classification == "MISSED_RUNNER":
+                stat["missed_runner_n"] += 1
+                stat["missed_return_values"].append(max_return)
+            elif classification == "PROTECTED":
+                stat["protected_n"] += 1
+                stat["protected_return_values"].append(max_return)
+            elif classification == "WEAK_BUY":
+                stat["weak_buy_n"] += 1
+                stat["weak_return_values"].append(max_return)
+
+    def _item_rank(item: dict) -> tuple[float, float]:
+        cls = item.get("classification")
+        urgency = {
+            "MISSED_RUNNER": 4.0,
+            "WEAK_BUY": 3.0,
+            "PROTECTED": 1.0,
+            "GOOD_BUY_CONFIRMED": 0.5,
+        }.get(str(cls), 0.0)
+        return (urgency, _gb_float(item.get("max_return_pct")))
+
+    items.sort(key=_item_rank, reverse=True)
+
+    blocker_reviews = []
+    for stat in blocker_stats.values():
+        missed_n = int(stat["missed_runner_n"])
+        protected_n = int(stat["protected_n"])
+        weak_n = int(stat["weak_buy_n"])
+        if missed_n >= max(2, protected_n + weak_n):
+            recommendation = "LOOSEN_OR_SCOUT"
+        elif protected_n >= max(2, missed_n):
+            recommendation = "KEEP_PROTECTIVE"
+        elif weak_n:
+            recommendation = "TIGHTEN_BUY_GATE"
+        else:
+            recommendation = "SIMULATE"
+        blocker_reviews.append({
+            "key": stat["key"],
+            "label": stat["label"],
+            "category": stat["category"],
+            "sample_n": int(stat["sample_n"]),
+            "missed_runner_n": missed_n,
+            "protected_n": protected_n,
+            "weak_buy_n": weak_n,
+            "avg_missed_return_pct": _avg(stat["missed_return_values"]),
+            "avg_protected_return_pct": _avg(stat["protected_return_values"]),
+            "avg_weak_return_pct": _avg(stat["weak_return_values"]),
+            "recommendation": recommendation,
+        })
+    blocker_reviews.sort(
+        key=lambda x: (
+            int(x.get("missed_runner_n") or 0) * 3 + int(x.get("weak_buy_n") or 0) * 2 + int(x.get("sample_n") or 0),
+            _gb_float(x.get("avg_missed_return_pct")),
+        ),
+        reverse=True,
+    )
+
+    top_rule = blocker_reviews[0] if blocker_reviews else None
+    missed_n = int(class_counts.get("MISSED_RUNNER", 0))
+    weak_n = int(class_counts.get("WEAK_BUY", 0))
+    protected_n = int(class_counts.get("PROTECTED", 0))
+    if not resolved_rows:
+        status = "NO_OUTCOMES"
+        headline = "Outcome autopsy is waiting for resolved decision rows."
+    elif missed_n or weak_n:
+        status = "PATCH_QUEUE"
+        headline = "Outcome autopsy found rule work in the last decision window."
+    else:
+        status = "STABLE_SAMPLE"
+        headline = "Outcome autopsy mostly confirms current wait/buy calls."
+
+    return {
+        "generated_at": now,
+        "lookback_hours": lookback_hours,
+        "status": status,
+        "headline": headline,
+        "summary": {
+            "resolved_count": len(resolved_rows),
+            "missed_runner_count": missed_n,
+            "weak_buy_count": weak_n,
+            "protected_count": protected_n,
+            "good_buy_confirmed_count": int(class_counts.get("GOOD_BUY_CONFIRMED", 0)),
+            "pending_count": int(class_counts.get("BUY_PENDING", 0)) + int(class_counts.get("WAIT_PENDING", 0)),
+        },
+        "top_rule_to_review": top_rule,
+        "blocker_reviews": blocker_reviews[:10],
+        "examples": items[:8],
+    }
+
+
+def _simulate_daily_rule_impacts(journal_rows: list[dict], autopsy: dict) -> dict:
+    """Lightweight replay simulator for proposed rule patches from the same outcome rows."""
+    rule_defs = [
+        {
+            "key": "spot_rotation_needs_confirmation",
+            "label": "Spot rotation confirmation",
+            "direction": "TIGHTEN",
+            "predicate": lambda m: (
+                str(m.get("market_source") or "").lower() == "spot_basket"
+                and (
+                    _gb_float(m.get("change_24h_pct")) < 0
+                    or _gb_float(m.get("change_1h_pct")) < 1.5
+                    or _gb_float(m.get("pressure_score")) < 78
+                    or _gb_float(m.get("buy_pressure")) < 70
+                    or _gb_float(m.get("volume_1h_usd")) < 50000
+                )
+            ),
+        },
+        {
+            "key": "meme_momentum_not_confirmed",
+            "label": "Meme momentum confirmation",
+            "direction": "TIGHTEN",
+            "predicate": lambda m: _gb_float(m.get("change_1h_pct")) < 0 and _gb_float(m.get("pressure_score")) < 80,
+        },
+        {
+            "key": "spike_without_buy_pressure",
+            "label": "Spike needs buy pressure",
+            "direction": "TIGHTEN",
+            "predicate": lambda m: _gb_float(m.get("change_1h_pct")) >= 4 and _gb_float(m.get("buy_pressure")) < 55,
+        },
+        {
+            "key": "thin_momentum_confirmation",
+            "label": "Thin momentum confirmation",
+            "direction": "TIGHTEN",
+            "predicate": lambda m: _gb_float(m.get("pressure_score")) < 72 and _gb_float(m.get("buy_pressure")) < 62,
+        },
+    ]
+    rows = [row for row in journal_rows if str(row.get("outcome_label") or "").strip()]
+    impacts = []
+    for rule in rule_defs:
+        weak_blocked = 0
+        good_blocked = 0
+        missed_still_blocked = 0
+        samples = []
+        for row in rows:
+            snapshot = _decision_snapshot(row)
+            metrics = _autopsy_candidate_metrics(snapshot)
+            candidate = dict(snapshot.get("candidate") or {})
+            data = dict(candidate.get("data") or {})
+            metrics["market_source"] = data.get("market_source") or metrics.get("market_source")
+            try:
+                matched = bool(rule["predicate"](metrics))
+            except Exception:
+                matched = False
+            if not matched:
+                continue
+            label = str(row.get("outcome_label") or "").upper()
+            action = str(row.get("recommended_action") or "").upper()
+            if action == "BUY" and label in {"BAD_BUY", "WEAK_BUY", "FLAT"}:
+                weak_blocked += 1
+            elif action == "BUY" and label in _BUY_DECISION_BULLISH_LABELS:
+                good_blocked += 1
+            elif action != "BUY" and label in _BUY_DECISION_BULLISH_LABELS:
+                missed_still_blocked += 1
+            if len(samples) < 3:
+                samples.append({
+                    "symbol": row.get("symbol"),
+                    "action": action,
+                    "outcome_label": label,
+                    "max_return_pct": _nullable_float(row.get("max_return_pct")),
+                })
+        net_score = weak_blocked * 2 - good_blocked * 3 - missed_still_blocked
+        impacts.append({
+            "key": rule["key"],
+            "label": rule["label"],
+            "direction": rule["direction"],
+            "would_block_weak_buy_n": weak_blocked,
+            "would_block_good_buy_n": good_blocked,
+            "missed_runner_still_blocked_n": missed_still_blocked,
+            "net_score": net_score,
+            "sample_symbols": samples,
+        })
+    impacts.sort(key=lambda x: (int(x.get("net_score") or 0), int(x.get("would_block_weak_buy_n") or 0)), reverse=True)
+
+    loosen = []
+    for review in list((autopsy or {}).get("blocker_reviews") or [])[:8]:
+        if int(review.get("missed_runner_n") or 0) > int(review.get("protected_n") or 0):
+            loosen.append({
+                "key": review.get("key"),
+                "label": review.get("label"),
+                "direction": "LOOSEN_OR_SCOUT",
+                "missed_runner_n": review.get("missed_runner_n"),
+                "protected_n": review.get("protected_n"),
+                "avg_missed_return_pct": review.get("avg_missed_return_pct"),
+                "net_score": int(review.get("missed_runner_n") or 0) * 2 - int(review.get("protected_n") or 0),
+            })
+    loosen.sort(key=lambda x: (int(x.get("net_score") or 0), _gb_float(x.get("avg_missed_return_pct"))), reverse=True)
+
+    top = (impacts + loosen)
+    top.sort(key=lambda x: (int(x.get("net_score") or 0), _gb_float(x.get("avg_missed_return_pct"))), reverse=True)
+    return {
+        "status": "READY" if rows else "NO_OUTCOMES",
+        "summary": {
+            "resolved_rows": len(rows),
+            "tighten_rules_tested": len(rule_defs),
+            "loosen_candidates": len(loosen),
+        },
+        "top_candidate": top[0] if top else None,
+        "tighten_candidates": impacts[:6],
+        "loosen_candidates": loosen[:6],
+    }
+
+
+def _build_candidate_replay_timeline(journal_rows: list[dict], autopsy: dict, limit: int = 8) -> dict:
+    examples = list((autopsy or {}).get("examples") or [])
+    anchor = next((x for x in examples if x.get("classification") in {"MISSED_RUNNER", "WEAK_BUY"}), None) or (examples[0] if examples else None)
+    if not anchor:
+        return {"status": "NO_CANDIDATE", "anchor": None, "events": []}
+    anchor_mint = str(anchor.get("mint") or "").strip()
+    anchor_symbol = str(anchor.get("symbol") or "").strip().upper()
+    events = []
+    for row in journal_rows:
+        row_mint = str(row.get("mint") or "").strip()
+        row_symbol = str(row.get("symbol") or "").strip().upper()
+        if anchor_mint and row_mint != anchor_mint:
+            continue
+        if not anchor_mint and anchor_symbol and row_symbol != anchor_symbol:
+            continue
+        snapshot = _decision_snapshot(row)
+        state = _decision_state_from_row(row, snapshot)
+        primary = _primary_blocker_from_row(row, snapshot)
+        events.append({
+            "ts": row.get("created_ts"),
+            "surface": row.get("source_surface"),
+            "action": row.get("recommended_action"),
+            "priority": row.get("priority"),
+            "decision_state": state,
+            "primary_blocker_key": (primary or {}).get("key"),
+            "primary_blocker_label": (primary or {}).get("label"),
+            "outcome_label": row.get("outcome_label"),
+            "max_return_pct": _nullable_float(row.get("max_return_pct")),
+            "reason": str(row.get("reason") or "")[:160],
+        })
+    events.sort(key=lambda x: str(x.get("ts") or ""))
+    return {
+        "status": "READY" if events else "NO_EVENTS",
+        "anchor": {
+            "symbol": anchor.get("symbol"),
+            "mint": anchor.get("mint"),
+            "classification": anchor.get("classification"),
+            "max_return_pct": anchor.get("max_return_pct"),
+        },
+        "events": events[-limit:],
+    }
+
+
+def _build_data_quality_watchdog(intelligence_rows: list[dict]) -> dict:
+    rows = list(intelligence_rows or [])
+    freshness_counts: dict[str, int] = {}
+    confidence_counts: dict[str, int] = {}
+    source_counts: dict[str, int] = {}
+    for row in rows:
+        freshness_counts[str(row.get("data_freshness") or "UNKNOWN").upper()] = freshness_counts.get(str(row.get("data_freshness") or "UNKNOWN").upper(), 0) + 1
+        confidence_counts[str(row.get("data_confidence") or "UNKNOWN").upper()] = confidence_counts.get(str(row.get("data_confidence") or "UNKNOWN").upper(), 0) + 1
+        source_counts[str(row.get("market_source") or "UNKNOWN").upper()] = source_counts.get(str(row.get("market_source") or "UNKNOWN").upper(), 0) + 1
+    live_recent = int(freshness_counts.get("LIVE", 0)) + int(freshness_counts.get("RECENT", 0))
+    stale = int(freshness_counts.get("STALE", 0))
+    low_conf = int(confidence_counts.get("LOW", 0))
+    stale_quality = [
+        {
+            "symbol": row.get("symbol"),
+            "market_source": row.get("market_source"),
+            "data_freshness": row.get("data_freshness"),
+            "data_confidence": row.get("data_confidence"),
+            "quality_score": row.get("quality_score"),
+            "pressure_score": row.get("pressure_score"),
+            "volume_24h_usd": row.get("volume_24h_usd"),
+            "liquidity": row.get("liquidity"),
+        }
+        for row in rows
+        if str(row.get("data_freshness") or "").upper() == "STALE"
+        and _gb_float(row.get("quality_score")) >= 75
+    ][:8]
+    status = "OK"
+    if low_conf > max(8, len(rows) * 0.15) or stale > live_recent:
+        status = "DEGRADED"
+    if stale_quality:
+        status = "PATCH_QUEUE"
+    return {
+        "status": status,
+        "summary": {
+            "rows": len(rows),
+            "live_recent_rows": live_recent,
+            "stale_rows": stale,
+            "low_confidence_rows": low_conf,
+            "sources": source_counts,
+        },
+        "stale_high_quality": stale_quality,
+        "action": (
+            "Refresh stale high-quality intelligence before trusting buy decisions."
+            if stale_quality
+            else "Provider coverage is usable for the daily build loop."
+        ),
+    }
+
+
+def _build_daily_build_hooks(autopsy: dict, simulator: dict, watchdog: dict, lock_ok: bool) -> dict:
+    top_rule = (autopsy or {}).get("top_rule_to_review") or {}
+    top_sim = (simulator or {}).get("top_candidate") or {}
+    if not lock_ok:
+        status = "LOCK_FIRST"
+        next_patch = "Verify execution lock before any signal patch."
+    elif str((watchdog or {}).get("status") or "").upper() in {"PATCH_QUEUE", "DEGRADED"}:
+        status = "DATA_FIRST"
+        next_patch = str((watchdog or {}).get("action") or "Patch data quality before rule changes.")
+    elif top_rule:
+        status = "RULE_REVIEW"
+        next_patch = f"Review {top_rule.get('label') or top_rule.get('key')} with {top_rule.get('recommendation') or 'simulation'}."
+    elif top_sim:
+        status = "SIMULATE"
+        next_patch = f"Replay {top_sim.get('label') or top_sim.get('key')} before coding another threshold."
+    else:
+        status = "OBSERVE"
+        next_patch = "Keep collecting outcomes; no urgent daily patch."
+    return {
+        "status": status,
+        "next_patch": next_patch,
+        "safe_to_rearm_discussion": bool(lock_ok and status == "OBSERVE"),
+        "automation_hooks": [
+            "24h guarded soak audit",
+            "daily crypto brief",
+            "outcome autopsy",
+            "rule impact simulator",
+            "data quality watchdog",
+        ],
+    }
+
+
 def _build_daily_crypto_brief(lookback_hours: int = 24) -> dict:
     """One read-only surface for the daily build loop."""
     lookback_hours = max(1, min(72, int(lookback_hours or 24)))
@@ -14000,9 +14482,10 @@ def _build_daily_crypto_brief(lookback_hours: int = 24) -> dict:
             journal_rows = [
                 dict(r) for r in conn.execute(
                     """
-                    SELECT created_ts, source_surface, symbol, mint, recommended_action,
-                           priority, reason, resolution_status, outcome_label,
-                           outcome_1h_pct, outcome_4h_pct, outcome_24h_pct, max_return_pct
+                        SELECT created_ts, source_surface, symbol, mint, recommended_action,
+                               priority, reason, blockers_json, snapshot_json, resolution_status,
+                               outcome_label, outcome_1h_pct, outcome_4h_pct, outcome_24h_pct,
+                               max_return_pct, max_drawdown_pct
                     FROM decision_journal
                     ORDER BY id DESC
                     LIMIT 1800
@@ -14138,6 +14621,11 @@ def _build_daily_crypto_brief(lookback_hours: int = 24) -> dict:
     stale_rows = int(freshness_counts.get("STALE", 0))
     lock_ok = executed_count == 0 and all(str(row.get("mode") or "").upper() == "OBSERVE" for row in intents_24h) and open_trade_count == 0
     data_ok = (live_rows + recent_rows) >= stale_rows and not stale_high_quality
+    outcome_autopsy = _build_outcome_autopsy_from_rows(journal_24h, lookback_hours)
+    rule_simulator = _simulate_daily_rule_impacts(journal_24h, outcome_autopsy)
+    candidate_replay_timeline = _build_candidate_replay_timeline(journal_rows, outcome_autopsy)
+    data_watchdog = _build_data_quality_watchdog(intelligence_rows)
+    daily_build_hooks = _build_daily_build_hooks(outcome_autopsy, rule_simulator, data_watchdog, lock_ok)
     missed_count = len(missed)
     weak_count = len(weak_buys)
     if lock_ok and data_ok and missed_count <= 3:
@@ -14155,6 +14643,8 @@ def _build_daily_crypto_brief(lookback_hours: int = 24) -> dict:
         next_actions.append("Review execution lock before changing signal rules.")
     if stale_high_quality:
         next_actions.append("Refresh stale high-quality token intelligence rows first.")
+    if daily_build_hooks.get("next_patch"):
+        next_actions.append(str(daily_build_hooks.get("next_patch")))
     if missed_count:
         next_actions.append("Review missed-runner blockers and scout-only timing.")
     if weak_count:
@@ -14203,6 +14693,11 @@ def _build_daily_crypto_brief(lookback_hours: int = 24) -> dict:
         "top_missed_runners": missed[:8],
         "weak_buy_calls": weak_buys[:8],
         "top_paper_movers": paper_movers[:10],
+        "outcome_autopsy": outcome_autopsy,
+        "rule_simulator": rule_simulator,
+        "candidate_replay_timeline": candidate_replay_timeline,
+        "data_watchdog": data_watchdog,
+        "daily_build_hooks": daily_build_hooks,
         "next_actions": next_actions[:5],
     }
 

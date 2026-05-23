@@ -101,6 +101,29 @@ interface DailyBriefTokenItem {
   return_24h_pct?: number | null
 }
 
+interface DailyBriefAutopsyExample {
+  symbol?: string | null
+  mint?: string | null
+  surface?: string | null
+  decision_state?: string | null
+  recommended_action?: string | null
+  priority?: string | null
+  outcome_label?: string | null
+  classification?: string | null
+  max_return_pct?: number | null
+  direction?: string | null
+  confidence?: string | null
+  what_happened?: string | null
+  why_it_matters?: string | null
+  rule_review?: string | null
+  primary_blocker?: {
+    key?: string | null
+    label?: string | null
+    category?: string | null
+    severity?: string | null
+  } | null
+}
+
 interface DailyCryptoBriefData {
   generated_at: string
   lookback_hours: number
@@ -148,6 +171,83 @@ interface DailyCryptoBriefData {
   top_missed_runners: DailyBriefTokenItem[]
   weak_buy_calls: DailyBriefTokenItem[]
   top_paper_movers: DailyBriefTokenItem[]
+  outcome_autopsy?: {
+    status?: string
+    headline?: string
+    summary?: {
+      resolved_count?: number
+      missed_runner_count?: number
+      weak_buy_count?: number
+      protected_count?: number
+      good_buy_confirmed_count?: number
+      pending_count?: number
+    }
+    top_rule_to_review?: {
+      key?: string | null
+      label?: string | null
+      category?: string | null
+      sample_n?: number
+      missed_runner_n?: number
+      protected_n?: number
+      weak_buy_n?: number
+      avg_missed_return_pct?: number | null
+      recommendation?: string | null
+    } | null
+    examples?: DailyBriefAutopsyExample[]
+  }
+  rule_simulator?: {
+    status?: string
+    summary?: {
+      resolved_rows?: number
+      tighten_rules_tested?: number
+      loosen_candidates?: number
+    }
+    top_candidate?: {
+      key?: string | null
+      label?: string | null
+      direction?: string | null
+      net_score?: number | null
+      would_block_weak_buy_n?: number
+      would_block_good_buy_n?: number
+      missed_runner_n?: number
+      protected_n?: number
+      avg_missed_return_pct?: number | null
+    } | null
+  }
+  candidate_replay_timeline?: {
+    status?: string
+    anchor?: {
+      symbol?: string | null
+      classification?: string | null
+      max_return_pct?: number | null
+    } | null
+    events?: Array<{
+      ts?: string | null
+      surface?: string | null
+      action?: string | null
+      priority?: string | null
+      decision_state?: string | null
+      primary_blocker_label?: string | null
+      outcome_label?: string | null
+      max_return_pct?: number | null
+    }>
+  }
+  data_watchdog?: {
+    status?: string
+    summary?: {
+      rows?: number
+      live_recent_rows?: number
+      stale_rows?: number
+      low_confidence_rows?: number
+    }
+    action?: string | null
+  }
+  daily_build_hooks?: {
+    status?: string
+    next_patch?: string | null
+    safe_to_rearm_discussion?: boolean
+    automation_hooks?: string[]
+  }
   next_actions: string[]
 }
 
@@ -4206,12 +4306,22 @@ function DailyCryptoBriefPanel({ data, loading }: { data?: DailyCryptoBriefData;
     status_counts: {},
     outcome_counts: {},
   }
-  const missedRunners = data.top_missed_runners ?? []
-  const weakBuyCalls = data.weak_buy_calls ?? []
-  const paperMovers = data.top_paper_movers ?? []
-  const nextActions = data.next_actions ?? []
-  const countText = (counts: Record<string, number>, keys: string[]) =>
-    keys.map(key => `${key.toLowerCase()} ${counts[key] ?? 0}`).join(' · ')
+    const missedRunners = data.top_missed_runners ?? []
+    const weakBuyCalls = data.weak_buy_calls ?? []
+    const paperMovers = data.top_paper_movers ?? []
+    const nextActions = data.next_actions ?? []
+    const autopsy = data.outcome_autopsy ?? {}
+    const autopsySummary = autopsy.summary ?? {}
+    const topRule = autopsy.top_rule_to_review ?? null
+    const autopsyExamples = autopsy.examples ?? []
+    const simulator = data.rule_simulator ?? {}
+    const simTop = simulator.top_candidate ?? null
+    const replay = data.candidate_replay_timeline ?? {}
+    const replayEvents = replay.events ?? []
+    const watchdog = data.data_watchdog ?? {}
+    const buildHooks = data.daily_build_hooks ?? {}
+    const countText = (counts: Record<string, number>, keys: string[]) =>
+      keys.map(key => `${key.toLowerCase()} ${counts[key] ?? 0}`).join(' · ')
   const Metric = ({ label, value, valueTone = '#d7e1ea' }: { label: string; value: string; valueTone?: string }) => (
     <div style={{
       border: '1px solid rgba(255,255,255,0.08)',
@@ -4228,7 +4338,7 @@ function DailyCryptoBriefPanel({ data, loading }: { data?: DailyCryptoBriefData;
       <span style={{ ...MONO, fontSize: 13, color: valueTone, fontWeight: 900 }}>{value}</span>
     </div>
   )
-  const TokenLine = ({ item, tone }: { item: DailyBriefTokenItem; tone: string }) => (
+    const TokenLine = ({ item, tone }: { item: DailyBriefTokenItem; tone: string }) => (
     <div style={{
       display: 'grid',
       gridTemplateColumns: '86px 76px 1fr',
@@ -4248,7 +4358,36 @@ function DailyCryptoBriefPanel({ data, loading }: { data?: DailyCryptoBriefData;
         {item.reason ? ` · ${item.reason}` : ''}
       </span>
     </div>
-  )
+    )
+    const AutopsyLine = ({ item }: { item: DailyBriefAutopsyExample }) => {
+      const classification = (item.classification || 'TRACKING').replace(/_/g, ' ').toLowerCase()
+      const direction = (item.direction || 'WAIT').replace(/_/g, ' ').toLowerCase()
+      const tone =
+        item.classification === 'MISSED_RUNNER' ? '#f59e0b'
+        : item.classification === 'WEAK_BUY' ? '#ef4444'
+        : item.classification === 'PROTECTED' ? '#00d48a'
+        : '#60a5fa'
+      return (
+        <div style={{
+          display: 'grid',
+          gridTemplateColumns: '86px 92px 1fr',
+          gap: 8,
+          alignItems: 'center',
+          padding: '7px 0',
+          borderTop: '1px solid rgba(255,255,255,0.055)',
+        }}>
+          <span style={{ ...MONO, fontSize: 10, color: '#f3f7fb', fontWeight: 900, overflow: 'hidden', textOverflow: 'ellipsis' }}>
+            {item.symbol || 'UNKNOWN'}
+          </span>
+          <span style={{ ...MONO, fontSize: 8, color: tone }}>
+            {classification}
+          </span>
+          <span style={{ ...MONO, fontSize: 8, color: '#8ca0b3', lineHeight: 1.45, overflow: 'hidden', textOverflow: 'ellipsis' }}>
+            {direction} · {item.primary_blocker?.label || item.outcome_label || 'collecting evidence'} · {fmtPct(item.max_return_pct)}
+          </span>
+        </div>
+      )
+    }
 
   return (
     <div style={{
@@ -4288,16 +4427,90 @@ function DailyCryptoBriefPanel({ data, loading }: { data?: DailyCryptoBriefData;
         </div>
       </div>
 
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 8 }}>
-        <Metric label="LOCK" value={safety.execution_lock} valueTone={safety.execution_lock === 'LOCKED' ? '#00d48a' : '#ef4444'} />
-        <Metric label="INTENTS" value={`${safety.execution_intents}/${safety.executed_intents} exec`} valueTone={safety.executed_intents ? '#ef4444' : '#60a5fa'} />
-        <Metric label="DATA" value={countText(freshness.freshness_counts, ['LIVE', 'RECENT', 'STALE'])} valueTone={(freshness.freshness_counts.STALE ?? 0) > (freshness.freshness_counts.LIVE ?? 0) + (freshness.freshness_counts.RECENT ?? 0) ? '#f59e0b' : '#00d48a'} />
-        <Metric label="DECISIONS" value={`${decision.journal_count} · ${fmtPct(decision.avg_max_return_pct)}`} />
-        <Metric label="MISSED/WEAK" value={`${decision.missed_runner_count}/${decision.weak_buy_count}`} valueTone={decision.missed_runner_count || decision.weak_buy_count ? '#f59e0b' : '#00d48a'} />
-        <Metric label="PAPER" value={`${paper.opened_count} · max ${fmtPct(paper.avg_max_return_pct)}`} valueTone="#a78bfa" />
-      </div>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 8 }}>
+          <Metric label="LOCK" value={safety.execution_lock} valueTone={safety.execution_lock === 'LOCKED' ? '#00d48a' : '#ef4444'} />
+          <Metric label="INTENTS" value={`${safety.execution_intents}/${safety.executed_intents} exec`} valueTone={safety.executed_intents ? '#ef4444' : '#60a5fa'} />
+          <Metric label="DATA" value={countText(freshness.freshness_counts, ['LIVE', 'RECENT', 'STALE'])} valueTone={(freshness.freshness_counts.STALE ?? 0) > (freshness.freshness_counts.LIVE ?? 0) + (freshness.freshness_counts.RECENT ?? 0) ? '#f59e0b' : '#00d48a'} />
+          <Metric label="DECISIONS" value={`${decision.journal_count} · ${fmtPct(decision.avg_max_return_pct)}`} />
+          <Metric label="MISSED/WEAK" value={`${decision.missed_runner_count}/${decision.weak_buy_count}`} valueTone={decision.missed_runner_count || decision.weak_buy_count ? '#f59e0b' : '#00d48a'} />
+          <Metric label="PAPER" value={`${paper.opened_count} · max ${fmtPct(paper.avg_max_return_pct)}`} valueTone="#a78bfa" />
+        </div>
 
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 14 }}>
+        <div style={{
+          display: 'grid',
+          gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
+          gap: 10,
+        }}>
+          <div style={{ border: '1px solid rgba(245,158,11,0.22)', borderRadius: 10, padding: 10, background: 'rgba(245,158,11,0.035)' }}>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+              <span style={{ ...MONO, fontSize: 8, color: '#f59e0b', fontWeight: 900, letterSpacing: '0.14em' }}>
+                OUTCOME AUTOPSY
+              </span>
+              <span style={{ ...MONO, fontSize: 8, color: '#8ca0b3' }}>
+                resolved {autopsySummary.resolved_count ?? 0} · missed {autopsySummary.missed_runner_count ?? 0} · weak {autopsySummary.weak_buy_count ?? 0}
+              </span>
+            </div>
+            <div style={{ ...MONO, fontSize: 10, color: '#d7e1ea', marginTop: 7, lineHeight: 1.45 }}>
+              {topRule?.label || autopsy.headline || 'Waiting for resolved outcomes'}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              {(topRule?.recommendation || buildHooks.next_patch || 'Keep collecting outcome evidence.').replace(/_/g, ' ').toLowerCase()}
+            </div>
+          </div>
+
+          <div style={{ border: '1px solid rgba(96,165,250,0.18)', borderRadius: 10, padding: 10, background: 'rgba(96,165,250,0.035)' }}>
+            <span style={{ ...MONO, fontSize: 8, color: '#60a5fa', fontWeight: 900, letterSpacing: '0.14em' }}>
+              RULE SIM
+            </span>
+            <div style={{ ...MONO, fontSize: 10, color: '#d7e1ea', marginTop: 7, lineHeight: 1.45 }}>
+              {simTop?.label || 'No rule candidate yet'}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              net {simTop?.net_score ?? 0} · weak blocked {simTop?.would_block_weak_buy_n ?? 0} · good blocked {simTop?.would_block_good_buy_n ?? 0}
+            </div>
+          </div>
+
+          <div style={{ border: '1px solid rgba(0,212,138,0.18)', borderRadius: 10, padding: 10, background: 'rgba(0,212,138,0.03)' }}>
+            <span style={{ ...MONO, fontSize: 8, color: '#00d48a', fontWeight: 900, letterSpacing: '0.14em' }}>
+              BUILD HOOKS
+            </span>
+            <div style={{ ...MONO, fontSize: 10, color: '#d7e1ea', marginTop: 7, lineHeight: 1.45 }}>
+              {buildHooks.status || watchdog.status || 'OBSERVE'}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              data {watchdog.summary?.live_recent_rows ?? 0}/{watchdog.summary?.stale_rows ?? 0} stale · rearm {buildHooks.safe_to_rearm_discussion ? 'separate discussion allowed' : 'locked'}
+            </div>
+          </div>
+        </div>
+
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 14 }}>
+          <div>
+            <span style={{ ...MONO, fontSize: 8, color: '#f59e0b', fontWeight: 900, letterSpacing: '0.14em' }}>
+              AUTOPSY EXAMPLES
+            </span>
+            {autopsyExamples.slice(0, 3).map((item, i) => (
+              <AutopsyLine key={`autopsy-${item.symbol}-${i}`} item={item} />
+            ))}
+            {autopsyExamples.length === 0 && (
+              <div style={{ ...MONO, fontSize: 8, color: '#7f95a8', paddingTop: 8 }}>waiting for resolved outcomes</div>
+            )}
+          </div>
+          <div>
+            <span style={{ ...MONO, fontSize: 8, color: '#60a5fa', fontWeight: 900, letterSpacing: '0.14em' }}>
+              REPLAY TIMELINE
+            </span>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', paddingTop: 7, lineHeight: 1.5 }}>
+              {(replay.anchor?.symbol || 'candidate')} · {(replay.anchor?.classification || replay.status || 'tracking').replace(/_/g, ' ').toLowerCase()} · {replayEvents.length} events
+            </div>
+            {replayEvents.slice(-3).map((event, i) => (
+              <div key={`replay-${event.ts}-${i}`} style={{ ...MONO, fontSize: 8, color: '#8ca0b3', paddingTop: 6, borderTop: i ? '1px solid rgba(255,255,255,0.045)' : 'none' }}>
+                {(event.decision_state || event.priority || 'state').replace(/_/g, ' ').toLowerCase()} · {event.primary_blocker_label || event.outcome_label || fmtPct(event.max_return_pct)}
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 14 }}>
         <div>
           <span style={{ ...MONO, fontSize: 8, color: '#f59e0b', fontWeight: 900, letterSpacing: '0.14em' }}>
             MISSED RUNNERS
