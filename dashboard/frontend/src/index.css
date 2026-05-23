@@ -1,22 +1,19 @@
-/* ═══════════════════════════════════════════════════════════════
-   ABRONS ENGINE — Liquid Glass Ultra Theme
-   Deep space canvas · true see-through glass · refracted light
-   ═══════════════════════════════════════════════════════════════ */
+/* ABRONS ENGINE - operator dashboard theme */
 
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
 
 :root {
   /* ── Canvas ── */
-  --bg:       #04060a;
+  --bg:       #05070b;
 
   /* ── Separator — barely-there chrome dividers ── */
   --sep: rgba(255, 255, 255, 0.09);
 
   /* ── Glass surfaces — truly transparent so background bleeds through ── */
-  --surface:     rgba(255, 255, 255, 0.04);
-  --surface2:    rgba(255, 255, 255, 0.07);
-  --surface3:    rgba(255, 255, 255, 0.02);
-  --surface-solid: #080c12;
+  --surface:     rgba(12, 18, 27, 0.74);
+  --surface2:    rgba(17, 25, 38, 0.82);
+  --surface3:    rgba(8, 13, 21, 0.70);
+  --surface-solid: #080d15;
 
   /* ── Glass borders — luminous hairlines ── */
   --border:      rgba(255, 255, 255, 0.08);
@@ -28,6 +25,8 @@
   --text2:   #b4c6de;
   --muted:   #8aaccb;
   --dim:     #5d84a8;
+  --chrome:  #6f8498;
+  --recessed:#44566a;
 
   /* ── Semantic colors ── */
   --green:        #00d48a;
@@ -45,9 +44,9 @@
   --purple:       #a78bfa;
 
   /* ── Blur strength ── */
-  --blur:    blur(28px) saturate(180%) brightness(1.05);
-  --blur-sm: blur(14px) saturate(160%);
-  --blur-xs: blur(6px)  saturate(130%);
+  --blur:    blur(18px) saturate(145%);
+  --blur-sm: blur(10px) saturate(135%);
+  --blur-xs: blur(4px)  saturate(120%);
 
   /* ── Typography ── */
   font-family: 'Inter', system-ui, sans-serif;
@@ -77,10 +76,10 @@ html, body, #root {
    through every glass panel
 ══════════════════════════════════════════════════════ */
 body {
-  background: #04060a;
+  background: #05070b;
+  overflow-x: hidden;
 }
 
-/* Primary nebula layer */
 body::before {
   content: '';
   position: fixed;
@@ -88,37 +87,19 @@ body::before {
   pointer-events: none;
   z-index: 0;
   background:
-    radial-gradient(ellipse 70% 55% at 8%  5%,  rgba(0, 212, 138, 0.13) 0%, transparent 65%),
-    radial-gradient(ellipse 55% 45% at 92% 10%, rgba(96, 165, 250, 0.11) 0%, transparent 60%),
-    radial-gradient(ellipse 50% 40% at 15% 58%, rgba(167, 139, 250, 0.08) 0%, transparent 60%),
-    radial-gradient(ellipse 65% 50% at 85% 90%, rgba(0, 212, 138, 0.10) 0%, transparent 65%),
-    radial-gradient(ellipse 45% 35% at 5%  95%, rgba(96, 165, 250, 0.07) 0%, transparent 60%),
-    radial-gradient(ellipse 40% 30% at 60% 40%, rgba(167, 139, 250, 0.05) 0%, transparent 55%),
-    linear-gradient(160deg, #04060e 0%, #05080f 40%, #040710 70%, #030508 100%);
+    linear-gradient(rgba(255,255,255,0.022) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,255,255,0.018) 1px, transparent 1px),
+    linear-gradient(180deg, #060912 0%, #05070b 50%, #030508 100%);
+  background-size: 32px 32px, 32px 32px, auto;
 }
 
-/* Star field */
 body::after {
   content: '';
   position: fixed;
   inset: 0;
   pointer-events: none;
   z-index: 0;
-  background-image:
-    radial-gradient(1px 1px at 15% 20%, rgba(255,255,255,0.30) 0%, transparent 100%),
-    radial-gradient(1px 1px at 72% 8%,  rgba(255,255,255,0.22) 0%, transparent 100%),
-    radial-gradient(1px 1px at 33% 65%, rgba(255,255,255,0.25) 0%, transparent 100%),
-    radial-gradient(1px 1px at 88% 45%, rgba(255,255,255,0.18) 0%, transparent 100%),
-    radial-gradient(1px 1px at 55% 80%, rgba(255,255,255,0.28) 0%, transparent 100%),
-    radial-gradient(1px 1px at 8%  88%, rgba(255,255,255,0.20) 0%, transparent 100%),
-    radial-gradient(1px 1px at 94% 72%, rgba(255,255,255,0.22) 0%, transparent 100%),
-    radial-gradient(1px 1px at 42% 30%, rgba(255,255,255,0.17) 0%, transparent 100%),
-    radial-gradient(1.5px 1.5px at 27% 52%, rgba(255,255,255,0.15) 0%, transparent 100%),
-    radial-gradient(1px 1px at 63% 15%, rgba(255,255,255,0.24) 0%, transparent 100%),
-    radial-gradient(1px 1px at 78% 60%, rgba(255,255,255,0.16) 0%, transparent 100%),
-    radial-gradient(1px 1px at 50% 42%, rgba(255,255,255,0.12) 0%, transparent 100%),
-    radial-gradient(1px 1px at 20% 75%, rgba(255,255,255,0.19) 0%, transparent 100%),
-    radial-gradient(1px 1px at 35% 10%, rgba(255,255,255,0.21) 0%, transparent 100%);
+  background: linear-gradient(180deg, rgba(96,165,250,0.035), transparent 28%);
 }
 
 #root { position: relative; z-index: 1; }
@@ -159,11 +140,11 @@ a:hover { color: var(--text); }
 
 /* glass-card: same as .card but lighter — used in ConfluencePage, SpotPage */
 .glass-card {
-  background: rgba(255, 255, 255, 0.028);
-  backdrop-filter: blur(24px) saturate(170%) brightness(1.05);
-  -webkit-backdrop-filter: blur(24px) saturate(170%) brightness(1.05);
+  background: var(--surface);
+  backdrop-filter: var(--blur);
+  -webkit-backdrop-filter: var(--blur);
   border: 1px solid rgba(255, 255, 255, 0.07);
-  border-radius: 12px;
+  border-radius: 8px;
   position: relative;
   overflow: hidden;
 }
@@ -175,11 +156,11 @@ a:hover { color: var(--text); }
 .grid-auto-4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; }
 
 .card {
-  background: rgba(255, 255, 255, 0.038);
-  backdrop-filter: blur(32px) saturate(190%) brightness(1.07);
-  -webkit-backdrop-filter: blur(32px) saturate(190%) brightness(1.07);
+  background: var(--surface);
+  backdrop-filter: var(--blur);
+  -webkit-backdrop-filter: var(--blur);
   border: 1px solid rgba(255, 255, 255, 0.085);
-  border-radius: 14px;
+  border-radius: 8px;
   padding: 16px 18px;
   position: relative;
   overflow: hidden;
@@ -188,7 +169,7 @@ a:hover { color: var(--text); }
     inset 0 1px 0 rgba(255, 255, 255, 0.11),
     inset 1px 0 0 rgba(255, 255, 255, 0.04),
     0 2px 4px  rgba(0, 0, 0, 0.30),
-    0 8px 32px rgba(0, 0, 0, 0.22),
+    0 8px 24px rgba(0, 0, 0, 0.22),
     0 0 0 0.5px rgba(255, 255, 255, 0.04);
 }
 
@@ -198,26 +179,12 @@ a:hover { color: var(--text); }
   position: absolute;
   top: 0; left: 0; right: 0;
   height: 1px;
-  background: linear-gradient(90deg,
-    transparent 0%,
-    rgba(255, 255, 255, 0.08) 15%,
-    rgba(255, 255, 255, 0.22) 50%,
-    rgba(255, 255, 255, 0.08) 85%,
-    transparent 100%
-  );
+  background: rgba(255, 255, 255, 0.10);
   pointer-events: none;
 }
 
 /* Bottom inner depth shadow */
-.card::after {
-  content: '';
-  position: absolute;
-  bottom: 0; left: 0; right: 0;
-  height: 45%;
-  background: linear-gradient(to top, rgba(0,0,0,0.07) 0%, transparent 100%);
-  pointer-events: none;
-  border-radius: 0 0 14px 14px;
-}
+.card::after { content: none; }
 
 /* ─────────────────────────────────────────────────
    BADGE
@@ -282,11 +249,11 @@ a:hover { color: var(--text); }
    STAT TILE — KPI cell
 ───────────────────────────────────────────────── */
 .stat-tile {
-  background: rgba(255, 255, 255, 0.038);
-  backdrop-filter: blur(28px) saturate(175%);
-  -webkit-backdrop-filter: blur(28px) saturate(175%);
+  background: var(--surface3);
+  backdrop-filter: var(--blur-sm);
+  -webkit-backdrop-filter: var(--blur-sm);
   border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 10px;
+  border-radius: 8px;
   padding: 12px 14px;
   display: flex;
   flex-direction: column;
@@ -465,11 +432,11 @@ a:hover { color: var(--text); }
    HERO CARD — full-bleed surface for stat strips
 ───────────────────────────────────────────────── */
 .hero-card {
-  background: rgba(255, 255, 255, 0.032);
-  backdrop-filter: blur(32px) saturate(200%) brightness(1.06);
-  -webkit-backdrop-filter: blur(32px) saturate(200%) brightness(1.06);
+  background: var(--surface);
+  backdrop-filter: var(--blur);
+  -webkit-backdrop-filter: var(--blur);
   border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 14px;
+  border-radius: 8px;
   overflow: hidden;
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.11),
@@ -628,18 +595,18 @@ a:hover { color: var(--text); }
 }
 
 .top-bar {
-  height: 44px;
+  min-height: 48px;
   padding: 0 18px;
   display: flex;
   align-items: center;
   gap: 14px;
   flex-shrink: 0;
-  background: rgba(4,6,12,0.7);
-  backdrop-filter: blur(24px) saturate(180%);
-  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  background: rgba(5, 8, 13, 0.88);
+  backdrop-filter: var(--blur);
+  -webkit-backdrop-filter: var(--blur);
   border-bottom: 1px solid rgba(255,255,255,0.065);
   position: relative;
-  overflow: hidden;
+  overflow: visible;
 }
 
 /* ─────────────────────────────────────────────────
@@ -675,6 +642,203 @@ a:hover { color: var(--text); }
 .nav-tab.active {
   color: var(--green);
   border-bottom-color: var(--green);
+}
+
+/* ─────────────────────────────────────────────────
+   APP SHELL CLEANUP
+───────────────────────────────────────────────── */
+.terminal-shell {
+  background: transparent;
+}
+
+.terminal-top-bar {
+  gap: 18px !important;
+}
+
+.terminal-status-strip,
+.terminal-nav-strip {
+  min-width: 0;
+}
+
+.terminal-status-strip {
+  flex: 1 1 auto;
+  overflow: hidden;
+}
+
+.terminal-nav-strip {
+  flex: 0 0 auto;
+}
+
+.brand-lockup {
+  flex: 0 0 auto;
+}
+
+.mode-pill-row {
+  flex-wrap: wrap;
+}
+
+.mode-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 24px;
+  background: color-mix(in srgb, var(--mode-color) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--mode-color) 30%, transparent);
+  border-radius: 5px;
+  padding: 2px 8px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+  color: var(--chrome);
+  white-space: nowrap;
+}
+
+.ui-health-pill {
+  flex: 0 0 auto;
+  font-size: 9px;
+  letter-spacing: 0.06em;
+  white-space: nowrap;
+}
+
+.header-icon-status {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: 1px solid rgba(255,255,255,0.06);
+  border-radius: 6px;
+  background: rgba(255,255,255,0.025);
+}
+
+.icon-text-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  background: rgba(255,255,255,0.025);
+  border: 1px solid var(--sep);
+  border-radius: 6px;
+  color: var(--dim);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 10px;
+  padding: 4px 9px;
+  white-space: nowrap;
+}
+
+.icon-text-button:hover {
+  color: var(--text2);
+  border-color: rgba(96,165,250,0.24);
+  background: rgba(96,165,250,0.055);
+}
+
+/* ─────────────────────────────────────────────────
+   HOME OPERATOR SURFACES
+───────────────────────────────────────────────── */
+.home-page {
+  width: min(100%, 1440px);
+}
+
+.operator-command-hero {
+  isolation: isolate;
+}
+
+.operator-command-hero::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background:
+    linear-gradient(90deg, rgba(255,255,255,0.04), transparent 28%),
+    linear-gradient(180deg, rgba(255,255,255,0.035), transparent 38%);
+  z-index: -1;
+}
+
+.operator-stat-tile {
+  border-radius: 8px !important;
+  background: rgba(8, 13, 21, 0.68) !important;
+}
+
+.operator-hero-grid {
+  align-items: start;
+}
+
+.operator-setup-grid,
+.home-command-grid {
+  min-width: 0;
+}
+
+.home-command-grid > *,
+.operator-hero-grid > *,
+.operator-setup-grid > * {
+  min-width: 0;
+}
+
+@media (max-width: 1180px) {
+  .terminal-top-bar {
+    align-items: stretch !important;
+    flex-direction: column;
+    padding: 8px 14px !important;
+  }
+
+  .terminal-status-strip,
+  .terminal-nav-strip {
+    width: 100%;
+  }
+
+  .terminal-status-strip {
+    overflow-x: auto;
+    padding-bottom: 2px;
+  }
+
+  .terminal-nav-strip {
+    justify-content: space-between;
+  }
+
+  .top-sep {
+    display: none !important;
+  }
+}
+
+@media (max-width: 980px) {
+  .operator-hero-grid,
+  .operator-setup-grid,
+  .home-command-grid {
+    grid-template-columns: 1fr !important;
+  }
+
+  .operator-stats-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+  }
+}
+
+@media (max-width: 680px) {
+  .home-page {
+    padding: 14px 12px 28px !important;
+    gap: 14px !important;
+  }
+
+  .operator-command-hero {
+    border-radius: 10px !important;
+    padding: 14px !important;
+  }
+
+  .operator-stats-grid {
+    grid-template-columns: 1fr !important;
+  }
+
+  .nav-tabs-row {
+    flex: 1 1 auto;
+  }
+
+  .nav-tab {
+    font-size: 8px;
+    padding: 5px 7px;
+  }
+
+  .brand-lockup span:last-child {
+    font-size: 10px !important;
+  }
 }
 
 /* Keyboard accessibility — visible focus ring */

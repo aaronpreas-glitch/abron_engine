@@ -6384,7 +6384,7 @@ function OperatorCommandHero({
     : '#7f95a8'
 
   const Stat = ({ label, value, tone, note }: { label: string; value: string; tone?: string; note?: string }) => (
-    <div style={{
+    <div className="operator-stat-tile" style={{
       background: 'linear-gradient(180deg, rgba(255,255,255,0.045), rgba(255,255,255,0.018))',
       border: '1px solid rgba(255,255,255,0.07)',
       borderRadius: 10,
@@ -6398,7 +6398,7 @@ function OperatorCommandHero({
   )
 
   return (
-    <div style={{
+    <div className="operator-command-hero" style={{
       position: 'relative',
       overflow: 'hidden',
       border: `1px solid ${stateColor}30`,
@@ -6918,7 +6918,7 @@ export function HomePage() {
   )
 
   return (
-    <div style={{
+    <div className="home-page" style={{
       maxWidth: 1360, margin: '0 auto',
       padding: '20px 24px 40px',
       display: 'flex', flexDirection: 'column', gap: 18,

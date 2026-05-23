@@ -1,5 +1,7 @@
 import { useQuery } from '@tanstack/react-query'
+import { Bell, LogOut } from 'lucide-react'
 import { Suspense, lazy, useEffect, useRef, useState } from 'react'
+import type { CSSProperties } from 'react'
 import { api, getDashboardRequestMetrics } from './api'
 import { liveBudgetedInterval, slowBudgetedInterval } from './queryBudget'
 import type { JupiterPosition } from './sections/WalletSection'
@@ -60,13 +62,7 @@ function ModePill({ label, mode }: { label: string; mode: string }) {
   const isLive = mode === 'LIVE'
   const color = isLive ? '#00d48a' : mode === 'SIM' ? '#f59e0b' : '#60a5fa'
   return (
-    <span style={{
-      display: 'inline-flex', alignItems: 'center', gap: 4,
-      background: `${color}10`, border: `1px solid ${color}30`,
-      borderRadius: 3, padding: '2px 8px',
-      fontFamily: 'JetBrains Mono, monospace', fontSize: 9,
-      color: 'var(--chrome)',
-    }}>
+    <span className="mode-pill" style={{ '--mode-color': color } as CSSProperties}>
       <span style={{ color: 'var(--chrome)' }}>{label}</span>
       <span style={{ color, fontWeight: 700 }}>:{mode}</span>
     </span>
@@ -245,7 +241,7 @@ export function Terminal({ onLogout }: Props) {
   // ── Layout ────────────────────────────────────────────────────────────────
 
   return (
-    <div style={{
+    <div className="terminal-shell" style={{
       minHeight: '100vh',
       color: '#e2e8f0',
       fontFamily: 'JetBrains Mono, monospace',
@@ -253,14 +249,14 @@ export function Terminal({ onLogout }: Props) {
     }}>
 
       {/* ── Header ── */}
-      <div className="top-bar" style={{
+      <div className="top-bar terminal-top-bar" style={{
         display: 'flex', alignItems: 'center', justifyContent: 'space-between',
         padding: '0 20px', position: 'sticky', top: 0, zIndex: 10,
       }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
+        <div className="terminal-status-strip" style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
 
           {/* Engine name + status dot */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <div className="brand-lockup" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <span style={{
               width: 7, height: 7, borderRadius: '50%',
               background: engineOn && !isDryRun ? '#00d48a' : isDryRun ? '#f59e0b' : '#ef4444',
@@ -272,16 +268,16 @@ export function Terminal({ onLogout }: Props) {
             </span>
           </div>
 
-          <span style={{ color: 'var(--sep)' }}>|</span>
+          <span className="top-sep" style={{ color: 'var(--sep)' }}>|</span>
 
           {/* Mode pills */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+          <div className="mode-pill-row" style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
             <ModePill label="PERP" mode={modes?.perp ?? (isDryRun ? 'SIM' : 'LIVE')} />
             <ModePill label="MEME" mode={modes?.memecoins ?? 'PAPER'} />
             <ModePill label="SPOT" mode={modes?.spot ?? 'PAPER'} />
           </div>
 
-          <span style={{ color: 'var(--sep)' }}>|</span>
+          <span className="top-sep" style={{ color: 'var(--sep)' }}>|</span>
 
           {regime !== '—' && (
             <>
@@ -293,7 +289,7 @@ export function Terminal({ onLogout }: Props) {
               }}>
                 {regime.toUpperCase()}
               </span>
-              <span style={{ color: 'var(--sep)' }}>|</span>
+              <span className="top-sep" style={{ color: 'var(--sep)' }}>|</span>
             </>
           )}
 
@@ -304,7 +300,7 @@ export function Terminal({ onLogout }: Props) {
                 <span style={{ color: 'var(--chrome)' }}>SOL </span>
                 <span style={{ color: '#8a9ab0', fontWeight: 700 }}>{solBalance.toFixed(3)}</span>
               </span>
-              <span style={{ color: 'var(--sep)' }}>|</span>
+              <span className="top-sep" style={{ color: 'var(--sep)' }}>|</span>
             </>
           )}
 
@@ -318,7 +314,7 @@ export function Terminal({ onLogout }: Props) {
                 </span>
                 <span style={{ color: 'var(--recessed)', fontSize: 10 }}> · ${perpValueUsd.toFixed(0)}</span>
               </span>
-              <span style={{ color: 'var(--sep)' }}>|</span>
+              <span className="top-sep" style={{ color: 'var(--sep)' }}>|</span>
             </>
           )}
 
@@ -329,16 +325,17 @@ export function Terminal({ onLogout }: Props) {
             </span>
           )}
 
-          <span style={{ color: 'var(--sep)' }}>|</span>
+          <span className="top-sep" style={{ color: 'var(--sep)' }}>|</span>
           <span
             title={`Dashboard requests last 60s: ${requestMetrics.requests_60s}; slow: ${requestMetrics.slow_60s}; failed: ${requestMetrics.failed_60s}; inflight: ${requestMetrics.inflight}`}
-            style={{ fontSize: 9, color: dashboardTone, letterSpacing: '0.06em' }}
+            className="ui-health-pill"
+            style={{ color: dashboardTone }}
           >
             UI {requestMetrics.requests_60s}/m · {requestMetrics.avg_ms}ms
           </span>
         </div>
 
-        <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+        <div className="terminal-nav-strip" style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
 
           {/* ── Page tabs ── */}
           <div className="nav-tabs-row">
@@ -353,24 +350,22 @@ export function Terminal({ onLogout }: Props) {
             ))}
           </div>
 
-          <span style={{ color: 'var(--sep)' }}>|</span>
+          <span className="top-sep" style={{ color: 'var(--sep)' }}>|</span>
 
           {'Notification' in window && (
             <span
               title={`Notifications: ${Notification.permission}`}
-              style={{ fontSize: 10, color: Notification.permission === 'granted' ? '#00d48a' : '#2d4060', cursor: 'default' }}
+              className="header-icon-status"
+              style={{ color: Notification.permission === 'granted' ? '#00d48a' : '#2d4060' }}
             >
-              🔔
+              <Bell size={14} strokeWidth={2.2} />
             </span>
           )}
           <button
             onClick={onLogout}
-            style={{
-              background: 'none', border: '1px solid var(--sep)', borderRadius: 3,
-              color: 'var(--dim)', cursor: 'pointer', fontFamily: 'inherit',
-              fontSize: 10, padding: '3px 8px',
-            }}
+            className="icon-text-button"
           >
+            <LogOut size={13} strokeWidth={2.2} />
             LOGOUT
           </button>
         </div>

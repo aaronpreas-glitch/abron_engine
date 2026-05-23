@@ -403,6 +403,15 @@ export function v3ReinfColor(level: string): string {
   return '#4d6070'
 }
 
+export function v3ProfitRoomColor(label: string | null | undefined): string {
+  const room = String(label || '').toUpperCase()
+  if (room.includes('HIGH') || room.includes('EXPANSIVE') || room.includes('OPEN')) return '#00d48a'
+  if (room.includes('MEDIUM') || room.includes('ENOUGH') || room.includes('OK')) return '#60a5fa'
+  if (room.includes('LOW') || room.includes('TIGHT') || room.includes('LATE')) return '#f59e0b'
+  if (room.includes('NONE') || room.includes('BLOCK') || room.includes('EXHAUST')) return '#ef4444'
+  return '#4d6070'
+}
+
 export function v3PolicyLabel(posture: string): string {
   if (posture === 'PAPER_PROOF_ONLY') return 'paper proof only'
   if (posture === 'LIMITED_PROOF_DEPLOYMENT') return 'limited deployment'
