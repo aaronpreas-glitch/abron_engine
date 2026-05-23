@@ -15149,6 +15149,8 @@ def _build_rule_promotion_gate(
     unresolved_reviews = int((escalation_review_queue or {}).get("unresolved_count") or 0)
     review_frozen_failures = list((escalation_review_queue or {}).get("frozen_failure_classes") or [])
     review_frozen_lanes = list((escalation_review_queue or {}).get("frozen_lanes") or [])
+    active_frozen_failures = review_frozen_failures if escalation_review_queue is not None else frozen_failures
+    active_frozen_lanes = review_frozen_lanes if escalation_review_queue is not None else frozen_lanes
     if not top:
         status = "NO_RULE"
         reason = "No simulator candidate has enough outcome evidence."
@@ -15187,8 +15189,8 @@ def _build_rule_promotion_gate(
             "escalation_accuracy_pct": _nullable_float(escalation_accuracy_raw),
             "escalation_sample_n": escalation_sample,
             "escalation_review_unresolved_count": unresolved_reviews,
-            "frozen_failure_classes": sorted(set(frozen_failures + review_frozen_failures)),
-            "frozen_lanes": sorted(set(frozen_lanes + review_frozen_lanes)),
+            "frozen_failure_classes": sorted(set(active_frozen_failures)),
+            "frozen_lanes": sorted(set(active_frozen_lanes)),
         },
     }
 
