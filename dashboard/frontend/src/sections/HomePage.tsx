@@ -287,6 +287,48 @@ interface DailyTopMission {
     function?: string | null
   }
   workbench_pack?: ProviderEscalationExecutionPack | null
+  source_gap?: LiveOpportunityGap | null
+  evidence_requirements?: LiveContextEvidenceRequirements | null
+  outcome_loop?: LiveContextOutcomeLoop | null
+  next_action?: string | null
+}
+
+interface LiveOpportunityGap {
+  gap_key?: string
+  gap_type?: string
+  symbol?: string | null
+  mint?: string | null
+  source?: string | null
+  heat_score?: number | null
+  gap_score?: number | null
+  data_freshness?: string | null
+  data_confidence?: string | null
+  quality_score?: number | null
+  pressure_score?: number | null
+  seen_decision?: boolean
+  reason?: string | null
+}
+
+interface LiveContextEvidenceRequirements {
+  status?: string
+  mission_type?: string
+  requirements?: string[]
+  pass_count?: number
+  required_count?: number
+  next_action?: string | null
+}
+
+interface LiveContextOutcomeLoop {
+  status?: string
+  gap_key?: string | null
+  symbol?: string | null
+  mint?: string | null
+  coverage_gap_count?: number
+  decision_surface_count?: number
+  freshness?: string | null
+  confidence?: string | null
+  resolved?: boolean
+  surfaced?: boolean
   next_action?: string | null
 }
 
@@ -689,6 +731,36 @@ interface DailyCryptoBriefData {
     }
     next_action?: string | null
   }
+  live_market_narrative_intake?: {
+    status?: string
+    updated_at?: string | null
+    source_counts?: Record<string, number>
+    hot_symbols?: string[]
+    hot_mints?: string[]
+    items?: Array<{
+      source?: string | null
+      symbol?: string | null
+      mint?: string | null
+      name?: string | null
+      type?: string | null
+      rank?: number | null
+      boosts?: number | null
+      heat_score?: number | null
+      reason?: string | null
+    }>
+    next_action?: string | null
+  }
+  live_opportunity_gaps?: {
+    status?: string
+    gap_count?: number
+    by_type?: Record<string, number>
+    top_gap?: LiveOpportunityGap | null
+    items?: LiveOpportunityGap[]
+    next_action?: string | null
+  }
+  live_context_generated_mission?: DailyTopMission
+  live_context_evidence_requirements?: LiveContextEvidenceRequirements
+  live_context_outcome_loop?: LiveContextOutcomeLoop
   daily_build_score?: {
     score?: number | null
     focus?: string
@@ -4822,6 +4894,11 @@ function DailyCryptoBriefPanel({
     const ruleGate = data.rule_promotion_gate ?? {}
     const missedClusters = data.missed_runner_clusters ?? {}
     const catalystContext = data.catalyst_context ?? {}
+    const liveIntake = data.live_market_narrative_intake ?? {}
+    const liveGaps = data.live_opportunity_gaps ?? {}
+    const liveMission = data.live_context_generated_mission ?? {}
+    const liveEvidence = data.live_context_evidence_requirements ?? {}
+    const liveOutcomeLoop = data.live_context_outcome_loop ?? {}
     const buildScore = data.daily_build_score ?? {}
     const topMission = data.daily_top_mission ?? {}
     const pilotGate = data.paper_to_pilot_gate ?? {}
@@ -4860,6 +4937,9 @@ function DailyCryptoBriefPanel({
     const executionPackRecipeStep = executionPackRecipe[0]
     const topPostPatch = postPatchOutcomes.top
     const topRegression = regressionGuard.items?.[0]
+    const topLiveItem = liveIntake.items?.[0]
+    const topLiveGap = liveGaps.top_gap ?? liveGaps.items?.[0]
+    const topEvidenceRequirement = liveEvidence.requirements?.[0]
     const buildHooks = data.daily_build_hooks ?? {}
     const countText = (counts: Record<string, number>, keys: string[]) =>
       keys.map(key => `${key.toLowerCase()} ${counts[key] ?? 0}`).join(' · ')
@@ -5105,8 +5185,11 @@ function DailyCryptoBriefPanel({
               )}
             </>
           ) : (
-            <div style={{ ...MONO, fontSize: 8, color: '#7f95a8', lineHeight: 1.5 }}>
-              Workbench is idle. The next pack appears here after a work order is ready or started.
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 10 }}>
+              <WorkbenchItem label="MISSION" value={`${topMission.title || liveMission.title || 'daily build focus'} · ${String(topMission.status || liveMission.status || 'observe').replace(/_/g, ' ').toLowerCase()}`} tone={executionPackTone} />
+              <WorkbenchItem label="TARGET" value={`${topMission.target?.subsystem || liveMission.target?.subsystem || 'daily brief'} · ${topMission.target?.file || liveMission.target?.file || 'read-only mission'}`} />
+              <WorkbenchItem label="PROOF" value={topMission.proof || liveMission.proof || topEvidenceRequirement || 'Wait for a scored pack or a live-context coverage gap.'} />
+              <WorkbenchItem label="OUTCOME LOOP" value={`${liveOutcomeLoop.status || 'NO_ACTIVE_MISSION'} · gaps ${liveOutcomeLoop.coverage_gap_count ?? liveGaps.gap_count ?? 0} · surfaced ${liveOutcomeLoop.decision_surface_count ?? 0}`} />
             </div>
           )}
         </div>
@@ -5478,6 +5561,70 @@ function DailyCryptoBriefPanel({
             </div>
             <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
               {(catalystContext.decision_overlap_symbols ?? []).slice(0, 5).join(', ') || 'No narrative overlap with current decisions.'}
+            </div>
+          </div>
+
+          <div style={{ border: `1px solid ${(liveIntake.status === 'ACTIVE') ? 'rgba(45,212,191,0.2)' : 'rgba(96,165,250,0.16)'}`, borderRadius: 10, padding: 10, background: (liveIntake.status === 'ACTIVE') ? 'rgba(45,212,191,0.025)' : 'rgba(96,165,250,0.02)' }}>
+            <span style={{ ...MONO, fontSize: 8, color: liveIntake.status === 'ACTIVE' ? '#2dd4bf' : '#60a5fa', fontWeight: 900, letterSpacing: '0.14em' }}>
+              LIVE PULSE
+            </span>
+            <div style={{ ...MONO, fontSize: 10, color: '#d7e1ea', marginTop: 7, lineHeight: 1.45 }}>
+              {liveIntake.status || 'NO_FEED'} · cg {liveIntake.source_counts?.coingecko ?? 0} · dex {liveIntake.source_counts?.dexscreener ?? 0} · conf {liveIntake.source_counts?.confluence ?? 0}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              {topLiveItem
+                ? `${topLiveItem.symbol || topLiveItem.mint || 'market'} · ${String(topLiveItem.source || 'source').replace(/_/g, ' ')} · heat ${fmtFixed(topLiveItem.heat_score, 0)}`
+                : liveIntake.next_action || 'Refresh live market narrative intake.'}
+            </div>
+          </div>
+
+          <div style={{ border: `1px solid ${(liveGaps.gap_count ?? 0) ? 'rgba(245,158,11,0.24)' : 'rgba(0,212,138,0.16)'}`, borderRadius: 10, padding: 10, background: (liveGaps.gap_count ?? 0) ? 'rgba(245,158,11,0.03)' : 'rgba(0,212,138,0.02)' }}>
+            <span style={{ ...MONO, fontSize: 8, color: (liveGaps.gap_count ?? 0) ? '#f59e0b' : '#00d48a', fontWeight: 900, letterSpacing: '0.14em' }}>
+              OPPORTUNITY GAP
+            </span>
+            <div style={{ ...MONO, fontSize: 10, color: '#d7e1ea', marginTop: 7, lineHeight: 1.45 }}>
+              {liveGaps.status || 'NO_FEED'} · gaps {liveGaps.gap_count ?? 0}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              {topLiveGap
+                ? `${topLiveGap.symbol || topLiveGap.mint || 'market'} · ${String(topLiveGap.gap_type || 'gap').replace(/_/g, ' ').toLowerCase()} · score ${fmtFixed(topLiveGap.gap_score, 0)}`
+                : liveGaps.next_action || 'No market coverage gap detected.'}
+            </div>
+          </div>
+
+          <div style={{ border: `1px solid ${liveMission.status === 'READY' ? 'rgba(245,158,11,0.24)' : 'rgba(96,165,250,0.16)'}`, borderRadius: 10, padding: 10, background: liveMission.status === 'READY' ? 'rgba(245,158,11,0.03)' : 'rgba(96,165,250,0.02)' }}>
+            <span style={{ ...MONO, fontSize: 8, color: liveMission.status === 'READY' ? '#f59e0b' : '#60a5fa', fontWeight: 900, letterSpacing: '0.14em' }}>
+              MARKET MISSION
+            </span>
+            <div style={{ ...MONO, fontSize: 10, color: '#d7e1ea', marginTop: 7, lineHeight: 1.45 }}>
+              {String(liveMission.mission_type || 'LIVE_CONTEXT_OBSERVE').replace(/_/g, ' ')} · {fmtFixed(liveMission.priority_score, 0)}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              {liveMission.headline || liveMission.next_action || 'No generated live-context mission yet.'}
+            </div>
+          </div>
+
+          <div style={{ border: '1px solid rgba(167,139,250,0.18)', borderRadius: 10, padding: 10, background: 'rgba(167,139,250,0.025)' }}>
+            <span style={{ ...MONO, fontSize: 8, color: '#a78bfa', fontWeight: 900, letterSpacing: '0.14em' }}>
+              MARKET PROOF
+            </span>
+            <div style={{ ...MONO, fontSize: 10, color: '#d7e1ea', marginTop: 7, lineHeight: 1.45 }}>
+              {liveEvidence.status || 'OBSERVE'} · {liveEvidence.pass_count ?? 0}/{liveEvidence.required_count ?? liveEvidence.requirements?.length ?? 0}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              {topEvidenceRequirement || liveEvidence.next_action || 'Evidence requirements appear when a market mission is generated.'}
+            </div>
+          </div>
+
+          <div style={{ border: `1px solid ${liveOutcomeLoop.status === 'IMPROVING' ? 'rgba(0,212,138,0.2)' : 'rgba(96,165,250,0.16)'}`, borderRadius: 10, padding: 10, background: liveOutcomeLoop.status === 'IMPROVING' ? 'rgba(0,212,138,0.025)' : 'rgba(96,165,250,0.02)' }}>
+            <span style={{ ...MONO, fontSize: 8, color: liveOutcomeLoop.status === 'IMPROVING' ? '#00d48a' : '#60a5fa', fontWeight: 900, letterSpacing: '0.14em' }}>
+              MARKET OUTCOME
+            </span>
+            <div style={{ ...MONO, fontSize: 10, color: '#d7e1ea', marginTop: 7, lineHeight: 1.45 }}>
+              {liveOutcomeLoop.status || 'NO_ACTIVE_MISSION'} · surfaced {liveOutcomeLoop.decision_surface_count ?? 0}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              {liveOutcomeLoop.next_action || 'Outcome loop starts after a live market mission exists.'}
             </div>
           </div>
 

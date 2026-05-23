@@ -15749,6 +15749,9 @@ def _build_daily_top_mission(
     post_patch_tracker: dict,
     regression_guard: dict,
     daily_build_score: dict,
+    live_context_mission: dict | None = None,
+    live_context_evidence: dict | None = None,
+    live_context_outcome_loop: dict | None = None,
 ) -> dict:
     top_pack = dict((execution_packs or {}).get("top_pack") or {})
     if str((regression_guard or {}).get("status") or "").upper() == "ACTIVE":
@@ -15801,6 +15804,25 @@ def _build_daily_top_mission(
             "proof": "Wait for enough 24h/48h outcomes to classify improvement or regression.",
             "workbench_pack": None,
             "next_action": (post_patch_tracker or {}).get("next_action"),
+        }
+    if str((live_context_mission or {}).get("status") or "").upper() == "READY":
+        mission = dict(live_context_mission or {})
+        return {
+            "status": "READY",
+            "mission_type": mission.get("mission_type") or "LIVE_CONTEXT_MISSION",
+            "title": mission.get("title") or "Live context mission",
+            "priority_score": mission.get("priority_score"),
+            "pack_key": None,
+            "group_key": mission.get("group_key"),
+            "headline": mission.get("headline"),
+            "expected_upside": mission.get("expected_upside"),
+            "proof": mission.get("proof") or (live_context_evidence or {}).get("next_action"),
+            "target": mission.get("target"),
+            "workbench_pack": None,
+            "source_gap": mission.get("source_gap"),
+            "evidence_requirements": live_context_evidence,
+            "outcome_loop": live_context_outcome_loop,
+            "next_action": mission.get("next_action"),
         }
     return {
         "status": "OBSERVE",
@@ -15965,6 +15987,331 @@ def _build_catalyst_context(kv_rows: dict[str, str], confluence_rows: list[dict]
         "decision_overlap_symbols": overlaps[:10],
         "recent_confluence": confluence,
         "next_action": "Use catalyst overlap as context, not as an execution trigger.",
+    }
+
+
+def _build_live_market_narrative_intake(kv_rows: dict[str, str], confluence_rows: list[dict]) -> dict:
+    narrative = {}
+    try:
+        narrative = json.loads(kv_rows.get("narrative_trending") or "{}")
+        if not isinstance(narrative, dict):
+            narrative = {}
+    except Exception:
+        narrative = {}
+    items: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+
+    def _add_item(source: str, symbol: str | None, mint: str | None = None, **extra) -> None:
+        symbol_u = str(symbol or "").strip().upper()
+        mint_s = str(mint or "").strip()
+        if not symbol_u and not mint_s:
+            return
+        key = (symbol_u, mint_s)
+        if key in seen:
+            return
+        seen.add(key)
+        items.append({
+            "source": source,
+            "symbol": symbol_u or None,
+            "mint": mint_s or None,
+            **extra,
+        })
+
+    for idx, item in enumerate(list(narrative.get("coingecko") or [])[:10]):
+        if not isinstance(item, dict):
+            continue
+        _add_item(
+            "coingecko",
+            item.get("symbol"),
+            None,
+            name=item.get("name"),
+            rank=item.get("rank"),
+            heat_score=max(0.0, 65.0 - idx * 4.0),
+            reason="CoinGecko global trending",
+        )
+    for idx, item in enumerate(list(narrative.get("dexscreener") or [])[:12]):
+        if not isinstance(item, dict):
+            continue
+        boosts = _gb_float(item.get("boosts"))
+        _add_item(
+            "dexscreener",
+            item.get("symbol"),
+            item.get("mint"),
+            name=item.get("name"),
+            boosts=int(boosts or 0),
+            heat_score=min(100.0, 72.0 + min(20.0, boosts / 5.0) - idx * 2.0),
+            reason="DexScreener Solana boosted",
+        )
+    for idx, row in enumerate(list(confluence_rows or [])[:12]):
+        _add_item(
+            "confluence",
+            row.get("token_symbol"),
+            row.get("token_mint"),
+            type=row.get("confluence_type"),
+            heat_score=min(100.0, _gb_float(row.get("confluence_score"), 50.0) + 10.0),
+            ts=row.get("ts_utc"),
+            reason=f"{row.get('confluence_type') or 'confluence'} event",
+        )
+
+    items.sort(key=lambda x: _gb_float(x.get("heat_score")), reverse=True)
+    hot_symbols = sorted({str(item.get("symbol") or "").upper() for item in items if item.get("symbol")})
+    hot_mints = sorted({str(item.get("mint") or "") for item in items if item.get("mint")})
+    updated_at = narrative.get("updated_at")
+    return {
+        "status": "ACTIVE" if items else "NO_FEED",
+        "updated_at": updated_at,
+        "source_counts": {
+            "coingecko": len(list(narrative.get("coingecko") or [])),
+            "dexscreener": len(list(narrative.get("dexscreener") or [])),
+            "confluence": len(confluence_rows or []),
+        },
+        "hot_symbols": hot_symbols[:18],
+        "hot_mints": hot_mints[:18],
+        "items": items[:18],
+        "next_action": (
+            "Compare hot market context against Abrons coverage."
+            if items
+            else "Refresh narrative momentum and confluence feeds."
+        ),
+    }
+
+
+def _build_live_opportunity_gap_detector(
+    live_intake: dict,
+    intelligence_rows: list[dict],
+    journal_rows: list[dict],
+) -> dict:
+    by_symbol: dict[str, dict] = {}
+    by_mint: dict[str, dict] = {}
+    for row in intelligence_rows or []:
+        symbol = str(row.get("symbol") or "").strip().upper()
+        mint = str(row.get("mint") or "").strip()
+        if symbol and symbol not in by_symbol:
+            by_symbol[symbol] = dict(row)
+        if mint and mint not in by_mint:
+            by_mint[mint] = dict(row)
+    journal_symbols = {
+        str(row.get("symbol") or "").strip().upper()
+        for row in journal_rows or []
+        if str(row.get("symbol") or "").strip()
+    }
+    journal_mints = {
+        str(row.get("mint") or "").strip()
+        for row in journal_rows or []
+        if str(row.get("mint") or "").strip()
+    }
+    gaps = []
+    for item in list((live_intake or {}).get("items") or []):
+        symbol = str(item.get("symbol") or "").strip().upper()
+        mint = str(item.get("mint") or "").strip()
+        row = by_mint.get(mint) if mint else None
+        if row is None and symbol:
+            row = by_symbol.get(symbol)
+        seen_decision = bool((mint and mint in journal_mints) or (symbol and symbol in journal_symbols))
+        freshness = str((row or {}).get("data_freshness") or "").upper()
+        confidence = str((row or {}).get("data_confidence") or "").upper()
+        quality = _gb_float((row or {}).get("quality_score"))
+        pressure = _gb_float((row or {}).get("pressure_score"))
+        gap_type = None
+        reason = None
+        if not row:
+            gap_type = "BLIND_SPOT"
+            reason = "Hot market item has no current token intelligence row."
+        elif freshness == "STALE":
+            gap_type = "STALE_COVERAGE"
+            reason = "Hot market item is known, but market data is stale."
+        elif confidence == "LOW":
+            gap_type = "LOW_CONFIDENCE"
+            reason = "Hot market item is known, but confidence is low."
+        elif not seen_decision:
+            gap_type = "NO_DECISION_SURFACE"
+            reason = "Hot market item has not surfaced in recent decisions."
+        elif quality < 45 and pressure >= 60:
+            gap_type = "QUALITY_PRESSURE_MISMATCH"
+            reason = "Pressure is elevated, but quality scoring is suppressing context."
+        if not gap_type:
+            continue
+        heat = _gb_float(item.get("heat_score"))
+        score = heat
+        if gap_type == "BLIND_SPOT":
+            score += 28.0
+        elif gap_type == "STALE_COVERAGE":
+            score += 22.0
+        elif gap_type == "NO_DECISION_SURFACE":
+            score += 16.0
+        elif gap_type == "LOW_CONFIDENCE":
+            score += 14.0
+        if str(item.get("source") or "") == "dexscreener":
+            score += 8.0
+        if str(item.get("source") or "") == "confluence":
+            score += 10.0
+        gaps.append({
+            "gap_key": f"{gap_type}:{mint or symbol or item.get('source')}",
+            "gap_type": gap_type,
+            "symbol": symbol or None,
+            "mint": mint or None,
+            "source": item.get("source"),
+            "heat_score": _nullable_float(heat),
+            "gap_score": round(min(100.0, score), 1),
+            "data_freshness": freshness or None,
+            "data_confidence": confidence or None,
+            "quality_score": _nullable_float(quality),
+            "pressure_score": _nullable_float(pressure),
+            "seen_decision": seen_decision,
+            "reason": reason,
+        })
+    gaps.sort(key=lambda x: _gb_float(x.get("gap_score")), reverse=True)
+    by_type: dict[str, int] = {}
+    for gap in gaps:
+        key = str(gap.get("gap_type") or "UNKNOWN")
+        by_type[key] = by_type.get(key, 0) + 1
+    return {
+        "status": "GAPS_FOUND" if gaps else "ALIGNED" if (live_intake or {}).get("items") else "NO_FEED",
+        "gap_count": len(gaps),
+        "by_type": by_type,
+        "top_gap": gaps[0] if gaps else None,
+        "items": gaps[:12],
+        "next_action": (
+            "Generate a build mission from the top market coverage gap."
+            if gaps
+            else "Market context is aligned with current Abrons coverage."
+            if (live_intake or {}).get("items")
+            else "Refresh market/narrative intake before generating a mission."
+        ),
+    }
+
+
+def _build_live_context_generated_mission(opportunity_gaps: dict, live_intake: dict) -> dict:
+    gap = dict((opportunity_gaps or {}).get("top_gap") or {})
+    if not gap:
+        return {
+            "status": "NO_MISSION",
+            "mission_type": "LIVE_CONTEXT_OBSERVE",
+            "title": "Market context aligned",
+            "priority_score": 0,
+            "headline": (opportunity_gaps or {}).get("next_action") or (live_intake or {}).get("next_action"),
+            "expected_upside": "Keep watching live context until a coverage gap appears.",
+            "next_action": (opportunity_gaps or {}).get("next_action") or "Keep observing market context.",
+        }
+    gap_type = str(gap.get("gap_type") or "").upper()
+    if gap_type in {"BLIND_SPOT", "NO_DECISION_SURFACE"}:
+        mission_type = "SCANNER_COVERAGE"
+        target_subsystem = "market/narrative scanner coverage"
+        title = "Add hot-context coverage"
+        proof = "Show the hot token or sector appears in token intelligence and a read-only decision surface."
+    elif gap_type in {"STALE_COVERAGE", "LOW_CONFIDENCE"}:
+        mission_type = "DATA_REPAIR"
+        target_subsystem = "token intelligence provider repair"
+        title = "Repair hot-context data coverage"
+        proof = "Refresh this hot item to LIVE/RECENT with non-low confidence before trusting decisions."
+    else:
+        mission_type = "RULE_REPLAY"
+        target_subsystem = "memecoin decision replay"
+        title = "Replay hot-context suppression"
+        proof = "Replay recent decisions and prove quality-pressure mismatch is not hiding runners."
+    symbol = gap.get("symbol") or "hot market item"
+    return {
+        "status": "READY",
+        "mission_type": mission_type,
+        "title": title,
+        "priority_score": gap.get("gap_score"),
+        "gap_key": gap.get("gap_key"),
+        "group_key": gap.get("gap_key"),
+        "headline": f"{symbol}: {str(gap_type).replace('_', ' ').lower()} from {gap.get('source') or 'live context'}.",
+        "expected_upside": gap.get("reason"),
+        "proof": proof,
+        "target": {
+            "subsystem": target_subsystem,
+            "file": "utils/narrative_momentum.py" if mission_type == "SCANNER_COVERAGE" else "utils/token_intelligence.py" if mission_type == "DATA_REPAIR" else "dashboard/backend/routers/home.py",
+            "function": "narrative/context intake" if mission_type == "SCANNER_COVERAGE" else "token_intelligence_step" if mission_type == "DATA_REPAIR" else "_build_daily_crypto_brief",
+        },
+        "source_gap": gap,
+        "next_action": "Use this generated mission as the next manual build target if no execution pack is active.",
+    }
+
+
+def _build_live_context_evidence_requirements(generated_mission: dict) -> dict:
+    mission_type = str((generated_mission or {}).get("mission_type") or "").upper()
+    if mission_type == "SCANNER_COVERAGE":
+        requirements = [
+            "Narrative/Dex/Confluence source shows the hot token or sector.",
+            "Abrons token intelligence has a current row or explicit watch record for it.",
+            "Home/Daily Brief displays the gap without creating a buy signal.",
+            "No live execution setting changes.",
+        ]
+    elif mission_type == "DATA_REPAIR":
+        requirements = [
+            "Provider refresh moves the target from stale/low confidence to LIVE or RECENT.",
+            "Market cap/liquidity/volume fields are non-zero when a valid pair exists.",
+            "Provider failure reason remains auditable if repair fails.",
+            "No automatic buy or rule promotion follows the repair.",
+        ]
+    elif mission_type == "RULE_REPLAY":
+        requirements = [
+            "Replay identifies whether suppression protected or missed a runner.",
+            "Weak-buy risk does not exceed expected missed-runner benefit.",
+            "Daily Brief can explain the blocker and the replay result.",
+            "Rule change remains manual-gated.",
+        ]
+    else:
+        requirements = [
+            "Wait for a live market gap or execution pack.",
+            "Keep the execution lock unchanged.",
+        ]
+    return {
+        "status": "READY" if mission_type not in {"", "LIVE_CONTEXT_OBSERVE"} else "OBSERVE",
+        "mission_type": mission_type or "LIVE_CONTEXT_OBSERVE",
+        "requirements": requirements,
+        "pass_count": 0,
+        "required_count": len(requirements),
+        "next_action": requirements[0] if requirements else "Keep observing.",
+    }
+
+
+def _build_live_context_outcome_loop(opportunity_gaps: dict, generated_mission: dict, journal_rows: list[dict], intelligence_rows: list[dict]) -> dict:
+    gap = dict((generated_mission or {}).get("source_gap") or (opportunity_gaps or {}).get("top_gap") or {})
+    symbol = str(gap.get("symbol") or "").upper()
+    mint = str(gap.get("mint") or "")
+    if not gap:
+        return {
+            "status": "NO_ACTIVE_MISSION",
+            "coverage_gap_count": int((opportunity_gaps or {}).get("gap_count") or 0),
+            "next_action": "Outcome loop starts when a live-context mission exists.",
+        }
+    seen_decisions = [
+        row for row in journal_rows or []
+        if (symbol and str(row.get("symbol") or "").upper() == symbol)
+        or (mint and str(row.get("mint") or "") == mint)
+    ]
+    intel_rows = [
+        row for row in intelligence_rows or []
+        if (symbol and str(row.get("symbol") or "").upper() == symbol)
+        or (mint and str(row.get("mint") or "") == mint)
+    ]
+    freshest = intel_rows[0] if intel_rows else {}
+    freshness = str(freshest.get("data_freshness") or "").upper()
+    confidence = str(freshest.get("data_confidence") or "").upper()
+    resolved = bool(freshest and freshness in {"LIVE", "RECENT"} and confidence != "LOW")
+    surfaced = bool(seen_decisions)
+    status = "IMPROVING" if resolved and surfaced else "COVERAGE_REPAIRED" if resolved else "SURFACED" if surfaced else "TRACKING"
+    return {
+        "status": status,
+        "gap_key": gap.get("gap_key"),
+        "symbol": symbol or None,
+        "mint": mint or None,
+        "coverage_gap_count": int((opportunity_gaps or {}).get("gap_count") or 0),
+        "decision_surface_count": len(seen_decisions),
+        "freshness": freshness or None,
+        "confidence": confidence or None,
+        "resolved": resolved,
+        "surfaced": surfaced,
+        "next_action": (
+            "Live-context mission improved coverage; keep watching outcomes."
+            if status == "IMPROVING"
+            else "Repair data coverage before judging this market gap."
+            if not resolved
+            else "Get this repaired context onto a read-only decision surface."
+        ),
     }
 
 
@@ -16565,6 +16912,23 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
     )
     missed_runner_clusters = _build_missed_runner_clusters(journal_24h)
     catalyst_context = _build_catalyst_context(kv_rows, confluence_rows, journal_24h)
+    live_market_narrative_intake = _build_live_market_narrative_intake(kv_rows, confluence_rows)
+    live_opportunity_gaps = _build_live_opportunity_gap_detector(
+        live_market_narrative_intake,
+        intelligence_rows,
+        journal_24h,
+    )
+    live_context_generated_mission = _build_live_context_generated_mission(
+        live_opportunity_gaps,
+        live_market_narrative_intake,
+    )
+    live_context_evidence_requirements = _build_live_context_evidence_requirements(live_context_generated_mission)
+    live_context_outcome_loop = _build_live_context_outcome_loop(
+        live_opportunity_gaps,
+        live_context_generated_mission,
+        journal_24h,
+        intelligence_rows,
+    )
     missed_count = len(missed)
     weak_count = len(weak_buys)
     decision_quality_payload = {
@@ -16601,6 +16965,9 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
         provider_post_patch_outcomes,
         provider_regression_guard,
         daily_build_score,
+        live_context_generated_mission,
+        live_context_evidence_requirements,
+        live_context_outcome_loop,
     )
     if lock_ok and data_ok and missed_count <= 3:
         status = "WATCH"
@@ -16627,6 +16994,8 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
         next_actions.append(str(provider_regression_guard.get("next_action") or "Review regression guard."))
     if str(provider_post_patch_outcomes.get("status") or "").upper() == "REGRESSION_REVIEW":
         next_actions.append(str(provider_post_patch_outcomes.get("next_action") or "Review post-patch outcomes."))
+    if str(live_opportunity_gaps.get("status") or "").upper() == "GAPS_FOUND":
+        next_actions.append(str(live_context_generated_mission.get("next_action") or "Work the top live-context gap."))
     if int(provider_escalation_queue.get("active_count") or 0):
         next_actions.append(str(provider_escalation_queue.get("next_action") or "Work the provider escalation queue."))
     if str((outcome_autorun or {}).get("status") or "").upper() in {"ERROR", "UNAVAILABLE"}:
@@ -16706,6 +17075,11 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
         "rule_promotion_gate": rule_promotion_gate,
         "missed_runner_clusters": missed_runner_clusters,
         "catalyst_context": catalyst_context,
+        "live_market_narrative_intake": live_market_narrative_intake,
+        "live_opportunity_gaps": live_opportunity_gaps,
+        "live_context_generated_mission": live_context_generated_mission,
+        "live_context_evidence_requirements": live_context_evidence_requirements,
+        "live_context_outcome_loop": live_context_outcome_loop,
         "daily_build_score": daily_build_score,
         "daily_top_mission": daily_top_mission,
         "paper_to_pilot_gate": paper_gate,
