@@ -554,6 +554,59 @@ interface DailyCryptoBriefData {
       } | null
       next_action?: string | null
     }
+    patch_workbench?: {
+      status?: string
+      candidate_drilldown?: {
+        status?: string
+        rule_key?: string | null
+        label?: string | null
+        direction?: string | null
+        proposed_action?: string | null
+        counts?: {
+          touched?: number
+          saved_weak_buys?: number
+          rescued_missed_runners?: number
+          damaged_good_buys?: number
+          false_positive_buys?: number
+          benefit?: number
+          harm?: number
+          net_score?: number
+        }
+      }
+      patch_hypothesis?: {
+        status?: string
+        rule_key?: string | null
+        label?: string | null
+        hypothesis?: string | null
+        confidence?: string | null
+        blockers?: string[]
+      }
+      target_code_map?: {
+        status?: string
+        items?: Array<{
+          file?: string | null
+          function?: string | null
+          reason?: string | null
+        }>
+      }
+      replay_test_recipe?: {
+        status?: string
+        commands?: Array<{
+          label?: string | null
+          command?: string | null
+        }>
+        acceptance_criteria?: string[]
+      }
+      manual_work_order?: {
+        status?: string
+        state?: string | null
+        work_order_type?: string | null
+        title?: string | null
+        blockers?: string[]
+        next_action?: string | null
+      }
+      next_action?: string | null
+    }
     next_action?: string | null
   }
   data_watchdog?: {
@@ -5078,6 +5131,12 @@ function DailyCryptoBriefPanel({
     const replayLabGate = replayLab.promotion_gate ?? {}
     const replayLabLedger = replayLab.false_positive_negative_ledger ?? {}
     const replayLabWindows = replayLab.forward_outcome_windows?.summary ?? {}
+    const replayWorkbench = replayLab.patch_workbench ?? {}
+    const replayWorkbenchDrilldown = replayWorkbench.candidate_drilldown ?? {}
+    const replayWorkbenchHypothesis = replayWorkbench.patch_hypothesis ?? {}
+    const replayWorkbenchOrder = replayWorkbench.manual_work_order ?? {}
+    const replayWorkbenchTarget = replayWorkbench.target_code_map?.items?.[0]
+    const replayWorkbenchRecipe = replayWorkbench.replay_test_recipe?.commands?.[0]
     const watchdog = data.data_watchdog ?? {}
     const freshnessSla = data.freshness_sla ?? {}
     const providerReliability = data.provider_reliability ?? {}
@@ -5455,6 +5514,23 @@ function DailyCryptoBriefPanel({
             </div>
             <div style={{ ...MONO, fontSize: 8, color: '#9db7ce', marginTop: 5, lineHeight: 1.45 }}>
               saved {replayLabLedger.saved_weak_buy_count ?? 0} · rescued {replayLabLedger.rescued_missed_runner_count ?? 0} · fp {replayLabLedger.false_positive_count ?? 0} · fn {replayLabLedger.false_negative_count ?? 0} · gate {String(replayLabGate.status || 'NO_RULE').replace(/_/g, ' ').toLowerCase()}
+            </div>
+          </div>
+
+          <div style={{ border: `1px solid ${replayWorkbenchOrder.state === 'READY_FOR_IMPLEMENTATION' ? 'rgba(0,212,138,0.22)' : 'rgba(245,158,11,0.2)'}`, borderRadius: 10, padding: 10, background: replayWorkbenchOrder.state === 'READY_FOR_IMPLEMENTATION' ? 'rgba(0,212,138,0.03)' : 'rgba(245,158,11,0.025)' }}>
+            <span style={{ ...MONO, fontSize: 8, color: replayWorkbenchOrder.state === 'READY_FOR_IMPLEMENTATION' ? '#00d48a' : '#f59e0b', fontWeight: 900, letterSpacing: '0.14em' }}>
+              REPLAY WORKBENCH
+            </span>
+            <div style={{ ...MONO, fontSize: 10, color: '#d7e1ea', marginTop: 7, lineHeight: 1.45 }}>
+              {replayWorkbenchDrilldown.label || replayWorkbench.status || 'NO_CANDIDATE'} · {String(replayWorkbenchOrder.state || 'WAITING').replace(/_/g, ' ').toLowerCase()}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              benefit {replayWorkbenchDrilldown.counts?.benefit ?? 0} · harm {replayWorkbenchDrilldown.counts?.harm ?? 0} · net {replayWorkbenchDrilldown.counts?.net_score ?? 0} · conf {String(replayWorkbenchHypothesis.confidence || 'none').toLowerCase()}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#9db7ce', marginTop: 5, lineHeight: 1.45 }}>
+              {replayWorkbenchTarget
+                ? `${replayWorkbenchTarget.file || 'file'} · ${replayWorkbenchTarget.function || 'function'}`
+                : replayWorkbenchRecipe?.label || replayWorkbench.next_action || 'No target map yet.'}
             </div>
           </div>
 

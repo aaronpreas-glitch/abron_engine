@@ -14654,15 +14654,55 @@ def _replay_rule_definitions() -> list[dict]:
     ]
 
 
+def _replay_rule_example(item: dict, rule: dict, category: str) -> dict:
+    outcome = dict(item.get("outcome") or {})
+    metrics = dict(item.get("known_then") or {})
+    return {
+        "decision_id": item.get("decision_id"),
+        "category": category,
+        "symbol": item.get("symbol"),
+        "mint": item.get("mint"),
+        "ts": item.get("ts"),
+        "surface": item.get("surface"),
+        "original_action": item.get("recommended_action"),
+        "proposed_action": rule.get("proposed_action"),
+        "decision_state": item.get("decision_state"),
+        "outcome_label": outcome.get("outcome_label"),
+        "return_1h_pct": outcome.get("return_1h_pct"),
+        "return_4h_pct": outcome.get("return_4h_pct"),
+        "return_24h_pct": outcome.get("return_24h_pct"),
+        "max_return_pct": outcome.get("max_return_pct"),
+        "max_drawdown_pct": outcome.get("max_drawdown_pct"),
+        "primary_blocker": item.get("primary_blocker"),
+        "known_then": {
+            "data_freshness": metrics.get("data_freshness"),
+            "data_confidence": metrics.get("data_confidence"),
+            "quality_score": metrics.get("quality_score"),
+            "risk_score": metrics.get("risk_score"),
+            "pressure_score": metrics.get("pressure_score"),
+            "buy_pressure": metrics.get("buy_pressure"),
+            "liquidity_usd": metrics.get("liquidity_usd"),
+            "volume_24h_usd": metrics.get("volume_24h_usd"),
+            "vol_liq_ratio": metrics.get("vol_liq_ratio"),
+            "change_1h_pct": metrics.get("change_1h_pct"),
+        },
+    }
+
+
 def _simulate_replay_lab_rules(decision_timeline: dict) -> dict:
     rows = [dict(item) for item in list((decision_timeline or {}).get("items") or []) if item.get("replay_ready")]
     simulations = []
     for rule in _replay_rule_definitions():
-        touched = []
+        touched = 0
         saved_weak = 0
         damaged_good = 0
         rescued_missed = 0
         false_positive = 0
+        saved_examples = []
+        damaged_examples = []
+        rescued_examples = []
+        false_positive_examples = []
+        sample_examples = []
         for item in rows:
             try:
                 applies = bool(rule["predicate"](item))
@@ -14670,6 +14710,7 @@ def _simulate_replay_lab_rules(decision_timeline: dict) -> dict:
                 applies = False
             if not applies:
                 continue
+            touched += 1
             original_buy = str(item.get("recommended_action") or "").upper() == "BUY"
             proposed_buy = str(rule.get("proposed_action") or "").upper() == "BUY"
             outcome = dict(item.get("outcome") or {})
@@ -14678,21 +14719,23 @@ def _simulate_replay_lab_rules(decision_timeline: dict) -> dict:
             if original_buy and not proposed_buy:
                 if weak:
                     saved_weak += 1
+                    if len(saved_examples) < 8:
+                        saved_examples.append(_replay_rule_example(item, rule, "SAVED_WEAK_BUY"))
                 elif bullish:
                     damaged_good += 1
+                    if len(damaged_examples) < 8:
+                        damaged_examples.append(_replay_rule_example(item, rule, "DAMAGED_GOOD_BUY"))
             elif not original_buy and proposed_buy:
                 if bullish:
                     rescued_missed += 1
+                    if len(rescued_examples) < 8:
+                        rescued_examples.append(_replay_rule_example(item, rule, "RESCUED_MISSED_RUNNER"))
                 elif weak:
                     false_positive += 1
-            if len(touched) < 8:
-                touched.append({
-                    "symbol": item.get("symbol"),
-                    "action": item.get("recommended_action"),
-                    "proposed_action": rule.get("proposed_action"),
-                    "outcome_label": outcome.get("outcome_label"),
-                    "max_return_pct": outcome.get("max_return_pct"),
-                })
+                    if len(false_positive_examples) < 8:
+                        false_positive_examples.append(_replay_rule_example(item, rule, "FALSE_POSITIVE_BUY"))
+            if len(sample_examples) < 8:
+                sample_examples.append(_replay_rule_example(item, rule, "TOUCHED"))
         benefit = saved_weak + rescued_missed
         harm = damaged_good + false_positive
         net = saved_weak * 2 + rescued_missed * 3 - damaged_good * 4 - false_positive * 3
@@ -14700,8 +14743,9 @@ def _simulate_replay_lab_rules(decision_timeline: dict) -> dict:
             "key": rule["key"],
             "label": rule["label"],
             "direction": rule["direction"],
-            "sample_n": len(touched),
-            "touched_count": saved_weak + damaged_good + rescued_missed + false_positive,
+            "proposed_action": rule["proposed_action"],
+            "sample_n": touched,
+            "touched_count": touched,
             "saved_weak_buy_n": saved_weak,
             "damaged_good_buy_n": damaged_good,
             "rescued_missed_runner_n": rescued_missed,
@@ -14709,7 +14753,23 @@ def _simulate_replay_lab_rules(decision_timeline: dict) -> dict:
             "benefit_n": benefit,
             "harm_n": harm,
             "net_score": net,
-            "sample_symbols": touched,
+            "examples": {
+                "saved_weak_buys": saved_examples,
+                "rescued_missed_runners": rescued_examples,
+                "damaged_good_buys": damaged_examples,
+                "false_positive_buys": false_positive_examples,
+                "touched": sample_examples,
+            },
+            "sample_symbols": [
+                {
+                    "symbol": item.get("symbol"),
+                    "action": item.get("original_action"),
+                    "proposed_action": item.get("proposed_action"),
+                    "outcome_label": item.get("outcome_label"),
+                    "max_return_pct": item.get("max_return_pct"),
+                }
+                for item in sample_examples
+            ],
         })
     simulations.sort(key=lambda item: (int(item.get("net_score") or 0), int(item.get("benefit_n") or 0)), reverse=True)
     return {
@@ -14791,6 +14851,249 @@ def _build_replay_lab_promotion_gate(rule_simulation: dict, ledger: dict, freshn
     }
 
 
+def _build_replay_candidate_drilldown(rule_simulation: dict) -> dict:
+    top = dict((rule_simulation or {}).get("top_candidate") or {})
+    if not top:
+        return {
+            "status": "NO_CANDIDATE",
+            "next_action": "Wait for the Replay Lab to produce a top candidate.",
+        }
+    examples = dict(top.get("examples") or {})
+    return {
+        "status": "READY",
+        "rule_key": top.get("key"),
+        "label": top.get("label"),
+        "direction": top.get("direction"),
+        "proposed_action": top.get("proposed_action"),
+        "counts": {
+            "touched": top.get("touched_count"),
+            "saved_weak_buys": top.get("saved_weak_buy_n"),
+            "rescued_missed_runners": top.get("rescued_missed_runner_n"),
+            "damaged_good_buys": top.get("damaged_good_buy_n"),
+            "false_positive_buys": top.get("false_positive_buy_n"),
+            "benefit": top.get("benefit_n"),
+            "harm": top.get("harm_n"),
+            "net_score": top.get("net_score"),
+        },
+        "saved_weak_buys": list(examples.get("saved_weak_buys") or []),
+        "rescued_missed_runners": list(examples.get("rescued_missed_runners") or []),
+        "damaged_good_buys": list(examples.get("damaged_good_buys") or []),
+        "false_positive_buys": list(examples.get("false_positive_buys") or []),
+        "touched_examples": list(examples.get("touched") or []),
+        "next_action": "Review saved/rescued rows against damaged/false-positive rows before drafting a patch.",
+    }
+
+
+def _build_replay_patch_hypothesis(drilldown: dict, promotion_gate: dict) -> dict:
+    if not drilldown or drilldown.get("status") != "READY":
+        return {
+            "status": "NO_HYPOTHESIS",
+            "next_action": "No replay candidate is ready for a patch hypothesis.",
+        }
+    counts = dict(drilldown.get("counts") or {})
+    rule_key = str(drilldown.get("rule_key") or "").strip()
+    label = str(drilldown.get("label") or rule_key.replace("_", " ")).strip()
+    benefit = int(counts.get("benefit") or 0)
+    harm = int(counts.get("harm") or 0)
+    net = int(counts.get("net_score") or 0)
+    blockers = list((promotion_gate or {}).get("blockers") or [])
+    if str(drilldown.get("direction") or "").upper() == "TIGHTEN":
+        verb = "block weak buys"
+        risk = "may block good buys if the gate is too strict"
+    else:
+        verb = "promote qualified waits into scout/buy review"
+        risk = "may create false-positive buys if pressure fades"
+    status = "READY_FOR_PATCH_REVIEW" if not blockers else "COLLECT_MORE_EVIDENCE"
+    return {
+        "status": status,
+        "rule_key": rule_key,
+        "label": label,
+        "hypothesis": f"If Abrons applies {label.lower()}, it should {verb} with net replay benefit {net}.",
+        "expected_benefit": {
+            "benefit_n": benefit,
+            "saved_weak_buys": counts.get("saved_weak_buys"),
+            "rescued_missed_runners": counts.get("rescued_missed_runners"),
+        },
+        "expected_harm": {
+            "harm_n": harm,
+            "damaged_good_buys": counts.get("damaged_good_buys"),
+            "false_positive_buys": counts.get("false_positive_buys"),
+            "risk": risk,
+        },
+        "blockers": blockers,
+        "confidence": (
+            "HIGH" if not blockers and net >= 16 and benefit >= max(4, harm * 2)
+            else "MEDIUM" if net >= 10 and benefit >= harm
+            else "LOW"
+        ),
+        "manual_only": True,
+        "next_action": (
+            "Build a small guarded patch only after reviewing target code and replay recipe."
+            if status == "READY_FOR_PATCH_REVIEW"
+            else "Collect more replay outcomes before implementation."
+        ),
+    }
+
+
+def _replay_target_code_map_for_rule(rule_key: str) -> list[dict]:
+    key = str(rule_key or "").strip().lower()
+    common = [
+        {
+            "file": "dashboard/backend/routers/home.py",
+            "function": "_simulate_replay_lab_rules",
+            "reason": "Keep replay simulation aligned with any production gate change.",
+        },
+    ]
+    if key == "clean_buy_requires_fresh_confirmed_data":
+        return [
+            {
+                "file": "dashboard/backend/routers/home.py",
+                "function": "_good_buy_gate",
+                "reason": "Strict good-buy label already evaluates freshness and confidence.",
+            },
+            {
+                "file": "dashboard/backend/routers/home.py",
+                "function": "_buy_decision_v1",
+                "reason": "Operator buy state must keep the same freshness/confidence blocker.",
+            },
+        ] + common
+    if key == "high_risk_buy_wait_gate":
+        return [
+            {
+                "file": "dashboard/backend/routers/home.py",
+                "function": "_good_buy_gate",
+                "reason": "Risk threshold participates in buyability and score construction.",
+            },
+            {
+                "file": "dashboard/backend/routers/home.py",
+                "function": "_buy_decision_v1",
+                "reason": "Buy-now verdict should expose the risk gate as a clear blocker.",
+            },
+        ] + common
+    if key == "thin_liquidity_buy_wait_gate":
+        return [
+            {
+                "file": "dashboard/backend/routers/home.py",
+                "function": "_good_buy_gate",
+                "reason": "Liquidity and vol/liq thresholds are good-buy structure gates.",
+            },
+            {
+                "file": "dashboard/backend/routers/home.py",
+                "function": "_execution_ticket_for_good_buy",
+                "reason": "Ticket sizing/invalidation should respect thin-depth warnings.",
+            },
+        ] + common
+    if key in {"strong_pressure_wait_to_scout", "quality_pressure_wait_to_scout"}:
+        return [
+            {
+                "file": "dashboard/backend/routers/home.py",
+                "function": "_buy_decision_v1",
+                "reason": "Scout/wait decision states are assigned here for Home operator guidance.",
+            },
+            {
+                "file": "dashboard/backend/routers/home.py",
+                "function": "_build_good_buy_signal_replay_from_rows",
+                "reason": "Replay-aware scout promotion should stay consistent with first-signal timing.",
+            },
+        ] + common
+    return common
+
+
+def _build_replay_target_code_map(hypothesis: dict) -> dict:
+    rule_key = str((hypothesis or {}).get("rule_key") or "").strip()
+    if not rule_key:
+        return {
+            "status": "NO_TARGET",
+            "items": [],
+            "next_action": "No rule key is available for target mapping.",
+        }
+    targets = _replay_target_code_map_for_rule(rule_key)
+    return {
+        "status": "READY",
+        "rule_key": rule_key,
+        "items": targets,
+        "next_action": "Patch only the mapped decision/gate functions, then rerun Replay Lab.",
+    }
+
+
+def _build_replay_test_recipe(hypothesis: dict, target_map: dict) -> dict:
+    rule_key = str((hypothesis or {}).get("rule_key") or "replay_rule").strip()
+    targets = list((target_map or {}).get("items") or [])
+    return {
+        "status": "READY" if rule_key else "NO_RECIPE",
+        "rule_key": rule_key,
+        "commands": [
+            {
+                "label": "backend compile",
+                "command": "python3 -m py_compile dashboard/backend/routers/home.py dashboard/backend/main.py dashboard/backend/snapshot_cache.py utils/token_intelligence.py",
+            },
+            {
+                "label": "frontend build",
+                "command": "cd dashboard/frontend && npm run build",
+            },
+            {
+                "label": "replay lab smoke",
+                "command": "cd /root/memecoin_engine && env PYTHONPATH=dashboard/backend:. python3 - <<'PY'\nfrom dashboard.backend.routers.home import _build_daily_crypto_brief\nbrief = _build_daily_crypto_brief(24)\nlab = brief.get('replay_outcome_lab') or {}\nassert lab.get('patch_workbench'), 'patch_workbench missing'\nprint((lab.get('patch_workbench') or {}).get('manual_work_order', {}).get('state'))\nPY",
+            },
+        ],
+        "acceptance_criteria": [
+            "Replay Lab still returns decision_timeline, forward_outcome_windows, rule_simulation_engine, ledger, promotion_gate, and patch_workbench.",
+            "Top rule net_score and benefit/harm do not regress after the patch.",
+            "Promotion gate remains manual-only and never changes execution authority.",
+            "No fresh tracebacks, DB locks, 504s, or coroutine warnings after deploy.",
+            "MEMECOIN_LIVE_EXECUTION_CONFIRMED remains not true/unset.",
+        ],
+        "target_files": [item.get("file") for item in targets if item.get("file")],
+        "next_action": "Use this recipe before and after any code patch.",
+    }
+
+
+def _build_replay_manual_work_order(hypothesis: dict, target_map: dict, test_recipe: dict, promotion_gate: dict) -> dict:
+    gate_status = str((promotion_gate or {}).get("status") or "").upper()
+    blockers = list((hypothesis or {}).get("blockers") or (promotion_gate or {}).get("blockers") or [])
+    ready = gate_status == "READY_FOR_MANUAL_REVIEW" and not blockers
+    state = "READY_FOR_IMPLEMENTATION" if ready else "COLLECT_MORE_EVIDENCE"
+    return {
+        "status": "READY",
+        "state": state,
+        "work_order_type": "REPLAY_RULE_PATCH" if ready else "REPLAY_EVIDENCE_COLLECTION",
+        "rule_key": (hypothesis or {}).get("rule_key"),
+        "title": (
+            f"Implement replay rule: {(hypothesis or {}).get('label')}"
+            if ready
+            else f"Collect more evidence for replay rule: {(hypothesis or {}).get('label')}"
+        ),
+        "blockers": blockers,
+        "target_code_map": target_map,
+        "replay_test_recipe": test_recipe,
+        "manual_only": True,
+        "next_action": (
+            "Open a separate implementation patch using the target map and replay recipe."
+            if ready
+            else "Let more 24h outcomes mature, then re-check Replay Lab."
+        ),
+    }
+
+
+def _build_replay_patch_workbench(replay_lab: dict) -> dict:
+    simulation = dict((replay_lab or {}).get("rule_simulation_engine") or {})
+    promotion = dict((replay_lab or {}).get("promotion_gate") or {})
+    drilldown = _build_replay_candidate_drilldown(simulation)
+    hypothesis = _build_replay_patch_hypothesis(drilldown, promotion)
+    target_map = _build_replay_target_code_map(hypothesis)
+    test_recipe = _build_replay_test_recipe(hypothesis, target_map)
+    work_order = _build_replay_manual_work_order(hypothesis, target_map, test_recipe, promotion)
+    return {
+        "status": "READY" if drilldown.get("status") == "READY" else "NO_CANDIDATE",
+        "candidate_drilldown": drilldown,
+        "patch_hypothesis": hypothesis,
+        "target_code_map": target_map,
+        "replay_test_recipe": test_recipe,
+        "manual_work_order": work_order,
+        "next_action": work_order.get("next_action") or hypothesis.get("next_action"),
+    }
+
+
 def _build_replay_outcome_lab(
     journal_rows: list[dict],
     signal_rows: list[dict],
@@ -14803,7 +15106,7 @@ def _build_replay_outcome_lab(
     simulation = _simulate_replay_lab_rules(timeline)
     ledger = _build_replay_false_positive_negative_ledger(simulation)
     promotion = _build_replay_lab_promotion_gate(simulation, ledger, freshness_sla, lock_ok)
-    return {
+    out = {
         "status": "READY" if str(simulation.get("status") or "").upper() == "READY" else str(simulation.get("status") or "EMPTY"),
         "lookback_hours": lookback_hours,
         "decision_timeline": timeline,
@@ -14813,6 +15116,8 @@ def _build_replay_outcome_lab(
         "promotion_gate": promotion,
         "next_action": promotion.get("next_action") or simulation.get("next_action"),
     }
+    out["patch_workbench"] = _build_replay_patch_workbench(out)
+    return out
 
 
 def _provider_refresh_priority_targets(intelligence_rows: list[dict], autopsy: dict | None = None, limit: int = 18) -> list[dict]:
