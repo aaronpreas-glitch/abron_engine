@@ -40,6 +40,7 @@ _PROVIDER_ESCALATION_REVIEW_STATES_KEY = "provider_escalation_review_states"
 _PROVIDER_ESCALATION_PATCH_STATES_KEY = "provider_escalation_patch_states"
 _PROVIDER_ESCALATION_WORK_ORDER_STATES_KEY = "provider_escalation_work_order_states"
 _LIVE_CONTEXT_MISSION_STATES_KEY = "live_context_mission_states"
+_LIVE_CONTEXT_MISSION_OUTCOME_JOURNAL_KEY = "live_context_mission_outcome_journal"
 _PROVIDER_ESCALATION_REVIEW_OPEN_STATES = {
     "OPEN",
     "ACKNOWLEDGED",
@@ -55,6 +56,17 @@ _LIVE_CONTEXT_MISSION_STATES = {
     "RESOLVED_COVERED",
     "RESOLVED_IGNORED",
     "NEEDS_SOURCE",
+}
+_LIVE_CONTEXT_MISSION_OUTCOMES = {
+    "PENDING_REVIEW",
+    "GOOD_IGNORE",
+    "FALSE_IGNORE",
+    "IGNORED_HOT_REVIEW",
+    "COVERED_CONFIRMED",
+    "COVER_STILL_MISSING",
+    "SOURCE_RESOLVED",
+    "SOURCE_PENDING",
+    "INVESTIGATION_OPEN",
 }
 _home_short_cache: dict[str, tuple[float, object]] = {}
 
@@ -16478,6 +16490,354 @@ def _build_live_context_outcome_loop(opportunity_gaps: dict, generated_mission: 
     }
 
 
+def _live_context_mission_outcome_journal(raw_value: str | None) -> list[dict]:
+    try:
+        payload = json.loads(raw_value or "[]")
+        if not isinstance(payload, list):
+            return []
+        return [dict(item) for item in payload if isinstance(item, dict)]
+    except Exception:
+        return []
+
+
+def _latest_live_context_mission_events(rows: list[dict]) -> dict[str, dict]:
+    latest: dict[str, dict] = {}
+    for row in rows or []:
+        key = str(row.get("mission_key") or row.get("gap_key") or "").strip().upper()
+        if not key:
+            continue
+        current = latest.get(key)
+        current_ts = _gb_parse_ts((current or {}).get("decision_at"))
+        row_ts = _gb_parse_ts(row.get("decision_at"))
+        if current is None or (row_ts and (not current_ts or row_ts >= current_ts)):
+            latest[key] = dict(row)
+    return latest
+
+
+def _live_context_current_item_map(live_intake: dict) -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    for item in list((live_intake or {}).get("items") or []):
+        item_dict = dict(item)
+        symbol = str(item_dict.get("symbol") or "").strip().upper()
+        mint = str(item_dict.get("mint") or "").strip()
+        gap_type = "BLIND_SPOT" if not mint else "MARKET_CONTEXT"
+        for key in {
+            _live_context_mission_key({**item_dict, "gap_type": gap_type}),
+            f"BLIND_SPOT:{symbol}".upper() if symbol else "",
+            f"MARKET_CONTEXT:{mint}".upper() if mint else "",
+            f"MARKET_CONTEXT:{symbol}".upper() if symbol else "",
+        }:
+            if key:
+                out[key] = item_dict
+    return out
+
+
+def _live_context_decision_matches(event: dict, rows: list[dict]) -> list[dict]:
+    symbol = str(event.get("symbol") or "").strip().upper()
+    mint = str(event.get("mint") or "").strip()
+    return [
+        dict(row) for row in rows or []
+        if (symbol and str(row.get("symbol") or "").strip().upper() == symbol)
+        or (mint and str(row.get("mint") or "").strip() == mint)
+    ]
+
+
+def _classify_live_context_mission_outcome(
+    event: dict,
+    live_item: dict | None,
+    decision_rows: list[dict],
+    intelligence_rows: list[dict],
+    now: datetime,
+) -> dict:
+    state = str(event.get("state") or "").upper()
+    scope = str(event.get("scope") or "").upper()
+    symbol = str(event.get("symbol") or "").strip().upper()
+    mint = str(event.get("mint") or "").strip()
+    heat = _gb_float((live_item or {}).get("heat_score"))
+    source = str((live_item or {}).get("source") or event.get("source") or "").lower()
+    matched_decisions = _live_context_decision_matches(event, decision_rows)
+    matched_intel = _live_context_decision_matches(event, intelligence_rows)
+    bullish_labels = {"BIG_RUNNER", "GOOD_RUNNER", "GOOD_BUY"}
+    bullish_rows = [
+        row for row in matched_decisions
+        if str(row.get("outcome_label") or "").upper() in bullish_labels
+        or _gb_float(row.get("max_return_pct")) >= 25.0
+    ]
+    fresh_intel = [
+        row for row in matched_intel
+        if str(row.get("data_freshness") or "").upper() in {"LIVE", "RECENT"}
+        and str(row.get("data_confidence") or "").upper() != "LOW"
+    ]
+    decision_age_hours = None
+    decision_ts = _gb_parse_ts(event.get("decision_at"))
+    if decision_ts:
+        decision_age_hours = round(max(0.0, (now - decision_ts).total_seconds() / 3600.0), 2)
+
+    if state == "RESOLVED_IGNORED":
+        if bullish_rows:
+            label = "FALSE_IGNORE"
+            correctness = "MISS"
+            reason = "Ignored mission later matched bullish decision/outcome evidence."
+        elif scope in {"OUT_OF_SCOPE_L1", "SPOT_ONLY"} and not mint:
+            label = "GOOD_IGNORE"
+            correctness = "CORRECT"
+            reason = "Ignored item is broad market/spot context without a tradable memecoin identity."
+        elif heat >= 80.0 or source == "dexscreener" or mint:
+            label = "IGNORED_HOT_REVIEW"
+            correctness = "REVIEW"
+            reason = "Ignored item still has hot or tradable context and deserves one more review."
+        else:
+            label = "PENDING_REVIEW"
+            correctness = "PENDING"
+            reason = "Waiting for later market evidence to confirm the ignore."
+    elif state == "RESOLVED_COVERED":
+        if fresh_intel or matched_decisions:
+            label = "COVERED_CONFIRMED"
+            correctness = "CORRECT"
+            reason = "Covered mission has current intelligence or decision-surface evidence."
+        else:
+            label = "COVER_STILL_MISSING"
+            correctness = "REVIEW"
+            reason = "Mission was marked covered, but coverage evidence is not visible yet."
+    elif state == "NEEDS_SOURCE":
+        if mint or (live_item or {}).get("mint") or source == "dexscreener":
+            label = "SOURCE_RESOLVED"
+            correctness = "CORRECT"
+            reason = "Source identity is now specific enough to classify coverage."
+        else:
+            label = "SOURCE_PENDING"
+            correctness = "PENDING"
+            reason = "Still waiting for a tradable source identity."
+    elif state == "INVESTIGATING":
+        label = "INVESTIGATION_OPEN"
+        correctness = "PENDING"
+        reason = "Operator investigation is still open."
+    else:
+        label = "PENDING_REVIEW"
+        correctness = "PENDING"
+        reason = "Mission has not been resolved yet."
+
+    return {
+        "outcome_label": label,
+        "correctness": correctness,
+        "reason": reason,
+        "decision_age_hours": decision_age_hours,
+        "live_heat_score": _nullable_float(heat),
+        "live_source": source or None,
+        "matched_decisions": len(matched_decisions),
+        "matched_intelligence_rows": len(matched_intel),
+        "bullish_match_count": len(bullish_rows),
+        "fresh_coverage_count": len(fresh_intel),
+        "symbol": symbol or None,
+        "mint": mint or None,
+    }
+
+
+def _build_live_context_mission_outcome_journal(
+    raw_journal: list[dict],
+    live_intake: dict,
+    decision_rows: list[dict],
+    intelligence_rows: list[dict],
+    now: datetime,
+) -> dict:
+    latest = _latest_live_context_mission_events(raw_journal)
+    item_map = _live_context_current_item_map(live_intake)
+    items = []
+    counts: dict[str, int] = {}
+    correctness_counts: dict[str, int] = {}
+    for key, event in latest.items():
+        live_item = item_map.get(key)
+        outcome = _classify_live_context_mission_outcome(event, live_item, decision_rows, intelligence_rows, now)
+        label = str(outcome.get("outcome_label") or "PENDING_REVIEW").upper()
+        correctness = str(outcome.get("correctness") or "PENDING").upper()
+        counts[label] = counts.get(label, 0) + 1
+        correctness_counts[correctness] = correctness_counts.get(correctness, 0) + 1
+        items.append({
+            "mission_key": key,
+            "state": event.get("state"),
+            "scope": event.get("scope"),
+            "symbol": event.get("symbol"),
+            "mint": event.get("mint"),
+            "gap_type": event.get("gap_type"),
+            "decision_at": event.get("decision_at"),
+            "operator_note": event.get("operator_note") or event.get("note"),
+            **outcome,
+        })
+    items.sort(key=lambda row: (_gb_parse_ts(row.get("decision_at")) or datetime.min.replace(tzinfo=timezone.utc)), reverse=True)
+    return {
+        "status": "ACTIVE" if items else "EMPTY",
+        "event_count": len(raw_journal or []),
+        "mission_count": len(items),
+        "outcome_counts": counts,
+        "correctness_counts": correctness_counts,
+        "items": items[:40],
+        "next_action": (
+            "Use review queue outcomes to score whether mission decisions were right."
+            if items
+            else "Resolve a live market mission to start the outcome journal."
+        ),
+    }
+
+
+def _build_live_context_review_queue(mission_journal: dict, current_gaps: dict, dossier: dict) -> dict:
+    queue = []
+    for item in list((mission_journal or {}).get("items") or []):
+        label = str(item.get("outcome_label") or "").upper()
+        state = str(item.get("state") or "").upper()
+        priority = 0.0
+        reason = None
+        if label == "FALSE_IGNORE":
+            priority = 100.0
+            reason = "Ignored item later matched bullish outcome evidence."
+        elif label == "COVER_STILL_MISSING":
+            priority = 88.0
+            reason = "Covered mission still lacks visible coverage evidence."
+        elif label == "IGNORED_HOT_REVIEW":
+            priority = 82.0
+            reason = "Ignored item remains hot/tradable enough to re-check."
+        elif label == "SOURCE_PENDING":
+            priority = 68.0
+            reason = "Source-needed mission still lacks tradable identity."
+        elif state in {"NEW", "INVESTIGATING", "NEEDS_SOURCE"}:
+            priority = 60.0
+            reason = "Mission still needs an operator resolution."
+        if priority:
+            queue.append({**item, "priority_score": priority, "review_reason": reason})
+    top_gap = dict((current_gaps or {}).get("top_gap") or {})
+    if top_gap:
+        queue.append({
+            "mission_key": top_gap.get("gap_key"),
+            "state": top_gap.get("mission_state") or "NEW",
+            "scope": top_gap.get("scope"),
+            "symbol": top_gap.get("symbol"),
+            "mint": top_gap.get("mint"),
+            "gap_type": top_gap.get("gap_type"),
+            "outcome_label": "PENDING_REVIEW",
+            "correctness": "PENDING",
+            "priority_score": _gb_float(top_gap.get("gap_score")),
+            "review_reason": top_gap.get("reason") or "Current top live opportunity gap needs resolution.",
+        })
+    if (dossier or {}).get("mission_key") and not any(q.get("mission_key") == dossier.get("mission_key") for q in queue):
+        state = str((dossier or {}).get("state") or "NEW").upper()
+        if state in {"NEW", "INVESTIGATING", "NEEDS_SOURCE"}:
+            queue.append({
+                "mission_key": dossier.get("mission_key"),
+                "state": state,
+                "scope": ((dossier or {}).get("scope") or {}).get("scope"),
+                "symbol": dossier.get("symbol"),
+                "mint": dossier.get("mint"),
+                "gap_type": dossier.get("gap_type"),
+                "outcome_label": "PENDING_REVIEW",
+                "correctness": "PENDING",
+                "priority_score": _gb_float((dossier or {}).get("gap_score"), 55.0),
+                "review_reason": (dossier or {}).get("next_action"),
+            })
+    dedup: dict[str, dict] = {}
+    for item in queue:
+        key = str(item.get("mission_key") or "").upper()
+        if not key:
+            continue
+        current = dedup.get(key)
+        if current is None or _gb_float(item.get("priority_score")) > _gb_float(current.get("priority_score")):
+            dedup[key] = item
+    items = sorted(dedup.values(), key=lambda row: _gb_float(row.get("priority_score")), reverse=True)
+    return {
+        "status": "REVIEW_NEEDED" if items else "CLEAR",
+        "open_count": len(items),
+        "top_item": items[0] if items else None,
+        "items": items[:12],
+        "next_action": (
+            "Work the top mission review before adding new market coverage."
+            if items
+            else "No mission decisions need review right now."
+        ),
+    }
+
+
+def _build_live_context_decision_accuracy(mission_journal: dict) -> dict:
+    items = list((mission_journal or {}).get("items") or [])
+    correct = [item for item in items if str(item.get("correctness") or "").upper() == "CORRECT"]
+    miss = [item for item in items if str(item.get("correctness") or "").upper() == "MISS"]
+    review = [item for item in items if str(item.get("correctness") or "").upper() == "REVIEW"]
+    pending = [item for item in items if str(item.get("correctness") or "").upper() == "PENDING"]
+    scored = len(correct) + len(miss)
+    accuracy = round((len(correct) / max(1, scored)) * 100.0, 1) if scored else None
+    status = "LEARNING" if scored < 5 else "NEEDS_REVIEW" if miss or (accuracy is not None and accuracy < 75.0) else "HEALTHY"
+    return {
+        "status": status,
+        "sample_n": scored,
+        "correct_n": len(correct),
+        "miss_n": len(miss),
+        "review_n": len(review),
+        "pending_n": len(pending),
+        "accuracy_pct": accuracy,
+        "top_miss": miss[0] if miss else None,
+        "next_action": (
+            "Collect at least five scored mission outcomes before trusting accuracy."
+            if scored < 5
+            else "Review false ignores before policy promotion."
+            if miss
+            else "Keep scoring mission decisions before changing policy."
+        ),
+    }
+
+
+def _build_live_context_policy_suggestions(mission_journal: dict, accuracy: dict) -> dict:
+    items = list((mission_journal or {}).get("items") or [])
+    good_l1_ignores = [
+        item for item in items
+        if str(item.get("outcome_label") or "").upper() == "GOOD_IGNORE"
+        and str(item.get("scope") or "").upper() in {"OUT_OF_SCOPE_L1", "SPOT_ONLY"}
+    ]
+    false_ignores = [item for item in items if str(item.get("outcome_label") or "").upper() == "FALSE_IGNORE"]
+    cover_missing = [item for item in items if str(item.get("outcome_label") or "").upper() == "COVER_STILL_MISSING"]
+    source_pending = [item for item in items if str(item.get("outcome_label") or "").upper() == "SOURCE_PENDING"]
+    suggestions = []
+    if false_ignores:
+        suggestions.append({
+            "policy_key": "NO_AUTO_IGNORE_HOT_TRADABLE",
+            "confidence": "HIGH",
+            "evidence_n": len(false_ignores),
+            "suggestion": "Do not auto-ignore hot items with mints, DexScreener source, or later bullish evidence.",
+            "manual_only": True,
+        })
+    if len(good_l1_ignores) >= 3 or (good_l1_ignores and not false_ignores):
+        suggestions.append({
+            "policy_key": "QUIET_OUT_OF_SCOPE_L1_HEAT",
+            "confidence": "MEDIUM" if len(good_l1_ignores) < 3 else "HIGH",
+            "evidence_n": len(good_l1_ignores),
+            "suggestion": "Keep CoinGecko-only L1/spot heat out of memecoin coverage unless spot strategy explicitly requests it.",
+            "manual_only": True,
+        })
+    if cover_missing:
+        suggestions.append({
+            "policy_key": "REQUIRE_VISIBLE_COVERAGE_PROOF",
+            "confidence": "MEDIUM",
+            "evidence_n": len(cover_missing),
+            "suggestion": "A covered mission should show fresh token intelligence or a decision-surface row before it is treated as complete.",
+            "manual_only": True,
+        })
+    if source_pending:
+        suggestions.append({
+            "policy_key": "SOURCE_NEEDED_EXPIRY",
+            "confidence": "LOW",
+            "evidence_n": len(source_pending),
+            "suggestion": "Expire source-needed missions that never gain a mint or concrete tradable source.",
+            "manual_only": True,
+        })
+    return {
+        "status": "READY_REVIEW" if suggestions else "NO_POLICY_CHANGE",
+        "suggestion_count": len(suggestions),
+        "items": suggestions[:6],
+        "accuracy_pct": (accuracy or {}).get("accuracy_pct"),
+        "next_action": (
+            "Review suggestions manually; none should auto-promote into execution."
+            if suggestions
+            else "Keep collecting mission outcomes before suggesting policy."
+        ),
+    }
+
+
 def _build_paper_to_pilot_gate(paper_rows: list[dict], lock_ok: bool, freshness_sla: dict, decision_quality: dict) -> dict:
     sample = len(paper_rows)
     wins = len([
@@ -16910,7 +17270,7 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
                 kv_rows = {
                     str(r["key"]): str(r["value"] or "")
                     for r in conn.execute(
-                        "SELECT key, value FROM kv_store WHERE key IN ('narrative_trending','provider_escalation_outcome_alerts','provider_escalation_outcome_autorun','provider_escalation_review_states','provider_escalation_patch_states','provider_escalation_work_order_states','live_context_mission_states')"
+                        "SELECT key, value FROM kv_store WHERE key IN ('narrative_trending','provider_escalation_outcome_alerts','provider_escalation_outcome_autorun','provider_escalation_review_states','provider_escalation_patch_states','provider_escalation_work_order_states','live_context_mission_states','live_context_mission_outcome_journal')"
                     ).fetchall()
                 }
             except Exception:
@@ -17089,6 +17449,23 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
         live_context_mission_states,
     )
     live_context_blind_spot_resolution = _build_live_context_blind_spot_resolution(live_context_mission_dossier)
+    live_context_mission_outcome_journal = _build_live_context_mission_outcome_journal(
+        _live_context_mission_outcome_journal(kv_rows.get(_LIVE_CONTEXT_MISSION_OUTCOME_JOURNAL_KEY)),
+        live_market_narrative_intake,
+        journal_24h,
+        intelligence_rows,
+        now,
+    )
+    live_context_review_queue = _build_live_context_review_queue(
+        live_context_mission_outcome_journal,
+        live_opportunity_gaps,
+        live_context_mission_dossier,
+    )
+    live_context_decision_accuracy = _build_live_context_decision_accuracy(live_context_mission_outcome_journal)
+    live_context_policy_suggestions = _build_live_context_policy_suggestions(
+        live_context_mission_outcome_journal,
+        live_context_decision_accuracy,
+    )
     live_context_generated_mission = _build_live_context_generated_mission(
         live_opportunity_gaps,
         live_market_narrative_intake,
@@ -17167,6 +17544,10 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
         next_actions.append(str(provider_post_patch_outcomes.get("next_action") or "Review post-patch outcomes."))
     if str(live_opportunity_gaps.get("status") or "").upper() == "GAPS_FOUND":
         next_actions.append(str(live_context_generated_mission.get("next_action") or "Work the top live-context gap."))
+    if int(live_context_review_queue.get("open_count") or 0):
+        next_actions.append(str(live_context_review_queue.get("next_action") or "Review live-context mission outcomes."))
+    if str(live_context_policy_suggestions.get("status") or "").upper() == "READY_REVIEW":
+        next_actions.append(str(live_context_policy_suggestions.get("next_action") or "Review live-context policy suggestions."))
     if int(provider_escalation_queue.get("active_count") or 0):
         next_actions.append(str(provider_escalation_queue.get("next_action") or "Work the provider escalation queue."))
     if str((outcome_autorun or {}).get("status") or "").upper() in {"ERROR", "UNAVAILABLE"}:
@@ -17250,6 +17631,10 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
         "live_opportunity_gaps": live_opportunity_gaps,
         "live_context_mission_dossier": live_context_mission_dossier,
         "live_context_blind_spot_resolution": live_context_blind_spot_resolution,
+        "live_context_mission_outcome_journal": live_context_mission_outcome_journal,
+        "live_context_review_queue": live_context_review_queue,
+        "live_context_decision_accuracy": live_context_decision_accuracy,
+        "live_context_policy_suggestions": live_context_policy_suggestions,
         "live_context_generated_mission": live_context_generated_mission,
         "live_context_evidence_requirements": live_context_evidence_requirements,
         "live_context_outcome_loop": live_context_outcome_loop,
@@ -19893,6 +20278,10 @@ async def home_live_context_mission_decision(
                 "SELECT value FROM kv_store WHERE key=?",
                 (_LIVE_CONTEXT_MISSION_STATES_KEY,),
             ).fetchone()
+            journal_row = conn.execute(
+                "SELECT value FROM kv_store WHERE key=?",
+                (_LIVE_CONTEXT_MISSION_OUTCOME_JOURNAL_KEY,),
+            ).fetchone()
             states = _live_context_mission_state_map(row["value"] if row else None)
             states[mission_key] = {
                 "state": state,
@@ -19900,9 +20289,26 @@ async def home_live_context_mission_decision(
                 "note": note,
                 "scope": scope,
             }
+            journal = _live_context_mission_outcome_journal(journal_row["value"] if journal_row else None)
+            journal.insert(0, {
+                "mission_key": mission_key,
+                "state": state,
+                "scope": scope,
+                "symbol": str(body.get("symbol") or "").strip().upper() or None,
+                "mint": str(body.get("mint") or "").strip() or None,
+                "gap_type": str(body.get("gap_type") or "").strip().upper() or None,
+                "source": str(body.get("source") or "").strip().lower() or None,
+                "decision_at": now,
+                "operator_note": note,
+                "manual_only": True,
+            })
             conn.execute(
                 "INSERT OR REPLACE INTO kv_store (key, value) VALUES (?, ?)",
                 (_LIVE_CONTEXT_MISSION_STATES_KEY, json.dumps(states, separators=(",", ":"))),
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO kv_store (key, value) VALUES (?, ?)",
+                (_LIVE_CONTEXT_MISSION_OUTCOME_JOURNAL_KEY, json.dumps(journal[:400], separators=(",", ":"))),
             )
             conn.commit()
         finally:

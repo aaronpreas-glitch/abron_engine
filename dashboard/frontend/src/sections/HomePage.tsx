@@ -314,6 +314,26 @@ interface LiveOpportunityGap {
   reason?: string | null
 }
 
+interface LiveContextMissionOutcomeItem {
+  mission_key?: string
+  state?: string | null
+  scope?: string | null
+  symbol?: string | null
+  mint?: string | null
+  gap_type?: string | null
+  decision_at?: string | null
+  operator_note?: string | null
+  outcome_label?: string | null
+  correctness?: string | null
+  reason?: string | null
+  review_reason?: string | null
+  priority_score?: number | null
+  decision_age_hours?: number | null
+  live_heat_score?: number | null
+  matched_decisions?: number | null
+  matched_intelligence_rows?: number | null
+}
+
 interface LiveContextEvidenceRequirements {
   status?: string
   mission_type?: string
@@ -790,6 +810,46 @@ interface DailyCryptoBriefData {
     scope?: string | null
     recommended_state?: LiveContextMissionState | string | null
     action?: string | null
+    next_action?: string | null
+  }
+  live_context_mission_outcome_journal?: {
+    status?: string
+    event_count?: number
+    mission_count?: number
+    outcome_counts?: Record<string, number>
+    correctness_counts?: Record<string, number>
+    items?: LiveContextMissionOutcomeItem[]
+    next_action?: string | null
+  }
+  live_context_review_queue?: {
+    status?: string
+    open_count?: number
+    top_item?: LiveContextMissionOutcomeItem | null
+    items?: LiveContextMissionOutcomeItem[]
+    next_action?: string | null
+  }
+  live_context_decision_accuracy?: {
+    status?: string
+    sample_n?: number
+    correct_n?: number
+    miss_n?: number
+    review_n?: number
+    pending_n?: number
+    accuracy_pct?: number | null
+    top_miss?: LiveContextMissionOutcomeItem | null
+    next_action?: string | null
+  }
+  live_context_policy_suggestions?: {
+    status?: string
+    suggestion_count?: number
+    accuracy_pct?: number | null
+    items?: Array<{
+      policy_key?: string | null
+      confidence?: string | null
+      evidence_n?: number | null
+      suggestion?: string | null
+      manual_only?: boolean
+    }>
     next_action?: string | null
   }
   live_context_generated_mission?: DailyTopMission
@@ -4855,7 +4915,7 @@ function DailyCryptoBriefPanel({
   onEscalationReviewAction?: (item: ProviderEscalationReviewGroup, state: ProviderEscalationReviewState) => void
   onEscalationPatchAction?: (item: ProviderEscalationPatchPlan, state: ProviderEscalationPatchState) => void
   onEscalationWorkOrderAction?: (item: ProviderEscalationWorkOrder, state: ProviderEscalationWorkOrderState) => void
-  onLiveContextMissionAction?: (item: DailyTopMission | LiveOpportunityGap, state: LiveContextMissionState) => void
+  onLiveContextMissionAction?: (item: DailyTopMission | LiveOpportunityGap | LiveContextMissionOutcomeItem, state: LiveContextMissionState) => void
   pendingEscalationId?: number | null
   pendingEscalationReviewKey?: string | null
   pendingEscalationPatchKey?: string | null
@@ -4936,6 +4996,10 @@ function DailyCryptoBriefPanel({
     const liveGaps = data.live_opportunity_gaps ?? {}
     const liveDossier = data.live_context_mission_dossier ?? {}
     const liveResolution = data.live_context_blind_spot_resolution ?? {}
+    const liveMissionJournal = data.live_context_mission_outcome_journal ?? {}
+    const liveReviewQueue = data.live_context_review_queue ?? {}
+    const liveDecisionAccuracy = data.live_context_decision_accuracy ?? {}
+    const livePolicySuggestions = data.live_context_policy_suggestions ?? {}
     const liveMission = data.live_context_generated_mission ?? {}
     const liveEvidence = data.live_context_evidence_requirements ?? {}
     const liveOutcomeLoop = data.live_context_outcome_loop ?? {}
@@ -4979,7 +5043,9 @@ function DailyCryptoBriefPanel({
     const topRegression = regressionGuard.items?.[0]
     const topLiveItem = liveIntake.items?.[0]
     const topLiveGap = liveGaps.top_gap ?? liveGaps.items?.[0]
-    const liveMissionActionItem = liveMission.group_key ? liveMission : topLiveGap
+    const topLiveReview = liveReviewQueue.top_item ?? liveReviewQueue.items?.[0]
+    const topLivePolicy = livePolicySuggestions.items?.[0]
+    const liveMissionActionItem = liveMission.group_key ? liveMission : topLiveReview ?? topLiveGap
     const topEvidenceRequirement = liveEvidence.requirements?.[0]
     const buildHooks = data.daily_build_hooks ?? {}
     const countText = (counts: Record<string, number>, keys: string[]) =>
@@ -5675,6 +5741,79 @@ function DailyCryptoBriefPanel({
             </div>
             <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
               {liveDossier.scope?.reason || liveResolution.next_action || liveDossier.next_action || 'Classify this mission before resolving it.'}
+            </div>
+          </div>
+
+          <div style={{ border: '1px solid rgba(45,212,191,0.18)', borderRadius: 10, padding: 10, background: 'rgba(45,212,191,0.025)' }}>
+            <span style={{ ...MONO, fontSize: 8, color: '#2dd4bf', fontWeight: 900, letterSpacing: '0.14em' }}>
+              MISSION JOURNAL
+            </span>
+            <div style={{ ...MONO, fontSize: 10, color: '#d7e1ea', marginTop: 7, lineHeight: 1.45 }}>
+              {liveMissionJournal.status || 'EMPTY'} · missions {liveMissionJournal.mission_count ?? 0} · events {liveMissionJournal.event_count ?? 0}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              correct {liveMissionJournal.correctness_counts?.CORRECT ?? 0} · review {liveMissionJournal.correctness_counts?.REVIEW ?? 0} · miss {liveMissionJournal.correctness_counts?.MISS ?? 0}
+            </div>
+          </div>
+
+          <div style={{ border: `1px solid ${(liveReviewQueue.open_count ?? 0) ? 'rgba(245,158,11,0.24)' : 'rgba(0,212,138,0.16)'}`, borderRadius: 10, padding: 10, background: (liveReviewQueue.open_count ?? 0) ? 'rgba(245,158,11,0.03)' : 'rgba(0,212,138,0.02)' }}>
+            <span style={{ ...MONO, fontSize: 8, color: (liveReviewQueue.open_count ?? 0) ? '#f59e0b' : '#00d48a', fontWeight: 900, letterSpacing: '0.14em' }}>
+              MISSION REVIEW
+            </span>
+            <div style={{ ...MONO, fontSize: 10, color: '#d7e1ea', marginTop: 7, lineHeight: 1.45 }}>
+              {liveReviewQueue.status || 'CLEAR'} · open {liveReviewQueue.open_count ?? 0}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              {topLiveReview
+                ? `${topLiveReview.symbol || topLiveReview.mint || topLiveReview.mission_key || 'mission'} · ${String(topLiveReview.outcome_label || topLiveReview.state || 'review').replace(/_/g, ' ').toLowerCase()} · score ${fmtFixed(topLiveReview.priority_score, 0)}`
+                : liveReviewQueue.next_action || 'No mission outcomes need review.'}
+            </div>
+            {topLiveReview && onLiveContextMissionAction && (
+              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 8 }}>
+                {([
+                  ['INVESTIGATING', 'INVESTIGATE'],
+                  ['RESOLVED_COVERED', 'COVER'],
+                  ['RESOLVED_IGNORED', 'IGNORE'],
+                  ['NEEDS_SOURCE', 'SOURCE'],
+                ] as Array<[LiveContextMissionState, string]>).map(([state, label]) => (
+                  <button
+                    key={`live-context-review-${state}`}
+                    type="button"
+                    className="mini-btn"
+                    disabled={pendingLiveContextMissionKey === topLiveReview.mission_key}
+                    onClick={() => onLiveContextMissionAction(topLiveReview, state)}
+                    style={{ fontSize: 7, padding: '4px 7px' }}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div style={{ border: `1px solid ${liveDecisionAccuracy.status === 'NEEDS_REVIEW' ? 'rgba(239,68,68,0.22)' : 'rgba(96,165,250,0.16)'}`, borderRadius: 10, padding: 10, background: liveDecisionAccuracy.status === 'NEEDS_REVIEW' ? 'rgba(239,68,68,0.03)' : 'rgba(96,165,250,0.02)' }}>
+            <span style={{ ...MONO, fontSize: 8, color: liveDecisionAccuracy.status === 'NEEDS_REVIEW' ? '#ef4444' : '#60a5fa', fontWeight: 900, letterSpacing: '0.14em' }}>
+              MISSION ACCURACY
+            </span>
+            <div style={{ ...MONO, fontSize: 10, color: '#d7e1ea', marginTop: 7, lineHeight: 1.45 }}>
+              {liveDecisionAccuracy.status || 'LEARNING'} · {liveDecisionAccuracy.accuracy_pct == null ? 'n/a' : `${fmtFixed(liveDecisionAccuracy.accuracy_pct, 0)}%`} · sample {liveDecisionAccuracy.sample_n ?? 0}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              correct {liveDecisionAccuracy.correct_n ?? 0} · miss {liveDecisionAccuracy.miss_n ?? 0} · pending {liveDecisionAccuracy.pending_n ?? 0}
+            </div>
+          </div>
+
+          <div style={{ border: `1px solid ${(livePolicySuggestions.suggestion_count ?? 0) ? 'rgba(167,139,250,0.24)' : 'rgba(96,165,250,0.16)'}`, borderRadius: 10, padding: 10, background: (livePolicySuggestions.suggestion_count ?? 0) ? 'rgba(167,139,250,0.03)' : 'rgba(96,165,250,0.02)' }}>
+            <span style={{ ...MONO, fontSize: 8, color: (livePolicySuggestions.suggestion_count ?? 0) ? '#a78bfa' : '#60a5fa', fontWeight: 900, letterSpacing: '0.14em' }}>
+              POLICY SUGGESTIONS
+            </span>
+            <div style={{ ...MONO, fontSize: 10, color: '#d7e1ea', marginTop: 7, lineHeight: 1.45 }}>
+              {livePolicySuggestions.status || 'NO_POLICY_CHANGE'} · {livePolicySuggestions.suggestion_count ?? 0}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              {topLivePolicy
+                ? `${String(topLivePolicy.policy_key || 'policy').replace(/_/g, ' ').toLowerCase()} · ${String(topLivePolicy.confidence || 'evidence').toLowerCase()} · n ${topLivePolicy.evidence_n ?? 0}`
+                : livePolicySuggestions.next_action || 'No policy suggestion until outcomes prove a pattern.'}
             </div>
           </div>
 
@@ -8725,6 +8864,7 @@ export function HomePage() {
       mint?: string | null
       gap_type?: string | null
       scope?: string | null
+      source?: string | null
       state: LiveContextMissionState
       operator_note?: string
     }) => api.post('/home/live-context-mission/decision', payload).then(r => r.data),
@@ -8739,19 +8879,21 @@ export function HomePage() {
     },
   })
 
-  const recordLiveContextMissionDecision = (item: DailyTopMission | LiveOpportunityGap, state: LiveContextMissionState) => {
+  const recordLiveContextMissionDecision = (item: DailyTopMission | LiveOpportunityGap | LiveContextMissionOutcomeItem, state: LiveContextMissionState) => {
     const isMission = 'mission_type' in item || 'source_gap' in item
     const mission = isMission ? item as DailyTopMission : null
     const gap = isMission ? mission?.source_gap : item as LiveOpportunityGap
-    const missionKey = (isMission ? mission?.group_key : gap?.gap_key) || gap?.gap_key || undefined
+    const review = !isMission && 'mission_key' in item ? item as LiveContextMissionOutcomeItem : null
+    const missionKey = (isMission ? mission?.group_key : gap?.gap_key) || gap?.gap_key || review?.mission_key || undefined
     liveContextMissionMutation.mutate({
       mission_key: missionKey,
       gap_key: gap?.gap_key,
       group_key: mission?.group_key,
-      symbol: gap?.symbol,
-      mint: gap?.mint,
-      gap_type: gap?.gap_type,
-      scope: gap?.scope,
+      symbol: gap?.symbol ?? review?.symbol,
+      mint: gap?.mint ?? review?.mint,
+      gap_type: gap?.gap_type ?? review?.gap_type,
+      scope: gap?.scope ?? review?.scope,
+      source: gap?.source,
       state,
       operator_note:
         state === 'INVESTIGATING' ? 'Operator started live-context mission investigation.'
