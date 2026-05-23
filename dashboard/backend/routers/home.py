@@ -15479,6 +15479,77 @@ def _build_replay_no_auto_promote_guard(lock_ok: bool) -> dict:
     }
 
 
+def _env_bool_state(name: str, default: str | None = None) -> dict:
+    raw = os.getenv(name, default)
+    if raw is None:
+        return {"name": name, "state": "UNSET", "is_true": False, "is_false": False}
+    text = str(raw).strip().lower()
+    return {
+        "name": name,
+        "state": "TRUE" if text == "true" else "FALSE" if text == "false" else "SET_NON_BOOL",
+        "is_true": text == "true",
+        "is_false": text == "false",
+    }
+
+
+def _build_locked_mode_contract(open_trade_count: int, executed_count: int, intent_modes: dict[str, int]) -> dict:
+    """Read-only safety contract for locked/paper mode; never arms execution."""
+    flags = {
+        "MEMECOIN_LIVE_EXECUTION_CONFIRMED": _env_bool_state("MEMECOIN_LIVE_EXECUTION_CONFIRMED"),
+        "MEMECOIN_AUTO_BUY": _env_bool_state("MEMECOIN_AUTO_BUY", "false"),
+        "EXECUTOR_ENABLED": _env_bool_state("EXECUTOR_ENABLED", "false"),
+        "MEMECOIN_DRY_RUN": _env_bool_state("MEMECOIN_DRY_RUN", "true"),
+        "PERP_EXECUTOR_ENABLED": _env_bool_state("PERP_EXECUTOR_ENABLED", "false"),
+        "MEMECOIN_PILOT_MODE": _env_bool_state("MEMECOIN_PILOT_MODE"),
+    }
+    blockers = []
+    if flags["MEMECOIN_LIVE_EXECUTION_CONFIRMED"]["is_true"]:
+        blockers.append("live_execution_confirmed_true")
+    if flags["MEMECOIN_AUTO_BUY"]["is_true"]:
+        blockers.append("memecoin_auto_buy_true")
+    if flags["EXECUTOR_ENABLED"]["is_true"]:
+        blockers.append("executor_enabled_true")
+    if not flags["MEMECOIN_DRY_RUN"]["is_true"]:
+        blockers.append("memecoin_dry_run_not_true")
+    if flags["PERP_EXECUTOR_ENABLED"]["is_true"]:
+        blockers.append("perp_executor_enabled_true")
+    if int(open_trade_count or 0) > 0:
+        blockers.append("open_memecoin_trades")
+    if int(executed_count or 0) > 0:
+        blockers.append("executed_intents_in_window")
+    non_observe_modes = [
+        key for key, value in dict(intent_modes or {}).items()
+        if str(key).upper() != "OBSERVE" and int(value or 0) > 0
+    ]
+    if non_observe_modes:
+        blockers.append("non_observe_intent_modes")
+    expected = {
+        "MEMECOIN_LIVE_EXECUTION_CONFIRMED": "UNSET_OR_FALSE",
+        "MEMECOIN_AUTO_BUY": "FALSE",
+        "EXECUTOR_ENABLED": "FALSE",
+        "MEMECOIN_DRY_RUN": "TRUE",
+        "PERP_EXECUTOR_ENABLED": "FALSE",
+        "open_memecoin_trades": 0,
+        "executed_intents": 0,
+        "intent_modes": "OBSERVE_ONLY",
+    }
+    status = "LOCKED_SAFE" if not blockers else "MIXED_FLAGS"
+    return {
+        "status": status,
+        "expected": expected,
+        "flags": {key: value["state"] for key, value in flags.items()},
+        "blockers": blockers,
+        "open_memecoin_trades": int(open_trade_count or 0),
+        "executed_intents": int(executed_count or 0),
+        "intent_modes": dict(intent_modes or {}),
+        "next_action": (
+            "Locked mode contract is clean; keep live buying disabled until a separate explicit re-arm discussion."
+            if status == "LOCKED_SAFE"
+            else "Patch execution-adjacent flags to locked-safe values before trusting promotion packets."
+        ),
+    }
+
+
 def _build_replay_manual_approval_packet(
     ranking: dict,
     risk_ledger: dict,
@@ -19790,10 +19861,12 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
         live_context_evidence_requirements,
         live_context_outcome_loop,
     )
-    if lock_ok and data_ok and missed_count <= 3:
+    safety_flag_contract = _build_locked_mode_contract(open_trade_count, executed_count, intent_modes)
+    flags_ok = str(safety_flag_contract.get("status") or "").upper() == "LOCKED_SAFE"
+    if lock_ok and flags_ok and data_ok and missed_count <= 3:
         status = "WATCH"
         headline = "Daily crypto brief is stable; keep improving missed-runner timing before any re-arm talk."
-    elif not lock_ok:
+    elif not lock_ok or not flags_ok:
         status = "LOCK_REVIEW"
         headline = "Execution safety needs review before anything else."
     else:
@@ -19803,6 +19876,8 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
     next_actions = []
     if not lock_ok:
         next_actions.append("Review execution lock before changing signal rules.")
+    if not flags_ok:
+        next_actions.append(str(safety_flag_contract.get("next_action") or "Patch mixed execution flags to locked-safe values."))
     if stale_high_quality:
         next_actions.append("Refresh stale high-quality token intelligence rows first.")
     if daily_build_hooks.get("next_patch"):
@@ -19855,12 +19930,14 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
         "headline": headline,
         "safety": {
             "execution_lock": "LOCKED" if lock_ok else "REVIEW",
+            "flag_contract": safety_flag_contract.get("status"),
             "open_memecoin_trades": open_trade_count,
             "execution_intents": len(intents_24h),
             "executed_intents": executed_count,
             "intent_modes": intent_modes,
             "authority_verdicts": intent_verdicts,
         },
+        "safety_flag_contract": safety_flag_contract,
         "data_freshness": {
             "rows": len(intelligence_rows),
             "freshest_updated_at": freshest.get("updated_at"),

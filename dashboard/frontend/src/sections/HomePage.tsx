@@ -399,11 +399,18 @@ interface DailyCryptoBriefData {
   headline: string
   safety: {
     execution_lock: string
+    flag_contract?: string | null
     open_memecoin_trades: number | null
     execution_intents: number
     executed_intents: number
     intent_modes: Record<string, number>
     authority_verdicts: Record<string, number>
+  }
+  safety_flag_contract?: {
+    status?: string
+    flags?: Record<string, string>
+    blockers?: string[]
+    next_action?: string | null
   }
   data_freshness: {
     rows: number
@@ -5289,6 +5296,7 @@ function DailyCryptoBriefPanel({
     intent_modes: {},
     authority_verdicts: {},
   }
+  const safetyFlagContract = data.safety_flag_contract ?? {}
   const freshness = data.data_freshness ?? {
     rows: 0,
     freshness_counts: {},
@@ -5546,6 +5554,7 @@ function DailyCryptoBriefPanel({
 
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 8 }}>
           <Metric label="LOCK" value={safety.execution_lock} valueTone={safety.execution_lock === 'LOCKED' ? '#00d48a' : '#ef4444'} />
+          <Metric label="FLAGS" value={safety.flag_contract || safetyFlagContract.status || 'UNKNOWN'} valueTone={(safety.flag_contract || safetyFlagContract.status) === 'LOCKED_SAFE' ? '#00d48a' : '#ef4444'} />
           <Metric label="INTENTS" value={`${safety.execution_intents}/${safety.executed_intents} exec`} valueTone={safety.executed_intents ? '#ef4444' : '#60a5fa'} />
           <Metric label="DATA" value={countText(freshness.freshness_counts, ['LIVE', 'RECENT', 'STALE'])} valueTone={(freshness.freshness_counts.STALE ?? 0) > (freshness.freshness_counts.LIVE ?? 0) + (freshness.freshness_counts.RECENT ?? 0) ? '#f59e0b' : '#00d48a'} />
           <Metric label="DECISIONS" value={`${decision.journal_count} · ${fmtPct(decision.avg_max_return_pct)}`} />
