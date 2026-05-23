@@ -14521,7 +14521,8 @@ def _build_data_quality_watchdog(intelligence_rows: list[dict], autopsy: dict | 
     status = "OK"
     if low_conf > max(8, len(rows) * 0.15) or stale > live_recent:
         status = "DEGRADED"
-    if stale_quality or refresh_priority:
+    urgent_refresh = any(_gb_float(item.get("priority_score")) >= 90 for item in refresh_priority)
+    if stale_quality or urgent_refresh:
         status = "PATCH_QUEUE"
     provider_alerts = []
     degraded_sources = [str(item.get("source") or "").lower() for item in by_source if str(item.get("status") or "") == "DEGRADED"]
@@ -14532,7 +14533,7 @@ def _build_data_quality_watchdog(intelligence_rows: list[dict], autopsy: dict | 
         provider_alerts.append(f"Refresh priority: {lead.get('symbol') or 'UNKNOWN'} from {lead.get('market_source') or 'unknown'} ({lead.get('data_freshness')}/{lead.get('data_confidence')}).")
     if stale_quality:
         action = "Refresh stale high-quality intelligence before trusting buy decisions."
-    elif refresh_priority:
+    elif urgent_refresh:
         action = "Use live confirmation budget on non-live high-priority intelligence rows before tuning signal rules."
     elif status == "DEGRADED":
         action = "Improve stale or low-confidence provider coverage before tuning signal rules."
