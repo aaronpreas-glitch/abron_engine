@@ -14071,6 +14071,13 @@ def _build_outcome_autopsy_from_rows(journal_rows: list[dict], lookback_hours: i
         classification = _autopsy_row_classification(row, decision_state, label)
         class_counts[classification] = class_counts.get(classification, 0) + 1
         primary = _primary_blocker_from_row(row, snapshot)
+        if not primary and classification == "WEAK_BUY":
+            primary = {
+                "key": "clean_buy_missing_confirmation",
+                "label": "Clean buy missing confirmation",
+                "category": "confirmation",
+                "severity": "TRIGGER",
+            }
         primary_key = str((primary or {}).get("key") or "no_primary_blocker").strip()
         max_return = _nullable_float(row.get("max_return_pct"))
         ret_1h = _nullable_float(row.get("outcome_1h_pct"))
@@ -14394,6 +14401,12 @@ def _build_data_quality_watchdog(intelligence_rows: list[dict]) -> dict:
         status = "DEGRADED"
     if stale_quality:
         status = "PATCH_QUEUE"
+    if stale_quality:
+        action = "Refresh stale high-quality intelligence before trusting buy decisions."
+    elif status == "DEGRADED":
+        action = "Improve stale or low-confidence provider coverage before tuning signal rules."
+    else:
+        action = "Provider coverage is usable for the daily build loop."
     return {
         "status": status,
         "summary": {
@@ -14404,11 +14417,7 @@ def _build_data_quality_watchdog(intelligence_rows: list[dict]) -> dict:
             "sources": source_counts,
         },
         "stale_high_quality": stale_quality,
-        "action": (
-            "Refresh stale high-quality intelligence before trusting buy decisions."
-            if stale_quality
-            else "Provider coverage is usable for the daily build loop."
-        ),
+        "action": action,
     }
 
 
