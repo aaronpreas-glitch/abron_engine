@@ -19,7 +19,7 @@ from fastapi import APIRouter, Depends, HTTPException
 
 import config as _config  # noqa: F401  # ensures .env is loaded for ad-hoc router imports
 from auth import get_current_user
-from snapshot_cache import snapshot_or_build
+from snapshot_cache import snapshot_or_build, store_snapshot
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/home", tags=["home"])
@@ -32,6 +32,10 @@ _ACTION_BOARD_OVERLAY_TIMEOUT_SECONDS = max(
 )
 _GOOD_BUY_BATCH_ENRICH_LIMIT = max(3, int(os.getenv("GOOD_BUY_BATCH_ENRICH_LIMIT", "20")))
 _CONFLICT_REVIEW_STALE_HOURS = max(1.0, float(os.getenv("GOOD_BUY_CONFLICT_REVIEW_STALE_HOURS", "6")))
+_DAILY_BRIEF_OUTCOME_AUTORUN_MIN_SECONDS = max(
+    30,
+    int(os.getenv("DAILY_BRIEF_OUTCOME_AUTORUN_MIN_SECONDS", "60")),
+)
 _home_short_cache: dict[str, tuple[float, object]] = {}
 
 
@@ -15275,10 +15279,152 @@ def _build_daily_build_hooks(autopsy: dict, simulator: dict, watchdog: dict, loc
     }
 
 
-def _build_daily_crypto_brief(lookback_hours: int = 24) -> dict:
+def _run_due_provider_escalation_outcome_checks(
+    now: datetime | None = None,
+    *,
+    min_interval_s: int = _DAILY_BRIEF_OUTCOME_AUTORUN_MIN_SECONDS,
+) -> dict:
+    now = now or datetime.now(timezone.utc)
+    now_iso = now.isoformat()
+    meta_key = "provider_escalation_outcome_autorun"
+    due_count = 0
+    overdue_count = 0
+    last_run_ts = None
+    try:
+        conn = _dj_conn()
+        try:
+            conn.execute("CREATE TABLE IF NOT EXISTS kv_store (key TEXT PRIMARY KEY, value TEXT)")
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='provider_repair_escalations'"
+            ).fetchone()
+            if not exists:
+                return {
+                    "status": "NO_ESCALATIONS",
+                    "ran": False,
+                    "checked_at": now_iso,
+                    "due_count": 0,
+                    "overdue_count": 0,
+                }
+            row = conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS due_count,
+                    SUM(CASE WHEN next_outcome_check_ts <= ? THEN 1 ELSE 0 END) AS overdue_count
+                FROM provider_repair_escalations
+                WHERE escalation_status IN (
+                    'REVIEW_COMPLETE_STILL_BLOCKED',
+                    'SUPPRESSED',
+                    'RESOLVED_REPAIRED'
+                )
+                  AND next_outcome_check_ts IS NOT NULL
+                  AND next_outcome_check_ts <= ?
+                """,
+                ((now - timedelta(minutes=30)).isoformat(), now_iso),
+            ).fetchone()
+            due_count = int((row["due_count"] if row else 0) or 0)
+            overdue_count = int((row["overdue_count"] if row else 0) or 0)
+            meta_row = conn.execute("SELECT value FROM kv_store WHERE key=?", (meta_key,)).fetchone()
+            if meta_row and meta_row[0]:
+                meta = json.loads(str(meta_row[0]))
+                if isinstance(meta, dict):
+                    last_run_ts = meta.get("last_run_at")
+        finally:
+            conn.close()
+    except Exception as exc:
+        return {
+            "status": "UNAVAILABLE",
+            "ran": False,
+            "checked_at": now_iso,
+            "due_count": due_count,
+            "overdue_count": overdue_count,
+            "reason": str(exc)[:180],
+        }
+
+    if due_count <= 0:
+        return {
+            "status": "NOT_DUE",
+            "ran": False,
+            "checked_at": now_iso,
+            "due_count": 0,
+            "overdue_count": 0,
+            "last_run_at": last_run_ts,
+        }
+
+    last_run = _gb_parse_ts(last_run_ts)
+    if last_run and (now - last_run).total_seconds() < max(30, int(min_interval_s)):
+        return {
+            "status": "RECENTLY_CHECKED",
+            "ran": False,
+            "checked_at": now_iso,
+            "due_count": due_count,
+            "overdue_count": overdue_count,
+            "last_run_at": last_run_ts,
+        }
+
+    started = {
+        "status": "RUNNING",
+        "last_run_at": now_iso,
+        "due_count": due_count,
+        "overdue_count": overdue_count,
+    }
+    try:
+        conn = _dj_conn()
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO kv_store (key, value) VALUES (?, ?)",
+                (meta_key, json.dumps(started, separators=(",", ":"))),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+    try:
+        from utils.token_intelligence import evaluate_provider_escalation_outcomes  # type: ignore
+
+        result = evaluate_provider_escalation_outcomes(limit=120)
+        status = "ALERTS" if int(result.get("alerts_emitted") or 0) else "CHECKED"
+        payload = {
+            "status": status,
+            "ran": True,
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+            "last_run_at": now_iso,
+            "due_count": due_count,
+            "overdue_count": overdue_count,
+            "result": result,
+        }
+    except Exception as exc:
+        payload = {
+            "status": "ERROR",
+            "ran": True,
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+            "last_run_at": now_iso,
+            "due_count": due_count,
+            "overdue_count": overdue_count,
+            "error": str(exc)[:220],
+        }
+
+    try:
+        conn = _dj_conn()
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO kv_store (key, value) VALUES (?, ?)",
+                (meta_key, json.dumps(payload, separators=(",", ":"))),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass
+    return payload
+
+
+def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | None = None) -> dict:
     """One read-only surface for the daily build loop."""
     lookback_hours = max(1, min(72, int(lookback_hours or 24)))
     now = datetime.now(timezone.utc)
+    outcome_autorun = outcome_autorun or _run_due_provider_escalation_outcome_checks(now)
     since = now - timedelta(hours=lookback_hours)
 
     def _in_window(value) -> bool:
@@ -15414,7 +15560,7 @@ def _build_daily_crypto_brief(lookback_hours: int = 24) -> dict:
                 kv_rows = {
                     str(r["key"]): str(r["value"] or "")
                     for r in conn.execute(
-                        "SELECT key, value FROM kv_store WHERE key IN ('narrative_trending','provider_escalation_outcome_alerts')"
+                        "SELECT key, value FROM kv_store WHERE key IN ('narrative_trending','provider_escalation_outcome_alerts','provider_escalation_outcome_autorun')"
                     ).fetchall()
                 }
             except Exception:
@@ -15607,6 +15753,8 @@ def _build_daily_crypto_brief(lookback_hours: int = 24) -> dict:
         next_actions.append(str(daily_build_score.get("next_action")))
     if int(provider_escalation_queue.get("active_count") or 0):
         next_actions.append(str(provider_escalation_queue.get("next_action") or "Work the provider escalation queue."))
+    if str((outcome_autorun or {}).get("status") or "").upper() in {"ERROR", "UNAVAILABLE"}:
+        next_actions.append("Fix escalation outcome auto-run before trusting the Daily Brief.")
     if int(provider_escalation_accuracy.get("missed_n") or 0):
         next_actions.append(str(provider_escalation_accuracy.get("next_action") or "Review missed escalation outcomes."))
     if int(provider_escalation_maturity.get("due_now_count") or 0):
@@ -15664,6 +15812,7 @@ def _build_daily_crypto_brief(lookback_hours: int = 24) -> dict:
         "provider_escalation_accuracy": provider_escalation_accuracy,
         "provider_escalation_maturity": provider_escalation_maturity,
         "provider_escalation_alerts": provider_escalation_alerts,
+        "provider_escalation_outcome_autorun": outcome_autorun,
         "rule_promotion_gate": rule_promotion_gate,
         "missed_runner_clusters": missed_runner_clusters,
         "catalyst_context": catalyst_context,
@@ -17275,9 +17424,29 @@ async def home_good_buy_board(_: str = Depends(get_current_user), limit: int = 8
 async def home_daily_crypto_brief(_: str = Depends(get_current_user), lookback_hours: int = 24):
     """Daily read-only intelligence brief for the build loop."""
     try:
+        import asyncio as _aio
+
+        lookback = max(1, min(72, int(lookback_hours or 24)))
+        snapshot_name = f"home:daily-crypto-brief:{lookback}"
+        outcome_autorun = await _aio.to_thread(_run_due_provider_escalation_outcome_checks)
+        if bool((outcome_autorun or {}).get("ran")):
+            payload = await _aio.to_thread(
+                lambda: _build_daily_crypto_brief(lookback, outcome_autorun=outcome_autorun)
+            )
+            snapshot = await _aio.to_thread(store_snapshot, snapshot_name, payload, status="OK")
+            payload = dict(payload or {})
+            payload["_snapshot"] = {
+                "name": snapshot_name,
+                "status": "OK",
+                "updated_at": snapshot.get("updated_at") if isinstance(snapshot, dict) else None,
+                "age_seconds": 0,
+                "stale": False,
+                "source": "live_due_outcome_check",
+            }
+            return payload
         return await snapshot_or_build(
-            f"home:daily-crypto-brief:{int(lookback_hours)}",
-            lambda: _build_daily_crypto_brief(lookback_hours),
+            snapshot_name,
+            lambda: _build_daily_crypto_brief(lookback),
             fresh_s=120,
             stale_s=900,
             wait_timeout_s=6,

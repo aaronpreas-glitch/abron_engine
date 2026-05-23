@@ -414,6 +414,23 @@ interface DailyCryptoBriefData {
       data?: Record<string, unknown>
     }>
   }
+  provider_escalation_outcome_autorun?: {
+    status?: string
+    ran?: boolean
+    checked_at?: string | null
+    last_run_at?: string | null
+    due_count?: number
+    overdue_count?: number
+    result?: {
+      checked?: number
+      updated?: number
+      due_checked?: number
+      alerts_emitted?: number
+      counts?: Record<string, number>
+    }
+    error?: string | null
+    reason?: string | null
+  }
   rule_promotion_gate?: {
     status?: string
     reason?: string | null
@@ -4561,6 +4578,7 @@ function DailyCryptoBriefPanel({
     const escalationAccuracy = data.provider_escalation_accuracy ?? {}
     const escalationMaturity = data.provider_escalation_maturity ?? {}
     const escalationAlerts = data.provider_escalation_alerts ?? {}
+    const escalationAutorun = data.provider_escalation_outcome_autorun ?? {}
     const ruleGate = data.rule_promotion_gate ?? {}
     const missedClusters = data.missed_runner_clusters ?? {}
     const catalystContext = data.catalyst_context ?? {}
@@ -4833,7 +4851,9 @@ function DailyCryptoBriefPanel({
               {escalationMaturity.status || 'CLEAR'} · pending {escalationMaturity.pending_count ?? 0} · due {escalationMaturity.due_now_count ?? 0}
             </div>
             <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
-              {nextEscalationDue
+              {escalationAutorun.ran
+                ? `auto ${String(escalationAutorun.status || 'checked').toLowerCase()} · checked ${escalationAutorun.result?.due_checked ?? escalationAutorun.result?.checked ?? 0} · alerts ${escalationAutorun.result?.alerts_emitted ?? 0}`
+                : nextEscalationDue
                 ? `${nextEscalationDue.symbol || 'UNKNOWN'} · ${nextEscalationDue.horizon || 'next'} · ${fmtAge(nextEscalationDue.next_check_ts || null)}`
                 : escalationMaturity.next_action || 'No pending escalation outcome checks.'}
             </div>
