@@ -15414,6 +15414,134 @@ def _build_provider_escalation_work_orders(patch_plans: dict, raw_work_states: s
     }
 
 
+def _execution_pack_replay_recipe(order: dict) -> list[dict]:
+    risk = str(order.get("risk_label") or "").upper()
+    group_key = str(order.get("group_key") or "")
+    if risk == "DATA_ONLY":
+        return [
+            {
+                "key": "provider_repair_smoke",
+                "label": "Run provider repair smoke for the affected failure class.",
+                "command": "env PYTHONPATH=. python3 -m py_compile utils/token_intelligence.py dashboard/backend/routers/home.py",
+            },
+            {
+                "key": "outcome_autorun_smoke",
+                "label": f"Use a temp-DB escalation smoke for {group_key} and confirm the blocker outcome stays auditable.",
+                "command": "env PYTHONPATH=dashboard/backend:. python3 - <<'PY'\n# Build a temp DB with a due escalation row, run the outcome evaluator, and assert alert/review evidence persists.\nPY",
+            },
+        ]
+    if risk == "SCOUT_ONLY":
+        return [
+            {
+                "key": "decision_replay",
+                "label": "Replay recent decision rows and confirm the blocker becomes scout-only, not full buy.",
+                "command": "env PYTHONPATH=dashboard/backend:. python3 - <<'PY'\n# Replay Daily Brief outcome rows for the target blocker and compare missed/protected/weak counts.\nPY",
+            },
+            {
+                "key": "frontend_snapshot",
+                "label": "Build frontend and verify Home cards still show blocker evidence.",
+                "command": "cd dashboard/frontend && npm run build",
+            },
+        ]
+    return [
+        {
+            "key": "rule_replay",
+            "label": "Replay the proposed rule tuning against recent outcome rows before changing thresholds.",
+            "command": "env PYTHONPATH=dashboard/backend:. python3 - <<'PY'\n# Call _build_daily_crypto_brief(24) and inspect rule_simulator + patch plan evidence.\nPY",
+        },
+        {
+            "key": "safety_compile",
+            "label": "Compile backend surfaces that expose the work order and rule gate.",
+            "command": "python3 -m py_compile dashboard/backend/routers/home.py dashboard/backend/main.py utils/token_intelligence.py",
+        },
+    ]
+
+
+def _build_provider_escalation_execution_packs(work_orders: dict) -> dict:
+    packs = []
+    for order in list((work_orders or {}).get("items") or []):
+        if not isinstance(order, dict):
+            continue
+        state = str(order.get("state") or "READY").upper()
+        if state not in {"READY", "STARTED"}:
+            continue
+        plan = dict(order.get("source_plan") or {})
+        evidence = [dict(item) for item in list(plan.get("evidence") or []) if isinstance(item, dict)]
+        target_files = list(order.get("target_files") or [])
+        target_functions = list(order.get("target_functions") or [])
+        packs.append({
+            "pack_key": f"exec:{order.get('group_key')}",
+            "group_key": order.get("group_key"),
+            "state": "ACTIVE" if state == "STARTED" else "READY",
+            "work_order_state": state,
+            "risk_label": order.get("risk_label"),
+            "target_subsystem": order.get("target_subsystem"),
+            "evidence_bundle": {
+                "symbols": [item.get("symbol") for item in evidence if item.get("symbol")][:8],
+                "mints": [item.get("mint") for item in evidence if item.get("mint")][:8],
+                "alert_kinds": sorted({str(item.get("kind") or "UNKNOWN") for item in evidence}),
+                "max_return_pct": plan.get("max_return_pct"),
+                "avg_1h_pct": plan.get("avg_1h_pct"),
+                "avg_4h_pct": plan.get("avg_4h_pct"),
+                "confidence_score": plan.get("confidence_score"),
+                "simulated_benefit_n": plan.get("simulated_benefit_n"),
+                "weak_buy_risk_n": plan.get("weak_buy_risk_n"),
+                "gate_status": plan.get("gate_status"),
+                "why_it_matters": plan.get("expected_effect") or order.get("goal"),
+                "evidence": evidence[:4],
+            },
+            "replay_test_recipe": _execution_pack_replay_recipe(order),
+            "target_code_map": [
+                {
+                    "file": target_files[idx] if idx < len(target_files) else target_files[-1] if target_files else None,
+                    "function": fn,
+                    "expected_change": (
+                        "Provider repair/read fallback behavior"
+                        if str(order.get("risk_label") or "") == "DATA_ONLY"
+                        else "Decision rule or scout-only blocker handling"
+                    ),
+                }
+                for idx, fn in enumerate(target_functions or ["target implementation"])
+            ],
+            "completion_criteria": [
+                "Code change is scoped to the target subsystem.",
+                "Replay/smoke proof passes for the affected blocker group.",
+                "Home/Daily Brief still renders review, patch plan, work order, and execution pack evidence.",
+                "Production deploy verifies services active, /api/health 200, public :8888 closed, and no fresh tracebacks.",
+                "MEMECOIN_LIVE_EXECUTION_CONFIRMED remains not true/unset; no live buying re-arm.",
+                str(order.get("rollback_condition") or "Rollback condition documented."),
+            ],
+            "next_action": (
+                "Continue this coding session from the target code map and replay recipe."
+                if state == "STARTED"
+                else "Press START on the work order before implementation begins."
+            ),
+        })
+    packs.sort(
+        key=lambda x: (
+            1 if x.get("state") == "ACTIVE" else 0,
+            _gb_float(((x.get("evidence_bundle") or {}).get("confidence_score"))),
+            _gb_float(((x.get("evidence_bundle") or {}).get("max_return_pct"))),
+        ),
+        reverse=True,
+    )
+    active = [pack for pack in packs if pack.get("state") == "ACTIVE"]
+    return {
+        "status": "ACTIVE" if active else "READY" if packs else "NO_PACKS",
+        "pack_count": len(packs),
+        "active_count": len(active),
+        "top_pack": packs[0] if packs else None,
+        "items": packs[:8],
+        "next_action": (
+            "Use the active execution pack as the coding handoff."
+            if active
+            else "Start a work order to activate its execution pack."
+            if packs
+            else "No execution pack is ready."
+        ),
+    }
+
+
 def _build_rule_promotion_gate(
     simulator: dict,
     watchdog: dict,
@@ -16151,6 +16279,7 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
         provider_escalation_patch_plans,
         kv_rows.get(_PROVIDER_ESCALATION_WORK_ORDER_STATES_KEY),
     )
+    provider_escalation_execution_packs = _build_provider_escalation_execution_packs(provider_escalation_work_orders)
     rule_promotion_gate = _build_rule_promotion_gate(
         rule_simulator,
         data_watchdog,
@@ -16214,6 +16343,8 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
         next_actions.append(str(provider_escalation_patch_plans.get("next_action") or "Review escalation patch plans."))
     if int(provider_escalation_work_orders.get("ready_count") or 0) or int(provider_escalation_work_orders.get("started_count") or 0):
         next_actions.append(str(provider_escalation_work_orders.get("next_action") or "Review escalation work orders."))
+    if int(provider_escalation_execution_packs.get("active_count") or 0):
+        next_actions.append(str(provider_escalation_execution_packs.get("next_action") or "Use the active escalation execution pack."))
     if int(provider_escalation_accuracy.get("missed_n") or 0):
         next_actions.append(str(provider_escalation_accuracy.get("next_action") or "Review missed escalation outcomes."))
     if int(provider_escalation_maturity.get("due_now_count") or 0):
@@ -16274,6 +16405,7 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
         "provider_escalation_review_queue": provider_escalation_review_queue,
         "provider_escalation_patch_plans": provider_escalation_patch_plans,
         "provider_escalation_work_orders": provider_escalation_work_orders,
+        "provider_escalation_execution_packs": provider_escalation_execution_packs,
         "provider_escalation_outcome_autorun": outcome_autorun,
         "rule_promotion_gate": rule_promotion_gate,
         "missed_runner_clusters": missed_runner_clusters,

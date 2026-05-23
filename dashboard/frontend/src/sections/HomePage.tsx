@@ -235,6 +235,33 @@ interface ProviderEscalationWorkOrder {
   next_action?: string | null
 }
 
+interface ProviderEscalationExecutionPack {
+  pack_key?: string
+  group_key?: string
+  state?: string | null
+  work_order_state?: string | null
+  risk_label?: string | null
+  target_subsystem?: string | null
+  evidence_bundle?: {
+    symbols?: string[]
+    mints?: string[]
+    alert_kinds?: string[]
+    max_return_pct?: number | null
+    avg_1h_pct?: number | null
+    avg_4h_pct?: number | null
+    confidence_score?: number | null
+    simulated_benefit_n?: number
+    weak_buy_risk_n?: number
+    gate_status?: string | null
+    why_it_matters?: string | null
+    evidence?: ProviderEscalationReviewGroup['evidence']
+  }
+  replay_test_recipe?: Array<{ key?: string; label?: string; command?: string }>
+  target_code_map?: Array<{ file?: string | null; function?: string | null; expected_change?: string | null }>
+  completion_criteria?: string[]
+  next_action?: string | null
+}
+
 interface DailyCryptoBriefData {
   generated_at: string
   lookback_hours: number
@@ -531,6 +558,14 @@ interface DailyCryptoBriefData {
     state_counts?: Record<string, number>
     top_work_order?: ProviderEscalationWorkOrder | null
     items?: ProviderEscalationWorkOrder[]
+    next_action?: string | null
+  }
+  provider_escalation_execution_packs?: {
+    status?: string
+    pack_count?: number
+    active_count?: number
+    top_pack?: ProviderEscalationExecutionPack | null
+    items?: ProviderEscalationExecutionPack[]
     next_action?: string | null
   }
   provider_escalation_outcome_autorun?: {
@@ -4712,6 +4747,7 @@ function DailyCryptoBriefPanel({
     const escalationReviewQueue = data.provider_escalation_review_queue ?? {}
     const escalationPatchPlans = data.provider_escalation_patch_plans ?? {}
     const escalationWorkOrders = data.provider_escalation_work_orders ?? {}
+    const escalationExecutionPacks = data.provider_escalation_execution_packs ?? {}
     const escalationAutorun = data.provider_escalation_outcome_autorun ?? {}
     const ruleGate = data.rule_promotion_gate ?? {}
     const missedClusters = data.missed_runner_clusters ?? {}
@@ -4733,6 +4769,7 @@ function DailyCryptoBriefPanel({
     const topEscalationReview = escalationReviewQueue.items?.[0]
     const topEscalationPatch = escalationPatchPlans.top_plan ?? escalationPatchPlans.items?.[0]
     const topEscalationWorkOrder = escalationWorkOrders.top_work_order ?? escalationWorkOrders.items?.[0]
+    const topEscalationExecutionPack = escalationExecutionPacks.top_pack ?? escalationExecutionPacks.items?.[0]
     const buildHooks = data.daily_build_hooks ?? {}
     const countText = (counts: Record<string, number>, keys: string[]) =>
       keys.map(key => `${key.toLowerCase()} ${counts[key] ?? 0}`).join(' · ')
@@ -5089,6 +5126,25 @@ function DailyCryptoBriefPanel({
                     {label}
                   </button>
                 ))}
+              </div>
+            )}
+          </div>
+
+          <div style={{ border: `1px solid ${(escalationExecutionPacks.active_count ?? 0) ? 'rgba(0,212,138,0.28)' : (escalationExecutionPacks.pack_count ?? 0) ? 'rgba(245,158,11,0.22)' : 'rgba(96,165,250,0.16)'}`, borderRadius: 10, padding: 10, background: (escalationExecutionPacks.active_count ?? 0) ? 'rgba(0,212,138,0.035)' : (escalationExecutionPacks.pack_count ?? 0) ? 'rgba(245,158,11,0.025)' : 'rgba(96,165,250,0.02)' }}>
+            <span style={{ ...MONO, fontSize: 8, color: (escalationExecutionPacks.active_count ?? 0) ? '#00d48a' : (escalationExecutionPacks.pack_count ?? 0) ? '#f59e0b' : '#60a5fa', fontWeight: 900, letterSpacing: '0.14em' }}>
+              EXECUTION PACK
+            </span>
+            <div style={{ ...MONO, fontSize: 10, color: '#d7e1ea', marginTop: 7, lineHeight: 1.45 }}>
+              {escalationExecutionPacks.status || 'NO_PACKS'} · active {escalationExecutionPacks.active_count ?? 0} · packs {escalationExecutionPacks.pack_count ?? 0}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              {topEscalationExecutionPack
+                ? `${String(topEscalationExecutionPack.risk_label || 'risk').replace(/_/g, ' ').toLowerCase()} · conf ${fmtFixed(topEscalationExecutionPack.evidence_bundle?.confidence_score, 0)} · benefit ${topEscalationExecutionPack.evidence_bundle?.simulated_benefit_n ?? 0}/risk ${topEscalationExecutionPack.evidence_bundle?.weak_buy_risk_n ?? 0}`
+                : escalationExecutionPacks.next_action || 'No active execution pack.'}
+            </div>
+            {topEscalationExecutionPack?.replay_test_recipe?.[0]?.label && (
+              <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+                {topEscalationExecutionPack.replay_test_recipe[0].label}
               </div>
             )}
           </div>
