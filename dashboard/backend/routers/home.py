@@ -14728,8 +14728,17 @@ def _build_catalyst_context(kv_rows: dict[str, str], confluence_rows: list[dict]
 
 def _build_paper_to_pilot_gate(paper_rows: list[dict], lock_ok: bool, freshness_sla: dict, decision_quality: dict) -> dict:
     sample = len(paper_rows)
-    wins = len([r for r in paper_rows if str(r.get("outcome_label") or "").upper() in {"BIG_RUNNER", "GOOD_RUNNER", "GOOD_BUY"}])
-    weak = len([r for r in paper_rows if str(r.get("outcome_label") or "").upper() in {"BAD_BUY", "WEAK_BUY"}])
+    wins = len([
+        r for r in paper_rows
+        if str(r.get("outcome_label") or "").upper() in {"BIG_RUNNER", "GOOD_RUNNER", "GOOD_BUY", "WIN", "PROFIT"}
+        or _gb_float(r.get("return_4h_pct")) > 0
+        or _gb_float(r.get("max_return_pct")) >= 5
+    ])
+    weak = len([
+        r for r in paper_rows
+        if str(r.get("outcome_label") or "").upper() in {"BAD_BUY", "WEAK_BUY", "LOSS"}
+        or _gb_float(r.get("return_4h_pct")) <= -5
+    ])
     avg_4h = _avg([_nullable_float(r.get("return_4h_pct")) for r in paper_rows])
     avg_max = _avg([_nullable_float(r.get("max_return_pct")) for r in paper_rows])
     win_rate = round((wins / max(1, sample)) * 100.0, 1) if sample else 0.0
