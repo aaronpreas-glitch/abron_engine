@@ -17475,6 +17475,468 @@ def _build_provider_failure_drilldown(repair_rows: list[dict]) -> dict:
     }
 
 
+def _provider_source_key(value) -> str:
+    return str(value or "unknown").strip().lower() or "unknown"
+
+
+def _provider_truth_source_index(data_watchdog: dict, provider_reliability: dict) -> dict[str, dict]:
+    by_source: dict[str, dict] = {}
+    for row in list((data_watchdog or {}).get("by_source") or []):
+        source = _provider_source_key(row.get("source"))
+        rows = int(_gb_float(row.get("rows")))
+        live = int(_gb_float(row.get("live")))
+        recent = int(_gb_float(row.get("recent")))
+        stale_pct = _gb_float(row.get("stale_pct"))
+        low_pct = _gb_float(row.get("low_confidence_pct"))
+        live_recent_pct = round(((live + recent) / max(1, rows)) * 100.0, 1)
+        score = 45.0 + live_recent_pct * 0.35 - stale_pct * 0.30 - low_pct * 0.25
+        if source.startswith("cache"):
+            score -= 18.0
+        by_source[source] = {
+            "source": source,
+            "rows": rows,
+            "live_recent_pct": live_recent_pct,
+            "stale_pct": stale_pct,
+            "low_confidence_pct": low_pct,
+            "watchdog_status": row.get("status"),
+            "avg_quality": row.get("avg_quality"),
+            "avg_pressure": row.get("avg_pressure"),
+            "repair_attempts": 0,
+            "repair_hit_rate_pct": None,
+            "unresolved_rate_pct": None,
+            "confidence_score": round(max(0.0, min(100.0, score)), 1),
+        }
+    for row in list((provider_reliability or {}).get("providers") or []):
+        source = _provider_source_key(row.get("provider"))
+        item = by_source.setdefault(source, {
+            "source": source,
+            "rows": 0,
+            "live_recent_pct": None,
+            "stale_pct": None,
+            "low_confidence_pct": None,
+            "watchdog_status": None,
+            "avg_quality": None,
+            "avg_pressure": None,
+            "confidence_score": 45.0,
+        })
+        attempts = int(_gb_float(row.get("attempts")))
+        hit = _gb_float(row.get("repair_hit_rate_pct"))
+        unresolved = _gb_float(row.get("unresolved_rate_pct"))
+        item["repair_attempts"] = attempts
+        item["repair_hit_rate_pct"] = hit
+        item["unresolved_rate_pct"] = unresolved
+        item["confidence_score"] = round(max(0.0, min(100.0, _gb_float(item.get("confidence_score"), 45.0) + hit * 0.22 - unresolved * 0.24)), 1)
+        item["failure_classes"] = row.get("failure_classes") or {}
+    for item in by_source.values():
+        score = _gb_float(item.get("confidence_score"))
+        item["trust_label"] = "TRUSTED" if score >= 70 else "PARTIAL" if score >= 48 else "WEAK"
+    return by_source
+
+
+def _build_provider_source_map(
+    intelligence_rows: list[dict],
+    data_watchdog: dict,
+    provider_reliability: dict,
+    freshness_repair_loop: dict,
+    journal_rows: list[dict],
+) -> dict:
+    source_index = _provider_truth_source_index(data_watchdog, provider_reliability)
+    surface_map = {
+        "token_intelligence": {
+            "label": "Token intelligence",
+            "sources": dict(((data_watchdog or {}).get("summary") or {}).get("sources") or {}),
+            "row_count": len(intelligence_rows or []),
+        },
+        "good_buy_board": {
+            "label": "Good Buy",
+            "sources": dict(((data_watchdog or {}).get("summary") or {}).get("sources") or {}),
+            "dependency": "token_intelligence_current + provider repair state",
+        },
+        "replay_promotion": {
+            "label": "Replay promotion",
+            "sources": {
+                "decision_journal": len(journal_rows or []),
+                "token_intelligence_current": len(intelligence_rows or []),
+            },
+            "dependency": "journaled outcomes + current market state",
+        },
+        "freshness_repair": {
+            "label": "Freshness repair",
+            "sources": {
+                item.get("source") or "unknown": int(item.get("queued") or 0)
+                for item in list((((freshness_repair_loop or {}).get("provider_health_limits") or {}).get("providers")) or [])
+            },
+            "dependency": "provider repair queue + repair events",
+        },
+        "paper_pilot": {
+            "label": "Paper pilot",
+            "sources": {
+                "decision_journal": len(journal_rows or []),
+                "token_intelligence_current": len(intelligence_rows or []),
+            },
+            "dependency": "read-only paper outcomes + authority gate",
+        },
+    }
+    providers = sorted(source_index.values(), key=lambda x: (_gb_float(x.get("confidence_score")), int(x.get("rows") or 0)), reverse=True)
+    weak = [item for item in providers if str(item.get("trust_label") or "").upper() == "WEAK"]
+    return {
+        "status": "WEAK_SOURCES" if weak else "MAPPED",
+        "surface_map": surface_map,
+        "providers": providers[:12],
+        "weak_provider_count": len(weak),
+        "next_action": (
+            "Use cross-provider confirmation before promotion because at least one source is weak."
+            if weak
+            else "Provider map is healthy enough for cross-provider arbitration."
+        ),
+    }
+
+
+def _provider_truth_target_key(item: dict) -> str:
+    mint = str(item.get("mint") or "").strip()
+    symbol = str(item.get("symbol") or "").strip().upper()
+    return mint or f"symbol:{symbol}"
+
+
+def _provider_truth_high_impact_targets(freshness_repair_loop: dict, data_watchdog: dict, limit: int = 16) -> list[dict]:
+    targets = []
+    seen: set[str] = set()
+    for source_item in list((((freshness_repair_loop or {}).get("provider_repair_priority_queue") or {}).get("items")) or []):
+        item = dict(source_item)
+        item["surface"] = "freshness_repair"
+        key = _provider_truth_target_key(item)
+        if key and key not in seen:
+            seen.add(key)
+            targets.append(item)
+    for source_item in list((data_watchdog or {}).get("refresh_priority") or []):
+        item = dict(source_item)
+        item["surface"] = "data_watchdog"
+        key = _provider_truth_target_key(item)
+        if key and key not in seen:
+            seen.add(key)
+            targets.append(item)
+    targets.sort(key=lambda x: (_gb_float(x.get("priority_score")), _gb_float(x.get("quality_score")), _gb_float(x.get("pressure_score"))), reverse=True)
+    return targets[: max(1, int(limit or 16))]
+
+
+def _provider_truth_evidence_for_target(item: dict, intelligence_rows: list[dict], repair_rows: list[dict], source_index: dict[str, dict]) -> list[dict]:
+    mint = str(item.get("mint") or "").strip()
+    symbol = str(item.get("symbol") or "").strip().upper()
+    evidence: list[dict] = []
+    for row in list(intelligence_rows or []):
+        if mint and str(row.get("mint") or "").strip() != mint:
+            continue
+        if not mint and symbol and str(row.get("symbol") or "").strip().upper() != symbol:
+            continue
+        source = _provider_source_key(row.get("market_source"))
+        source_meta = source_index.get(source, {})
+        evidence.append({
+            "source": source,
+            "basis": "current_intelligence",
+            "freshness": row.get("data_freshness"),
+            "confidence": row.get("data_confidence"),
+            "quality_score": row.get("quality_score"),
+            "pressure_score": row.get("pressure_score"),
+            "trust_label": source_meta.get("trust_label"),
+            "source_confidence_score": source_meta.get("confidence_score"),
+            "updated_at": row.get("updated_at"),
+        })
+        break
+    for row in list(repair_rows or [])[:120]:
+        row_mint = str(row.get("mint") or "").strip()
+        row_symbol = str(row.get("symbol") or "").strip().upper()
+        if mint and row_mint != mint:
+            continue
+        if not mint and symbol and row_symbol != symbol:
+            continue
+        for source_key, basis, freshness, confidence, quality, pressure in [
+            (row.get("new_source"), "repair_new_source", row.get("new_freshness"), row.get("new_confidence"), row.get("new_quality"), row.get("new_pressure")),
+            (row.get("previous_source"), "repair_previous_source", row.get("previous_freshness"), row.get("previous_confidence"), row.get("previous_quality"), row.get("previous_pressure")),
+        ]:
+            source = _provider_source_key(source_key)
+            if source == "unknown":
+                continue
+            source_meta = source_index.get(source, {})
+            evidence.append({
+                "source": source,
+                "basis": basis,
+                "freshness": freshness,
+                "confidence": confidence,
+                "quality_score": quality,
+                "pressure_score": pressure,
+                "repair_status": row.get("repair_status"),
+                "failure_class": row.get("failure_class"),
+                "trust_label": source_meta.get("trust_label"),
+                "source_confidence_score": source_meta.get("confidence_score"),
+                "ts_utc": row.get("ts_utc"),
+            })
+    compact: dict[str, dict] = {}
+    for row in evidence:
+        source = _provider_source_key(row.get("source"))
+        current = compact.get(source)
+        row_score = _gb_float(row.get("source_confidence_score"), 45.0)
+        freshness = str(row.get("freshness") or "").upper()
+        if freshness == "LIVE":
+            row_score += 18
+        elif freshness == "RECENT":
+            row_score += 9
+        if str(row.get("confidence") or "").upper() == "HIGH":
+            row_score += 8
+        elif str(row.get("confidence") or "").upper() == "LOW":
+            row_score -= 12
+        row["evidence_score"] = round(max(0.0, min(100.0, row_score)), 1)
+        if not current or _gb_float(row.get("evidence_score")) > _gb_float(current.get("evidence_score")):
+            compact[source] = row
+    return sorted(compact.values(), key=lambda x: _gb_float(x.get("evidence_score")), reverse=True)
+
+
+def _build_cross_provider_agreement_layer(
+    targets: list[dict],
+    intelligence_rows: list[dict],
+    repair_rows: list[dict],
+    source_index: dict[str, dict],
+) -> dict:
+    items = []
+    blocked = 0
+    confirmed = 0
+    single_source = 0
+    for target in targets:
+        evidence = _provider_truth_evidence_for_target(target, intelligence_rows, repair_rows, source_index)
+        flags = {str(x).lower() for x in list(target.get("impact_flags") or target.get("reasons") or [])}
+        high_impact = _gb_float(target.get("priority_score")) >= 80 or bool(flags & {"promotion_candidate", "good_buy_candidate", "high_quality_stale", "missed_runner", "research", "paper", "catalyst", "watch_to_entry"})
+        independent_good = []
+        stale_or_low = []
+        for row in evidence:
+            source = _provider_source_key(row.get("source"))
+            freshness = str(row.get("freshness") or "").upper()
+            confidence = str(row.get("confidence") or "").upper()
+            trust = str(row.get("trust_label") or "").upper()
+            if freshness in {"LIVE", "RECENT"} and confidence != "LOW" and trust != "WEAK" and not source.startswith("cache"):
+                independent_good.append(source)
+            if freshness == "STALE" or confidence == "LOW" or trust == "WEAK":
+                stale_or_low.append(source)
+        unique_good = sorted(set(independent_good))
+        if len(unique_good) >= 2:
+            status = "AGREEMENT_CONFIRMED"
+            confirmed += 1
+        elif len(unique_good) == 1:
+            status = "SINGLE_SOURCE_CONFIRMED"
+            single_source += 1
+        elif stale_or_low:
+            status = "STALE_OR_LOW_CONFIDENCE"
+            blocked += 1
+        else:
+            status = "NO_INDEPENDENT_CONFIRMATION"
+            blocked += 1
+        needs_confirmation = bool(high_impact and len(unique_good) < 2)
+        if needs_confirmation and status == "SINGLE_SOURCE_CONFIRMED":
+            status = "NEEDS_SECOND_SOURCE"
+        items.append({
+            "symbol": target.get("symbol"),
+            "mint": target.get("mint"),
+            "surface": target.get("surface"),
+            "priority_score": target.get("priority_score"),
+            "impact_flags": list(target.get("impact_flags") or target.get("reasons") or []),
+            "status": status,
+            "high_impact": high_impact,
+            "needs_confirmation": needs_confirmation,
+            "independent_confirmation_count": len(unique_good),
+            "confirming_sources": unique_good,
+            "stale_or_low_sources": sorted(set(stale_or_low))[:6],
+            "evidence": evidence[:6],
+        })
+    return {
+        "status": "BLOCKED" if any(item.get("needs_confirmation") for item in items) else "CONFIRMED" if confirmed else "WATCH",
+        "target_count": len(items),
+        "confirmed_count": confirmed,
+        "single_source_count": single_source,
+        "blocked_count": blocked,
+        "items": items,
+        "next_action": (
+            "High-impact candidates need two independent provider confirmations before promotion."
+            if any(item.get("needs_confirmation") for item in items)
+            else "No high-impact provider truth blocker is active."
+        ),
+    }
+
+
+def _build_provider_confidence_arbitration(agreement_layer: dict, source_map: dict) -> dict:
+    source_index = {
+        _provider_source_key(item.get("source")): item
+        for item in list((source_map or {}).get("providers") or [])
+    }
+    items = []
+    for item in list((agreement_layer or {}).get("items") or []):
+        evidence = list(item.get("evidence") or [])
+        best = evidence[0] if evidence else {}
+        source = _provider_source_key(best.get("source"))
+        source_meta = source_index.get(source, {})
+        score = _gb_float(best.get("evidence_score"), _gb_float(source_meta.get("confidence_score"), 0.0))
+        if item.get("needs_confirmation"):
+            verdict = "BLOCK_PROMOTION_UNTIL_SECOND_SOURCE"
+        elif score >= 70 and str(best.get("freshness") or "").upper() in {"LIVE", "RECENT"}:
+            verdict = "USE_BEST_SOURCE"
+        elif evidence:
+            verdict = "USE_WITH_CAUTION"
+        else:
+            verdict = "NO_USABLE_SOURCE"
+        items.append({
+            "symbol": item.get("symbol"),
+            "mint": item.get("mint"),
+            "status": item.get("status"),
+            "best_source": source if source != "unknown" else None,
+            "best_source_score": round(score, 1),
+            "best_source_freshness": best.get("freshness"),
+            "best_source_confidence": best.get("confidence"),
+            "verdict": verdict,
+            "reason": (
+                "Promotion-grade items require two independent confirmations."
+                if item.get("needs_confirmation")
+                else "Best source selected by freshness, confidence, and historical provider reliability."
+            ),
+        })
+    blocked = [item for item in items if str(item.get("verdict") or "").startswith("BLOCK")]
+    return {
+        "status": "BLOCKING" if blocked else "READY" if items else "NO_TARGETS",
+        "blocked_count": len(blocked),
+        "items": items[:16],
+        "top": items[0] if items else None,
+        "next_action": (
+            "Route blocked high-impact names to fallback confirmation."
+            if blocked
+            else "Provider arbitration has selected usable source precedence."
+        ),
+    }
+
+
+def _build_fallback_provider_router(arbitration: dict, provider_health_limits: dict) -> dict:
+    provider_caps = dict((provider_health_limits or {}).get("provider_limits") or {})
+    routes = []
+    for item in list((arbitration or {}).get("items") or []):
+        verdict = str(item.get("verdict") or "").upper()
+        source = _provider_source_key(item.get("best_source"))
+        freshness = str(item.get("best_source_freshness") or "").upper()
+        confidence = str(item.get("best_source_confidence") or "").upper()
+        if "BLOCK" not in verdict and freshness in {"LIVE", "RECENT"} and confidence != "LOW":
+            continue
+        if source.startswith("cache") or source == "unknown":
+            route = "ALTERNATE_LIVE_MARKET_SOURCE"
+        elif confidence == "LOW":
+            route = "SECOND_SOURCE_CONFIDENCE_CHECK"
+        elif freshness == "STALE":
+            route = "FRESHNESS_REFRESH"
+        else:
+            route = "SECOND_SOURCE_CONFIRMATION"
+        routes.append({
+            "symbol": item.get("symbol"),
+            "mint": item.get("mint"),
+            "route": route,
+            "current_source": item.get("best_source"),
+            "provider_cap": provider_caps.get(source),
+            "read_only": True,
+            "reason": item.get("reason"),
+        })
+    return {
+        "status": "ROUTES_READY" if routes else "NO_FALLBACK_NEEDED",
+        "route_count": len(routes),
+        "routes": routes[:12],
+        "next_action": (
+            "Run fallback confirmation only for the routed high-impact candidates."
+            if routes
+            else "No fallback route is needed right now."
+        ),
+    }
+
+
+def _build_dashboard_provider_truth_panel(
+    source_map: dict,
+    agreement_layer: dict,
+    arbitration: dict,
+    fallback_router: dict,
+) -> dict:
+    top_agreement = (list((agreement_layer or {}).get("items") or []) or [{}])[0]
+    top_arbitration = dict((arbitration or {}).get("top") or {})
+    status = (
+        "BLOCKED"
+        if str((agreement_layer or {}).get("status") or "").upper() == "BLOCKED"
+        else "ROUTING"
+        if int((fallback_router or {}).get("route_count") or 0)
+        else "READY"
+    )
+    return {
+        "status": status,
+        "headline": (
+            f"{top_agreement.get('symbol') or 'Top candidate'} needs provider truth confirmation."
+            if status == "BLOCKED"
+            else "Provider truth is mapped and arbitration is ready."
+        ),
+        "provider_count": len(list((source_map or {}).get("providers") or [])),
+        "weak_provider_count": int((source_map or {}).get("weak_provider_count") or 0),
+        "agreement_status": (agreement_layer or {}).get("status"),
+        "blocked_count": int((arbitration or {}).get("blocked_count") or 0),
+        "fallback_routes": int((fallback_router or {}).get("route_count") or 0),
+        "top_symbol": top_agreement.get("symbol"),
+        "top_status": top_agreement.get("status"),
+        "top_best_source": top_arbitration.get("best_source"),
+        "top_best_score": top_arbitration.get("best_source_score"),
+        "next_action": (fallback_router or {}).get("next_action") or (agreement_layer or {}).get("next_action"),
+    }
+
+
+def _build_provider_truth_layer(
+    intelligence_rows: list[dict],
+    journal_rows: list[dict],
+    data_watchdog: dict,
+    freshness_repair_loop: dict,
+    provider_reliability: dict,
+    repair_rows: list[dict],
+) -> dict:
+    source_map = _build_provider_source_map(intelligence_rows, data_watchdog, provider_reliability, freshness_repair_loop, journal_rows)
+    source_index = {
+        _provider_source_key(item.get("source")): item
+        for item in list(source_map.get("providers") or [])
+    }
+    targets = _provider_truth_high_impact_targets(freshness_repair_loop, data_watchdog)
+    agreement_layer = _build_cross_provider_agreement_layer(targets, intelligence_rows, repair_rows, source_index)
+    arbitration = _build_provider_confidence_arbitration(agreement_layer, source_map)
+    fallback_router = _build_fallback_provider_router(
+        arbitration,
+        dict((freshness_repair_loop or {}).get("provider_health_limits") or {}),
+    )
+    truth_panel = _build_dashboard_provider_truth_panel(source_map, agreement_layer, arbitration, fallback_router)
+    return {
+        "status": truth_panel.get("status"),
+        "provider_source_map": source_map,
+        "cross_provider_agreement": agreement_layer,
+        "provider_confidence_arbitration": arbitration,
+        "fallback_provider_router": fallback_router,
+        "dashboard_provider_truth_panel": truth_panel,
+        "next_action": truth_panel.get("next_action"),
+    }
+
+
+def _apply_provider_truth_to_rule_gate(rule_gate: dict, provider_truth: dict) -> dict:
+    out = copy.deepcopy(rule_gate or {})
+    agreement = dict((provider_truth or {}).get("cross_provider_agreement") or {})
+    panel = dict((provider_truth or {}).get("dashboard_provider_truth_panel") or {})
+    if str(agreement.get("status") or "").upper() != "BLOCKED":
+        return out
+    blockers = list(out.get("blockers") or [])
+    if "provider_truth_confirmation_missing" not in blockers:
+        blockers.append("provider_truth_confirmation_missing")
+    out["blockers"] = blockers
+    out["status"] = "BLOCKED"
+    out["provider_truth_gate"] = {
+        "status": "BLOCKED",
+        "blocked_count": int(panel.get("blocked_count") or 0),
+        "top_symbol": panel.get("top_symbol"),
+        "top_status": panel.get("top_status"),
+        "requirement": "High-impact candidates need two independent non-weak provider confirmations before promotion.",
+    }
+    out["next_action"] = provider_truth.get("next_action") or out.get("next_action")
+    return out
+
+
 def _build_provider_escalation_queue(escalation_rows: list[dict], now: datetime | None = None) -> dict:
     now = now or datetime.now(timezone.utc)
     active_statuses = {"QUEUED", "WATCHING", "FORCE_REFRESH_REQUESTED", "STALE_REVIEW"}
@@ -20434,6 +20896,14 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
         kv_rows.get(_PROVIDER_ESCALATION_WORK_ORDER_STATES_KEY),
     )
     provider_escalation_execution_packs = _build_provider_escalation_execution_packs(provider_escalation_work_orders)
+    provider_truth_layer = _build_provider_truth_layer(
+        intelligence_rows,
+        journal_24h,
+        data_watchdog,
+        freshness_sla_repair_loop,
+        provider_reliability,
+        repair_rows,
+    )
     rule_promotion_gate = _build_rule_promotion_gate(
         rule_simulator,
         data_watchdog,
@@ -20442,6 +20912,7 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
         provider_escalation_accuracy,
         provider_escalation_review_queue,
     )
+    rule_promotion_gate = _apply_provider_truth_to_rule_gate(rule_promotion_gate, provider_truth_layer)
     missed_runner_clusters = _build_missed_runner_clusters(journal_24h)
     catalyst_context = _build_catalyst_context(kv_rows, confluence_rows, journal_24h)
     live_market_narrative_intake = _build_live_market_narrative_intake(kv_rows, confluence_rows)
@@ -20566,6 +21037,8 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
         next_actions.append(str(safety_flag_contract.get("next_action") or "Patch mixed execution flags to locked-safe values."))
     if str((freshness_sla_repair_loop or {}).get("status") or "").upper() == "BLOCKED":
         next_actions.append(str(freshness_sla_repair_loop.get("next_action") or "Continue targeted freshness repairs."))
+    if str((provider_truth_layer or {}).get("status") or "").upper() in {"BLOCKED", "ROUTING"}:
+        next_actions.append(str(provider_truth_layer.get("next_action") or "Resolve provider truth confirmation before promotion."))
     if stale_high_quality:
         next_actions.append("Refresh stale high-quality token intelligence rows first.")
     if daily_build_hooks.get("next_patch"):
@@ -20665,6 +21138,7 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
         "provider_escalation_execution_packs": provider_escalation_execution_packs,
         "provider_post_patch_outcomes": provider_post_patch_outcomes,
         "provider_regression_guard": provider_regression_guard,
+        "provider_truth_layer": provider_truth_layer,
         "provider_escalation_outcome_autorun": outcome_autorun,
         "rule_promotion_gate": rule_promotion_gate,
         "missed_runner_clusters": missed_runner_clusters,

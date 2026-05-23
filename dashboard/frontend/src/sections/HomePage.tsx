@@ -848,6 +848,72 @@ interface DailyCryptoBriefData {
     repair_plan?: string | null
     action?: string | null
   }
+  provider_truth_layer?: {
+    status?: string
+    provider_source_map?: {
+      status?: string
+      weak_provider_count?: number
+      providers?: Array<{
+        source?: string
+        rows?: number
+        trust_label?: string
+        confidence_score?: number
+        live_recent_pct?: number | null
+        repair_hit_rate_pct?: number | null
+      }>
+    }
+    cross_provider_agreement?: {
+      status?: string
+      target_count?: number
+      confirmed_count?: number
+      single_source_count?: number
+      blocked_count?: number
+      items?: Array<{
+        symbol?: string | null
+        status?: string
+        needs_confirmation?: boolean
+        independent_confirmation_count?: number
+        confirming_sources?: string[]
+        stale_or_low_sources?: string[]
+      }>
+    }
+    provider_confidence_arbitration?: {
+      status?: string
+      blocked_count?: number
+      top?: {
+        symbol?: string | null
+        best_source?: string | null
+        best_source_score?: number
+        verdict?: string
+      } | null
+    }
+    fallback_provider_router?: {
+      status?: string
+      route_count?: number
+      routes?: Array<{
+        symbol?: string | null
+        route?: string
+        current_source?: string | null
+        provider_cap?: number | null
+        read_only?: boolean
+      }>
+    }
+    dashboard_provider_truth_panel?: {
+      status?: string
+      headline?: string
+      provider_count?: number
+      weak_provider_count?: number
+      agreement_status?: string
+      blocked_count?: number
+      fallback_routes?: number
+      top_symbol?: string | null
+      top_status?: string
+      top_best_source?: string | null
+      top_best_score?: number
+      next_action?: string | null
+    }
+    next_action?: string | null
+  }
   freshness_sla?: {
     status?: string
     score?: number | null
@@ -5485,6 +5551,15 @@ function DailyCryptoBriefPanel({
     const freshnessTopProviderLimit = freshnessProviderLimits.providers?.[0]
     const freshnessTopSegment = freshnessBacklogSegmentation.top_segment
     const providerReliability = data.provider_reliability ?? {}
+    const providerTruth = data.provider_truth_layer ?? {}
+    const providerTruthPanel = providerTruth.dashboard_provider_truth_panel ?? {}
+    const providerTruthAgreement = providerTruth.cross_provider_agreement ?? {}
+    const providerTruthArbitration = providerTruth.provider_confidence_arbitration ?? {}
+    const providerTruthFallback = providerTruth.fallback_provider_router ?? {}
+    const providerTruthSourceMap = providerTruth.provider_source_map ?? {}
+    const topProviderTruthItem = providerTruthAgreement.items?.[0]
+    const topProviderTruthSource = providerTruthSourceMap.providers?.[0]
+    const topFallbackRoute = providerTruthFallback.routes?.[0]
     const providerDrilldown = data.provider_failure_drilldown ?? {}
     const escalationQueue = data.provider_escalation_queue ?? {}
     const escalationAccuracy = data.provider_escalation_accuracy ?? {}
@@ -6007,6 +6082,25 @@ function DailyCryptoBriefPanel({
             </div>
             <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
               {topProviderFailure ? `${String(topProviderFailure.failure_class || 'unknown').replace(/_/g, ' ')} · ${topProviderFailure.count ?? 0}` : 'No repair failures in this window.'}
+            </div>
+          </div>
+
+          <div style={{ border: `1px solid ${providerTruthPanel.status === 'BLOCKED' ? 'rgba(239,68,68,0.24)' : providerTruthPanel.status === 'ROUTING' ? 'rgba(245,158,11,0.22)' : 'rgba(0,212,138,0.18)'}`, borderRadius: 10, padding: 10, background: providerTruthPanel.status === 'BLOCKED' ? 'rgba(239,68,68,0.035)' : providerTruthPanel.status === 'ROUTING' ? 'rgba(245,158,11,0.03)' : 'rgba(0,212,138,0.025)' }}>
+            <span style={{ ...MONO, fontSize: 8, color: providerTruthPanel.status === 'BLOCKED' ? '#ef4444' : providerTruthPanel.status === 'ROUTING' ? '#f59e0b' : '#00d48a', fontWeight: 900, letterSpacing: '0.14em' }}>
+              PROVIDER TRUTH
+            </span>
+            <div style={{ ...MONO, fontSize: 10, color: '#d7e1ea', marginTop: 7, lineHeight: 1.45 }}>
+              {providerTruthPanel.top_symbol || topProviderTruthItem?.symbol || providerTruthPanel.status || 'Mapped'} · {String(providerTruthPanel.agreement_status || providerTruthAgreement.status || 'watch').replace(/_/g, ' ').toLowerCase()}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              providers {providerTruthPanel.provider_count ?? providerTruthSourceMap.providers?.length ?? 0} · weak {providerTruthPanel.weak_provider_count ?? providerTruthSourceMap.weak_provider_count ?? 0} · blocked {providerTruthPanel.blocked_count ?? providerTruthArbitration.blocked_count ?? 0} · routes {providerTruthPanel.fallback_routes ?? providerTruthFallback.route_count ?? 0}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#9db7ce', marginTop: 5, lineHeight: 1.45 }}>
+              {topFallbackRoute?.symbol
+                ? `${topFallbackRoute.symbol} routes to ${String(topFallbackRoute.route || 'confirmation').replace(/_/g, ' ').toLowerCase()} · ${topFallbackRoute.current_source || 'source'}`
+                : topProviderTruthSource?.source
+                  ? `${topProviderTruthSource.source} ${topProviderTruthSource.trust_label || 'trust'} · score ${fmtFixed(topProviderTruthSource.confidence_score, 0)}`
+                  : providerTruthPanel.next_action || providerTruth.next_action || 'Provider truth panel waiting.'}
             </div>
           </div>
 
