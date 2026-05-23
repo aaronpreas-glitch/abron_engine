@@ -283,6 +283,41 @@ interface DailyCryptoBriefData {
     retired_24h?: number
     next_action?: string | null
   }
+  provider_reliability?: {
+    status?: string
+    attempts_24h?: number
+    repair_hit_rate_pct?: number | null
+    status_counts?: Record<string, number>
+    top_failures?: Array<{ failure_class?: string; count?: number }>
+    providers?: Array<{
+      provider?: string
+      attempts?: number
+      live_repaired?: number
+      fallback_repaired?: number
+      unresolved?: number
+      retired?: number
+      repair_hit_rate_pct?: number | null
+      unresolved_rate_pct?: number | null
+      avg_latency_ms?: number | null
+      failure_classes?: Record<string, number>
+    }>
+  }
+  provider_failure_drilldown?: {
+    status?: string
+    items?: Array<{
+      symbol?: string | null
+      mint?: string | null
+      repair_status?: string | null
+      failure_class?: string | null
+      provider_path?: string | null
+      previous_source?: string | null
+      new_source?: string | null
+      repair_score?: number | null
+      queue_flags?: string[]
+      latency_ms?: number | null
+      reason?: string | null
+    }>
+  }
   rule_promotion_gate?: {
     status?: string
     reason?: string | null
@@ -4414,6 +4449,8 @@ function DailyCryptoBriefPanel({ data, loading }: { data?: DailyCryptoBriefData;
     const replayEvents = replay.events ?? []
     const watchdog = data.data_watchdog ?? {}
     const freshnessSla = data.freshness_sla ?? {}
+    const providerReliability = data.provider_reliability ?? {}
+    const providerDrilldown = data.provider_failure_drilldown ?? {}
     const ruleGate = data.rule_promotion_gate ?? {}
     const missedClusters = data.missed_runner_clusters ?? {}
     const catalystContext = data.catalyst_context ?? {}
@@ -4425,6 +4462,8 @@ function DailyCryptoBriefPanel({ data, loading }: { data?: DailyCryptoBriefData;
     const providerLine = providerRows.slice(0, 3)
       .map(row => `${String(row.source || 'unknown').toLowerCase()} ${row.live ?? 0}/${row.stale ?? 0} stale`)
       .join(' · ')
+    const topProviderFailure = providerReliability.top_failures?.[0]
+    const topProviderDrilldown = providerDrilldown.items?.[0]
     const buildHooks = data.daily_build_hooks ?? {}
     const countText = (counts: Record<string, number>, keys: string[]) =>
       keys.map(key => `${key.toLowerCase()} ${counts[key] ?? 0}`).join(' · ')
@@ -4599,6 +4638,32 @@ function DailyCryptoBriefPanel({ data, loading }: { data?: DailyCryptoBriefData;
               {topRefreshTarget
                 ? `${String(topRefreshTarget.market_source || 'source').toLowerCase()} · ${String(topRefreshTarget.data_freshness || 'unknown').toLowerCase()}/${String(topRefreshTarget.data_confidence || 'unknown').toLowerCase()} · q ${fmtFixed(topRefreshTarget.quality_score, 0)}`
                 : watchdog.action || 'No provider repair target queued.'}
+            </div>
+          </div>
+
+          <div style={{ border: '1px solid rgba(245,158,11,0.18)', borderRadius: 10, padding: 10, background: 'rgba(245,158,11,0.025)' }}>
+            <span style={{ ...MONO, fontSize: 8, color: '#f59e0b', fontWeight: 900, letterSpacing: '0.14em' }}>
+              PROVIDER RELIABILITY
+            </span>
+            <div style={{ ...MONO, fontSize: 10, color: '#d7e1ea', marginTop: 7, lineHeight: 1.45 }}>
+              hit {fmtFixed(providerReliability.repair_hit_rate_pct, 0)}% · attempts {providerReliability.attempts_24h ?? 0}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              {topProviderFailure ? `${String(topProviderFailure.failure_class || 'unknown').replace(/_/g, ' ')} · ${topProviderFailure.count ?? 0}` : 'No repair failures in this window.'}
+            </div>
+          </div>
+
+          <div style={{ border: '1px solid rgba(239,68,68,0.18)', borderRadius: 10, padding: 10, background: 'rgba(239,68,68,0.025)' }}>
+            <span style={{ ...MONO, fontSize: 8, color: '#ef4444', fontWeight: 900, letterSpacing: '0.14em' }}>
+              STALE WHY
+            </span>
+            <div style={{ ...MONO, fontSize: 10, color: '#d7e1ea', marginTop: 7, lineHeight: 1.45 }}>
+              {topProviderDrilldown?.symbol || providerDrilldown.status || 'NO_FAILURES'}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              {topProviderDrilldown
+                ? `${String(topProviderDrilldown.failure_class || 'unknown').replace(/_/g, ' ')} · ${String(topProviderDrilldown.provider_path || 'provider').replace(/->/g, ' > ')}`
+                : 'No stale provider drilldown yet.'}
             </div>
           </div>
 

@@ -12858,6 +12858,17 @@ def _good_buy_gate(row: dict, provider_context: dict, memory_index: dict[str, di
     elif freshness == "LIVE":
         strengths.append("live_market_data")
 
+    repair_status = str(row.get("provider_repair_status") or "").strip().upper()
+    repair_failure = str(row.get("provider_repair_failure_class") or "").strip().lower()
+    if repair_status == "RETIRED_UNRESOLVED":
+        blockers.append(f"provider_repair_retired_{repair_failure or 'unresolved'}")
+    elif repair_status == "UNRESOLVED" and repair_failure in {"bad_ca_or_pair_mismatch", "no_market_data", "dexscreener_no_pair"}:
+        blockers.append(f"provider_repair_{repair_failure}")
+    elif repair_status == "UNRESOLVED" and repair_failure:
+        warnings.append(f"provider_repair_{repair_failure}")
+    elif repair_status == "FALLBACK_REPAIRED":
+        warnings.append("provider_fallback_repaired_not_primary_live")
+
     if age_minutes is None:
         blockers.append("missing_snapshot_age")
     elif age_minutes > 180:
@@ -13255,10 +13266,10 @@ def _failure_detail(key: str) -> dict:
         category, severity, priority = "identity", "BLOCKER", 5
         unlock = "Wait for resolved identity and a verified contract address."
         why = "The system should not suggest a buy until the ticker maps to the correct CA."
-    elif norm.startswith("freshness_") or norm.startswith("market_data_") or norm.startswith("snapshot_") or norm == "data_confidence_low":
+    elif norm.startswith("freshness_") or norm.startswith("market_data_") or norm.startswith("snapshot_") or norm == "data_confidence_low" or norm.startswith("provider_repair_") or norm.startswith("provider_fallback_"):
         category, severity, priority = "freshness", "BLOCKER", 10
-        unlock = "Wait for live market data to refresh; confirm the live chart after it clears."
-        why = "Stale or low-confidence market data can make momentum and liquidity reads false."
+        unlock = "Wait for live market data to refresh or for the provider repair layer to find a trustworthy fallback."
+        why = "Stale, unresolved, or fallback-only provider data can make momentum and liquidity reads false."
     elif norm.startswith("liquidity") or norm.startswith("volume"):
         category, severity, priority = "depth", "BLOCKER", 20
         unlock = "Wait for cleaner liquidity and real volume so the entry is not thin."
@@ -14564,7 +14575,9 @@ def _build_freshness_sla(intelligence_rows: list[dict], snapshot_rows: list[dict
     recent = len([r for r in rows if str(r.get("data_freshness") or "").upper() == "RECENT"])
     stale = len([r for r in rows if str(r.get("data_freshness") or "").upper() == "STALE"])
     low_conf = len([r for r in rows if str(r.get("data_confidence") or "").upper() == "LOW"])
-    repaired = len([r for r in repair_rows if str(r.get("repair_status") or "").upper() == "LIVE_REPAIRED"])
+    repaired = len([r for r in repair_rows if str(r.get("repair_status") or "").upper() in {"LIVE_REPAIRED", "FALLBACK_REPAIRED"}])
+    live_repaired = len([r for r in repair_rows if str(r.get("repair_status") or "").upper() == "LIVE_REPAIRED"])
+    fallback_repaired = len([r for r in repair_rows if str(r.get("repair_status") or "").upper() == "FALLBACK_REPAIRED"])
     unresolved = len([r for r in repair_rows if str(r.get("repair_status") or "").upper() == "UNRESOLVED"])
     retired = len([r for r in repair_rows if str(r.get("repair_status") or "").upper() == "RETIRED_UNRESOLVED"])
     live_recent_pct = round(((live + recent) / total) * 100.0, 1)
@@ -14601,7 +14614,9 @@ def _build_freshness_sla(intelligence_rows: list[dict], snapshot_rows: list[dict
         "low_confidence_pct": low_conf_pct,
         "repair_attempts_24h": repair_attempts,
         "repair_success_pct": repair_success_pct,
-        "live_repaired_24h": repaired,
+        "live_repaired_24h": live_repaired,
+        "fallback_repaired_24h": fallback_repaired,
+        "repaired_24h": repaired,
         "unresolved_24h": unresolved,
         "retired_24h": retired,
         "trend": trend,
@@ -14613,17 +14628,105 @@ def _build_freshness_sla(intelligence_rows: list[dict], snapshot_rows: list[dict
     }
 
 
-def _build_rule_promotion_gate(simulator: dict, watchdog: dict, freshness_sla: dict) -> dict:
+def _build_provider_reliability_scorecard(repair_rows: list[dict]) -> dict:
+    rows = list(repair_rows or [])
+    provider_map: dict[str, dict] = {}
+    failure_counts: dict[str, int] = {}
+    status_counts: dict[str, int] = {}
+    for row in rows:
+        provider = str(row.get("previous_source") or row.get("new_source") or "unknown").lower()
+        item = provider_map.setdefault(provider, {
+            "provider": provider,
+            "attempts": 0,
+            "live_repaired": 0,
+            "fallback_repaired": 0,
+            "unresolved": 0,
+            "retired": 0,
+            "latency_total_ms": 0,
+            "failure_classes": {},
+        })
+        status = str(row.get("repair_status") or "UNKNOWN").upper()
+        failure = str(row.get("failure_class") or row.get("reason") or "unknown").lower()
+        item["attempts"] += 1
+        item["latency_total_ms"] += int(_gb_float(row.get("latency_ms")))
+        status_counts[status] = status_counts.get(status, 0) + 1
+        failure_counts[failure] = failure_counts.get(failure, 0) + 1
+        if status == "LIVE_REPAIRED":
+            item["live_repaired"] += 1
+        elif status == "FALLBACK_REPAIRED":
+            item["fallback_repaired"] += 1
+        elif status == "RETIRED_UNRESOLVED":
+            item["retired"] += 1
+        else:
+            item["unresolved"] += 1
+        item["failure_classes"][failure] = item["failure_classes"].get(failure, 0) + 1
+    providers = []
+    for item in provider_map.values():
+        attempts = max(1, int(item.get("attempts") or 0))
+        repaired = int(item.get("live_repaired") or 0) + int(item.get("fallback_repaired") or 0)
+        unresolved = int(item.get("unresolved") or 0) + int(item.get("retired") or 0)
+        item["repair_hit_rate_pct"] = round((repaired / attempts) * 100.0, 1)
+        item["unresolved_rate_pct"] = round((unresolved / attempts) * 100.0, 1)
+        item["avg_latency_ms"] = round(_gb_float(item.get("latency_total_ms")) / attempts, 0)
+        item.pop("latency_total_ms", None)
+        providers.append(item)
+    providers.sort(key=lambda x: (int(x.get("attempts") or 0), _gb_float(x.get("unresolved_rate_pct"))), reverse=True)
+    top_failures = [{"failure_class": k, "count": v} for k, v in sorted(failure_counts.items(), key=lambda kv: kv[1], reverse=True)[:8]]
+    attempts = len(rows)
+    repaired_total = int(status_counts.get("LIVE_REPAIRED", 0)) + int(status_counts.get("FALLBACK_REPAIRED", 0))
+    return {
+        "status": "READY" if attempts else "NO_REPAIR_EVENTS",
+        "attempts_24h": attempts,
+        "repair_hit_rate_pct": round((repaired_total / max(1, attempts)) * 100.0, 1) if attempts else None,
+        "status_counts": status_counts,
+        "top_failures": top_failures,
+        "providers": providers[:8],
+    }
+
+
+def _build_provider_failure_drilldown(repair_rows: list[dict]) -> dict:
+    rows = list(repair_rows or [])
+    out = []
+    for row in rows[:20]:
+        flags = []
+        try:
+            flags = json.loads(row.get("queue_flags_json") or "[]")
+        except Exception:
+            flags = []
+        out.append({
+            "symbol": row.get("symbol"),
+            "mint": row.get("mint"),
+            "repair_status": row.get("repair_status"),
+            "failure_class": row.get("failure_class") or row.get("reason"),
+            "provider_path": row.get("provider_path"),
+            "previous_source": row.get("previous_source"),
+            "new_source": row.get("new_source"),
+            "repair_score": _nullable_float(row.get("repair_score")),
+            "queue_flags": flags,
+            "latency_ms": row.get("latency_ms"),
+            "reason": row.get("reason"),
+        })
+    return {
+        "status": "READY" if out else "NO_FAILURES",
+        "items": out,
+    }
+
+
+def _build_rule_promotion_gate(simulator: dict, watchdog: dict, freshness_sla: dict, provider_reliability: dict | None = None) -> dict:
     top = dict((simulator or {}).get("top_candidate") or {})
     data_status = str((watchdog or {}).get("status") or "").upper()
     sla_status = str((freshness_sla or {}).get("status") or "").upper()
     score = _gb_float((freshness_sla or {}).get("score"))
+    provider_hit_rate = _gb_float((provider_reliability or {}).get("repair_hit_rate_pct"), 100.0)
     if not top:
         status = "NO_RULE"
         reason = "No simulator candidate has enough outcome evidence."
     elif data_status in {"PATCH_QUEUE", "DEGRADED"} or sla_status == "DEGRADED" or score < 55:
         status = "BLOCKED_DATA"
         reason = "Provider freshness is not strong enough to promote a rule change."
+    elif provider_hit_rate < 35 and int((provider_reliability or {}).get("attempts_24h") or 0) >= 8:
+        status = "BLOCKED_PROVIDER_REPAIR"
+        reason = "Provider repair hit rate is too weak to trust rule promotion."
     elif int(top.get("net_score") or 0) < 8:
         status = "OBSERVE"
         reason = "Top rule edge is not large enough to promote."
@@ -14637,8 +14740,10 @@ def _build_rule_promotion_gate(simulator: dict, watchdog: dict, freshness_sla: d
         "requirements": {
             "freshness_score_min": 55,
             "rule_net_score_min": 8,
+            "provider_repair_hit_rate_min": 35,
             "data_status": data_status or "UNKNOWN",
             "freshness_sla_status": sla_status or "UNKNOWN",
+            "provider_repair_hit_rate_pct": provider_hit_rate,
         },
     }
 
@@ -14947,7 +15052,8 @@ def _build_daily_crypto_brief(lookback_hours: int = 24) -> dict:
                         SELECT ts_utc, mint, symbol, previous_source, previous_freshness,
                                previous_confidence, previous_quality, previous_pressure,
                                repair_status, new_source, new_freshness, new_confidence,
-                               new_quality, new_pressure, latency_ms, unresolved_count, reason
+                               new_quality, new_pressure, latency_ms, unresolved_count, reason,
+                               failure_class, provider_path, repair_score, queue_flags_json
                         FROM token_provider_repair_events
                         WHERE ts_utc >= ?
                         ORDER BY id DESC
@@ -15095,7 +15201,9 @@ def _build_daily_crypto_brief(lookback_hours: int = 24) -> dict:
     candidate_replay_timeline = _build_candidate_replay_timeline(journal_rows, outcome_autopsy)
     data_watchdog = _build_data_quality_watchdog(intelligence_rows, outcome_autopsy)
     freshness_sla = _build_freshness_sla(intelligence_rows, token_snapshot_rows, repair_rows)
-    rule_promotion_gate = _build_rule_promotion_gate(rule_simulator, data_watchdog, freshness_sla)
+    provider_reliability = _build_provider_reliability_scorecard(repair_rows)
+    provider_failure_drilldown = _build_provider_failure_drilldown(repair_rows)
+    rule_promotion_gate = _build_rule_promotion_gate(rule_simulator, data_watchdog, freshness_sla, provider_reliability)
     missed_runner_clusters = _build_missed_runner_clusters(journal_24h)
     catalyst_context = _build_catalyst_context(kv_rows, confluence_rows, journal_24h)
     missed_count = len(missed)
@@ -15184,6 +15292,8 @@ def _build_daily_crypto_brief(lookback_hours: int = 24) -> dict:
         "candidate_replay_timeline": candidate_replay_timeline,
         "data_watchdog": data_watchdog,
         "freshness_sla": freshness_sla,
+        "provider_reliability": provider_reliability,
+        "provider_failure_drilldown": provider_failure_drilldown,
         "rule_promotion_gate": rule_promotion_gate,
         "missed_runner_clusters": missed_runner_clusters,
         "catalyst_context": catalyst_context,

@@ -147,6 +147,18 @@ def _ensure_tables(conn) -> None:
         )
         """
     )
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(token_intelligence_current)").fetchall()}
+        for col, col_type in [
+            ("provider_repair_status", "TEXT"),
+            ("provider_repair_failure_class", "TEXT"),
+            ("provider_repair_updated_at", "TEXT"),
+            ("provider_repair_retired_until_unix", "REAL"),
+        ]:
+            if col not in cols:
+                conn.execute(f"ALTER TABLE token_intelligence_current ADD COLUMN {col} {col_type}")
+    except Exception:
+        pass
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS token_provider_repair_events (
@@ -171,6 +183,18 @@ def _ensure_tables(conn) -> None:
         )
         """
     )
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(token_provider_repair_events)").fetchall()}
+        for col, col_type in [
+            ("failure_class", "TEXT"),
+            ("provider_path", "TEXT"),
+            ("repair_score", "REAL"),
+            ("queue_flags_json", "TEXT"),
+        ]:
+            if col not in cols:
+                conn.execute(f"ALTER TABLE token_provider_repair_events ADD COLUMN {col} {col_type}")
+    except Exception:
+        pass
     conn.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_token_provider_repair_events_ts
@@ -570,6 +594,186 @@ def _build_snapshot(item: dict, *, live_enabled: bool, holder_enabled: bool, res
     return row
 
 
+def _snapshot_from_market(item: dict, market: dict, market_source: str) -> dict:
+    mint = str(item.get("mint") or "").strip()
+    raw = _best_raw(item)
+    symbol = str(market.get("symbol") or item.get("symbol") or raw.get("symbol") or "").strip().upper() or None
+    if not symbol:
+        raise ValueError("missing_symbol")
+    row = {
+        **market,
+        "ts_utc": _now_iso(),
+        "mint": mint,
+        "symbol": symbol,
+        "lane_sources": ",".join(item.get("sources") or []),
+        "market_source": market_source,
+    }
+    row.update(_identity(row))
+    risk, pressure, quality, reasons, data_confidence, freshness = _score(row)
+    row.update(
+        {
+            "risk_score": risk,
+            "pressure_score": pressure,
+            "quality_score": quality,
+            "reasons": reasons,
+            "data_confidence": data_confidence,
+            "data_freshness": freshness,
+            "raw": {"inputs": item.get("raw_inputs") or [], "market": market, "fallback_source": market_source},
+        }
+    )
+    return row
+
+
+def _snapshot_from_token_stats(item: dict) -> dict | None:
+    mint = str(item.get("mint") or "").strip()
+    if not mint:
+        return None
+    try:
+        from utils.db import get_latest_memecoin_token_stats_for_mints  # type: ignore
+
+        stats = (get_latest_memecoin_token_stats_for_mints([mint], max_age_minutes=240) or {}).get(mint) or {}
+    except Exception:
+        stats = {}
+    if not stats:
+        return None
+    market = {
+        "symbol": str(stats.get("symbol") or item.get("symbol") or "").upper() or None,
+        "base_mint": mint,
+        "quote_mint": None,
+        "pair_address": None,
+        "price": _f(stats.get("price")),
+        "liquidity": _f(stats.get("liquidity")),
+        "marketcap": _f(stats.get("marketcap")),
+        "fdv": _f(stats.get("fdv")),
+        "volume_5m_usd": 0.0,
+        "volume_1h_usd": _f(stats.get("volume_1h_usd")),
+        "volume_6h_usd": 0.0,
+        "volume_24h_usd": _f(stats.get("volume_24h_usd")),
+        "price_change_1h_percent": _f(stats.get("price_change_1h_percent")),
+        "price_change_6h_percent": 0.0,
+        "price_change_24h_percent": _f(stats.get("price_change_24h_percent")),
+        "trade_1h": _i(stats.get("trade_1h")),
+        "trade_24h": 0,
+        "buy_pressure_1h": (
+            round((_f(stats.get("volume_buy_1h_usd")) / max(1.0, _f(stats.get("volume_1h_usd"))) * 100.0), 1)
+            if _f(stats.get("volume_1h_usd")) > 0
+            else None
+        ),
+    }
+    if _f(market.get("price")) <= 0:
+        return None
+    return _snapshot_from_market(item, market, "token_stats_cache")
+
+
+def _jupiter_price(mint: str) -> float:
+    try:
+        resp = requests.get("https://api.jup.ag/price/v2", params={"ids": mint}, timeout=8)
+        if resp.status_code != 200:
+            return 0.0
+        data = resp.json() or {}
+        return _f(((data.get("data") or {}).get(mint) or {}).get("price"))
+    except Exception:
+        return 0.0
+
+
+def _snapshot_from_birdeye_jupiter(item: dict) -> dict | None:
+    mint = str(item.get("mint") or "").strip()
+    if not mint:
+        return None
+    try:
+        from data.birdeye import fetch_birdeye_token_overview  # type: ignore
+
+        overview = fetch_birdeye_token_overview(mint) or {}
+    except Exception:
+        overview = {}
+    price = _jupiter_price(mint)
+    if price <= 0 and not overview:
+        return None
+    market = {
+        "symbol": str(item.get("symbol") or "").upper() or None,
+        "base_mint": mint,
+        "quote_mint": None,
+        "pair_address": None,
+        "price": price,
+        "liquidity": 0.0,
+        "marketcap": 0.0,
+        "fdv": 0.0,
+        "volume_5m_usd": 0.0,
+        "volume_1h_usd": 0.0,
+        "volume_6h_usd": 0.0,
+        "volume_24h_usd": 0.0,
+        "price_change_1h_percent": _f(overview.get("priceChange1hPercent")),
+        "price_change_6h_percent": 0.0,
+        "price_change_24h_percent": _f(overview.get("priceChange24hPercent")),
+        "trade_1h": _i(overview.get("txns_h1")),
+        "trade_24h": _i(overview.get("txns_h24")),
+        "buy_pressure_1h": None,
+        "unique_wallet_1h": _i(overview.get("uniqueWallet1h")),
+    }
+    if _f(market.get("price")) <= 0:
+        return None
+    return _snapshot_from_market(item, market, "birdeye_jupiter_fallback")
+
+
+def _classify_repair_failure(previous: dict, snapshot: dict | None, provider_path: list[str], exc: Exception | None = None) -> tuple[str, str]:
+    if exc is not None:
+        text = str(exc).lower()
+        if "429" in text or "rate" in text or "budget" in text:
+            return "provider_budget_or_rate_limit", "provider_budget_or_rate_limit"
+        return "temporary_error", "provider_exception"
+    if snapshot and str(snapshot.get("identity_status") or "").upper() == "MISMATCH":
+        return "bad_ca_or_pair_mismatch", "live_pair_base_mint_mismatch"
+    if snapshot and _f(snapshot.get("price")) > 0 and _f(snapshot.get("liquidity")) < 5_000:
+        return "low_liquidity", "provider_found_price_but_liquidity_is_too_low"
+    if "dexscreener" in provider_path and not snapshot:
+        return "dexscreener_no_pair", "dexscreener_returned_no_usable_solana_pair"
+    if _f(previous.get("price")) <= 0 and _f(previous.get("liquidity")) <= 0:
+        return "no_market_data", "no_provider_returned_usable_market_data"
+    if _i(previous.get("unresolved_count")) >= 2:
+        return "dead_or_inactive_token", "repeated_provider_miss"
+    return "provider_miss", "live_provider_missing_or_incomplete"
+
+
+def _build_provider_repair_snapshot(item: dict) -> tuple[dict | None, str, str, str, list[str]]:
+    provider_path: list[str] = []
+    first_snapshot: dict | None = None
+    first_exc: Exception | None = None
+    try:
+        provider_path.append("dexscreener")
+        first_snapshot = _build_snapshot(
+            item,
+            live_enabled=True,
+            holder_enabled=False,
+            reserve_market=True,
+        )
+        if (
+            str(first_snapshot.get("data_freshness") or "").upper() == "LIVE"
+            and str(first_snapshot.get("data_confidence") or "").upper() == "HIGH"
+        ):
+            return first_snapshot, "LIVE_REPAIRED", "live_provider_returned_high_confidence_market_data", "live_repaired", provider_path
+    except Exception as exc:
+        first_exc = exc
+
+    try:
+        provider_path.append("token_stats_cache")
+        stats_snapshot = _snapshot_from_token_stats(item)
+        if stats_snapshot and str(stats_snapshot.get("data_confidence") or "").upper() != "LOW":
+            return stats_snapshot, "FALLBACK_REPAIRED", "recent_token_stats_cache_repaired_provider_gap", "fallback_repaired", provider_path
+    except Exception:
+        pass
+
+    try:
+        provider_path.append("birdeye_jupiter")
+        fallback_snapshot = _snapshot_from_birdeye_jupiter(item)
+        if fallback_snapshot and _f(fallback_snapshot.get("price")) > 0:
+            return fallback_snapshot, "FALLBACK_REPAIRED", "birdeye_or_jupiter_repaired_price_context", "fallback_repaired", provider_path
+    except Exception:
+        pass
+
+    failure_class, reason = _classify_repair_failure(dict(item.get("_previous") or {}), first_snapshot, provider_path, first_exc)
+    return first_snapshot, "UNRESOLVED", reason, failure_class, provider_path
+
+
 def _record_snapshots(rows: list[dict]) -> int:
     if not rows:
         return 0
@@ -767,6 +971,16 @@ def _live_confirmation_candidates(limit: int = TOKEN_INTEL_CONFIRMATION_LIMIT) -
 
 
 def _current_row_to_item(raw: dict, *, source: str) -> dict:
+    queue_flags = []
+    for key, label in [
+        ("missed_context", "missed_runner"),
+        ("research_context", "research"),
+        ("paper_context", "paper"),
+        ("catalyst_context", "catalyst"),
+        ("watch_context", "watch_to_entry"),
+    ]:
+        if _i(raw.get(key)):
+            queue_flags.append(label)
     return {
         "mint": raw.get("mint"),
         "symbol": raw.get("symbol"),
@@ -789,6 +1003,8 @@ def _current_row_to_item(raw: dict, *, source: str) -> dict:
             }
         ],
         "_previous": raw,
+        "_repair_score": _f(raw.get("repair_score")),
+        "_queue_flags": queue_flags,
     }
 
 
@@ -806,7 +1022,73 @@ def _provider_repair_candidates(limit: int = TOKEN_INTEL_PROVIDER_REPAIR_LIMIT) 
                          FROM token_provider_repair_events e
                          WHERE e.mint=c.mint
                            AND e.repair_status IN ('UNRESOLVED','RETIRED_UNRESOLVED')
-                       ), 0) AS unresolved_count
+                       ), 0) AS unresolved_count,
+                       EXISTS (
+                         SELECT 1 FROM decision_journal dj
+                         WHERE (dj.mint=c.mint OR UPPER(COALESCE(dj.symbol,''))=UPPER(COALESCE(c.symbol,'')))
+                           AND dj.created_ts >= datetime('now','-36 hours')
+                           AND UPPER(COALESCE(dj.outcome_label,'')) IN ('BIG_RUNNER','GOOD_RUNNER','GOOD_BUY')
+                           AND UPPER(COALESCE(dj.recommended_action,'')) != 'BUY'
+                       ) AS missed_context,
+                       EXISTS (
+                         SELECT 1 FROM memecoin_research_dossiers rd
+                         WHERE rd.mint=c.mint
+                           AND UPPER(COALESCE(rd.action,'')) NOT IN ('IGNORE','SKIP')
+                       ) AS research_context,
+                       EXISTS (
+                         SELECT 1 FROM memecoin_entry_paper_trades pt
+                         WHERE UPPER(COALESCE(pt.symbol,''))=UPPER(COALESCE(c.symbol,''))
+                           AND pt.entry_ts >= datetime('now','-36 hours')
+                       ) AS paper_context,
+                       EXISTS (
+                         SELECT 1 FROM memecoin_research_dossiers rd2
+                         WHERE rd2.mint=c.mint
+                           AND COALESCE(rd2.last_catalyst_confidence,0) >= 50
+                       ) AS catalyst_context,
+                       EXISTS (
+                         SELECT 1 FROM decision_journal dj2
+                         WHERE (dj2.mint=c.mint OR UPPER(COALESCE(dj2.symbol,''))=UPPER(COALESCE(c.symbol,'')))
+                           AND dj2.created_ts >= datetime('now','-36 hours')
+                           AND UPPER(COALESCE(dj2.priority,'')) IN ('WATCH','ENTRY_WATCH','SCOUT_ONLY')
+                       ) AS watch_context,
+                       (
+                         CASE WHEN EXISTS (
+                           SELECT 1 FROM decision_journal dj
+                           WHERE (dj.mint=c.mint OR UPPER(COALESCE(dj.symbol,''))=UPPER(COALESCE(c.symbol,'')))
+                             AND dj.created_ts >= datetime('now','-36 hours')
+                             AND UPPER(COALESCE(dj.outcome_label,'')) IN ('BIG_RUNNER','GOOD_RUNNER','GOOD_BUY')
+                             AND UPPER(COALESCE(dj.recommended_action,'')) != 'BUY'
+                         ) THEN 100 ELSE 0 END
+                         + CASE WHEN EXISTS (
+                           SELECT 1 FROM memecoin_research_dossiers rd
+                           WHERE rd.mint=c.mint
+                             AND UPPER(COALESCE(rd.action,'')) NOT IN ('IGNORE','SKIP')
+                         ) THEN 70 ELSE 0 END
+                         + CASE WHEN EXISTS (
+                           SELECT 1 FROM memecoin_entry_paper_trades pt
+                           WHERE UPPER(COALESCE(pt.symbol,''))=UPPER(COALESCE(c.symbol,''))
+                             AND pt.entry_ts >= datetime('now','-36 hours')
+                         ) THEN 60 ELSE 0 END
+                         + CASE WHEN EXISTS (
+                           SELECT 1 FROM memecoin_research_dossiers rd2
+                           WHERE rd2.mint=c.mint
+                             AND COALESCE(rd2.last_catalyst_confidence,0) >= 50
+                         ) THEN 45 ELSE 0 END
+                         + CASE WHEN EXISTS (
+                           SELECT 1 FROM decision_journal dj2
+                           WHERE (dj2.mint=c.mint OR UPPER(COALESCE(dj2.symbol,''))=UPPER(COALESCE(c.symbol,'')))
+                             AND dj2.created_ts >= datetime('now','-36 hours')
+                             AND UPPER(COALESCE(dj2.priority,'')) IN ('WATCH','ENTRY_WATCH','SCOUT_ONLY')
+                         ) THEN 35 ELSE 0 END
+                         + COALESCE(c.quality_score,0) * 0.35
+                         + COALESCE(c.pressure_score,0) * 0.25
+                         - COALESCE((
+                           SELECT COUNT(*)
+                           FROM token_provider_repair_events e
+                           WHERE e.mint=c.mint
+                             AND e.repair_status IN ('UNRESOLVED','RETIRED_UNRESOLVED')
+                         ), 0) * 12
+                       ) AS repair_score
                 FROM token_intelligence_current c
                 WHERE c.mint IS NOT NULL AND TRIM(c.mint) != ''
                   AND c.symbol IS NOT NULL AND TRIM(c.symbol) != ''
@@ -816,18 +1098,51 @@ def _provider_repair_candidates(limit: int = TOKEN_INTEL_PROVIDER_REPAIR_LIMIT) 
                     OR LOWER(COALESCE(c.market_source, '')) LIKE 'cache%'
                   )
                   AND COALESCE(c.identity_status, '') IN ('RESOLVED','ASSERTED')
+                  AND (
+                    COALESCE(c.provider_repair_retired_until_unix, 0) <= ?
+                    OR COALESCE(c.quality_score,0) >= 72
+                    OR COALESCE(c.pressure_score,0) >= 60
+                  )
                 ORDER BY
-                  CASE WHEN COALESCE(c.quality_score,0) >= 72 OR COALESCE(c.pressure_score,0) >= 60 THEN 1 ELSE 0 END DESC,
+                  repair_score DESC,
                   COALESCE(unresolved_count, 0) ASC,
                   COALESCE(c.quality_score,0) DESC,
                   COALESCE(c.pressure_score,0) DESC,
                   c.updated_at ASC
                 LIMIT ?
                 """,
-                (int(limit),),
+                (time.time(), int(limit),),
             ).fetchall()
     except Exception:
-        return []
+        try:
+            with _get_conn() as conn:
+                _ensure_tables(conn)
+                rows = conn.execute(
+                    """
+                    SELECT c.*,
+                           0 AS unresolved_count,
+                           0 AS missed_context,
+                           0 AS research_context,
+                           0 AS paper_context,
+                           0 AS catalyst_context,
+                           0 AS watch_context,
+                           (COALESCE(c.quality_score,0) * 0.35 + COALESCE(c.pressure_score,0) * 0.25) AS repair_score
+                    FROM token_intelligence_current c
+                    WHERE c.mint IS NOT NULL AND TRIM(c.mint) != ''
+                      AND c.symbol IS NOT NULL AND TRIM(c.symbol) != ''
+                      AND (
+                        UPPER(COALESCE(c.data_freshness, ''))='STALE'
+                        OR UPPER(COALESCE(c.data_confidence, ''))='LOW'
+                        OR LOWER(COALESCE(c.market_source, '')) LIKE 'cache%'
+                      )
+                      AND COALESCE(c.identity_status, '') IN ('RESOLVED','ASSERTED')
+                    ORDER BY repair_score DESC, c.updated_at ASC
+                    LIMIT ?
+                    """,
+                    (int(limit),),
+                ).fetchall()
+        except Exception:
+            return []
     return [_current_row_to_item(dict(row), source="provider_repair") for row in rows]
 
 
@@ -845,9 +1160,10 @@ def _record_provider_repair_events(events: list[dict]) -> int:
                         ts_utc, mint, symbol, previous_source, previous_freshness,
                         previous_confidence, previous_quality, previous_pressure,
                         repair_status, new_source, new_freshness, new_confidence,
-                        new_quality, new_pressure, latency_ms, unresolved_count, reason
+                        new_quality, new_pressure, latency_ms, unresolved_count, reason,
+                        failure_class, provider_path, repair_score, queue_flags_json
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         event.get("ts_utc"),
@@ -867,8 +1183,33 @@ def _record_provider_repair_events(events: list[dict]) -> int:
                         _i(event.get("latency_ms")),
                         _i(event.get("unresolved_count")),
                         event.get("reason"),
+                        event.get("failure_class"),
+                        event.get("provider_path"),
+                        _f(event.get("repair_score")),
+                        json.dumps(list(event.get("queue_flags") or []), separators=(",", ":")),
                     ),
                 )
+                if event.get("mint"):
+                    retired_until = None
+                    if str(event.get("repair_status") or "").upper() == "RETIRED_UNRESOLVED":
+                        retired_until = time.time() + 24 * 3600
+                    conn.execute(
+                        """
+                        UPDATE token_intelligence_current
+                        SET provider_repair_status=?,
+                            provider_repair_failure_class=?,
+                            provider_repair_updated_at=?,
+                            provider_repair_retired_until_unix=?
+                        WHERE mint=?
+                        """,
+                        (
+                            event.get("repair_status"),
+                            event.get("failure_class"),
+                            event.get("ts_utc"),
+                            retired_until,
+                            event.get("mint"),
+                        ),
+                    )
                 inserted += 1
     except Exception:
         return inserted
@@ -936,32 +1277,31 @@ def token_intelligence_step(*, force: bool = False) -> dict:
         previous = dict(item.get("_previous") or {})
         started = time.time()
         snapshot: dict | None = None
-        try:
-            snapshot = _build_snapshot(
-                item,
-                live_enabled=True,
-                holder_enabled=False,
-                reserve_market=True,
-            )
-        except Exception:
-            snapshot = None
+        repair_status = "UNRESOLVED"
+        reason = "live_provider_missing_or_incomplete"
+        failure_class = "provider_miss"
+        provider_path: list[str] = []
+        snapshot, repair_status, reason, failure_class, provider_path = _build_provider_repair_snapshot(item)
         latency_ms = int(max(0.0, (time.time() - started) * 1000.0))
         previous_unresolved = _i(previous.get("unresolved_count"))
-        live_repaired = bool(
+        repaired = bool(
             snapshot
-            and str(snapshot.get("data_freshness") or "").upper() == "LIVE"
-            and str(snapshot.get("data_confidence") or "").upper() == "HIGH"
+            and repair_status in {"LIVE_REPAIRED", "FALLBACK_REPAIRED"}
+            and str(snapshot.get("data_confidence") or "").upper() != "LOW"
         )
-        if live_repaired and snapshot:
-            repair_status = "LIVE_REPAIRED"
-            reason = "live_provider_returned_high_confidence_market_data"
+        high_value_flags = set(item.get("_queue_flags") or [])
+        high_value = _f(item.get("_repair_score")) >= 80 or bool(high_value_flags & {"missed_runner", "research", "paper", "catalyst", "watch_to_entry"})
+        if repaired and snapshot:
             repair_rows.append(snapshot)
-        elif previous_unresolved >= 2 and _f(previous.get("quality_score")) < 65 and _f(previous.get("pressure_score")) < 58:
+        elif (
+            previous_unresolved >= 2
+            and not high_value
+            and failure_class in {"no_market_data", "dexscreener_no_pair", "dead_or_inactive_token", "low_liquidity", "provider_miss"}
+            and _f(previous.get("quality_score")) < 68
+            and _f(previous.get("pressure_score")) < 62
+        ):
             repair_status = "RETIRED_UNRESOLVED"
-            reason = "repeated_provider_miss_low_priority_cache_row"
-        else:
-            repair_status = "UNRESOLVED"
-            reason = "live_provider_missing_or_incomplete"
+            reason = f"retired_after_repeated_{failure_class}"
         repair_events.append(
             {
                 "ts_utc": _now_iso(),
@@ -979,8 +1319,12 @@ def token_intelligence_step(*, force: bool = False) -> dict:
                 "new_quality": (snapshot or {}).get("quality_score"),
                 "new_pressure": (snapshot or {}).get("pressure_score"),
                 "latency_ms": latency_ms,
-                "unresolved_count": previous_unresolved + (0 if live_repaired else 1),
+                "unresolved_count": previous_unresolved + (0 if repaired else 1),
                 "reason": reason,
+                "failure_class": failure_class,
+                "provider_path": "->".join(provider_path),
+                "repair_score": _f(item.get("_repair_score")),
+                "queue_flags": list(item.get("_queue_flags") or []),
             }
         )
     if repair_rows:
@@ -1014,8 +1358,10 @@ def token_intelligence_step(*, force: bool = False) -> dict:
             "candidate_count": len(repair_items),
             "event_count": repair_events_inserted,
             "live_repaired_count": len([e for e in repair_events if e.get("repair_status") == "LIVE_REPAIRED"]),
+            "fallback_repaired_count": len([e for e in repair_events if e.get("repair_status") == "FALLBACK_REPAIRED"]),
             "unresolved_count": len([e for e in repair_events if e.get("repair_status") == "UNRESOLVED"]),
             "retired_count": len([e for e in repair_events if e.get("repair_status") == "RETIRED_UNRESOLVED"]),
+            "failure_classes": sorted({str(e.get("failure_class") or "unknown") for e in repair_events}),
             "symbols": [e.get("symbol") for e in repair_events[:10] if e.get("symbol")],
         },
         "top_symbols": [r.get("symbol") for r in rows[:10] if r.get("symbol")],
