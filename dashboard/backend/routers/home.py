@@ -17917,6 +17917,9 @@ def _build_provider_confidence_arbitration(agreement_layer: dict, source_map: di
         items.append({
             "symbol": item.get("symbol"),
             "mint": item.get("mint"),
+            "priority_score": item.get("priority_score"),
+            "high_impact": item.get("high_impact"),
+            "impact_flags": item.get("impact_flags"),
             "status": item.get("status"),
             "best_source": source if source != "unknown" else None,
             "best_source_score": round(score, 1),
@@ -17964,6 +17967,9 @@ def _build_fallback_provider_router(arbitration: dict, provider_health_limits: d
         routes.append({
             "symbol": item.get("symbol"),
             "mint": item.get("mint"),
+            "priority_score": item.get("priority_score"),
+            "high_impact": bool(item.get("high_impact")),
+            "impact_flags": list(item.get("impact_flags") or []),
             "route": route,
             "current_source": item.get("best_source"),
             "provider_cap": provider_caps.get(source),
@@ -17980,6 +17986,242 @@ def _build_fallback_provider_router(arbitration: dict, provider_health_limits: d
             else "No fallback route is needed right now."
         ),
     }
+
+
+def _provider_truth_queue_key(item: dict) -> str:
+    mint = str(item.get("mint") or "").strip()
+    symbol = str(item.get("symbol") or "").strip().upper()
+    if mint:
+        return mint
+    return f"symbol:{symbol}" if symbol else ""
+
+
+def _provider_truth_memory_history_by_key(truth_memory: dict) -> dict[str, list[dict]]:
+    out: dict[str, list[dict]] = {}
+    for row in list((truth_memory or {}).get("items") or []):
+        for key in [
+            str(row.get("mint") or "").strip(),
+            f"symbol:{str(row.get('symbol') or '').strip().upper()}",
+        ]:
+            if key and key != "symbol:":
+                out.setdefault(key, []).append(dict(row))
+    for rows in out.values():
+        rows.sort(key=lambda x: str(x.get("ts_utc") or ""), reverse=True)
+    return out
+
+
+def _provider_truth_retry_delay_minutes(retry_count: int, high_impact: bool) -> int:
+    if retry_count <= 0:
+        return 0
+    schedule = [20, 60, 180, 360] if high_impact else [45, 180, 480, 720]
+    return schedule[min(max(0, retry_count - 1), len(schedule) - 1)]
+
+
+def _build_provider_truth_queue_health(fallback_router: dict, truth_memory: dict, now: datetime) -> dict:
+    history_by_key = _provider_truth_memory_history_by_key(truth_memory)
+    items = []
+    retry_due_routes = []
+    active_routes = []
+    downgraded = 0
+    escalated = 0
+    waiting = 0
+    due = 0
+    oldest_age_minutes = 0.0
+    for route in list((fallback_router or {}).get("routes") or []):
+        route = dict(route)
+        key = _provider_truth_queue_key(route)
+        history = history_by_key.get(key) or []
+        latest = history[0] if history else {}
+        latest_status = str(latest.get("confirmation_status") or "").upper()
+        unresolved_rows = [row for row in history if str(row.get("confirmation_status") or "").upper() == "UNRESOLVED"]
+        retry_count = len(unresolved_rows)
+        first_unresolved_ts = _gb_parse_ts((unresolved_rows[-1] if unresolved_rows else latest).get("ts_utc"))
+        last_attempt_ts = _gb_parse_ts(latest.get("ts_utc"))
+        age_minutes = round(max(0.0, (now - first_unresolved_ts).total_seconds() / 60.0), 1) if first_unresolved_ts else 0.0
+        oldest_age_minutes = max(oldest_age_minutes, age_minutes)
+        high_impact = bool(route.get("high_impact")) or _gb_float(route.get("priority_score")) >= 80
+        low_impact = (not high_impact) and _gb_float(route.get("priority_score")) < 65
+        retry_delay = _provider_truth_retry_delay_minutes(retry_count, high_impact)
+        next_retry_at = (
+            last_attempt_ts + timedelta(minutes=retry_delay)
+            if last_attempt_ts and retry_delay > 0
+            else now
+        )
+        retry_due = bool(next_retry_at <= now)
+        status = "DUE_RETRY" if retry_due else "WAITING_RETRY"
+        if latest_status == "CONFIRMED":
+            status = "CONFIRMED_MEMORY"
+            retry_due = False
+        elif latest_status == "IDENTITY_MISMATCH":
+            status = "IDENTITY_MISMATCH_REVIEW"
+            retry_due = False
+        elif low_impact and retry_count >= 2 and age_minutes >= 120:
+            status = "DOWNGRADED_LOW_IMPACT"
+            retry_due = False
+            downgraded += 1
+        elif high_impact and retry_count >= 2 and age_minutes >= 60:
+            status = "ESCALATE_HIGH_IMPACT"
+            retry_due = False
+            escalated += 1
+        elif retry_due:
+            due += 1
+        else:
+            waiting += 1
+
+        item = {
+            "symbol": route.get("symbol"),
+            "mint": route.get("mint"),
+            "route": route.get("route"),
+            "current_source": route.get("current_source"),
+            "priority_score": route.get("priority_score"),
+            "high_impact": high_impact,
+            "impact_flags": list(route.get("impact_flags") or []),
+            "status": status,
+            "retry_count": retry_count,
+            "age_minutes": age_minutes,
+            "last_checked_at": latest.get("ts_utc"),
+            "next_retry_at": next_retry_at.isoformat() if next_retry_at else None,
+            "retry_due": retry_due,
+            "latest_confirmation_status": latest_status or None,
+            "reason": route.get("reason"),
+        }
+        items.append(item)
+        if status in {"DUE_RETRY", "WAITING_RETRY"}:
+            active_routes.append(route)
+        if retry_due and status == "DUE_RETRY":
+            retry_due_routes.append(route)
+
+    items.sort(key=lambda x: (
+        1 if str(x.get("status")) == "ESCALATE_HIGH_IMPACT" else 0,
+        1 if x.get("retry_due") else 0,
+        _gb_float(x.get("priority_score")),
+        _gb_float(x.get("age_minutes")),
+    ), reverse=True)
+    status = (
+        "ESCALATE" if escalated
+        else "DUE" if due
+        else "DOWNGRADED" if downgraded
+        else "WAITING" if waiting
+        else "CLEAR"
+    )
+    return {
+        "status": status,
+        "total_routes": len(items),
+        "active_count": len(active_routes),
+        "due_count": due,
+        "waiting_count": waiting,
+        "downgraded_count": downgraded,
+        "escalated_count": escalated,
+        "oldest_age_minutes": round(oldest_age_minutes, 1),
+        "retry_due_routes": retry_due_routes[:8],
+        "active_routes": active_routes[:12],
+        "items": items[:16],
+        "next_action": (
+            "Escalate high-impact unresolved provider-truth routes to review."
+            if escalated
+            else "Retry due provider-truth routes on the controlled cadence."
+            if due
+            else "Low-impact unresolved routes were downgraded; keep the queue focused."
+            if downgraded
+            else "Provider-truth queue is waiting for the next retry window."
+            if waiting
+            else "Provider-truth queue is clear."
+        ),
+    }
+
+
+def _apply_provider_truth_queue_health_to_router(fallback_router: dict, queue_health: dict) -> dict:
+    out = dict(fallback_router or {})
+    all_routes = list((fallback_router or {}).get("routes") or [])
+    active_routes = list((queue_health or {}).get("active_routes") if "active_routes" in (queue_health or {}) else all_routes)
+    out["all_route_count"] = len(all_routes)
+    out["route_count"] = len(active_routes)
+    out["routes"] = active_routes[:12]
+    out["queue_status"] = (queue_health or {}).get("status")
+    out["due_count"] = int((queue_health or {}).get("due_count") or 0)
+    out["downgraded_count"] = int((queue_health or {}).get("downgraded_count") or 0)
+    out["escalated_count"] = int((queue_health or {}).get("escalated_count") or 0)
+    if not active_routes:
+        out["status"] = "NO_FALLBACK_NEEDED"
+    return out
+
+
+def _write_provider_truth_queue_escalations(queue_health: dict, now: datetime) -> dict:
+    escalated_items = [
+        dict(item) for item in list((queue_health or {}).get("items") or [])
+        if str(item.get("status") or "").upper() == "ESCALATE_HIGH_IMPACT" and str(item.get("mint") or "").strip()
+    ]
+    if not escalated_items:
+        return {"status": "CLEAR", "written_count": 0, "items": []}
+    written = 0
+    try:
+        conn = _dj_conn()
+        try:
+            for item in escalated_items[:8]:
+                mint = str(item.get("mint") or "").strip()
+                flags_json = json.dumps(list(item.get("impact_flags") or []) + ["provider_truth"], separators=(",", ":"))
+                raw_json = json.dumps(item, separators=(",", ":"))
+                conn.execute(
+                    """
+                    INSERT INTO provider_repair_escalations (
+                        created_ts, updated_ts, mint, symbol, failure_class, repair_status,
+                        escalation_lane, escalation_status, priority_score, queue_flags_json,
+                        provider_path, reason, source_event_id, operator_decision, operator_note,
+                        outcome_label, last_action_ts, sla_due_ts, raw_json
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, ?, ?)
+                    ON CONFLICT(mint, escalation_lane) DO UPDATE SET
+                        updated_ts=excluded.updated_ts,
+                        symbol=excluded.symbol,
+                        failure_class=excluded.failure_class,
+                        repair_status=excluded.repair_status,
+                        escalation_status=CASE
+                            WHEN provider_repair_escalations.escalation_status IN ('DISMISSED','RESOLVED_REPAIRED','REVIEW_COMPLETE_STILL_BLOCKED') THEN provider_repair_escalations.escalation_status
+                            ELSE excluded.escalation_status
+                        END,
+                        priority_score=MAX(COALESCE(provider_repair_escalations.priority_score, 0), COALESCE(excluded.priority_score, 0)),
+                        queue_flags_json=excluded.queue_flags_json,
+                        provider_path=excluded.provider_path,
+                        reason=excluded.reason,
+                        operator_decision=CASE
+                            WHEN provider_repair_escalations.escalation_status IN ('DISMISSED','RESOLVED_REPAIRED','REVIEW_COMPLETE_STILL_BLOCKED') THEN provider_repair_escalations.operator_decision
+                            ELSE excluded.operator_decision
+                        END,
+                        outcome_label=CASE
+                            WHEN provider_repair_escalations.escalation_status IN ('DISMISSED','RESOLVED_REPAIRED','REVIEW_COMPLETE_STILL_BLOCKED') THEN provider_repair_escalations.outcome_label
+                            ELSE excluded.outcome_label
+                        END,
+                        last_action_ts=excluded.last_action_ts,
+                        sla_due_ts=excluded.sla_due_ts,
+                        raw_json=excluded.raw_json
+                    """,
+                    (
+                        now.isoformat(),
+                        now.isoformat(),
+                        mint,
+                        item.get("symbol"),
+                        "provider_truth_unresolved",
+                        "UNRESOLVED",
+                        "PROVIDER_TRUTH_REVIEW",
+                        "QUEUED",
+                        _gb_float(item.get("priority_score")),
+                        flags_json,
+                        item.get("route"),
+                        f"Provider truth unresolved after {int(item.get('retry_count') or 0)} retries.",
+                        "PENDING",
+                        "PENDING_PROVIDER_TRUTH_REVIEW",
+                        now.isoformat(),
+                        (now + timedelta(hours=6)).isoformat(),
+                        raw_json,
+                    ),
+                )
+                written += 1
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as exc:
+        return {"status": "ERROR", "written_count": written, "error": str(exc)[:160], "items": escalated_items[:8]}
+    return {"status": "QUEUED", "written_count": written, "items": escalated_items[:8]}
 
 
 def _run_provider_truth_fallback_confirmation(fallback_router: dict, now: datetime, min_interval_minutes: int = 20) -> dict:
@@ -18114,12 +18356,16 @@ def _build_dashboard_provider_truth_panel(
     fallback_confirmation: dict | None = None,
     truth_memory: dict | None = None,
     outcome_tracking: dict | None = None,
+    queue_health: dict | None = None,
+    escalation_writer: dict | None = None,
 ) -> dict:
     top_agreement = (list((agreement_layer or {}).get("items") or []) or [{}])[0]
     top_arbitration = dict((arbitration or {}).get("top") or {})
     fallback_confirmation = dict(fallback_confirmation or {})
     truth_memory = dict(truth_memory or {})
     outcome_tracking = dict(outcome_tracking or {})
+    queue_health = dict(queue_health or {})
+    escalation_writer = dict(escalation_writer or {})
     status = (
         "BLOCKED"
         if str((agreement_layer or {}).get("status") or "").upper() == "BLOCKED"
@@ -18148,11 +18394,18 @@ def _build_dashboard_provider_truth_panel(
         "memory_promoted_24h": int(truth_memory.get("promoted_24h") or 0),
         "outcome_tracked_count": int(outcome_tracking.get("tracked_count") or 0),
         "outcome_avg_return_pct": outcome_tracking.get("avg_return_pct"),
+        "queue_status": queue_health.get("status"),
+        "queue_due_count": int(queue_health.get("due_count") or 0),
+        "queue_waiting_count": int(queue_health.get("waiting_count") or 0),
+        "queue_downgraded_count": int(queue_health.get("downgraded_count") or 0),
+        "queue_escalated_count": int(queue_health.get("escalated_count") or 0),
+        "queue_oldest_age_minutes": queue_health.get("oldest_age_minutes"),
+        "escalation_written_count": int(escalation_writer.get("written_count") or 0),
         "top_symbol": top_agreement.get("symbol"),
         "top_status": top_agreement.get("status"),
         "top_best_source": top_arbitration.get("best_source"),
         "top_best_score": top_arbitration.get("best_source_score"),
-        "next_action": (fallback_router or {}).get("next_action") or (agreement_layer or {}).get("next_action"),
+        "next_action": queue_health.get("next_action") or (fallback_router or {}).get("next_action") or (agreement_layer or {}).get("next_action"),
     }
 
 
@@ -18178,7 +18431,13 @@ def _build_provider_truth_layer(
         arbitration,
         dict((freshness_repair_loop or {}).get("provider_health_limits") or {}),
     )
-    fallback_confirmation = _run_provider_truth_fallback_confirmation(fallback_router, now)
+    queue_health = _build_provider_truth_queue_health(fallback_router, truth_memory, now)
+    fallback_router = _apply_provider_truth_queue_health_to_router(fallback_router, queue_health)
+    escalation_writer = _write_provider_truth_queue_escalations(queue_health, now)
+    due_router = dict(fallback_router)
+    due_router["routes"] = list(queue_health.get("retry_due_routes") or [])
+    due_router["route_count"] = len(due_router["routes"])
+    fallback_confirmation = _run_provider_truth_fallback_confirmation(due_router, now)
     if str(fallback_confirmation.get("status") or "").upper() in {"CONFIRMED", "IDENTITY_MISMATCH", "UNRESOLVED"}:
         truth_memory = _read_provider_truth_memory(now - timedelta(days=7))
         agreement_layer = _build_cross_provider_agreement_layer(targets, intelligence_rows, repair_rows, source_index, truth_memory)
@@ -18187,6 +18446,9 @@ def _build_provider_truth_layer(
             arbitration,
             dict((freshness_repair_loop or {}).get("provider_health_limits") or {}),
         )
+        queue_health = _build_provider_truth_queue_health(fallback_router, truth_memory, now)
+        fallback_router = _apply_provider_truth_queue_health_to_router(fallback_router, queue_health)
+        escalation_writer = _write_provider_truth_queue_escalations(queue_health, now)
     outcome_tracking = _build_provider_truth_outcome_tracking(truth_memory, intelligence_rows, now)
     truth_panel = _build_dashboard_provider_truth_panel(
         source_map,
@@ -18196,6 +18458,8 @@ def _build_provider_truth_layer(
         fallback_confirmation,
         truth_memory,
         outcome_tracking,
+        queue_health,
+        escalation_writer,
     )
     return {
         "status": truth_panel.get("status"),
@@ -18206,6 +18470,8 @@ def _build_provider_truth_layer(
         "fallback_confirmation_runner": fallback_confirmation,
         "provider_truth_memory": truth_memory,
         "provider_truth_outcome_tracking": outcome_tracking,
+        "provider_truth_queue_health": queue_health,
+        "provider_truth_escalation_writer": escalation_writer,
         "dashboard_provider_truth_panel": truth_panel,
         "next_action": truth_panel.get("next_action"),
     }

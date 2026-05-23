@@ -943,6 +943,29 @@ interface DailyCryptoBriefData {
         source?: string | null
       }>
     }
+    provider_truth_queue_health?: {
+      status?: string
+      total_routes?: number
+      active_count?: number
+      due_count?: number
+      waiting_count?: number
+      downgraded_count?: number
+      escalated_count?: number
+      oldest_age_minutes?: number | null
+      items?: Array<{
+        symbol?: string | null
+        status?: string
+        retry_count?: number
+        age_minutes?: number | null
+        next_retry_at?: string | null
+        priority_score?: number | null
+      }>
+      next_action?: string | null
+    }
+    provider_truth_escalation_writer?: {
+      status?: string
+      written_count?: number
+    }
     dashboard_provider_truth_panel?: {
       status?: string
       headline?: string
@@ -960,6 +983,13 @@ interface DailyCryptoBriefData {
       memory_promoted_24h?: number
       outcome_tracked_count?: number
       outcome_avg_return_pct?: number | null
+      queue_status?: string
+      queue_due_count?: number
+      queue_waiting_count?: number
+      queue_downgraded_count?: number
+      queue_escalated_count?: number
+      queue_oldest_age_minutes?: number | null
+      escalation_written_count?: number
       top_symbol?: string | null
       top_status?: string
       top_best_source?: string | null
@@ -5614,11 +5644,14 @@ function DailyCryptoBriefPanel({
     const providerTruthSourceMap = providerTruth.provider_source_map ?? {}
     const providerTruthMemory = providerTruth.provider_truth_memory ?? {}
     const providerTruthOutcome = providerTruth.provider_truth_outcome_tracking ?? {}
+    const providerTruthQueue = providerTruth.provider_truth_queue_health ?? {}
+    const providerTruthEscalationWriter = providerTruth.provider_truth_escalation_writer ?? {}
     const topProviderTruthItem = providerTruthAgreement.items?.[0]
     const topProviderTruthSource = providerTruthSourceMap.providers?.[0]
     const topFallbackRoute = providerTruthFallback.routes?.[0]
     const topProviderTruthMemory = providerTruthMemory.items?.[0]
     const topProviderTruthOutcome = providerTruthOutcome.items?.[0]
+    const topProviderTruthQueue = providerTruthQueue.items?.[0]
     const providerDrilldown = data.provider_failure_drilldown ?? {}
     const escalationQueue = data.provider_escalation_queue ?? {}
     const escalationAccuracy = data.provider_escalation_accuracy ?? {}
@@ -6163,16 +6196,24 @@ function DailyCryptoBriefPanel({
             <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
               outcomes tracked {providerTruthPanel.outcome_tracked_count ?? providerTruthOutcome.tracked_count ?? 0} · avg {fmtPct(providerTruthPanel.outcome_avg_return_pct ?? providerTruthOutcome.avg_return_pct)} · pos/neg {providerTruthOutcome.positive_count ?? 0}/{providerTruthOutcome.negative_count ?? 0}
             </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              queue {String(providerTruthPanel.queue_status || providerTruthQueue.status || 'clear').replace(/_/g, ' ').toLowerCase()} · due {providerTruthPanel.queue_due_count ?? providerTruthQueue.due_count ?? 0} · waiting {providerTruthPanel.queue_waiting_count ?? providerTruthQueue.waiting_count ?? 0} · down {providerTruthPanel.queue_downgraded_count ?? providerTruthQueue.downgraded_count ?? 0} · esc {providerTruthPanel.queue_escalated_count ?? providerTruthQueue.escalated_count ?? 0}
+            </div>
             <div style={{ ...MONO, fontSize: 8, color: '#9db7ce', marginTop: 5, lineHeight: 1.45 }}>
               {topFallbackRoute?.symbol
                 ? `${topFallbackRoute.symbol} routes to ${String(topFallbackRoute.route || 'confirmation').replace(/_/g, ' ').toLowerCase()} · ${topFallbackRoute.current_source || 'source'}`
+                : topProviderTruthQueue?.symbol
+                  ? `${topProviderTruthQueue.symbol} queue ${String(topProviderTruthQueue.status || 'tracking').replace(/_/g, ' ').toLowerCase()} · retries ${topProviderTruthQueue.retry_count ?? 0} · age ${fmtFixed(topProviderTruthQueue.age_minutes, 0)}m`
                 : topProviderTruthMemory?.symbol
                   ? `${topProviderTruthMemory.symbol} remembered as ${String(topProviderTruthMemory.confirmation_status || 'tracking').replace(/_/g, ' ').toLowerCase()} · ${topProviderTruthMemory.new_source || 'source'}`
                 : topProviderTruthOutcome?.symbol
                   ? `${topProviderTruthOutcome.symbol} outcome ${String(topProviderTruthOutcome.status || 'tracking').toLowerCase()} · ${fmtPct(topProviderTruthOutcome.return_pct)}`
                 : topProviderTruthSource?.source
                   ? `${topProviderTruthSource.source} ${topProviderTruthSource.trust_label || 'trust'} · score ${fmtFixed(topProviderTruthSource.confidence_score, 0)}`
-                  : providerTruthPanel.next_action || providerTruth.next_action || 'Provider truth panel waiting.'}
+                  : providerTruthPanel.next_action || providerTruthQueue.next_action || providerTruth.next_action || 'Provider truth panel waiting.'}
+              {(providerTruthPanel.escalation_written_count ?? providerTruthEscalationWriter.written_count ?? 0) > 0
+                ? ` · wrote ${providerTruthPanel.escalation_written_count ?? providerTruthEscalationWriter.written_count} review`
+                : ''}
             </div>
           </div>
 
