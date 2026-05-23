@@ -14425,6 +14425,396 @@ def _build_candidate_replay_timeline(journal_rows: list[dict], autopsy: dict, li
     }
 
 
+def _replay_identity_key(row: dict) -> str:
+    mint = str(row.get("mint") or "").strip()
+    symbol = str(row.get("symbol") or "").strip().upper()
+    return mint or symbol or "UNKNOWN"
+
+
+def _replay_signal_matches(signal_rows: list[dict], row: dict, limit: int = 8) -> list[dict]:
+    mint = str(row.get("mint") or "").strip()
+    symbol = str(row.get("symbol") or "").strip().upper()
+    matches = [
+        dict(signal) for signal in signal_rows or []
+        if (mint and str(signal.get("mint") or "").strip() == mint)
+        or (symbol and str(signal.get("symbol") or "").strip().upper() == symbol)
+    ]
+    matches.sort(key=lambda item: str(item.get("scanned_at") or ""), reverse=True)
+    return matches[:limit]
+
+
+def _replay_row_metrics(row: dict) -> dict:
+    snapshot = _decision_snapshot(row)
+    metrics = _autopsy_candidate_metrics(snapshot)
+    candidate = dict(snapshot.get("candidate") or {})
+    data = dict(candidate.get("data") or snapshot.get("data") or {})
+    metrics["market_source"] = data.get("market_source") or metrics.get("market_source")
+    metrics["score"] = _nullable_float(candidate.get("score") or snapshot.get("score"))
+    return metrics
+
+
+def _replay_outcome_payload(row: dict, signal_matches: list[dict]) -> dict:
+    best_signal = signal_matches[0] if signal_matches else {}
+    ret_1h = _nullable_float(row.get("outcome_1h_pct"))
+    ret_4h = _nullable_float(row.get("outcome_4h_pct"))
+    ret_24h = _nullable_float(row.get("outcome_24h_pct"))
+    if ret_1h is None:
+        ret_1h = _nullable_float(best_signal.get("return_1h_pct"))
+    if ret_4h is None:
+        ret_4h = _nullable_float(best_signal.get("return_4h_pct"))
+    if ret_24h is None:
+        ret_24h = _nullable_float(best_signal.get("return_24h_pct"))
+    max_return = _nullable_float(row.get("max_return_pct"))
+    if max_return is None:
+        max_return = max([_gb_float(ret_1h), _gb_float(ret_4h), _gb_float(ret_24h)])
+    max_drawdown = _nullable_float(row.get("max_drawdown_pct"))
+    label = str(row.get("outcome_label") or "").upper() or None
+    if not label and best_signal:
+        status = str(best_signal.get("status") or "").upper()
+        if status == "COMPLETE":
+            label = "GOOD_RUNNER" if _gb_float(max_return) >= 25 else "GOOD_BUY" if _gb_float(ret_24h) > 0 else "WEAK_BUY"
+    bullish = bool(label in _BUY_DECISION_BULLISH_LABELS or _gb_float(max_return) >= 25.0 or _gb_float(ret_4h) >= 12.0)
+    weak = bool(label in {"BAD_BUY", "WEAK_BUY", "FLAT"} or (_gb_float(max_return) < 5.0 and _gb_float(ret_4h) <= 0.0))
+    return {
+        "outcome_label": label,
+        "return_15m_pct": None,
+        "return_15m_status": "UNAVAILABLE",
+        "return_1h_pct": ret_1h,
+        "return_4h_pct": ret_4h,
+        "return_24h_pct": ret_24h,
+        "max_return_pct": max_return,
+        "max_drawdown_pct": max_drawdown,
+        "bullish": bullish,
+        "weak": weak,
+        "matched_signal_count": len(signal_matches),
+        "best_signal_status": best_signal.get("status"),
+        "best_signal_scanned_at": best_signal.get("scanned_at"),
+    }
+
+
+def _build_replay_decision_timeline(journal_rows: list[dict], signal_rows: list[dict], limit: int = 360) -> dict:
+    items = []
+    for row in list(journal_rows or [])[:limit]:
+        snapshot = _decision_snapshot(row)
+        metrics = _replay_row_metrics(row)
+        primary = _primary_blocker_from_row(row, snapshot)
+        matches = _replay_signal_matches(signal_rows, row)
+        outcome = _replay_outcome_payload(row, matches)
+        action = str(row.get("recommended_action") or "").upper()
+        decision_state = _decision_state_from_row(row, snapshot)
+        blockers = []
+        try:
+            blockers = json.loads(row.get("blockers_json") or "[]")
+            if not isinstance(blockers, list):
+                blockers = []
+        except Exception:
+            blockers = []
+        items.append({
+            "decision_id": row.get("id"),
+            "ts": row.get("created_ts"),
+            "surface": row.get("source_surface"),
+            "symbol": row.get("symbol"),
+            "mint": row.get("mint"),
+            "identity_key": _replay_identity_key(row),
+            "recommended_action": action or None,
+            "decision_state": decision_state,
+            "priority": row.get("priority"),
+            "reason": str(row.get("reason") or "")[:220],
+            "primary_blocker": primary,
+            "blocker_count": len(blockers),
+            "known_then": metrics,
+            "outcome": outcome,
+            "replay_ready": bool(action and (outcome.get("outcome_label") or outcome.get("matched_signal_count"))),
+        })
+    items.sort(key=lambda item: str(item.get("ts") or ""), reverse=True)
+    ready = [item for item in items if item.get("replay_ready")]
+    return {
+        "status": "READY" if ready else "NO_READY_ROWS" if items else "EMPTY",
+        "decision_count": len(items),
+        "replay_ready_count": len(ready),
+        "items": items[:80],
+        "next_action": (
+            "Run rule simulations over replay-ready decisions."
+            if ready
+            else "Wait for decision rows with forward outcome evidence."
+        ),
+    }
+
+
+def _build_replay_forward_outcome_windows(decision_timeline: dict) -> dict:
+    items = []
+    summary = {
+        "with_1h": 0,
+        "with_4h": 0,
+        "with_24h": 0,
+        "bullish_count": 0,
+        "weak_count": 0,
+    }
+    for item in list((decision_timeline or {}).get("items") or []):
+        outcome = dict(item.get("outcome") or {})
+        if outcome.get("return_1h_pct") is not None:
+            summary["with_1h"] += 1
+        if outcome.get("return_4h_pct") is not None:
+            summary["with_4h"] += 1
+        if outcome.get("return_24h_pct") is not None:
+            summary["with_24h"] += 1
+        if outcome.get("bullish"):
+            summary["bullish_count"] += 1
+        if outcome.get("weak"):
+            summary["weak_count"] += 1
+        items.append({
+            "decision_id": item.get("decision_id"),
+            "symbol": item.get("symbol"),
+            "mint": item.get("mint"),
+            "ts": item.get("ts"),
+            "action": item.get("recommended_action"),
+            "outcome_label": outcome.get("outcome_label"),
+            "windows": {
+                "15m": {"status": outcome.get("return_15m_status") or "UNAVAILABLE", "return_pct": outcome.get("return_15m_pct")},
+                "1h": {"status": "READY" if outcome.get("return_1h_pct") is not None else "PENDING", "return_pct": outcome.get("return_1h_pct")},
+                "4h": {"status": "READY" if outcome.get("return_4h_pct") is not None else "PENDING", "return_pct": outcome.get("return_4h_pct")},
+                "24h": {"status": "READY" if outcome.get("return_24h_pct") is not None else "PENDING", "return_pct": outcome.get("return_24h_pct")},
+            },
+            "max_return_pct": outcome.get("max_return_pct"),
+            "max_drawdown_pct": outcome.get("max_drawdown_pct"),
+            "bullish": outcome.get("bullish"),
+            "weak": outcome.get("weak"),
+        })
+    return {
+        "status": "READY" if items else "EMPTY",
+        "summary": summary,
+        "items": items[:80],
+        "next_action": "Use forward windows as the truth set for rule simulation.",
+    }
+
+
+def _replay_rule_definitions() -> list[dict]:
+    return [
+        {
+            "key": "clean_buy_requires_fresh_confirmed_data",
+            "label": "Clean buy requires fresh confirmed data",
+            "direction": "TIGHTEN",
+            "proposed_action": "WAIT",
+            "predicate": lambda item: (
+                str(item.get("recommended_action") or "").upper() == "BUY"
+                and (
+                    str((item.get("known_then") or {}).get("data_freshness") or "").upper() not in {"LIVE", "RECENT"}
+                    or str((item.get("known_then") or {}).get("data_confidence") or "").upper() == "LOW"
+                )
+            ),
+        },
+        {
+            "key": "high_risk_buy_wait_gate",
+            "label": "High risk buy wait gate",
+            "direction": "TIGHTEN",
+            "proposed_action": "WAIT",
+            "predicate": lambda item: (
+                str(item.get("recommended_action") or "").upper() == "BUY"
+                and _gb_float((item.get("known_then") or {}).get("risk_score")) >= 72.0
+            ),
+        },
+        {
+            "key": "thin_liquidity_buy_wait_gate",
+            "label": "Thin liquidity buy wait gate",
+            "direction": "TIGHTEN",
+            "proposed_action": "WAIT",
+            "predicate": lambda item: (
+                str(item.get("recommended_action") or "").upper() == "BUY"
+                and (
+                    _gb_float((item.get("known_then") or {}).get("liquidity_usd")) < 10_000
+                    or _gb_float((item.get("known_then") or {}).get("vol_liq_ratio")) < 0.20
+                )
+            ),
+        },
+        {
+            "key": "strong_pressure_wait_to_scout",
+            "label": "Strong pressure wait to scout",
+            "direction": "LOOSEN_OR_SCOUT",
+            "proposed_action": "BUY",
+            "predicate": lambda item: (
+                str(item.get("recommended_action") or "").upper() != "BUY"
+                and _gb_float((item.get("known_then") or {}).get("pressure_score")) >= 78.0
+                and _gb_float((item.get("known_then") or {}).get("buy_pressure")) >= 65.0
+                and _gb_float((item.get("known_then") or {}).get("quality_score")) >= 58.0
+                and _gb_float((item.get("known_then") or {}).get("risk_score")) < 75.0
+            ),
+        },
+        {
+            "key": "quality_pressure_wait_to_scout",
+            "label": "Quality pressure wait to scout",
+            "direction": "LOOSEN_OR_SCOUT",
+            "proposed_action": "BUY",
+            "predicate": lambda item: (
+                str(item.get("recommended_action") or "").upper() != "BUY"
+                and _gb_float((item.get("known_then") or {}).get("quality_score")) >= 68.0
+                and _gb_float((item.get("known_then") or {}).get("pressure_score")) >= 70.0
+                and str((item.get("known_then") or {}).get("data_freshness") or "").upper() in {"LIVE", "RECENT"}
+            ),
+        },
+    ]
+
+
+def _simulate_replay_lab_rules(decision_timeline: dict) -> dict:
+    rows = [dict(item) for item in list((decision_timeline or {}).get("items") or []) if item.get("replay_ready")]
+    simulations = []
+    for rule in _replay_rule_definitions():
+        touched = []
+        saved_weak = 0
+        damaged_good = 0
+        rescued_missed = 0
+        false_positive = 0
+        for item in rows:
+            try:
+                applies = bool(rule["predicate"](item))
+            except Exception:
+                applies = False
+            if not applies:
+                continue
+            original_buy = str(item.get("recommended_action") or "").upper() == "BUY"
+            proposed_buy = str(rule.get("proposed_action") or "").upper() == "BUY"
+            outcome = dict(item.get("outcome") or {})
+            bullish = bool(outcome.get("bullish"))
+            weak = bool(outcome.get("weak"))
+            if original_buy and not proposed_buy:
+                if weak:
+                    saved_weak += 1
+                elif bullish:
+                    damaged_good += 1
+            elif not original_buy and proposed_buy:
+                if bullish:
+                    rescued_missed += 1
+                elif weak:
+                    false_positive += 1
+            if len(touched) < 8:
+                touched.append({
+                    "symbol": item.get("symbol"),
+                    "action": item.get("recommended_action"),
+                    "proposed_action": rule.get("proposed_action"),
+                    "outcome_label": outcome.get("outcome_label"),
+                    "max_return_pct": outcome.get("max_return_pct"),
+                })
+        benefit = saved_weak + rescued_missed
+        harm = damaged_good + false_positive
+        net = saved_weak * 2 + rescued_missed * 3 - damaged_good * 4 - false_positive * 3
+        simulations.append({
+            "key": rule["key"],
+            "label": rule["label"],
+            "direction": rule["direction"],
+            "sample_n": len(touched),
+            "touched_count": saved_weak + damaged_good + rescued_missed + false_positive,
+            "saved_weak_buy_n": saved_weak,
+            "damaged_good_buy_n": damaged_good,
+            "rescued_missed_runner_n": rescued_missed,
+            "false_positive_buy_n": false_positive,
+            "benefit_n": benefit,
+            "harm_n": harm,
+            "net_score": net,
+            "sample_symbols": touched,
+        })
+    simulations.sort(key=lambda item: (int(item.get("net_score") or 0), int(item.get("benefit_n") or 0)), reverse=True)
+    return {
+        "status": "READY" if rows else "NO_REPLAY_ROWS",
+        "sample_n": len(rows),
+        "rules_tested": len(simulations),
+        "top_candidate": simulations[0] if simulations else None,
+        "items": simulations,
+        "next_action": "Inspect the false positive/negative ledger before considering promotion.",
+    }
+
+
+def _build_replay_false_positive_negative_ledger(rule_simulation: dict) -> dict:
+    top = dict((rule_simulation or {}).get("top_candidate") or {})
+    items = list((rule_simulation or {}).get("items") or [])
+    false_positive = [item for item in items if int(item.get("false_positive_buy_n") or 0) > 0]
+    false_negative = [item for item in items if int(item.get("damaged_good_buy_n") or 0) > 0]
+    rescued = [item for item in items if int(item.get("rescued_missed_runner_n") or 0) > 0]
+    saved = [item for item in items if int(item.get("saved_weak_buy_n") or 0) > 0]
+    return {
+        "status": "READY" if top else "NO_RULE",
+        "top_rule_key": top.get("key"),
+        "false_positive_count": sum(int(item.get("false_positive_buy_n") or 0) for item in items),
+        "false_negative_count": sum(int(item.get("damaged_good_buy_n") or 0) for item in items),
+        "rescued_missed_runner_count": sum(int(item.get("rescued_missed_runner_n") or 0) for item in items),
+        "saved_weak_buy_count": sum(int(item.get("saved_weak_buy_n") or 0) for item in items),
+        "false_positive_rules": false_positive[:5],
+        "false_negative_rules": false_negative[:5],
+        "rescued_rules": rescued[:5],
+        "saved_rules": saved[:5],
+        "next_action": (
+            "Promotion is blocked if false positives or damaged good buys outweigh saved/rescued decisions."
+            if top
+            else "Run simulations before building a ledger."
+        ),
+    }
+
+
+def _build_replay_lab_promotion_gate(rule_simulation: dict, ledger: dict, freshness_sla: dict, lock_ok: bool) -> dict:
+    top = dict((rule_simulation or {}).get("top_candidate") or {})
+    sample_n = int((rule_simulation or {}).get("sample_n") or 0)
+    net = int(top.get("net_score") or 0)
+    benefit = int(top.get("benefit_n") or 0)
+    harm = int(top.get("harm_n") or 0)
+    freshness_status = str((freshness_sla or {}).get("status") or "").upper()
+    blockers = []
+    if not lock_ok:
+        blockers.append("execution_lock_not_clean")
+    if sample_n < 30:
+        blockers.append("replay_sample_below_30")
+    if net < 10:
+        blockers.append("net_score_below_10")
+    if benefit < max(3, harm * 2):
+        blockers.append("benefit_not_2x_harm")
+    if harm > 0 and net < 16:
+        blockers.append("harm_requires_stronger_edge")
+    if freshness_status not in {"OK", "HEALTHY", "GOOD"}:
+        blockers.append("freshness_sla_not_ok")
+    status = "READY_FOR_MANUAL_REVIEW" if top and not blockers else "BLOCKED" if top else "NO_RULE"
+    return {
+        "status": status,
+        "candidate": top or None,
+        "sample_n": sample_n,
+        "requirements": {
+            "sample_min": 30,
+            "net_score_min": 10,
+            "benefit_to_harm_min": "2x",
+            "freshness_sla_status": freshness_status or "UNKNOWN",
+            "lock_ok": lock_ok,
+        },
+        "blockers": blockers,
+        "next_action": (
+            "Manual review may draft a patch, but no automatic promotion is allowed."
+            if status == "READY_FOR_MANUAL_REVIEW"
+            else "Keep collecting replay evidence before promoting any rule."
+            if top
+            else "No replay candidate is ready."
+        ),
+    }
+
+
+def _build_replay_outcome_lab(
+    journal_rows: list[dict],
+    signal_rows: list[dict],
+    freshness_sla: dict,
+    lock_ok: bool,
+    lookback_hours: int,
+) -> dict:
+    timeline = _build_replay_decision_timeline(journal_rows, signal_rows)
+    windows = _build_replay_forward_outcome_windows(timeline)
+    simulation = _simulate_replay_lab_rules(timeline)
+    ledger = _build_replay_false_positive_negative_ledger(simulation)
+    promotion = _build_replay_lab_promotion_gate(simulation, ledger, freshness_sla, lock_ok)
+    return {
+        "status": "READY" if str(simulation.get("status") or "").upper() == "READY" else str(simulation.get("status") or "EMPTY"),
+        "lookback_hours": lookback_hours,
+        "decision_timeline": timeline,
+        "forward_outcome_windows": windows,
+        "rule_simulation_engine": simulation,
+        "false_positive_negative_ledger": ledger,
+        "promotion_gate": promotion,
+        "next_action": promotion.get("next_action") or simulation.get("next_action"),
+    }
+
+
 def _provider_refresh_priority_targets(intelligence_rows: list[dict], autopsy: dict | None = None, limit: int = 18) -> list[dict]:
     rows = list(intelligence_rows or [])
     autopsy_symbols = {
@@ -17378,7 +17768,7 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
             journal_rows = [
                 dict(r) for r in conn.execute(
                     """
-                        SELECT created_ts, source_surface, symbol, mint, recommended_action,
+                        SELECT id, created_ts, source_surface, symbol, mint, recommended_action,
                                priority, reason, blockers_json, snapshot_json, resolution_status,
                                outcome_label, outcome_1h_pct, outcome_4h_pct, outcome_24h_pct,
                                max_return_pct, max_drawdown_pct
@@ -17388,6 +17778,25 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
                     """
                 ).fetchall()
             ]
+            try:
+                signal_outcome_rows = [
+                    dict(r) for r in conn.execute(
+                        """
+                        SELECT scanned_at, symbol, mint, source, score, status,
+                               return_1h_pct, return_4h_pct, return_24h_pct,
+                               liquidity_usd, volume_24h, mcap_at_scan,
+                               rug_label, token_age_days, heat_state_at_scan,
+                               heat_score_at_scan
+                        FROM memecoin_signal_outcomes
+                        WHERE scanned_at >= ?
+                        ORDER BY scanned_at DESC
+                        LIMIT 3000
+                        """,
+                        ((now - timedelta(hours=max(lookback_hours, 24) + 24)).isoformat(),),
+                    ).fetchall()
+                ]
+            except Exception:
+                signal_outcome_rows = []
             paper_rows = [
                 dict(r) for r in conn.execute(
                     """
@@ -17612,6 +18021,13 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
     candidate_replay_timeline = _build_candidate_replay_timeline(journal_rows, outcome_autopsy)
     data_watchdog = _build_data_quality_watchdog(intelligence_rows, outcome_autopsy)
     freshness_sla = _build_freshness_sla(intelligence_rows, token_snapshot_rows, repair_rows)
+    replay_outcome_lab = _build_replay_outcome_lab(
+        journal_rows,
+        signal_outcome_rows,
+        freshness_sla,
+        lock_ok,
+        lookback_hours,
+    )
     provider_reliability = _build_provider_reliability_scorecard(repair_rows)
     provider_failure_drilldown = _build_provider_failure_drilldown(repair_rows)
     provider_escalation_queue = _build_provider_escalation_queue(escalation_rows, now)
@@ -17768,6 +18184,8 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
         next_actions.append(str(daily_build_score.get("next_action")))
     if daily_top_mission.get("next_action"):
         next_actions.append(str(daily_top_mission.get("next_action")))
+    if str((replay_outcome_lab.get("promotion_gate") or {}).get("status") or "").upper() == "READY_FOR_MANUAL_REVIEW":
+        next_actions.append(str((replay_outcome_lab.get("promotion_gate") or {}).get("next_action") or "Review Replay Lab promotion candidate."))
     if str(provider_regression_guard.get("status") or "").upper() == "ACTIVE":
         next_actions.append(str(provider_regression_guard.get("next_action") or "Review regression guard."))
     if str(provider_post_patch_outcomes.get("status") or "").upper() == "REGRESSION_REVIEW":
@@ -17839,6 +18257,7 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
         "outcome_autopsy": outcome_autopsy,
         "rule_simulator": rule_simulator,
         "candidate_replay_timeline": candidate_replay_timeline,
+        "replay_outcome_lab": replay_outcome_lab,
         "data_watchdog": data_watchdog,
         "freshness_sla": freshness_sla,
         "provider_reliability": provider_reliability,

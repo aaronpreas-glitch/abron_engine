@@ -500,6 +500,62 @@ interface DailyCryptoBriefData {
       max_return_pct?: number | null
     }>
   }
+  replay_outcome_lab?: {
+    status?: string
+    lookback_hours?: number
+    decision_timeline?: {
+      status?: string
+      decision_count?: number
+      replay_ready_count?: number
+    }
+    forward_outcome_windows?: {
+      status?: string
+      summary?: {
+        with_1h?: number
+        with_4h?: number
+        with_24h?: number
+        bullish_count?: number
+        weak_count?: number
+      }
+    }
+    rule_simulation_engine?: {
+      status?: string
+      sample_n?: number
+      rules_tested?: number
+      top_candidate?: {
+        key?: string | null
+        label?: string | null
+        direction?: string | null
+        touched_count?: number
+        saved_weak_buy_n?: number
+        damaged_good_buy_n?: number
+        rescued_missed_runner_n?: number
+        false_positive_buy_n?: number
+        benefit_n?: number
+        harm_n?: number
+        net_score?: number | null
+      } | null
+    }
+    false_positive_negative_ledger?: {
+      status?: string
+      false_positive_count?: number
+      false_negative_count?: number
+      rescued_missed_runner_count?: number
+      saved_weak_buy_count?: number
+    }
+    promotion_gate?: {
+      status?: string
+      sample_n?: number
+      blockers?: string[]
+      candidate?: {
+        key?: string | null
+        label?: string | null
+        net_score?: number | null
+      } | null
+      next_action?: string | null
+    }
+    next_action?: string | null
+  }
   data_watchdog?: {
     status?: string
     summary?: {
@@ -5017,6 +5073,11 @@ function DailyCryptoBriefPanel({
     const simTop = simulator.top_candidate ?? null
     const replay = data.candidate_replay_timeline ?? {}
     const replayEvents = replay.events ?? []
+    const replayLab = data.replay_outcome_lab ?? {}
+    const replayLabRule = replayLab.rule_simulation_engine?.top_candidate
+    const replayLabGate = replayLab.promotion_gate ?? {}
+    const replayLabLedger = replayLab.false_positive_negative_ledger ?? {}
+    const replayLabWindows = replayLab.forward_outcome_windows?.summary ?? {}
     const watchdog = data.data_watchdog ?? {}
     const freshnessSla = data.freshness_sla ?? {}
     const providerReliability = data.provider_reliability ?? {}
@@ -5379,6 +5440,21 @@ function DailyCryptoBriefPanel({
             </div>
             <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
               net {simTop?.net_score ?? 0} · weak blocked {simTop?.would_block_weak_buy_n ?? 0} · good blocked {simTop?.would_block_good_buy_n ?? 0}
+            </div>
+          </div>
+
+          <div style={{ border: `1px solid ${replayLabGate.status === 'READY_FOR_MANUAL_REVIEW' ? 'rgba(0,212,138,0.22)' : 'rgba(167,139,250,0.18)'}`, borderRadius: 10, padding: 10, background: replayLabGate.status === 'READY_FOR_MANUAL_REVIEW' ? 'rgba(0,212,138,0.03)' : 'rgba(167,139,250,0.025)' }}>
+            <span style={{ ...MONO, fontSize: 8, color: replayLabGate.status === 'READY_FOR_MANUAL_REVIEW' ? '#00d48a' : '#a78bfa', fontWeight: 900, letterSpacing: '0.14em' }}>
+              REPLAY LAB
+            </span>
+            <div style={{ ...MONO, fontSize: 10, color: '#d7e1ea', marginTop: 7, lineHeight: 1.45 }}>
+              {replayLabRule?.label || replayLab.status || 'NO_REPLAY'} · net {fmtFixed(replayLabRule?.net_score, 0)} · sample {replayLab.rule_simulation_engine?.sample_n ?? 0}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              ready {replayLab.decision_timeline?.replay_ready_count ?? 0}/{replayLab.decision_timeline?.decision_count ?? 0} · 1h {replayLabWindows.with_1h ?? 0} · 4h {replayLabWindows.with_4h ?? 0} · 24h {replayLabWindows.with_24h ?? 0}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#9db7ce', marginTop: 5, lineHeight: 1.45 }}>
+              saved {replayLabLedger.saved_weak_buy_count ?? 0} · rescued {replayLabLedger.rescued_missed_runner_count ?? 0} · fp {replayLabLedger.false_positive_count ?? 0} · fn {replayLabLedger.false_negative_count ?? 0} · gate {String(replayLabGate.status || 'NO_RULE').replace(/_/g, ' ').toLowerCase()}
             </div>
           </div>
 
