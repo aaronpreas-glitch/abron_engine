@@ -906,6 +906,42 @@ interface DailyCryptoBriefData {
       confirmed_count?: number
       unresolved_count?: number
       identity_mismatch_count?: number
+      promoted_snapshot_count?: number
+      confirmation_event_count?: number
+    }
+    provider_truth_memory?: {
+      status?: string
+      summary?: Record<string, number>
+      confirmed_24h?: number
+      unresolved_24h?: number
+      identity_mismatch_24h?: number
+      promoted_24h?: number
+      items?: Array<{
+        symbol?: string | null
+        mint?: string | null
+        confirmation_status?: string
+        new_source?: string | null
+        new_freshness?: string | null
+        new_confidence?: string | null
+        ts_utc?: string
+      }>
+    }
+    provider_truth_outcome_tracking?: {
+      status?: string
+      confirmed_count?: number
+      tracked_count?: number
+      avg_return_pct?: number | null
+      positive_count?: number
+      negative_count?: number
+      flat_count?: number
+      identity_mismatch_count?: number
+      unresolved_count?: number
+      items?: Array<{
+        symbol?: string | null
+        status?: string
+        return_pct?: number | null
+        source?: string | null
+      }>
     }
     dashboard_provider_truth_panel?: {
       status?: string
@@ -917,6 +953,13 @@ interface DailyCryptoBriefData {
       fallback_routes?: number
       fallback_confirmation_status?: string
       fallback_confirmed_count?: number
+      memory_status?: string
+      memory_confirmed_24h?: number
+      memory_unresolved_24h?: number
+      memory_identity_mismatch_24h?: number
+      memory_promoted_24h?: number
+      outcome_tracked_count?: number
+      outcome_avg_return_pct?: number | null
       top_symbol?: string | null
       top_status?: string
       top_best_source?: string | null
@@ -5569,9 +5612,13 @@ function DailyCryptoBriefPanel({
     const providerTruthFallback = providerTruth.fallback_provider_router ?? {}
     const providerTruthFallbackRunner = providerTruth.fallback_confirmation_runner ?? {}
     const providerTruthSourceMap = providerTruth.provider_source_map ?? {}
+    const providerTruthMemory = providerTruth.provider_truth_memory ?? {}
+    const providerTruthOutcome = providerTruth.provider_truth_outcome_tracking ?? {}
     const topProviderTruthItem = providerTruthAgreement.items?.[0]
     const topProviderTruthSource = providerTruthSourceMap.providers?.[0]
     const topFallbackRoute = providerTruthFallback.routes?.[0]
+    const topProviderTruthMemory = providerTruthMemory.items?.[0]
+    const topProviderTruthOutcome = providerTruthOutcome.items?.[0]
     const providerDrilldown = data.provider_failure_drilldown ?? {}
     const escalationQueue = data.provider_escalation_queue ?? {}
     const escalationAccuracy = data.provider_escalation_accuracy ?? {}
@@ -6110,9 +6157,19 @@ function DailyCryptoBriefPanel({
             <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
               fallback {String(providerTruthPanel.fallback_confirmation_status || providerTruthFallbackRunner.status || 'waiting').replace(/_/g, ' ').toLowerCase()} · confirmed {providerTruthPanel.fallback_confirmed_count ?? providerTruthFallbackRunner.confirmed_count ?? 0} · mismatch {providerTruthFallbackRunner.identity_mismatch_count ?? 0}
             </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              memory {String(providerTruthPanel.memory_status || providerTruthMemory.status || 'empty').replace(/_/g, ' ').toLowerCase()} · confirmed {providerTruthPanel.memory_confirmed_24h ?? providerTruthMemory.confirmed_24h ?? 0} · promoted {providerTruthPanel.memory_promoted_24h ?? providerTruthMemory.promoted_24h ?? 0} · mismatch {providerTruthPanel.memory_identity_mismatch_24h ?? providerTruthMemory.identity_mismatch_24h ?? 0}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              outcomes tracked {providerTruthPanel.outcome_tracked_count ?? providerTruthOutcome.tracked_count ?? 0} · avg {fmtPct(providerTruthPanel.outcome_avg_return_pct ?? providerTruthOutcome.avg_return_pct)} · pos/neg {providerTruthOutcome.positive_count ?? 0}/{providerTruthOutcome.negative_count ?? 0}
+            </div>
             <div style={{ ...MONO, fontSize: 8, color: '#9db7ce', marginTop: 5, lineHeight: 1.45 }}>
               {topFallbackRoute?.symbol
                 ? `${topFallbackRoute.symbol} routes to ${String(topFallbackRoute.route || 'confirmation').replace(/_/g, ' ').toLowerCase()} · ${topFallbackRoute.current_source || 'source'}`
+                : topProviderTruthMemory?.symbol
+                  ? `${topProviderTruthMemory.symbol} remembered as ${String(topProviderTruthMemory.confirmation_status || 'tracking').replace(/_/g, ' ').toLowerCase()} · ${topProviderTruthMemory.new_source || 'source'}`
+                : topProviderTruthOutcome?.symbol
+                  ? `${topProviderTruthOutcome.symbol} outcome ${String(topProviderTruthOutcome.status || 'tracking').toLowerCase()} · ${fmtPct(topProviderTruthOutcome.return_pct)}`
                 : topProviderTruthSource?.source
                   ? `${topProviderTruthSource.source} ${topProviderTruthSource.trust_label || 'trust'} · score ${fmtFixed(topProviderTruthSource.confidence_score, 0)}`
                   : providerTruthPanel.next_action || providerTruth.next_action || 'Provider truth panel waiting.'}

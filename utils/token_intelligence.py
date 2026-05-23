@@ -209,6 +209,48 @@ def _ensure_tables(conn) -> None:
     )
     conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS provider_truth_confirmations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts_utc TEXT NOT NULL,
+            mint TEXT NOT NULL,
+            symbol TEXT,
+            route TEXT,
+            current_source TEXT,
+            confirmation_status TEXT NOT NULL,
+            repair_status TEXT,
+            new_source TEXT,
+            new_freshness TEXT,
+            new_confidence TEXT,
+            identity_status TEXT,
+            new_price REAL,
+            new_liquidity REAL,
+            new_marketcap REAL,
+            new_quality REAL,
+            new_pressure REAL,
+            latency_ms INTEGER,
+            reason TEXT,
+            failure_class TEXT,
+            provider_path TEXT,
+            read_only INTEGER DEFAULT 1,
+            promoted_to_intelligence INTEGER DEFAULT 0,
+            raw_json TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_provider_truth_confirmations_mint_ts
+        ON provider_truth_confirmations(mint, ts_utc)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_provider_truth_confirmations_status_ts
+        ON provider_truth_confirmations(confirmation_status, ts_utc)
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS provider_repair_escalations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             created_ts TEXT NOT NULL,
@@ -1383,7 +1425,7 @@ def _record_provider_repair_events(events: list[dict]) -> int:
                     """,
                     (
                         event.get("ts_utc"),
-                        event.get("mint"),
+                        event.get("mint") or "",
                         event.get("symbol"),
                         event.get("previous_source"),
                         event.get("previous_freshness"),
@@ -1430,6 +1472,59 @@ def _record_provider_repair_events(events: list[dict]) -> int:
                             event.get("mint"),
                         ),
                     )
+                inserted += 1
+    except Exception:
+        return inserted
+    return inserted
+
+
+def _record_provider_truth_confirmations(events: list[dict]) -> int:
+    if not events:
+        return 0
+    inserted = 0
+    try:
+        with _get_conn() as conn:
+            _ensure_tables(conn)
+            for event in events:
+                conn.execute(
+                    """
+                    INSERT INTO provider_truth_confirmations (
+                        ts_utc, mint, symbol, route, current_source,
+                        confirmation_status, repair_status, new_source,
+                        new_freshness, new_confidence, identity_status,
+                        new_price, new_liquidity, new_marketcap, new_quality,
+                        new_pressure, latency_ms, reason, failure_class,
+                        provider_path, read_only, promoted_to_intelligence,
+                        raw_json
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event.get("ts_utc"),
+                        event.get("mint"),
+                        event.get("symbol"),
+                        event.get("route"),
+                        event.get("current_source"),
+                        event.get("confirmation_status"),
+                        event.get("repair_status"),
+                        event.get("new_source"),
+                        event.get("new_freshness"),
+                        event.get("new_confidence"),
+                        event.get("identity_status"),
+                        _f(event.get("new_price")),
+                        _f(event.get("new_liquidity")),
+                        _f(event.get("new_marketcap")),
+                        _f(event.get("new_quality")),
+                        _f(event.get("new_pressure")),
+                        _i(event.get("latency_ms")),
+                        event.get("reason"),
+                        event.get("failure_class"),
+                        event.get("provider_path"),
+                        1 if event.get("read_only", True) else 0,
+                        1 if event.get("promoted_to_intelligence") else 0,
+                        json.dumps(dict(event), separators=(",", ":")),
+                    ),
+                )
                 inserted += 1
     except Exception:
         return inserted
@@ -2245,7 +2340,7 @@ def token_intelligence_targeted_repair_step(targets: list[dict], *, limit: int =
 
 
 def token_intelligence_fallback_confirmation_step(targets: list[dict], *, limit: int = 6) -> dict:
-    """Check fallback provider routes for specific targets without persisting market snapshots."""
+    """Check fallback provider routes, persist confirmations, and promote clean repairs."""
     selected = []
     seen: set[str] = set()
     for target in list(targets or []):
@@ -2302,6 +2397,7 @@ def token_intelligence_fallback_confirmation_step(targets: list[dict], *, limit:
         }
 
     events = []
+    promoted_rows: list[dict] = []
     for raw, target in rows:
         item = _current_row_to_item(raw, source="provider_truth_fallback")
         item["_repair_score"] = _f(target.get("priority_score"), _f(raw.get("repair_score")))
@@ -2331,6 +2427,8 @@ def token_intelligence_fallback_confirmation_step(targets: list[dict], *, limit:
             and confidence != "LOW"
             and identity not in {"MISMATCH", "QUARANTINED"}
         )
+        if confirmed and snapshot:
+            promoted_rows.append(snapshot)
         events.append({
             "ts_utc": _now_iso(),
             "mint": previous.get("mint") or item.get("mint"),
@@ -2343,6 +2441,9 @@ def token_intelligence_fallback_confirmation_step(targets: list[dict], *, limit:
             "new_freshness": freshness or None,
             "new_confidence": confidence or None,
             "identity_status": identity or None,
+            "new_price": (snapshot or {}).get("price"),
+            "new_liquidity": (snapshot or {}).get("liquidity"),
+            "new_marketcap": (snapshot or {}).get("marketcap"),
             "new_quality": (snapshot or {}).get("quality_score"),
             "new_pressure": (snapshot or {}).get("pressure_score"),
             "latency_ms": latency_ms,
@@ -2350,17 +2451,24 @@ def token_intelligence_fallback_confirmation_step(targets: list[dict], *, limit:
             "failure_class": failure_class,
             "provider_path": "->".join(provider_path),
             "read_only": True,
+            "promoted_to_intelligence": confirmed,
         })
 
     confirmed_count = len([e for e in events if e.get("confirmation_status") == "CONFIRMED"])
     identity_mismatch_count = len([e for e in events if e.get("confirmation_status") == "IDENTITY_MISMATCH"])
     unresolved_count = len([e for e in events if e.get("confirmation_status") == "UNRESOLVED"])
+    promoted_snapshot_count = _record_snapshots(promoted_rows) if promoted_rows else 0
+    token_stats_inserted = _backfill_token_stats(promoted_rows) if promoted_rows else 0
+    confirmation_events_inserted = _record_provider_truth_confirmations(events)
     payload = {
         "status": "CONFIRMED" if confirmed_count else "IDENTITY_MISMATCH" if identity_mismatch_count else "UNRESOLVED" if events else "NO_ROWS",
         "checked_at": _now_iso(),
         "read_only": True,
         "target_count": len(selected),
         "matched_current_rows": len(rows),
+        "promoted_snapshot_count": promoted_snapshot_count,
+        "token_stats_inserted": token_stats_inserted,
+        "confirmation_event_count": confirmation_events_inserted,
         "confirmed_count": confirmed_count,
         "unresolved_count": unresolved_count,
         "identity_mismatch_count": identity_mismatch_count,

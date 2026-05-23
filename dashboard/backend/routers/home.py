@@ -17622,7 +17622,96 @@ def _provider_truth_high_impact_targets(freshness_repair_loop: dict, data_watchd
     return targets[: max(1, int(limit or 16))]
 
 
-def _provider_truth_evidence_for_target(item: dict, intelligence_rows: list[dict], repair_rows: list[dict], source_index: dict[str, dict]) -> list[dict]:
+def _read_provider_truth_memory(since: datetime, limit: int = 500) -> dict:
+    try:
+        conn = _dj_conn()
+        try:
+            rows = [
+                dict(r) for r in conn.execute(
+                    """
+                    SELECT ts_utc, mint, symbol, route, current_source,
+                           confirmation_status, repair_status, new_source,
+                           new_freshness, new_confidence, identity_status,
+                           new_price, new_liquidity, new_marketcap, new_quality,
+                           new_pressure, latency_ms, reason, failure_class,
+                           provider_path, read_only, promoted_to_intelligence
+                    FROM provider_truth_confirmations
+                    WHERE ts_utc >= ?
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (since.isoformat(), max(1, int(limit or 500))),
+                ).fetchall()
+            ]
+        finally:
+            conn.close()
+    except Exception as exc:
+        return {"status": "UNAVAILABLE", "summary": {}, "items": [], "latest_by_key": {}, "error": str(exc)[:140]}
+
+    now = datetime.now(timezone.utc)
+    summary: dict[str, int] = {}
+    latest_by_key: dict[str, dict] = {}
+    confirmed_24h = 0
+    unresolved_24h = 0
+    identity_mismatch_24h = 0
+    promoted_24h = 0
+    for row in rows:
+        status = str(row.get("confirmation_status") or "UNKNOWN").upper()
+        summary[status] = summary.get(status, 0) + 1
+        ts = _gb_parse_ts(row.get("ts_utc"))
+        if ts and (now - ts).total_seconds() <= 24 * 3600:
+            if status == "CONFIRMED":
+                confirmed_24h += 1
+            elif status == "UNRESOLVED":
+                unresolved_24h += 1
+            elif status == "IDENTITY_MISMATCH":
+                identity_mismatch_24h += 1
+            if int(row.get("promoted_to_intelligence") or 0):
+                promoted_24h += 1
+        for key in [
+            str(row.get("mint") or "").strip(),
+            f"symbol:{str(row.get('symbol') or '').strip().upper()}",
+        ]:
+            if key and key != "symbol:" and key not in latest_by_key:
+                latest_by_key[key] = row
+
+    status = "CONFIRMED" if confirmed_24h else "MISMATCH" if identity_mismatch_24h else "TRACKING" if rows else "EMPTY"
+    return {
+        "status": status,
+        "summary": summary,
+        "confirmed_24h": confirmed_24h,
+        "unresolved_24h": unresolved_24h,
+        "identity_mismatch_24h": identity_mismatch_24h,
+        "promoted_24h": promoted_24h,
+        "items": rows[:80],
+        "latest_by_key": latest_by_key,
+        "next_action": "Use confirmed provider-truth memory as arbitration evidence." if rows else "Provider-truth memory is waiting for its first confirmation event.",
+    }
+
+
+def _provider_truth_memory_for_target(item: dict, truth_memory: dict | None) -> list[dict]:
+    memory_items = list((truth_memory or {}).get("items") or [])
+    mint = str(item.get("mint") or "").strip()
+    symbol = str(item.get("symbol") or "").strip().upper()
+    out = []
+    for row in memory_items:
+        row_mint = str(row.get("mint") or "").strip()
+        row_symbol = str(row.get("symbol") or "").strip().upper()
+        if mint and row_mint == mint:
+            out.append(dict(row))
+        elif not mint and symbol and row_symbol == symbol:
+            out.append(dict(row))
+    out.sort(key=lambda x: str(x.get("ts_utc") or ""), reverse=True)
+    return out[:8]
+
+
+def _provider_truth_evidence_for_target(
+    item: dict,
+    intelligence_rows: list[dict],
+    repair_rows: list[dict],
+    source_index: dict[str, dict],
+    truth_memory: dict | None = None,
+) -> list[dict]:
     mint = str(item.get("mint") or "").strip()
     symbol = str(item.get("symbol") or "").strip().upper()
     evidence: list[dict] = []
@@ -17673,6 +17762,25 @@ def _provider_truth_evidence_for_target(item: dict, intelligence_rows: list[dict
                 "source_confidence_score": source_meta.get("confidence_score"),
                 "ts_utc": row.get("ts_utc"),
             })
+    for row in _provider_truth_memory_for_target(item, truth_memory):
+        source = _provider_source_key(row.get("new_source") or row.get("current_source"))
+        source_meta = source_index.get(source, {})
+        evidence.append({
+            "source": source,
+            "basis": "provider_truth_memory",
+            "freshness": row.get("new_freshness"),
+            "confidence": row.get("new_confidence"),
+            "quality_score": row.get("new_quality"),
+            "pressure_score": row.get("new_pressure"),
+            "trust_label": source_meta.get("trust_label"),
+            "source_confidence_score": source_meta.get("confidence_score"),
+            "confirmation_status": row.get("confirmation_status"),
+            "identity_status": row.get("identity_status"),
+            "repair_status": row.get("repair_status"),
+            "failure_class": row.get("failure_class"),
+            "route": row.get("route"),
+            "ts_utc": row.get("ts_utc"),
+        })
     compact: dict[str, dict] = {}
     for row in evidence:
         source = _provider_source_key(row.get("source"))
@@ -17698,28 +17806,49 @@ def _build_cross_provider_agreement_layer(
     intelligence_rows: list[dict],
     repair_rows: list[dict],
     source_index: dict[str, dict],
+    truth_memory: dict | None = None,
 ) -> dict:
     items = []
     blocked = 0
     confirmed = 0
     single_source = 0
     for target in targets:
-        evidence = _provider_truth_evidence_for_target(target, intelligence_rows, repair_rows, source_index)
+        evidence = _provider_truth_evidence_for_target(target, intelligence_rows, repair_rows, source_index, truth_memory)
         flags = {str(x).lower() for x in list(target.get("impact_flags") or target.get("reasons") or [])}
         high_impact = _gb_float(target.get("priority_score")) >= 80 or bool(flags & {"promotion_candidate", "good_buy_candidate", "high_quality_stale", "missed_runner", "research", "paper", "catalyst", "watch_to_entry"})
         independent_good = []
         stale_or_low = []
+        memory_confirmed = False
+        memory_mismatch = False
         for row in evidence:
             source = _provider_source_key(row.get("source"))
             freshness = str(row.get("freshness") or "").upper()
             confidence = str(row.get("confidence") or "").upper()
             trust = str(row.get("trust_label") or "").upper()
+            if str(row.get("basis") or "") == "provider_truth_memory":
+                memory_status = str(row.get("confirmation_status") or "").upper()
+                if memory_status == "IDENTITY_MISMATCH":
+                    memory_mismatch = True
+                if (
+                    memory_status == "CONFIRMED"
+                    and freshness in {"LIVE", "RECENT"}
+                    and confidence != "LOW"
+                    and trust != "WEAK"
+                    and not source.startswith("cache")
+                ):
+                    memory_confirmed = True
             if freshness in {"LIVE", "RECENT"} and confidence != "LOW" and trust != "WEAK" and not source.startswith("cache"):
                 independent_good.append(source)
             if freshness == "STALE" or confidence == "LOW" or trust == "WEAK":
                 stale_or_low.append(source)
         unique_good = sorted(set(independent_good))
-        if len(unique_good) >= 2:
+        if memory_mismatch:
+            status = "IDENTITY_MISMATCH_CONFIRMED"
+            blocked += 1
+        elif memory_confirmed and unique_good:
+            status = "MEMORY_CONFIRMED"
+            confirmed += 1
+        elif len(unique_good) >= 2:
             status = "AGREEMENT_CONFIRMED"
             confirmed += 1
         elif len(unique_good) == 1:
@@ -17731,7 +17860,9 @@ def _build_cross_provider_agreement_layer(
         else:
             status = "NO_INDEPENDENT_CONFIRMATION"
             blocked += 1
-        needs_confirmation = bool(high_impact and len(unique_good) < 2)
+        needs_confirmation = bool(high_impact and len(unique_good) < 2 and not memory_confirmed)
+        if memory_mismatch:
+            needs_confirmation = bool(high_impact)
         if needs_confirmation and status == "SINGLE_SOURCE_CONFIRMED":
             status = "NEEDS_SECOND_SOURCE"
         items.append({
@@ -17908,16 +18039,87 @@ def _run_provider_truth_fallback_confirmation(fallback_router: dict, now: dateti
     return result
 
 
+def _build_provider_truth_outcome_tracking(truth_memory: dict, intelligence_rows: list[dict], now: datetime) -> dict:
+    current_by_key: dict[str, dict] = {}
+    for row in list(intelligence_rows or []):
+        mint = str(row.get("mint") or "").strip()
+        symbol = str(row.get("symbol") or "").strip().upper()
+        if mint:
+            current_by_key[mint] = row
+        if symbol:
+            current_by_key[f"symbol:{symbol}"] = row
+
+    tracked = []
+    confirmed_rows = [
+        dict(row) for row in list((truth_memory or {}).get("items") or [])
+        if str(row.get("confirmation_status") or "").upper() == "CONFIRMED"
+    ]
+    for row in confirmed_rows[:80]:
+        mint = str(row.get("mint") or "").strip()
+        symbol = str(row.get("symbol") or "").strip().upper()
+        current = current_by_key.get(mint) or current_by_key.get(f"symbol:{symbol}") or {}
+        start_marketcap = _gb_float(row.get("new_marketcap"))
+        current_marketcap = _gb_float(current.get("marketcap"))
+        return_pct = None
+        status = "NO_MARKETCAP"
+        if start_marketcap > 0 and current_marketcap > 0:
+            return_pct = round(((current_marketcap - start_marketcap) / start_marketcap) * 100.0, 2)
+            status = "POSITIVE" if return_pct > 2.0 else "NEGATIVE" if return_pct < -2.0 else "FLAT"
+        tracked.append({
+            "symbol": row.get("symbol"),
+            "mint": row.get("mint"),
+            "confirmed_at": row.get("ts_utc"),
+            "source": row.get("new_source") or row.get("current_source"),
+            "route": row.get("route"),
+            "status": status,
+            "return_pct": return_pct,
+            "confirmed_marketcap": _nullable_float(row.get("new_marketcap")),
+            "current_marketcap": _nullable_float(current.get("marketcap")),
+            "current_freshness": current.get("data_freshness"),
+            "current_confidence": current.get("data_confidence"),
+        })
+
+    tracked_with_return = [item for item in tracked if item.get("return_pct") is not None]
+    avg_return = (
+        round(sum(_gb_float(item.get("return_pct")) for item in tracked_with_return) / len(tracked_with_return), 2)
+        if tracked_with_return
+        else None
+    )
+    identity_mismatch_count = int((truth_memory or {}).get("summary", {}).get("IDENTITY_MISMATCH") or 0)
+    unresolved_count = int((truth_memory or {}).get("summary", {}).get("UNRESOLVED") or 0)
+    return {
+        "status": "TRACKING" if tracked else "WAITING",
+        "confirmed_count": len(confirmed_rows),
+        "tracked_count": len(tracked_with_return),
+        "avg_return_pct": avg_return,
+        "positive_count": len([item for item in tracked_with_return if str(item.get("status")) == "POSITIVE"]),
+        "negative_count": len([item for item in tracked_with_return if str(item.get("status")) == "NEGATIVE"]),
+        "flat_count": len([item for item in tracked_with_return if str(item.get("status")) == "FLAT"]),
+        "identity_mismatch_count": identity_mismatch_count,
+        "unresolved_count": unresolved_count,
+        "items": tracked[:12],
+        "next_action": (
+            "Review provider-truth outcomes before changing source precedence."
+            if tracked
+            else "Collect confirmed fallback repairs before scoring provider-truth outcomes."
+        ),
+    }
+
+
 def _build_dashboard_provider_truth_panel(
     source_map: dict,
     agreement_layer: dict,
     arbitration: dict,
     fallback_router: dict,
     fallback_confirmation: dict | None = None,
+    truth_memory: dict | None = None,
+    outcome_tracking: dict | None = None,
 ) -> dict:
     top_agreement = (list((agreement_layer or {}).get("items") or []) or [{}])[0]
     top_arbitration = dict((arbitration or {}).get("top") or {})
     fallback_confirmation = dict(fallback_confirmation or {})
+    truth_memory = dict(truth_memory or {})
+    outcome_tracking = dict(outcome_tracking or {})
     status = (
         "BLOCKED"
         if str((agreement_layer or {}).get("status") or "").upper() == "BLOCKED"
@@ -17939,6 +18141,13 @@ def _build_dashboard_provider_truth_panel(
         "fallback_routes": int((fallback_router or {}).get("route_count") or 0),
         "fallback_confirmation_status": fallback_confirmation.get("status"),
         "fallback_confirmed_count": int(fallback_confirmation.get("confirmed_count") or 0),
+        "memory_status": truth_memory.get("status"),
+        "memory_confirmed_24h": int(truth_memory.get("confirmed_24h") or 0),
+        "memory_unresolved_24h": int(truth_memory.get("unresolved_24h") or 0),
+        "memory_identity_mismatch_24h": int(truth_memory.get("identity_mismatch_24h") or 0),
+        "memory_promoted_24h": int(truth_memory.get("promoted_24h") or 0),
+        "outcome_tracked_count": int(outcome_tracking.get("tracked_count") or 0),
+        "outcome_avg_return_pct": outcome_tracking.get("avg_return_pct"),
         "top_symbol": top_agreement.get("symbol"),
         "top_status": top_agreement.get("status"),
         "top_best_source": top_arbitration.get("best_source"),
@@ -17960,15 +18169,34 @@ def _build_provider_truth_layer(
         _provider_source_key(item.get("source")): item
         for item in list(source_map.get("providers") or [])
     }
+    now = datetime.now(timezone.utc)
+    truth_memory = _read_provider_truth_memory(now - timedelta(days=7))
     targets = _provider_truth_high_impact_targets(freshness_repair_loop, data_watchdog)
-    agreement_layer = _build_cross_provider_agreement_layer(targets, intelligence_rows, repair_rows, source_index)
+    agreement_layer = _build_cross_provider_agreement_layer(targets, intelligence_rows, repair_rows, source_index, truth_memory)
     arbitration = _build_provider_confidence_arbitration(agreement_layer, source_map)
     fallback_router = _build_fallback_provider_router(
         arbitration,
         dict((freshness_repair_loop or {}).get("provider_health_limits") or {}),
     )
-    fallback_confirmation = _run_provider_truth_fallback_confirmation(fallback_router, datetime.now(timezone.utc))
-    truth_panel = _build_dashboard_provider_truth_panel(source_map, agreement_layer, arbitration, fallback_router, fallback_confirmation)
+    fallback_confirmation = _run_provider_truth_fallback_confirmation(fallback_router, now)
+    if str(fallback_confirmation.get("status") or "").upper() in {"CONFIRMED", "IDENTITY_MISMATCH", "UNRESOLVED"}:
+        truth_memory = _read_provider_truth_memory(now - timedelta(days=7))
+        agreement_layer = _build_cross_provider_agreement_layer(targets, intelligence_rows, repair_rows, source_index, truth_memory)
+        arbitration = _build_provider_confidence_arbitration(agreement_layer, source_map)
+        fallback_router = _build_fallback_provider_router(
+            arbitration,
+            dict((freshness_repair_loop or {}).get("provider_health_limits") or {}),
+        )
+    outcome_tracking = _build_provider_truth_outcome_tracking(truth_memory, intelligence_rows, now)
+    truth_panel = _build_dashboard_provider_truth_panel(
+        source_map,
+        agreement_layer,
+        arbitration,
+        fallback_router,
+        fallback_confirmation,
+        truth_memory,
+        outcome_tracking,
+    )
     return {
         "status": truth_panel.get("status"),
         "provider_source_map": source_map,
@@ -17976,6 +18204,8 @@ def _build_provider_truth_layer(
         "provider_confidence_arbitration": arbitration,
         "fallback_provider_router": fallback_router,
         "fallback_confirmation_runner": fallback_confirmation,
+        "provider_truth_memory": truth_memory,
+        "provider_truth_outcome_tracking": outcome_tracking,
         "dashboard_provider_truth_panel": truth_panel,
         "next_action": truth_panel.get("next_action"),
     }
