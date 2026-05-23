@@ -2113,6 +2113,7 @@ function TokenAddressChip({
 }
 
 const MONO: React.CSSProperties = { fontFamily: 'JetBrains Mono, monospace' }
+const DAILY_INTELLIGENCE_REV = 'outcome-loop-v1'
 
 const LANE_COLOR: Record<string, string> = {
   MEMECOINS: '#a78bfa',
@@ -2152,8 +2153,8 @@ function SystemCard({ sys, mode, modeColor, title, children }: {
   children: React.ReactNode
 }) {
   const c = C[sys]
-  return (
-    <div style={{
+	  return (
+	    <div style={{
       flex: '1 1 0', minWidth: 220,
       background: c.bg,
       border: `1px solid ${c.border}`,
@@ -4211,8 +4212,8 @@ function GoodBuyBoardPanel({ board }: { board: GoodBuyBoardV2 | undefined }) {
         'linear-gradient(180deg, rgba(5,10,18,0.78), rgba(3,7,13,0.72))',
       display: 'flex',
       flexDirection: 'column',
-      gap: 12,
-    }}>
+	      gap: 12,
+	    }} title={DAILY_INTELLIGENCE_REV}>
       <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12, flexWrap: 'wrap' }}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 5, minWidth: 240, flex: 1 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
