@@ -201,21 +201,23 @@ async def snapshot_or_build(
     age = float(snap.get("_age_seconds") if snap else 10**9)
     if snap and age <= fresh_s:
         return _with_snapshot_meta(snap.get("data"), snap, stale=False)
-    if snap and snap.get("data") not in (None, {}, []):
-        schedule_refresh(name, builder, min_interval_s=1.0 if age > stale_s else 10.0)
+    if snap and age <= stale_s and snap.get("data") not in (None, {}, []):
+        schedule_refresh(name, builder, min_interval_s=10.0)
         return _with_snapshot_meta(snap.get("data"), snap, stale=True)
-
     if not _SCHEDULE_REFRESH_ENABLED:
         lock = _locks.setdefault(name, asyncio.Lock())
         if lock.locked():
+            if snap and snap.get("data") not in (None, {}, []):
+                return _with_snapshot_meta(snap.get("data"), snap, stale=True)
             raise TimeoutError(f"snapshot_warming:{name}:refresh_in_progress")
         try:
             async with lock:
                 _last_refresh_started[name] = time.monotonic()
-                result = await asyncio.wait_for(
-                    asyncio.to_thread(builder),
-                    timeout=min(float(wait_timeout_s), _LIVE_BUILD_TIMEOUT_SECONDS),
-                )
+                # Empty snapshots need the shortest warmup cap, but expired snapshots
+                # already have a safe fallback. Let those use the endpoint's budget so
+                # they can actually recover instead of timing out forever.
+                timeout_s = float(wait_timeout_s) if snap else min(float(wait_timeout_s), _LIVE_BUILD_TIMEOUT_SECONDS)
+                result = await asyncio.wait_for(asyncio.to_thread(builder), timeout=timeout_s)
             if _STORE_LIVE_BUILDS_ENABLED:
                 try:
                     asyncio.create_task(asyncio.to_thread(store_snapshot, name, result, status="OK"))
@@ -227,6 +229,9 @@ async def snapshot_or_build(
                 log.debug("snapshot live build failed for %s, serving stale: %s", name, exc)
                 return _with_snapshot_meta(snap.get("data"), snap, stale=True)
             raise
+    if snap and snap.get("data") not in (None, {}, []):
+        schedule_refresh(name, builder, min_interval_s=1.0 if age > stale_s else 10.0)
+        return _with_snapshot_meta(snap.get("data"), snap, stale=True)
     if snap and age <= stale_s:
         schedule_refresh(name, builder)
         return _with_snapshot_meta(snap.get("data"), snap, stale=True)
