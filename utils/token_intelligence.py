@@ -2244,6 +2244,140 @@ def token_intelligence_targeted_repair_step(targets: list[dict], *, limit: int =
     return payload
 
 
+def token_intelligence_fallback_confirmation_step(targets: list[dict], *, limit: int = 6) -> dict:
+    """Check fallback provider routes for specific targets without persisting market snapshots."""
+    selected = []
+    seen: set[str] = set()
+    for target in list(targets or []):
+        mint = str(target.get("mint") or "").strip()
+        symbol = str(target.get("symbol") or "").strip().upper()
+        key = mint or f"symbol:{symbol}"
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        selected.append({"mint": mint, "symbol": symbol, "target": dict(target)})
+        if len(selected) >= max(1, int(limit or 6)):
+            break
+    if not selected:
+        return {
+            "status": "NO_TARGETS",
+            "checked_at": _now_iso(),
+            "target_count": 0,
+            "confirmed_count": 0,
+            "unresolved_count": 0,
+            "identity_mismatch_count": 0,
+            "events": [],
+        }
+
+    rows = []
+    try:
+        with _get_conn() as conn:
+            _ensure_tables(conn)
+            for target in selected:
+                row = None
+                if target.get("mint"):
+                    row = conn.execute(
+                        "SELECT * FROM token_intelligence_current WHERE mint=? LIMIT 1",
+                        (target["mint"],),
+                    ).fetchone()
+                if row is None and target.get("symbol"):
+                    row = conn.execute(
+                        "SELECT * FROM token_intelligence_current WHERE UPPER(symbol)=? ORDER BY updated_at DESC LIMIT 1",
+                        (target["symbol"],),
+                    ).fetchone()
+                if row:
+                    raw = dict(row)
+                    raw["repair_score"] = _f(target["target"].get("priority_score"))
+                    rows.append((raw, target["target"]))
+    except Exception as exc:
+        return {
+            "status": "ERROR",
+            "checked_at": _now_iso(),
+            "target_count": len(selected),
+            "confirmed_count": 0,
+            "unresolved_count": 0,
+            "identity_mismatch_count": 0,
+            "error": str(exc)[:180],
+            "events": [],
+        }
+
+    events = []
+    for raw, target in rows:
+        item = _current_row_to_item(raw, source="provider_truth_fallback")
+        item["_repair_score"] = _f(target.get("priority_score"), _f(raw.get("repair_score")))
+        flags = set(item.get("_queue_flags") or [])
+        flags.update(str(x) for x in list(target.get("impact_flags") or target.get("reasons") or []) if str(x))
+        flags.add("provider_truth")
+        item["_queue_flags"] = sorted(flags)
+        previous = dict(item.get("_previous") or {})
+        started = time.time()
+        snapshot: dict | None = None
+        repair_status = "UNRESOLVED"
+        reason = "fallback_provider_missing_or_incomplete"
+        failure_class = "provider_miss"
+        provider_path: list[str] = []
+        try:
+            snapshot, repair_status, reason, failure_class, provider_path = _build_provider_repair_snapshot(item)
+        except Exception as exc:
+            reason = f"fallback_confirmation_exception:{str(exc)[:80]}"
+            failure_class = "temporary_error"
+        latency_ms = int(max(0.0, (time.time() - started) * 1000.0))
+        identity = str((snapshot or {}).get("identity_status") or "").upper()
+        confidence = str((snapshot or {}).get("data_confidence") or "").upper()
+        freshness = str((snapshot or {}).get("data_freshness") or "").upper()
+        confirmed = bool(
+            snapshot
+            and repair_status in {"LIVE_REPAIRED", "FALLBACK_REPAIRED"}
+            and confidence != "LOW"
+            and identity not in {"MISMATCH", "QUARANTINED"}
+        )
+        events.append({
+            "ts_utc": _now_iso(),
+            "mint": previous.get("mint") or item.get("mint"),
+            "symbol": previous.get("symbol") or item.get("symbol"),
+            "route": target.get("route"),
+            "current_source": target.get("current_source") or previous.get("market_source"),
+            "confirmation_status": "CONFIRMED" if confirmed else "IDENTITY_MISMATCH" if identity in {"MISMATCH", "QUARANTINED"} else "UNRESOLVED",
+            "repair_status": repair_status,
+            "new_source": (snapshot or {}).get("market_source"),
+            "new_freshness": freshness or None,
+            "new_confidence": confidence or None,
+            "identity_status": identity or None,
+            "new_quality": (snapshot or {}).get("quality_score"),
+            "new_pressure": (snapshot or {}).get("pressure_score"),
+            "latency_ms": latency_ms,
+            "reason": reason,
+            "failure_class": failure_class,
+            "provider_path": "->".join(provider_path),
+            "read_only": True,
+        })
+
+    confirmed_count = len([e for e in events if e.get("confirmation_status") == "CONFIRMED"])
+    identity_mismatch_count = len([e for e in events if e.get("confirmation_status") == "IDENTITY_MISMATCH"])
+    unresolved_count = len([e for e in events if e.get("confirmation_status") == "UNRESOLVED"])
+    payload = {
+        "status": "CONFIRMED" if confirmed_count else "IDENTITY_MISMATCH" if identity_mismatch_count else "UNRESOLVED" if events else "NO_ROWS",
+        "checked_at": _now_iso(),
+        "read_only": True,
+        "target_count": len(selected),
+        "matched_current_rows": len(rows),
+        "confirmed_count": confirmed_count,
+        "unresolved_count": unresolved_count,
+        "identity_mismatch_count": identity_mismatch_count,
+        "symbols": [e.get("symbol") for e in events[:10] if e.get("symbol")],
+        "events": events[:10],
+    }
+    try:
+        with _get_conn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO kv_store (key, value) VALUES (?, ?)",
+                ("provider_truth_fallback_confirmation_status", json.dumps(payload, separators=(",", ":"))),
+            )
+    except Exception:
+        pass
+    return payload
+
+
 def get_token_intelligence_summary(limit: int = 12) -> dict:
     try:
         with _get_conn() as conn:

@@ -13190,7 +13190,10 @@ def _execution_ticket_for_good_buy(item: dict, provider_context: dict) -> dict:
         "required_rank": 3,
     }
     try:
-        from authority import read_snapshot, _LAW_RANK  # type: ignore[import]
+        try:
+            from utils.authority import read_snapshot, _LAW_RANK  # type: ignore[import]
+        except Exception:
+            from authority import read_snapshot, _LAW_RANK  # type: ignore[import]
 
         snap = read_snapshot() or {}
         computed_at = _gb_parse_ts(snap.get("computed_at"))
@@ -17848,14 +17851,73 @@ def _build_fallback_provider_router(arbitration: dict, provider_health_limits: d
     }
 
 
+def _run_provider_truth_fallback_confirmation(fallback_router: dict, now: datetime, min_interval_minutes: int = 20) -> dict:
+    routes = list((fallback_router or {}).get("routes") or [])
+    if not routes:
+        return {
+            "status": "NO_ROUTES",
+            "ran": False,
+            "read_only": True,
+            "target_count": 0,
+            "next_action": "No provider-truth fallback route is due.",
+        }
+    meta_key = "provider_truth_fallback_confirmation_autorun"
+    previous = _freshness_kv_read(meta_key)
+    last_ts = _gb_parse_ts((previous or {}).get("checked_at"))
+    if last_ts and (now - last_ts).total_seconds() < max(60, min_interval_minutes * 60):
+        return {
+            "status": "THROTTLED",
+            "ran": False,
+            "read_only": True,
+            "target_count": min(6, len(routes)),
+            "last_checked_at": previous.get("checked_at"),
+            "previous": previous,
+            "next_action": "Provider-truth fallback confirmation was recently run; wait for the throttle window.",
+        }
+    try:
+        from utils.token_intelligence import token_intelligence_fallback_confirmation_step  # type: ignore
+
+        result = token_intelligence_fallback_confirmation_step(routes, limit=6)
+    except Exception as exc:
+        result = {
+            "status": "ERROR",
+            "checked_at": now.isoformat(),
+            "read_only": True,
+            "target_count": min(6, len(routes)),
+            "error": str(exc)[:180],
+            "events": [],
+        }
+    result = dict(result or {})
+    result["ran"] = str(result.get("status") or "").upper() not in {"NO_TARGETS", "ERROR"}
+    result["read_only"] = True
+    result["requested_routes"] = [
+        {
+            "symbol": item.get("symbol"),
+            "mint": item.get("mint"),
+            "route": item.get("route"),
+            "current_source": item.get("current_source"),
+        }
+        for item in routes[:6]
+    ]
+    result["next_action"] = (
+        "Use confirmed fallback source evidence to clear provider-truth blockers."
+        if int(result.get("confirmed_count") or 0)
+        else "Fallback confirmation did not clear the blocker; keep the route blocked or send it to manual CA review."
+    )
+    _freshness_kv_write(meta_key, result)
+    return result
+
+
 def _build_dashboard_provider_truth_panel(
     source_map: dict,
     agreement_layer: dict,
     arbitration: dict,
     fallback_router: dict,
+    fallback_confirmation: dict | None = None,
 ) -> dict:
     top_agreement = (list((agreement_layer or {}).get("items") or []) or [{}])[0]
     top_arbitration = dict((arbitration or {}).get("top") or {})
+    fallback_confirmation = dict(fallback_confirmation or {})
     status = (
         "BLOCKED"
         if str((agreement_layer or {}).get("status") or "").upper() == "BLOCKED"
@@ -17875,6 +17937,8 @@ def _build_dashboard_provider_truth_panel(
         "agreement_status": (agreement_layer or {}).get("status"),
         "blocked_count": int((arbitration or {}).get("blocked_count") or 0),
         "fallback_routes": int((fallback_router or {}).get("route_count") or 0),
+        "fallback_confirmation_status": fallback_confirmation.get("status"),
+        "fallback_confirmed_count": int(fallback_confirmation.get("confirmed_count") or 0),
         "top_symbol": top_agreement.get("symbol"),
         "top_status": top_agreement.get("status"),
         "top_best_source": top_arbitration.get("best_source"),
@@ -17903,13 +17967,15 @@ def _build_provider_truth_layer(
         arbitration,
         dict((freshness_repair_loop or {}).get("provider_health_limits") or {}),
     )
-    truth_panel = _build_dashboard_provider_truth_panel(source_map, agreement_layer, arbitration, fallback_router)
+    fallback_confirmation = _run_provider_truth_fallback_confirmation(fallback_router, datetime.now(timezone.utc))
+    truth_panel = _build_dashboard_provider_truth_panel(source_map, agreement_layer, arbitration, fallback_router, fallback_confirmation)
     return {
         "status": truth_panel.get("status"),
         "provider_source_map": source_map,
         "cross_provider_agreement": agreement_layer,
         "provider_confidence_arbitration": arbitration,
         "fallback_provider_router": fallback_router,
+        "fallback_confirmation_runner": fallback_confirmation,
         "dashboard_provider_truth_panel": truth_panel,
         "next_action": truth_panel.get("next_action"),
     }

@@ -898,6 +898,15 @@ interface DailyCryptoBriefData {
         read_only?: boolean
       }>
     }
+    fallback_confirmation_runner?: {
+      status?: string
+      ran?: boolean
+      read_only?: boolean
+      target_count?: number
+      confirmed_count?: number
+      unresolved_count?: number
+      identity_mismatch_count?: number
+    }
     dashboard_provider_truth_panel?: {
       status?: string
       headline?: string
@@ -906,6 +915,8 @@ interface DailyCryptoBriefData {
       agreement_status?: string
       blocked_count?: number
       fallback_routes?: number
+      fallback_confirmation_status?: string
+      fallback_confirmed_count?: number
       top_symbol?: string | null
       top_status?: string
       top_best_source?: string | null
@@ -5556,6 +5567,7 @@ function DailyCryptoBriefPanel({
     const providerTruthAgreement = providerTruth.cross_provider_agreement ?? {}
     const providerTruthArbitration = providerTruth.provider_confidence_arbitration ?? {}
     const providerTruthFallback = providerTruth.fallback_provider_router ?? {}
+    const providerTruthFallbackRunner = providerTruth.fallback_confirmation_runner ?? {}
     const providerTruthSourceMap = providerTruth.provider_source_map ?? {}
     const topProviderTruthItem = providerTruthAgreement.items?.[0]
     const topProviderTruthSource = providerTruthSourceMap.providers?.[0]
@@ -6094,6 +6106,9 @@ function DailyCryptoBriefPanel({
             </div>
             <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
               providers {providerTruthPanel.provider_count ?? providerTruthSourceMap.providers?.length ?? 0} · weak {providerTruthPanel.weak_provider_count ?? providerTruthSourceMap.weak_provider_count ?? 0} · blocked {providerTruthPanel.blocked_count ?? providerTruthArbitration.blocked_count ?? 0} · routes {providerTruthPanel.fallback_routes ?? providerTruthFallback.route_count ?? 0}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              fallback {String(providerTruthPanel.fallback_confirmation_status || providerTruthFallbackRunner.status || 'waiting').replace(/_/g, ' ').toLowerCase()} · confirmed {providerTruthPanel.fallback_confirmed_count ?? providerTruthFallbackRunner.confirmed_count ?? 0} · mismatch {providerTruthFallbackRunner.identity_mismatch_count ?? 0}
             </div>
             <div style={{ ...MONO, fontSize: 8, color: '#9db7ce', marginTop: 5, lineHeight: 1.45 }}>
               {topFallbackRoute?.symbol
