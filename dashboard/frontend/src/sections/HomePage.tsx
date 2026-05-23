@@ -892,11 +892,63 @@ interface DailyCryptoBriefData {
       status?: string
       ran?: boolean
       target_count?: number
+      batch_size?: number
+      min_interval_minutes?: number
       event_count?: number
       live_repaired_count?: number
       fallback_repaired_count?: number
       unresolved_count?: number
+      skipped_by_provider_limit?: number
       symbols?: string[]
+    }
+    adaptive_repair_budget?: {
+      status?: string
+      batch_size?: number
+      min_interval_minutes?: number
+      hit_rate_pct?: number | null
+      unresolved_rate_pct?: number | null
+      reason?: string | null
+    }
+    backlog_segmentation?: {
+      status?: string
+      summary?: Record<string, number>
+      top_segment?: {
+        key?: string
+        label?: string
+        count?: number
+      }
+    }
+    retire_suppress_rules?: {
+      status?: string
+      suppressed_count?: number
+      candidate_count?: number
+      retired_hours?: number
+      next_action?: string | null
+    }
+    burndown_progress_tracker?: {
+      status?: string
+      queue_reduction_since_last?: number | null
+      latest?: {
+        queue_count?: number
+        repaired_count?: number
+        unresolved_count?: number
+        suppressed_count?: number
+        sla_status?: string
+        sla_score?: number
+        runner_status?: string
+      }
+    }
+    provider_health_limits?: {
+      status?: string
+      default_limit_per_batch?: number
+      providers?: Array<{
+        source?: string
+        queued?: number
+        recent_failures?: number
+        limit_per_batch?: number
+        cooldown_minutes?: number
+        status?: string
+      }>
     }
     sla_recheck?: {
       status?: string
@@ -5424,7 +5476,14 @@ function DailyCryptoBriefPanel({
     const freshnessRepairQueue = freshnessRepairLoop.provider_repair_priority_queue ?? {}
     const freshnessRepairRunner = freshnessRepairLoop.targeted_refresh_runner ?? {}
     const freshnessRepairDrilldown = freshnessRepairLoop.dashboard_freshness_drilldown ?? {}
+    const freshnessAdaptiveBudget = freshnessRepairLoop.adaptive_repair_budget ?? {}
+    const freshnessBacklogSegmentation = freshnessRepairLoop.backlog_segmentation ?? {}
+    const freshnessSuppressRules = freshnessRepairLoop.retire_suppress_rules ?? {}
+    const freshnessBurndown = freshnessRepairLoop.burndown_progress_tracker ?? {}
+    const freshnessProviderLimits = freshnessRepairLoop.provider_health_limits ?? {}
     const freshnessRepairTopTarget = freshnessRepairQueue.items?.[0]
+    const freshnessTopProviderLimit = freshnessProviderLimits.providers?.[0]
+    const freshnessTopSegment = freshnessBacklogSegmentation.top_segment
     const providerReliability = data.provider_reliability ?? {}
     const providerDrilldown = data.provider_failure_drilldown ?? {}
     const escalationQueue = data.provider_escalation_queue ?? {}
@@ -5896,12 +5955,20 @@ function DailyCryptoBriefPanel({
               {freshnessRepairLoop.status || freshnessSla.status || 'WATCH'} · score {fmtFixed(freshnessRepairDrilldown.score_after ?? freshnessRepairAudit.score ?? freshnessSla.score, 1)}
             </div>
             <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
-              queue {freshnessRepairQueue.queued_count ?? 0} · runner {String(freshnessRepairRunner.status || 'waiting').replace(/_/g, ' ').toLowerCase()} · events {freshnessRepairRunner.event_count ?? 0}
+              budget {freshnessAdaptiveBudget.batch_size ?? freshnessRepairRunner.batch_size ?? 0}/{freshnessAdaptiveBudget.min_interval_minutes ?? freshnessRepairRunner.min_interval_minutes ?? 0}m · queue {freshnessBurndown.latest?.queue_count ?? freshnessRepairQueue.queued_count ?? 0} · {String(freshnessAdaptiveBudget.status || freshnessRepairRunner.status || 'waiting').replace(/_/g, ' ').toLowerCase()}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              fixed {(freshnessRepairRunner.live_repaired_count ?? 0) + (freshnessRepairRunner.fallback_repaired_count ?? 0)} · unresolved {freshnessRepairRunner.unresolved_count ?? freshnessBurndown.latest?.unresolved_count ?? 0} · suppressed {freshnessSuppressRules.suppressed_count ?? freshnessBurndown.latest?.suppressed_count ?? 0}
             </div>
             <div style={{ ...MONO, fontSize: 8, color: '#9db7ce', marginTop: 5, lineHeight: 1.45 }}>
               {freshnessRepairTopTarget?.symbol
                 ? `${freshnessRepairTopTarget.symbol} · ${freshnessRepairTopTarget.data_freshness || 'freshness'} / ${freshnessRepairTopTarget.data_confidence || 'confidence'} · ${fmtFixed(freshnessRepairTopTarget.priority_score, 0)}`
                 : freshnessRepairDrilldown.next_action || freshnessRepairLoop.next_action || 'Freshness drilldown waiting.'}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#9db7ce', marginTop: 5, lineHeight: 1.45 }}>
+              {freshnessTopSegment?.label
+                ? `${freshnessTopSegment.label} ${freshnessTopSegment.count ?? 0} · provider ${freshnessTopProviderLimit?.source || freshnessProviderLimits.status || 'ok'} cap ${freshnessTopProviderLimit?.limit_per_batch ?? freshnessProviderLimits.default_limit_per_batch ?? 0}`
+                : freshnessAdaptiveBudget.reason || freshnessSuppressRules.next_action || 'Burn-down tracker waiting.'}
             </div>
           </div>
 

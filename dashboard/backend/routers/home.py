@@ -16832,8 +16832,306 @@ def _build_provider_repair_priority_queue(
     }
 
 
-def _run_targeted_freshness_refresh(queue: dict, now: datetime, min_interval_minutes: int = 10) -> dict:
-    items = list((queue or {}).get("items") or [])[:6]
+def _freshness_kv_read(key: str) -> dict:
+    try:
+        conn = _dj_conn()
+        try:
+            conn.execute("CREATE TABLE IF NOT EXISTS kv_store (key TEXT PRIMARY KEY, value TEXT)")
+            row = conn.execute("SELECT value FROM kv_store WHERE key=?", (key,)).fetchone()
+            if not row:
+                return {}
+            value = row["value"] if hasattr(row, "keys") else row[0]
+            return json.loads(value or "{}") if value else {}
+        finally:
+            conn.close()
+    except Exception:
+        return {}
+
+
+def _freshness_kv_write(key: str, payload: dict) -> None:
+    try:
+        conn = _dj_conn()
+        try:
+            conn.execute("CREATE TABLE IF NOT EXISTS kv_store (key TEXT PRIMARY KEY, value TEXT)")
+            conn.execute(
+                "INSERT OR REPLACE INTO kv_store (key, value) VALUES (?, ?)",
+                (key, json.dumps(payload, separators=(",", ":"))),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+
+def _build_adaptive_freshness_repair_budget(queue: dict, previous_refresh: dict, freshness_sla: dict) -> dict:
+    queue_count = int(_gb_float((queue or {}).get("queued_count")))
+    event_count = int(_gb_float((previous_refresh or {}).get("event_count")))
+    repaired = int(_gb_float((previous_refresh or {}).get("live_repaired_count"))) + int(_gb_float((previous_refresh or {}).get("fallback_repaired_count")))
+    unresolved = int(_gb_float((previous_refresh or {}).get("unresolved_count")))
+    attempts = max(event_count, repaired + unresolved)
+    hit_rate = round((repaired / attempts) * 100.0, 1) if attempts else None
+    unresolved_rate = round((unresolved / attempts) * 100.0, 1) if attempts else None
+    failure_classes = {str(x).lower() for x in list((previous_refresh or {}).get("failure_classes") or [])}
+    previous_status = str((previous_refresh or {}).get("status") or "NONE").upper()
+
+    batch_size = 6
+    min_interval = 10
+    status = "STEADY"
+    reason = "Use the normal guarded repair budget."
+    if previous_status == "ERROR" or failure_classes & {"provider_budget_or_rate_limit", "temporary_error", "provider_error"}:
+        batch_size = 3
+        min_interval = 20
+        status = "PROTECTIVE"
+        reason = "Provider errors or rate-limit signals were seen; slow the burn-down pass."
+    elif attempts and (unresolved_rate or 0) >= 60:
+        batch_size = 4
+        min_interval = 18
+        status = "CONSERVE"
+        reason = "Recent targeted repairs are missing too often; reduce pressure and let suppression rules work."
+    elif queue_count >= 80 and attempts and (hit_rate or 0) >= 65 and (unresolved_rate or 0) <= 35:
+        batch_size = 10
+        min_interval = 8
+        status = "ACCELERATE"
+        reason = "Repair hit-rate is strong and backlog is large; safely raise the batch cap."
+    elif queue_count >= 40 and attempts and (hit_rate or 0) >= 50 and (unresolved_rate or 0) <= 45:
+        batch_size = 8
+        min_interval = 8
+        status = "ACCELERATE"
+        reason = "Recent repairs are productive enough to burn down more stale rows."
+
+    score = _gb_float((freshness_sla or {}).get("score"))
+    if score < 35 and status == "ACCELERATE":
+        min_interval = max(min_interval, 10)
+        reason = "Backlog repair can accelerate, but SLA is still weak so cadence remains guarded."
+
+    return {
+        "status": status,
+        "batch_size": max(1, min(10, int(batch_size))),
+        "min_interval_minutes": max(5, int(min_interval)),
+        "queue_count": queue_count,
+        "previous_status": previous_status,
+        "previous_attempts": attempts,
+        "hit_rate_pct": hit_rate,
+        "unresolved_rate_pct": unresolved_rate,
+        "caps": {"max_batch_size": 10, "min_interval_floor_minutes": 5},
+        "reason": reason,
+    }
+
+
+def _segment_freshness_backlog(queue: dict) -> dict:
+    segments = {
+        "promotion_critical": {"label": "promotion critical", "count": 0, "items": []},
+        "good_buy_critical": {"label": "good-buy critical", "count": 0, "items": []},
+        "high_quality_stale": {"label": "high-quality stale", "count": 0, "items": []},
+        "low_value_stale": {"label": "low-value stale", "count": 0, "items": []},
+        "likely_dead_or_retire": {"label": "likely dead or retire", "count": 0, "items": []},
+        "standard_repair": {"label": "standard repair", "count": 0, "items": []},
+    }
+    for item in list((queue or {}).get("items") or []):
+        flags = {str(x).lower() for x in list(item.get("impact_flags") or [])}
+        quality = _gb_float(item.get("quality_score"))
+        pressure = _gb_float(item.get("pressure_score"))
+        liquidity = _gb_float(item.get("liquidity"))
+        volume = _gb_float(item.get("volume_24h_usd"))
+        freshness = str(item.get("data_freshness") or "").upper()
+        confidence = str(item.get("data_confidence") or "").upper()
+        if flags & {"promotion_candidate", "missed_runner", "outcome_autopsy", "mint_autopsy", "research", "paper", "catalyst", "watch_to_entry"}:
+            key = "promotion_critical"
+        elif "good_buy_candidate" in flags or quality >= 75:
+            key = "good_buy_critical"
+        elif "high_quality_stale" in flags or quality >= 68:
+            key = "high_quality_stale"
+        elif freshness == "STALE" and confidence == "LOW" and liquidity < 25_000 and volume < 10_000:
+            key = "likely_dead_or_retire"
+        elif quality < 60 and pressure < 50:
+            key = "low_value_stale"
+        else:
+            key = "standard_repair"
+        item["backlog_segment"] = key
+        bucket = segments[key]
+        bucket["count"] += 1
+        if len(bucket["items"]) < 5:
+            bucket["items"].append({
+                "symbol": item.get("symbol"),
+                "mint": item.get("mint"),
+                "priority_score": item.get("priority_score"),
+                "quality_score": item.get("quality_score"),
+                "pressure_score": item.get("pressure_score"),
+                "market_source": item.get("market_source"),
+            })
+    ordered = [{"key": key, **value} for key, value in segments.items()]
+    focus = next((item for item in ordered if int(item.get("count") or 0) > 0), ordered[-1])
+    return {
+        "status": "SEGMENTED" if list((queue or {}).get("items") or []) else "EMPTY",
+        "segments": ordered,
+        "summary": {item["key"]: item["count"] for item in ordered},
+        "top_segment": focus,
+        "next_action": "Burn down promotion and good-buy critical rows before standard stale rows.",
+    }
+
+
+def _build_freshness_retire_suppress_rules(queue: dict, repair_rows: list[dict], now: datetime) -> dict:
+    unresolved_by_key: dict[str, int] = {}
+    for row in list(repair_rows or []):
+        status = str(row.get("repair_status") or "").upper()
+        if status not in {"UNRESOLVED", "RETIRED_UNRESOLVED"}:
+            continue
+        mint = str(row.get("mint") or "").strip()
+        symbol = str(row.get("symbol") or "").strip().upper()
+        for key in [mint, f"symbol:{symbol}" if symbol else ""]:
+            if key:
+                unresolved_by_key[key] = unresolved_by_key.get(key, 0) + 1
+
+    candidates = []
+    protected_flags = {"promotion_candidate", "good_buy_candidate", "high_quality_stale", "missed_runner", "research", "paper", "catalyst", "watch_to_entry"}
+    for item in list((queue or {}).get("items") or []):
+        mint = str(item.get("mint") or "").strip()
+        symbol = str(item.get("symbol") or "").strip().upper()
+        unresolved = max(unresolved_by_key.get(mint, 0), unresolved_by_key.get(f"symbol:{symbol}", 0))
+        flags = {str(x).lower() for x in list(item.get("impact_flags") or [])}
+        quality = _gb_float(item.get("quality_score"))
+        pressure = _gb_float(item.get("pressure_score"))
+        priority = _gb_float(item.get("priority_score"))
+        liquidity = _gb_float(item.get("liquidity"))
+        high_impact = bool(flags & protected_flags) or priority >= 80 or quality >= 72 or pressure >= 60
+        if unresolved >= 2 and not high_impact and quality < 68 and pressure < 62 and liquidity < 150_000:
+            candidates.append({
+                "symbol": item.get("symbol"),
+                "mint": mint,
+                "unresolved_count": unresolved,
+                "priority_score": item.get("priority_score"),
+                "quality_score": item.get("quality_score"),
+                "pressure_score": item.get("pressure_score"),
+                "reason": "Repeated unresolved low-value provider repair; retired for 24h unless quality/pressure improves.",
+            })
+
+    suppressed = []
+    retired_until = time.time() + 24 * 3600
+    for item in candidates[:10]:
+        mint = str(item.get("mint") or "").strip()
+        if not mint:
+            continue
+        try:
+            conn = _dj_conn()
+            try:
+                cols = {row[1] for row in conn.execute("PRAGMA table_info(token_intelligence_current)").fetchall()}
+                for col, col_type in [
+                    ("provider_repair_status", "TEXT"),
+                    ("provider_repair_failure_class", "TEXT"),
+                    ("provider_repair_updated_at", "TEXT"),
+                    ("provider_repair_retired_until_unix", "REAL"),
+                ]:
+                    if col not in cols:
+                        conn.execute(f"ALTER TABLE token_intelligence_current ADD COLUMN {col} {col_type}")
+                conn.execute(
+                    """
+                    UPDATE token_intelligence_current
+                    SET provider_repair_status='RETIRED_UNRESOLVED',
+                        provider_repair_failure_class='burn_down_low_value_suppressed',
+                        provider_repair_updated_at=?,
+                        provider_repair_retired_until_unix=?
+                    WHERE mint=?
+                    """,
+                    (now.isoformat(), retired_until, mint),
+                )
+                conn.commit()
+                suppressed.append(item)
+            finally:
+                conn.close()
+        except Exception:
+            continue
+
+    payload = {
+        "status": "SUPPRESSED" if suppressed else "NO_SUPPRESSION_DUE",
+        "checked_at": now.isoformat(),
+        "candidate_count": len(candidates),
+        "suppressed_count": len(suppressed),
+        "retired_hours": 24,
+        "items": suppressed,
+        "protected_rule": "Promotion, good-buy, high-quality, catalyst, paper, and watch-to-entry rows are never auto-suppressed by this pass.",
+        "next_action": (
+            "Suppressed repeated low-value unresolved rows so provider budget can focus on live candidates."
+            if suppressed
+            else "No low-value repeated unresolved rows met the retire/suppress rule."
+        ),
+    }
+    _freshness_kv_write("freshness_retire_suppress_rules", payload)
+    return payload
+
+
+def _effective_freshness_repair_queue(queue: dict, suppression: dict) -> dict:
+    suppressed_mints = {str(item.get("mint") or "").strip() for item in list((suppression or {}).get("items") or [])}
+    out = dict(queue or {})
+    out["items"] = [item for item in list((queue or {}).get("items") or []) if str(item.get("mint") or "").strip() not in suppressed_mints]
+    out["suppressed_count"] = len(suppressed_mints)
+    out["queued_count"] = max(len(out["items"]), int(_gb_float((queue or {}).get("queued_count"))) - len(suppressed_mints))
+    if not out["items"]:
+        out["status"] = "EMPTY"
+    return out
+
+
+def _build_provider_health_limits(queue: dict, repair_rows: list[dict], budget: dict) -> dict:
+    by_source: dict[str, dict] = {}
+    for item in list((queue or {}).get("items") or []):
+        source = str(item.get("market_source") or "unknown").strip().lower() or "unknown"
+        entry = by_source.setdefault(source, {"source": source, "queued": 0, "recent_failures": 0, "failure_classes": {}, "limit_per_batch": 2})
+        entry["queued"] += 1
+    for row in list(repair_rows or []):
+        source = str(row.get("previous_source") or row.get("new_source") or "unknown").strip().lower() or "unknown"
+        if source not in by_source:
+            continue
+        status = str(row.get("repair_status") or "").upper()
+        failure = str(row.get("failure_class") or row.get("reason") or "unknown").lower()
+        if status in {"UNRESOLVED", "RETIRED_UNRESOLVED"}:
+            by_source[source]["recent_failures"] += 1
+            by_source[source]["failure_classes"][failure] = by_source[source]["failure_classes"].get(failure, 0) + 1
+    default_cap = max(1, min(4, int(_gb_float((budget or {}).get("batch_size"), 6)) // 2 or 1))
+    constrained = False
+    for entry in by_source.values():
+        failures = int(entry.get("recent_failures") or 0)
+        classes = set((entry.get("failure_classes") or {}).keys())
+        cap = default_cap
+        cooldown = int(_gb_float((budget or {}).get("min_interval_minutes"), 10))
+        if classes & {"provider_budget_or_rate_limit", "temporary_error", "provider_error"} or failures >= 4:
+            cap = 1
+            cooldown = max(cooldown, 20)
+            constrained = True
+        elif failures >= 2:
+            cap = min(cap, 2)
+            cooldown = max(cooldown, 12)
+        entry["limit_per_batch"] = max(1, int(cap))
+        entry["cooldown_minutes"] = int(cooldown)
+        entry["status"] = "CONSTRAINED" if cap == 1 and failures else "OK"
+    providers = sorted(by_source.values(), key=lambda x: (int(x.get("queued") or 0), int(x.get("recent_failures") or 0)), reverse=True)
+    return {
+        "status": "CONSTRAINED" if constrained else "OK",
+        "default_limit_per_batch": default_cap,
+        "providers": providers[:8],
+        "provider_limits": {item["source"]: int(item.get("limit_per_batch") or default_cap) for item in providers},
+        "next_action": "Respect constrained provider caps while burning down stale rows.",
+    }
+
+
+def _run_targeted_freshness_refresh(queue: dict, now: datetime, budget: dict | None = None, provider_limits: dict | None = None) -> dict:
+    budget = dict(budget or {})
+    batch_size = max(1, min(10, int(_gb_float(budget.get("batch_size"), 6))))
+    min_interval_minutes = max(5, int(_gb_float(budget.get("min_interval_minutes"), 10)))
+    source_caps = dict((provider_limits or {}).get("provider_limits") or {})
+    selected = []
+    source_counts: dict[str, int] = {}
+    skipped_by_limit = 0
+    for item in list((queue or {}).get("items") or []):
+        source = str(item.get("market_source") or "unknown").strip().lower() or "unknown"
+        cap = max(1, int(_gb_float(source_caps.get(source), batch_size)))
+        if source_counts.get(source, 0) >= cap:
+            skipped_by_limit += 1
+            continue
+        selected.append(item)
+        source_counts[source] = source_counts.get(source, 0) + 1
+        if len(selected) >= batch_size:
+            break
+    items = selected
     if not items:
         return {
             "status": "NO_TARGETS",
@@ -16858,13 +17156,16 @@ def _run_targeted_freshness_refresh(queue: dict, now: datetime, min_interval_min
             "status": "THROTTLED",
             "ran": False,
             "target_count": len(items),
+            "batch_size": batch_size,
+            "min_interval_minutes": min_interval_minutes,
+            "skipped_by_provider_limit": skipped_by_limit,
             "last_checked_at": previous.get("checked_at"),
             "previous": previous,
             "next_action": "Targeted freshness refresh was recently run; wait for the throttle window.",
         }
     try:
         from utils.token_intelligence import token_intelligence_targeted_repair_step  # type: ignore
-        result = token_intelligence_targeted_repair_step(items, limit=6)
+        result = token_intelligence_targeted_repair_step(items, limit=batch_size)
     except Exception as exc:
         result = {
             "status": "ERROR",
@@ -16874,6 +17175,10 @@ def _run_targeted_freshness_refresh(queue: dict, now: datetime, min_interval_min
         }
     result = dict(result or {})
     result["ran"] = str(result.get("status") or "").upper() not in {"NO_TARGETS", "ERROR"} or bool(result.get("event_count"))
+    result["batch_size"] = batch_size
+    result["min_interval_minutes"] = min_interval_minutes
+    result["skipped_by_provider_limit"] = skipped_by_limit
+    result["source_counts"] = source_counts
     result["requested_targets"] = [
         {
             "symbol": item.get("symbol"),
@@ -16902,6 +17207,51 @@ def _run_targeted_freshness_refresh(queue: dict, now: datetime, min_interval_min
         else "No provider repair events were produced; inspect the queued target paths."
     )
     return result
+
+
+def _build_freshness_burndown_progress_tracker(
+    queue: dict,
+    suppression: dict,
+    runner: dict,
+    recheck: dict,
+    now: datetime,
+) -> dict:
+    key = "freshness_burndown_progress"
+    previous_payload = _freshness_kv_read(key)
+    history = list((previous_payload or {}).get("history") or [])
+    recheck_sla = dict((recheck or {}).get("freshness_sla") or {})
+    repaired = int(_gb_float((runner or {}).get("live_repaired_count"))) + int(_gb_float((runner or {}).get("fallback_repaired_count")))
+    latest = {
+        "ts_utc": now.isoformat(),
+        "queue_count": int(_gb_float((queue or {}).get("queued_count"))),
+        "effective_items": len(list((queue or {}).get("items") or [])),
+        "repaired_count": repaired,
+        "unresolved_count": int(_gb_float((runner or {}).get("unresolved_count"))),
+        "suppressed_count": int(_gb_float((suppression or {}).get("suppressed_count"))),
+        "sla_status": recheck_sla.get("status"),
+        "sla_score": recheck_sla.get("score"),
+        "runner_status": (runner or {}).get("status"),
+    }
+    previous = history[-1] if history else {}
+    queue_delta = None
+    if previous:
+        queue_delta = int(_gb_float(previous.get("queue_count"))) - int(_gb_float(latest.get("queue_count")))
+    history.append(latest)
+    history = history[-48:]
+    payload = {
+        "status": "TRACKING",
+        "latest": latest,
+        "previous": previous,
+        "queue_reduction_since_last": queue_delta,
+        "history": history,
+        "next_action": (
+            "Backlog is shrinking; keep the guarded cadence."
+            if queue_delta is not None and queue_delta > 0
+            else "Keep burning down high-impact stale rows until the SLA score clears."
+        ),
+    }
+    _freshness_kv_write(key, payload)
+    return payload
 
 
 def _read_freshness_sla_recheck(lookback_hours: int, since: datetime) -> dict:
@@ -17005,19 +17355,33 @@ def _build_freshness_sla_repair_loop(
     since: datetime,
 ) -> dict:
     audit = _build_freshness_sla_audit(freshness_sla, data_watchdog, intelligence_rows, repair_rows)
-    queue = _build_provider_repair_priority_queue(intelligence_rows, data_watchdog, replay_lab, limit=12)
-    runner = _run_targeted_freshness_refresh(queue, now) if str(audit.get("status") or "").upper() == "BLOCKED" else {
+    raw_queue = _build_provider_repair_priority_queue(intelligence_rows, data_watchdog, replay_lab, limit=40)
+    previous_refresh = _freshness_kv_read("freshness_targeted_refresh_autorun") or _freshness_kv_read("freshness_targeted_refresh_status")
+    adaptive_budget = _build_adaptive_freshness_repair_budget(raw_queue, previous_refresh, freshness_sla)
+    backlog_segmentation = _segment_freshness_backlog(raw_queue)
+    retire_suppress_rules = _build_freshness_retire_suppress_rules(raw_queue, repair_rows, now)
+    queue = _effective_freshness_repair_queue(raw_queue, retire_suppress_rules)
+    provider_health_limits = _build_provider_health_limits(queue, repair_rows, adaptive_budget)
+    runner = _run_targeted_freshness_refresh(queue, now, adaptive_budget, provider_health_limits) if str(audit.get("status") or "").upper() == "BLOCKED" else {
         "status": "NOT_NEEDED",
         "ran": False,
         "target_count": 0,
+        "batch_size": adaptive_budget.get("batch_size"),
+        "min_interval_minutes": adaptive_budget.get("min_interval_minutes"),
         "next_action": "Freshness SLA is already clean.",
     }
     recheck = _read_freshness_sla_recheck(lookback_hours, since)
+    burndown_tracker = _build_freshness_burndown_progress_tracker(queue, retire_suppress_rules, runner, recheck, now)
     drilldown = _build_freshness_repair_drilldown(audit, queue, runner, recheck)
     return {
         "status": drilldown.get("status"),
         "freshness_sla_audit": audit,
         "provider_repair_priority_queue": queue,
+        "adaptive_repair_budget": adaptive_budget,
+        "backlog_segmentation": backlog_segmentation,
+        "retire_suppress_rules": retire_suppress_rules,
+        "burndown_progress_tracker": burndown_tracker,
+        "provider_health_limits": provider_health_limits,
         "targeted_refresh_runner": runner,
         "sla_recheck": recheck,
         "dashboard_freshness_drilldown": drilldown,
