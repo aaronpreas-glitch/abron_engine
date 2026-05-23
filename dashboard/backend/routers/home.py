@@ -13510,6 +13510,15 @@ def _buy_decision_v1(item: dict | None, provider_context: dict | None = None) ->
 
 
 _BUY_DECISION_BULLISH_LABELS = {"BIG_RUNNER", "GOOD_RUNNER", "GOOD_BUY"}
+_BUY_DECISION_STATE_ORDER = (
+    "BUY_NOW",
+    "SCOUT_ONLY",
+    "WAIT_PULLBACK",
+    "CONFLICT_REVIEW",
+    "WAIT_FOR_TRIGGER",
+    "SKIP_FOR_NOW",
+    "NO_BUY",
+)
 
 
 def _decision_snapshot(row) -> dict:
@@ -13784,8 +13793,16 @@ def _build_buy_decision_learning(current_decision: dict | None = None) -> dict:
                     b["avg_protected_4h_values"].append(ret_4h)
                     b["avg_protected_24h_values"].append(ret_24h)
 
+    current_state = str((current_decision or {}).get("decision_state") or "").strip().upper()
+    state_order = list(_BUY_DECISION_STATE_ORDER)
+    for state in sorted(state_stats):
+        if state and state not in state_order:
+            state_order.append(state)
+    if current_state and current_state not in state_order:
+        state_order.append(current_state)
+
     by_state = []
-    for state in ("BUY_NOW", "WAIT_FOR_TRIGGER", "SKIP_FOR_NOW", "NO_BUY"):
+    for state in state_order:
         stat = state_stats.get(state, {
             "decision_state": state,
             "sample_n": 0,
@@ -13885,7 +13902,6 @@ def _build_buy_decision_learning(current_decision: dict | None = None) -> dict:
     elif resolved_n > 0:
         global_trust = "THIN_SAMPLE"
     evidence_label = _evidence_label(final_n, observed_n)
-    current_state = str((current_decision or {}).get("decision_state") or "").strip().upper()
     current_state_lesson = next((row for row in by_state if row.get("decision_state") == current_state), None) if current_state else None
 
     return {
