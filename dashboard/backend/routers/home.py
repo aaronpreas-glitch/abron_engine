@@ -16838,6 +16838,215 @@ def _build_live_context_policy_suggestions(mission_journal: dict, accuracy: dict
     }
 
 
+def _build_live_context_mission_evidence_packet(
+    review_queue: dict,
+    mission_journal: dict,
+    raw_journal: list[dict],
+    live_intake: dict,
+    intelligence_rows: list[dict],
+    decision_rows: list[dict],
+    dossier: dict,
+) -> dict:
+    top = dict((review_queue or {}).get("top_item") or {})
+    if not top:
+        return {
+            "status": "NO_OPEN_REVIEW",
+            "next_action": "No live mission review item needs an evidence packet.",
+        }
+    mission_key = str(top.get("mission_key") or "").strip().upper()
+    item_map = _live_context_current_item_map(live_intake)
+    live_item = item_map.get(mission_key)
+    symbol = str(top.get("symbol") or (live_item or {}).get("symbol") or "").strip().upper()
+    mint = str(top.get("mint") or (live_item or {}).get("mint") or "").strip()
+    identity_event = {
+        "symbol": symbol or None,
+        "mint": mint or None,
+    }
+    matched_decisions = _live_context_decision_matches(identity_event, decision_rows)[:8]
+    matched_intel = _live_context_decision_matches(identity_event, intelligence_rows)[:8]
+    bullish_labels = {"BIG_RUNNER", "GOOD_RUNNER", "GOOD_BUY"}
+    bullish = [
+        row for row in matched_decisions
+        if str(row.get("outcome_label") or "").upper() in bullish_labels
+        or _gb_float(row.get("max_return_pct")) >= 25.0
+    ][:5]
+    fresh_coverage = [
+        row for row in matched_intel
+        if str(row.get("data_freshness") or "").upper() in {"LIVE", "RECENT"}
+        and str(row.get("data_confidence") or "").upper() != "LOW"
+    ][:5]
+    history = [
+        dict(row) for row in raw_journal or []
+        if str(row.get("mission_key") or row.get("gap_key") or "").strip().upper() == mission_key
+    ][:8]
+    evidence_flags = []
+    if live_item:
+        evidence_flags.append("live_context_seen")
+    if bullish:
+        evidence_flags.append("bullish_outcome_match")
+    if fresh_coverage:
+        evidence_flags.append("fresh_coverage_visible")
+    if matched_decisions:
+        evidence_flags.append("decision_surface_seen")
+    if matched_intel:
+        evidence_flags.append("token_intelligence_seen")
+    if not evidence_flags:
+        evidence_flags.append("evidence_sparse")
+    return {
+        "status": "READY",
+        "mission_key": mission_key,
+        "symbol": symbol or None,
+        "mint": mint or None,
+        "state": top.get("state"),
+        "scope": top.get("scope") or ((dossier or {}).get("scope") or {}).get("scope"),
+        "outcome_label": top.get("outcome_label"),
+        "correctness": top.get("correctness"),
+        "priority_score": top.get("priority_score"),
+        "review_reason": top.get("review_reason") or top.get("reason"),
+        "source": (live_item or {}).get("source") or top.get("live_source") or (dossier or {}).get("source"),
+        "heat_score": top.get("live_heat_score") if top.get("live_heat_score") is not None else (live_item or {}).get("heat_score"),
+        "gap_type": top.get("gap_type") or (dossier or {}).get("gap_type"),
+        "evidence_flags": evidence_flags,
+        "source_item": live_item,
+        "mission_history": history,
+        "decision_matches": matched_decisions,
+        "intelligence_matches": matched_intel,
+        "bullish_matches": bullish,
+        "fresh_coverage": fresh_coverage,
+        "counts": {
+            "history": len(history),
+            "decision_matches": len(matched_decisions),
+            "intelligence_matches": len(matched_intel),
+            "bullish_matches": len(bullish),
+            "fresh_coverage": len(fresh_coverage),
+        },
+        "next_action": "Use the recommended verdict only if this evidence packet matches the chart/read.",
+    }
+
+
+def _build_live_context_recommended_verdict(evidence_packet: dict, blind_spot_resolution: dict) -> dict:
+    if not evidence_packet or evidence_packet.get("status") != "READY":
+        return {
+            "status": "NO_VERDICT",
+            "recommended_state": None,
+            "confidence": "NONE",
+            "reason": "No open evidence packet.",
+            "next_action": "Wait for an open mission review item.",
+        }
+    label = str(evidence_packet.get("outcome_label") or "").upper()
+    scope = str(evidence_packet.get("scope") or "").upper()
+    counts = dict(evidence_packet.get("counts") or {})
+    bullish_n = int(counts.get("bullish_matches") or 0)
+    fresh_n = int(counts.get("fresh_coverage") or 0)
+    decision_n = int(counts.get("decision_matches") or 0)
+    source = str(evidence_packet.get("source") or "").lower()
+    mint = str(evidence_packet.get("mint") or "").strip()
+
+    if label == "FALSE_IGNORE" or bullish_n:
+        state = "INVESTIGATING"
+        confidence = "HIGH"
+        reason = "Ignored mission has bullish outcome evidence; reopen investigation before keeping it ignored."
+    elif label == "COVER_STILL_MISSING":
+        state = "NEEDS_SOURCE" if not fresh_n and not decision_n else "RESOLVED_COVERED"
+        confidence = "MEDIUM"
+        reason = "Coverage proof is missing; require source/coverage unless fresh evidence is now visible."
+    elif label == "IGNORED_HOT_REVIEW":
+        state = "INVESTIGATING"
+        confidence = "MEDIUM"
+        reason = "Ignored item still looks hot or tradable enough for another operator look."
+    elif label == "SOURCE_PENDING":
+        state = "NEEDS_SOURCE"
+        confidence = "MEDIUM"
+        reason = "Keep this source-gated until a mint or concrete tradable source appears."
+    elif scope in {"OUT_OF_SCOPE_L1", "SPOT_ONLY"} and not mint and source != "dexscreener":
+        state = "RESOLVED_IGNORED"
+        confidence = "HIGH"
+        reason = "Broad L1/spot context should stay out of memecoin coverage unless spot strategy asks for it."
+    elif fresh_n or decision_n:
+        state = "RESOLVED_COVERED"
+        confidence = "HIGH" if fresh_n else "MEDIUM"
+        reason = "Coverage or decision-surface proof is visible."
+    elif str((blind_spot_resolution or {}).get("recommended_state") or "").upper() in _LIVE_CONTEXT_MISSION_STATES:
+        state = str((blind_spot_resolution or {}).get("recommended_state") or "").upper()
+        confidence = "LOW"
+        reason = str((blind_spot_resolution or {}).get("action") or "Use scope classifier recommendation.")
+    else:
+        state = "INVESTIGATING"
+        confidence = "LOW"
+        reason = "Evidence is sparse; investigate before resolving."
+
+    return {
+        "status": "READY",
+        "mission_key": evidence_packet.get("mission_key"),
+        "recommended_state": state,
+        "confidence": confidence,
+        "reason": reason,
+        "button_label": {
+            "RESOLVED_IGNORED": "KEEP IGNORED",
+            "RESOLVED_COVERED": "MARK COVERED",
+            "NEEDS_SOURCE": "NEEDS SOURCE",
+            "INVESTIGATING": "REOPEN",
+        }.get(state, "APPLY"),
+        "next_action": "Apply this verdict only after checking the evidence packet.",
+    }
+
+
+def _live_context_policy_window_counts(items: list[dict], now: datetime) -> dict:
+    def _in_window(row: dict, hours: int) -> bool:
+        ts = _gb_parse_ts(row.get("decision_at"))
+        return bool(ts and ts >= now - timedelta(hours=hours))
+
+    return {
+        "24h": [item for item in items if _in_window(item, 24)],
+        "7d": [item for item in items if _in_window(item, 24 * 7)],
+    }
+
+
+def _attach_live_context_policy_impact_preview(policy_suggestions: dict, mission_journal: dict, now: datetime) -> dict:
+    suggestions = []
+    items = list((mission_journal or {}).get("items") or [])
+    windows = _live_context_policy_window_counts(items, now)
+    for suggestion in list((policy_suggestions or {}).get("items") or []):
+        key = str(suggestion.get("policy_key") or "").upper()
+        preview = {}
+        for label, rows in windows.items():
+            if key == "QUIET_OUT_OF_SCOPE_L1_HEAT":
+                affected = [
+                    row for row in rows
+                    if str(row.get("scope") or "").upper() in {"OUT_OF_SCOPE_L1", "SPOT_ONLY"}
+                    and not row.get("mint")
+                ]
+                risk = [row for row in affected if str(row.get("outcome_label") or "").upper() == "FALSE_IGNORE"]
+            elif key == "NO_AUTO_IGNORE_HOT_TRADABLE":
+                affected = [
+                    row for row in rows
+                    if row.get("mint")
+                    or str(row.get("live_source") or "").lower() == "dexscreener"
+                    or _gb_float(row.get("live_heat_score")) >= 80.0
+                ]
+                risk = [row for row in affected if str(row.get("outcome_label") or "").upper() == "GOOD_IGNORE"]
+            elif key == "REQUIRE_VISIBLE_COVERAGE_PROOF":
+                affected = [row for row in rows if str(row.get("state") or "").upper() == "RESOLVED_COVERED"]
+                risk = []
+            elif key == "SOURCE_NEEDED_EXPIRY":
+                affected = [row for row in rows if str(row.get("outcome_label") or "").upper() == "SOURCE_PENDING"]
+                risk = []
+            else:
+                affected = []
+                risk = []
+            preview[label] = {
+                "affected_count": len(affected),
+                "risk_count": len(risk),
+                "sample_symbols": [str(row.get("symbol") or row.get("mint") or row.get("mission_key") or "mission") for row in affected[:5]],
+            }
+        suggestions.append({**suggestion, "impact_preview": preview})
+    return {
+        **(policy_suggestions or {}),
+        "items": suggestions,
+        "impact_preview_status": "READY" if suggestions else "NO_POLICY_CHANGE",
+    }
+
+
 def _build_paper_to_pilot_gate(paper_rows: list[dict], lock_ok: bool, freshness_sla: dict, decision_quality: dict) -> dict:
     sample = len(paper_rows)
     wins = len([
@@ -17449,8 +17658,11 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
         live_context_mission_states,
     )
     live_context_blind_spot_resolution = _build_live_context_blind_spot_resolution(live_context_mission_dossier)
+    live_context_raw_mission_journal = _live_context_mission_outcome_journal(
+        kv_rows.get(_LIVE_CONTEXT_MISSION_OUTCOME_JOURNAL_KEY)
+    )
     live_context_mission_outcome_journal = _build_live_context_mission_outcome_journal(
-        _live_context_mission_outcome_journal(kv_rows.get(_LIVE_CONTEXT_MISSION_OUTCOME_JOURNAL_KEY)),
+        live_context_raw_mission_journal,
         live_market_narrative_intake,
         journal_24h,
         intelligence_rows,
@@ -17465,6 +17677,24 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
     live_context_policy_suggestions = _build_live_context_policy_suggestions(
         live_context_mission_outcome_journal,
         live_context_decision_accuracy,
+    )
+    live_context_mission_evidence_packet = _build_live_context_mission_evidence_packet(
+        live_context_review_queue,
+        live_context_mission_outcome_journal,
+        live_context_raw_mission_journal,
+        live_market_narrative_intake,
+        intelligence_rows,
+        journal_rows,
+        live_context_mission_dossier,
+    )
+    live_context_recommended_verdict = _build_live_context_recommended_verdict(
+        live_context_mission_evidence_packet,
+        live_context_blind_spot_resolution,
+    )
+    live_context_policy_suggestions = _attach_live_context_policy_impact_preview(
+        live_context_policy_suggestions,
+        live_context_mission_outcome_journal,
+        now,
     )
     live_context_generated_mission = _build_live_context_generated_mission(
         live_opportunity_gaps,
@@ -17635,6 +17865,8 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
         "live_context_review_queue": live_context_review_queue,
         "live_context_decision_accuracy": live_context_decision_accuracy,
         "live_context_policy_suggestions": live_context_policy_suggestions,
+        "live_context_mission_evidence_packet": live_context_mission_evidence_packet,
+        "live_context_recommended_verdict": live_context_recommended_verdict,
         "live_context_generated_mission": live_context_generated_mission,
         "live_context_evidence_requirements": live_context_evidence_requirements,
         "live_context_outcome_loop": live_context_outcome_loop,

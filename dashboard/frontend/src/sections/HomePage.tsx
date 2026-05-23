@@ -334,6 +334,41 @@ interface LiveContextMissionOutcomeItem {
   matched_intelligence_rows?: number | null
 }
 
+interface LiveContextMissionEvidencePacket {
+  status?: string
+  mission_key?: string
+  symbol?: string | null
+  mint?: string | null
+  state?: string | null
+  scope?: string | null
+  outcome_label?: string | null
+  correctness?: string | null
+  priority_score?: number | null
+  review_reason?: string | null
+  source?: string | null
+  heat_score?: number | null
+  gap_type?: string | null
+  evidence_flags?: string[]
+  source_item?: Record<string, unknown> | null
+  mission_history?: Array<Record<string, unknown>>
+  decision_matches?: Array<Record<string, unknown>>
+  intelligence_matches?: Array<Record<string, unknown>>
+  bullish_matches?: Array<Record<string, unknown>>
+  fresh_coverage?: Array<Record<string, unknown>>
+  counts?: Record<string, number>
+  next_action?: string | null
+}
+
+interface LiveContextRecommendedVerdict {
+  status?: string
+  mission_key?: string
+  recommended_state?: LiveContextMissionState | string | null
+  confidence?: string | null
+  reason?: string | null
+  button_label?: string | null
+  next_action?: string | null
+}
+
 interface LiveContextEvidenceRequirements {
   status?: string
   mission_type?: string
@@ -843,15 +878,23 @@ interface DailyCryptoBriefData {
     status?: string
     suggestion_count?: number
     accuracy_pct?: number | null
+    impact_preview_status?: string | null
     items?: Array<{
       policy_key?: string | null
       confidence?: string | null
       evidence_n?: number | null
       suggestion?: string | null
       manual_only?: boolean
+      impact_preview?: Record<string, {
+        affected_count?: number
+        risk_count?: number
+        sample_symbols?: string[]
+      }>
     }>
     next_action?: string | null
   }
+  live_context_mission_evidence_packet?: LiveContextMissionEvidencePacket
+  live_context_recommended_verdict?: LiveContextRecommendedVerdict
   live_context_generated_mission?: DailyTopMission
   live_context_evidence_requirements?: LiveContextEvidenceRequirements
   live_context_outcome_loop?: LiveContextOutcomeLoop
@@ -5000,6 +5043,8 @@ function DailyCryptoBriefPanel({
     const liveReviewQueue = data.live_context_review_queue ?? {}
     const liveDecisionAccuracy = data.live_context_decision_accuracy ?? {}
     const livePolicySuggestions = data.live_context_policy_suggestions ?? {}
+    const liveEvidencePacket = data.live_context_mission_evidence_packet ?? {}
+    const liveRecommendedVerdict = data.live_context_recommended_verdict ?? {}
     const liveMission = data.live_context_generated_mission ?? {}
     const liveEvidence = data.live_context_evidence_requirements ?? {}
     const liveOutcomeLoop = data.live_context_outcome_loop ?? {}
@@ -5045,6 +5090,8 @@ function DailyCryptoBriefPanel({
     const topLiveGap = liveGaps.top_gap ?? liveGaps.items?.[0]
     const topLiveReview = liveReviewQueue.top_item ?? liveReviewQueue.items?.[0]
     const topLivePolicy = livePolicySuggestions.items?.[0]
+    const topPolicyImpact24h = topLivePolicy?.impact_preview?.['24h']
+    const topPolicyImpact7d = topLivePolicy?.impact_preview?.['7d']
     const liveMissionActionItem = liveMission.group_key ? liveMission : topLiveReview ?? topLiveGap
     const topEvidenceRequirement = liveEvidence.requirements?.[0]
     const buildHooks = data.daily_build_hooks ?? {}
@@ -5791,6 +5838,48 @@ function DailyCryptoBriefPanel({
             )}
           </div>
 
+          <div style={{ border: `1px solid ${liveEvidencePacket.status === 'READY' ? 'rgba(45,212,191,0.22)' : 'rgba(96,165,250,0.16)'}`, borderRadius: 10, padding: 10, background: liveEvidencePacket.status === 'READY' ? 'rgba(45,212,191,0.03)' : 'rgba(96,165,250,0.02)' }}>
+            <span style={{ ...MONO, fontSize: 8, color: liveEvidencePacket.status === 'READY' ? '#2dd4bf' : '#60a5fa', fontWeight: 900, letterSpacing: '0.14em' }}>
+              EVIDENCE PACKET
+            </span>
+            <div style={{ ...MONO, fontSize: 10, color: '#d7e1ea', marginTop: 7, lineHeight: 1.45 }}>
+              {liveEvidencePacket.symbol || liveEvidencePacket.mint || liveEvidencePacket.mission_key || 'mission'} · {String(liveEvidencePacket.outcome_label || liveEvidencePacket.status || 'waiting').replace(/_/g, ' ').toLowerCase()}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              source {liveEvidencePacket.source || 'none'} · heat {fmtFixed(liveEvidencePacket.heat_score, 0)} · decisions {liveEvidencePacket.counts?.decision_matches ?? 0} · intel {liveEvidencePacket.counts?.intelligence_matches ?? 0} · bullish {liveEvidencePacket.counts?.bullish_matches ?? 0}
+            </div>
+            <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap', marginTop: 8 }}>
+              {(liveEvidencePacket.evidence_flags ?? ['evidence_sparse']).slice(0, 4).map(flag => (
+                <span key={`mission-evidence-${flag}`} style={{ ...MONO, fontSize: 7, color: '#9db7ce', border: '1px solid rgba(255,255,255,0.08)', borderRadius: 999, padding: '2px 7px', background: 'rgba(255,255,255,0.025)' }}>
+                  {flag.replace(/_/g, ' ')}
+                </span>
+              ))}
+            </div>
+          </div>
+
+          <div style={{ border: `1px solid ${liveRecommendedVerdict.confidence === 'HIGH' ? 'rgba(0,212,138,0.22)' : liveRecommendedVerdict.status === 'READY' ? 'rgba(245,158,11,0.22)' : 'rgba(96,165,250,0.16)'}`, borderRadius: 10, padding: 10, background: liveRecommendedVerdict.confidence === 'HIGH' ? 'rgba(0,212,138,0.03)' : liveRecommendedVerdict.status === 'READY' ? 'rgba(245,158,11,0.03)' : 'rgba(96,165,250,0.02)' }}>
+            <span style={{ ...MONO, fontSize: 8, color: liveRecommendedVerdict.confidence === 'HIGH' ? '#00d48a' : liveRecommendedVerdict.status === 'READY' ? '#f59e0b' : '#60a5fa', fontWeight: 900, letterSpacing: '0.14em' }}>
+              RECOMMENDED VERDICT
+            </span>
+            <div style={{ ...MONO, fontSize: 10, color: '#d7e1ea', marginTop: 7, lineHeight: 1.45 }}>
+              {String(liveRecommendedVerdict.recommended_state || liveRecommendedVerdict.status || 'NO_VERDICT').replace(/_/g, ' ')} · {String(liveRecommendedVerdict.confidence || 'NONE').toLowerCase()}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              {liveRecommendedVerdict.reason || liveRecommendedVerdict.next_action || 'No verdict until an evidence packet is ready.'}
+            </div>
+            {liveRecommendedVerdict.recommended_state && topLiveReview && onLiveContextMissionAction && (
+              <button
+                type="button"
+                className="mini-btn"
+                disabled={pendingLiveContextMissionKey === liveRecommendedVerdict.mission_key}
+                onClick={() => onLiveContextMissionAction(topLiveReview, liveRecommendedVerdict.recommended_state as LiveContextMissionState)}
+                style={{ fontSize: 7, padding: '4px 8px', marginTop: 8 }}
+              >
+                {liveRecommendedVerdict.button_label || 'APPLY VERDICT'}
+              </button>
+            )}
+          </div>
+
           <div style={{ border: `1px solid ${liveDecisionAccuracy.status === 'NEEDS_REVIEW' ? 'rgba(239,68,68,0.22)' : 'rgba(96,165,250,0.16)'}`, borderRadius: 10, padding: 10, background: liveDecisionAccuracy.status === 'NEEDS_REVIEW' ? 'rgba(239,68,68,0.03)' : 'rgba(96,165,250,0.02)' }}>
             <span style={{ ...MONO, fontSize: 8, color: liveDecisionAccuracy.status === 'NEEDS_REVIEW' ? '#ef4444' : '#60a5fa', fontWeight: 900, letterSpacing: '0.14em' }}>
               MISSION ACCURACY
@@ -5815,6 +5904,11 @@ function DailyCryptoBriefPanel({
                 ? `${String(topLivePolicy.policy_key || 'policy').replace(/_/g, ' ').toLowerCase()} · ${String(topLivePolicy.confidence || 'evidence').toLowerCase()} · n ${topLivePolicy.evidence_n ?? 0}`
                 : livePolicySuggestions.next_action || 'No policy suggestion until outcomes prove a pattern.'}
             </div>
+            {topLivePolicy && (
+              <div style={{ ...MONO, fontSize: 8, color: '#9db7ce', marginTop: 6, lineHeight: 1.45 }}>
+                24h touches {topPolicyImpact24h?.affected_count ?? 0} risk {topPolicyImpact24h?.risk_count ?? 0} · 7d touches {topPolicyImpact7d?.affected_count ?? 0} risk {topPolicyImpact7d?.risk_count ?? 0}
+              </div>
+            )}
           </div>
 
           <div style={{ border: '1px solid rgba(167,139,250,0.18)', borderRadius: 10, padding: 10, background: 'rgba(167,139,250,0.025)' }}>
