@@ -127,6 +127,7 @@ interface DailyBriefAutopsyExample {
 type ProviderEscalationAction = 'DISMISS' | 'KEEP_WATCHING' | 'FORCE_REFRESH'
 type ProviderEscalationReviewState = 'ACKNOWLEDGED' | 'RULE_PATCH_NEEDED' | 'DATA_PATCH_NEEDED' | 'FALSE_ALARM' | 'RESOLVED'
 type ProviderEscalationPatchState = 'WATCH' | 'NEEDS_MORE_DATA' | 'READY_FOR_IMPLEMENTATION'
+type ProviderEscalationWorkOrderState = 'READY' | 'STARTED' | 'BLOCKED' | 'COMPLETE'
 
 interface ProviderEscalationItem {
   id?: number | null
@@ -207,6 +208,31 @@ interface ProviderEscalationPatchPlan {
   gate_reason?: string | null
   ready_for_implementation?: boolean
   evidence?: ProviderEscalationReviewGroup['evidence']
+}
+
+interface ProviderEscalationWorkOrder {
+  group_key?: string
+  work_order_key?: string
+  state?: string | null
+  state_updated_at?: string | null
+  operator_note?: string | null
+  risk_label?: string | null
+  target_subsystem?: string | null
+  target_files?: string[]
+  target_functions?: string[]
+  goal?: string | null
+  constraints?: string[]
+  proof_required?: {
+    sample_n?: number
+    confidence_score?: number | null
+    simulated_benefit_n?: number
+    weak_buy_risk_n?: number
+    gate_status?: string | null
+  }
+  checklist?: Array<{ key?: string; label?: string; required?: boolean }>
+  rollback_condition?: string | null
+  source_plan?: ProviderEscalationPatchPlan
+  next_action?: string | null
 }
 
 interface DailyCryptoBriefData {
@@ -495,6 +521,16 @@ interface DailyCryptoBriefData {
     state_counts?: Record<string, number>
     top_plan?: ProviderEscalationPatchPlan | null
     items?: ProviderEscalationPatchPlan[]
+    next_action?: string | null
+  }
+  provider_escalation_work_orders?: {
+    status?: string
+    work_order_count?: number
+    started_count?: number
+    ready_count?: number
+    state_counts?: Record<string, number>
+    top_work_order?: ProviderEscalationWorkOrder | null
+    items?: ProviderEscalationWorkOrder[]
     next_action?: string | null
   }
   provider_escalation_outcome_autorun?: {
@@ -4596,18 +4632,22 @@ function DailyCryptoBriefPanel({
   onEscalationAction,
   onEscalationReviewAction,
   onEscalationPatchAction,
+  onEscalationWorkOrderAction,
   pendingEscalationId,
   pendingEscalationReviewKey,
   pendingEscalationPatchKey,
+  pendingEscalationWorkOrderKey,
 }: {
   data?: DailyCryptoBriefData
   loading: boolean
   onEscalationAction?: (item: ProviderEscalationItem, action: ProviderEscalationAction) => void
   onEscalationReviewAction?: (item: ProviderEscalationReviewGroup, state: ProviderEscalationReviewState) => void
   onEscalationPatchAction?: (item: ProviderEscalationPatchPlan, state: ProviderEscalationPatchState) => void
+  onEscalationWorkOrderAction?: (item: ProviderEscalationWorkOrder, state: ProviderEscalationWorkOrderState) => void
   pendingEscalationId?: number | null
   pendingEscalationReviewKey?: string | null
   pendingEscalationPatchKey?: string | null
+  pendingEscalationWorkOrderKey?: string | null
 }) {
   if (loading && !data) {
     return (
@@ -4671,6 +4711,7 @@ function DailyCryptoBriefPanel({
     const escalationAlerts = data.provider_escalation_alerts ?? {}
     const escalationReviewQueue = data.provider_escalation_review_queue ?? {}
     const escalationPatchPlans = data.provider_escalation_patch_plans ?? {}
+    const escalationWorkOrders = data.provider_escalation_work_orders ?? {}
     const escalationAutorun = data.provider_escalation_outcome_autorun ?? {}
     const ruleGate = data.rule_promotion_gate ?? {}
     const missedClusters = data.missed_runner_clusters ?? {}
@@ -4691,6 +4732,7 @@ function DailyCryptoBriefPanel({
     const topEscalationAlert = escalationAlerts.items?.[0]
     const topEscalationReview = escalationReviewQueue.items?.[0]
     const topEscalationPatch = escalationPatchPlans.top_plan ?? escalationPatchPlans.items?.[0]
+    const topEscalationWorkOrder = escalationWorkOrders.top_work_order ?? escalationWorkOrders.items?.[0]
     const buildHooks = data.daily_build_hooks ?? {}
     const countText = (counts: Record<string, number>, keys: string[]) =>
       keys.map(key => `${key.toLowerCase()} ${counts[key] ?? 0}`).join(' · ')
@@ -5003,6 +5045,45 @@ function DailyCryptoBriefPanel({
                     className="mini-btn"
                     disabled={pendingEscalationPatchKey === topEscalationPatch.group_key || (state === 'READY_FOR_IMPLEMENTATION' && topEscalationPatch.gate_status !== 'READY_FOR_MANUAL_REVIEW')}
                     onClick={() => onEscalationPatchAction(topEscalationPatch, state)}
+                    style={{ fontSize: 7, padding: '4px 7px' }}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div style={{ border: `1px solid ${(escalationWorkOrders.started_count ?? 0) ? 'rgba(0,212,138,0.26)' : (escalationWorkOrders.ready_count ?? 0) ? 'rgba(245,158,11,0.24)' : 'rgba(96,165,250,0.16)'}`, borderRadius: 10, padding: 10, background: (escalationWorkOrders.started_count ?? 0) ? 'rgba(0,212,138,0.035)' : (escalationWorkOrders.ready_count ?? 0) ? 'rgba(245,158,11,0.03)' : 'rgba(96,165,250,0.02)' }}>
+            <span style={{ ...MONO, fontSize: 8, color: (escalationWorkOrders.started_count ?? 0) ? '#00d48a' : (escalationWorkOrders.ready_count ?? 0) ? '#f59e0b' : '#60a5fa', fontWeight: 900, letterSpacing: '0.14em' }}>
+              WORK ORDER
+            </span>
+            <div style={{ ...MONO, fontSize: 10, color: '#d7e1ea', marginTop: 7, lineHeight: 1.45 }}>
+              {escalationWorkOrders.status || 'NO_WORK_ORDERS'} · ready {escalationWorkOrders.ready_count ?? 0} · started {escalationWorkOrders.started_count ?? 0}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              {topEscalationWorkOrder
+                ? `${String(topEscalationWorkOrder.risk_label || 'risk').replace(/_/g, ' ').toLowerCase()} · ${topEscalationWorkOrder.target_subsystem || 'subsystem'} · checks ${topEscalationWorkOrder.checklist?.length ?? 0}`
+                : escalationWorkOrders.next_action || 'No implementation work order is ready.'}
+            </div>
+            {topEscalationWorkOrder?.goal && (
+              <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+                {topEscalationWorkOrder.goal}
+              </div>
+            )}
+            {topEscalationWorkOrder && onEscalationWorkOrderAction && (
+              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 8 }}>
+                {([
+                  ['STARTED', 'START'],
+                  ['BLOCKED', 'BLOCK'],
+                  ['COMPLETE', 'DONE'],
+                ] as Array<[ProviderEscalationWorkOrderState, string]>).map(([state, label]) => (
+                  <button
+                    key={`escalation-work-order-${state}`}
+                    type="button"
+                    className="mini-btn"
+                    disabled={pendingEscalationWorkOrderKey === topEscalationWorkOrder.group_key}
+                    onClick={() => onEscalationWorkOrderAction(topEscalationWorkOrder, state)}
                     style={{ fontSize: 7, padding: '4px 7px' }}
                   >
                     {label}
@@ -7843,6 +7924,7 @@ export function HomePage() {
   const [pendingEscalationId, setPendingEscalationId] = React.useState<number | null>(null)
   const [pendingEscalationReviewKey, setPendingEscalationReviewKey] = React.useState<string | null>(null)
   const [pendingEscalationPatchKey, setPendingEscalationPatchKey] = React.useState<string | null>(null)
+  const [pendingEscalationWorkOrderKey, setPendingEscalationWorkOrderKey] = React.useState<string | null>(null)
   const [homeQueryStage, setHomeQueryStage] = React.useState(0)
 
   React.useEffect(() => {
@@ -8075,6 +8157,35 @@ export function HomePage() {
     })
   }
 
+  const providerEscalationWorkOrderMutation = useMutation({
+    mutationFn: (payload: {
+      group_key?: string
+      state: ProviderEscalationWorkOrderState
+      operator_note?: string
+    }) => api.post('/home/provider-escalation-work-order/decision', payload).then(r => r.data),
+    onMutate: (payload) => {
+      setPendingEscalationWorkOrderKey(payload.group_key ?? null)
+    },
+    onSettled: async () => {
+      setPendingEscalationWorkOrderKey(null)
+      await queryClient.invalidateQueries({ queryKey: ['home-daily-crypto-brief'] })
+      await queryClient.invalidateQueries({ queryKey: ['home-action-board'] })
+      await queryClient.invalidateQueries({ queryKey: ['home-system-audit-confidence'] })
+    },
+  })
+
+  const recordProviderEscalationWorkOrderDecision = (item: ProviderEscalationWorkOrder, state: ProviderEscalationWorkOrderState) => {
+    providerEscalationWorkOrderMutation.mutate({
+      group_key: item.group_key,
+      state,
+      operator_note:
+        state === 'STARTED' ? 'Operator started this escalation implementation work order.'
+        : state === 'BLOCKED' ? 'Operator blocked this escalation implementation work order.'
+        : state === 'COMPLETE' ? 'Operator completed this escalation implementation work order.'
+        : 'Operator reset this escalation implementation work order to ready.',
+    })
+  }
+
   // Confluence reinforcement — annotates MEMECOINS entries on the Action Board
   const confluenceReinQ = useQuery<{
     top_candidates: Array<{ symbol: string; reinforcement_level: string }>
@@ -8206,9 +8317,11 @@ export function HomePage() {
           onEscalationAction={recordProviderEscalationDecision}
           onEscalationReviewAction={recordProviderEscalationReviewDecision}
           onEscalationPatchAction={recordProviderEscalationPatchDecision}
+          onEscalationWorkOrderAction={recordProviderEscalationWorkOrderDecision}
           pendingEscalationId={pendingEscalationId}
           pendingEscalationReviewKey={pendingEscalationReviewKey}
           pendingEscalationPatchKey={pendingEscalationPatchKey}
+          pendingEscalationWorkOrderKey={pendingEscalationWorkOrderKey}
         />
       </div>
 

@@ -38,6 +38,7 @@ _DAILY_BRIEF_OUTCOME_AUTORUN_MIN_SECONDS = max(
 )
 _PROVIDER_ESCALATION_REVIEW_STATES_KEY = "provider_escalation_review_states"
 _PROVIDER_ESCALATION_PATCH_STATES_KEY = "provider_escalation_patch_states"
+_PROVIDER_ESCALATION_WORK_ORDER_STATES_KEY = "provider_escalation_work_order_states"
 _PROVIDER_ESCALATION_REVIEW_OPEN_STATES = {
     "OPEN",
     "ACKNOWLEDGED",
@@ -46,6 +47,7 @@ _PROVIDER_ESCALATION_REVIEW_OPEN_STATES = {
 }
 _PROVIDER_ESCALATION_REVIEW_CLOSED_STATES = {"FALSE_ALARM", "RESOLVED"}
 _PROVIDER_ESCALATION_PATCH_STATES = {"WATCH", "NEEDS_MORE_DATA", "READY_FOR_IMPLEMENTATION"}
+_PROVIDER_ESCALATION_WORK_ORDER_STATES = {"READY", "STARTED", "BLOCKED", "COMPLETE"}
 _home_short_cache: dict[str, tuple[float, object]] = {}
 
 
@@ -15281,6 +15283,137 @@ def _build_provider_escalation_patch_plans(
     }
 
 
+def _work_order_state_map(raw_value: str | None) -> dict[str, dict]:
+    try:
+        payload = json.loads(raw_value or "{}")
+        if not isinstance(payload, dict):
+            return {}
+        out: dict[str, dict] = {}
+        for key, value in payload.items():
+            if isinstance(value, dict):
+                out[str(key)] = dict(value)
+        return out
+    except Exception:
+        return {}
+
+
+def _work_order_risk_label(plan: dict) -> str:
+    plan_type = str(plan.get("plan_type") or "").upper()
+    lane = str(plan.get("lane") or "").upper()
+    if "EXECUTION" in lane or "BUY" in lane:
+        return "EXECUTION_SENSITIVE"
+    if plan_type == "DATA_PROVIDER_REPAIR":
+        return "DATA_ONLY"
+    if plan_type == "BLOCKER_RULE_PATCH" and "SCOUT" in str(plan.get("proposed_fix") or "").upper():
+        return "SCOUT_ONLY"
+    if plan_type in {"BLOCKER_RULE_PATCH", "RULE_PATCH"}:
+        return "RULE_TUNING"
+    return "DATA_ONLY"
+
+
+def _build_provider_escalation_work_orders(patch_plans: dict, raw_work_states: str | None) -> dict:
+    states = _work_order_state_map(raw_work_states)
+    items = []
+    for plan in list((patch_plans or {}).get("items") or []):
+        if not isinstance(plan, dict) or not bool(plan.get("ready_for_implementation")):
+            continue
+        group_key = str(plan.get("group_key") or "").strip()
+        if not group_key:
+            continue
+        state_row = dict(states.get(group_key) or {})
+        state = str(state_row.get("state") or "READY").upper()
+        if state not in _PROVIDER_ESCALATION_WORK_ORDER_STATES:
+            state = "READY"
+        risk = _work_order_risk_label(plan)
+        if risk == "DATA_ONLY":
+            subsystem = "token intelligence provider repair"
+            files = ["utils/token_intelligence.py", "dashboard/backend/routers/home.py"]
+            functions = ["_build_provider_repair_snapshot", "token_intelligence_step", "_build_provider_escalation_patch_plans"]
+            goal = f"Improve data repair for {plan.get('failure_class')} so the blocker does not suppress recoverable runners."
+        elif risk == "SCOUT_ONLY":
+            subsystem = "memecoin decision/routing rules"
+            files = ["utils/memecoin_manager.py", "dashboard/backend/routers/home.py"]
+            functions = ["decision_state generation", "Good Buy/Action Board blocker handling"]
+            goal = f"Convert {plan.get('failure_class')} in {plan.get('lane')} from hard suppression to scout-only when proof is strong."
+        else:
+            subsystem = "memecoin rule tuning"
+            files = ["utils/memecoin_manager.py", "dashboard/backend/routers/home.py"]
+            functions = ["decision state rules", "rule simulator", "Daily Brief patch proof"]
+            goal = f"Tune {plan.get('failure_class')} in {plan.get('lane')} using replay evidence before promotion."
+        checklist = [
+            {"key": "code_change", "label": "Make the smallest scoped code change in the target subsystem.", "required": True},
+            {"key": "replay_or_smoke", "label": "Run replay/smoke proof against the affected blocker group.", "required": True},
+            {"key": "frontend_proof", "label": "Verify Home/Daily Brief still exposes evidence and state correctly.", "required": True},
+            {"key": "deploy_verification", "label": "Deploy and verify services, health, logs, and dashboard route.", "required": True},
+            {"key": "rollback_condition", "label": "Define rollback condition: weaker buys increase or provider freshness degrades.", "required": True},
+        ]
+        items.append({
+            "group_key": group_key,
+            "work_order_key": f"work:{group_key}",
+            "state": state,
+            "state_updated_at": state_row.get("updated_at"),
+            "operator_note": state_row.get("note"),
+            "risk_label": risk,
+            "target_subsystem": subsystem,
+            "target_files": files,
+            "target_functions": functions,
+            "goal": goal,
+            "constraints": [
+                "No automatic rule edits from the dashboard.",
+                "No live buying re-arm.",
+                "Keep execution lock unchanged.",
+                "Require manual implementation and post-deploy verification.",
+            ],
+            "proof_required": {
+                "sample_n": plan.get("sample_n"),
+                "confidence_score": plan.get("confidence_score"),
+                "simulated_benefit_n": plan.get("simulated_benefit_n"),
+                "weak_buy_risk_n": plan.get("weak_buy_risk_n"),
+                "gate_status": plan.get("gate_status"),
+            },
+            "checklist": checklist,
+            "rollback_condition": "Rollback if replay increases weak buys, removes active safety gates, or creates dashboard/runtime errors.",
+            "source_plan": plan,
+            "next_action": (
+                "Engineering work is started; complete checklist before deploy."
+                if state == "STARTED"
+                else "Start work order manually when ready to implement."
+                if state == "READY"
+                else "Resolve blocker before implementation continues."
+                if state == "BLOCKED"
+                else "Work order complete; keep monitoring outcomes."
+            ),
+        })
+    items.sort(
+        key=lambda x: (
+            {"STARTED": 3, "READY": 2, "BLOCKED": 1, "COMPLETE": 0}.get(str(x.get("state") or ""), 0),
+            _gb_float(((x.get("source_plan") or {}).get("confidence_score"))),
+            _gb_float(((x.get("source_plan") or {}).get("max_return_pct"))),
+        ),
+        reverse=True,
+    )
+    state_counts: dict[str, int] = {}
+    for item in items:
+        state = str(item.get("state") or "READY").upper()
+        state_counts[state] = state_counts.get(state, 0) + 1
+    return {
+        "status": "IN_PROGRESS" if state_counts.get("STARTED") else "READY" if state_counts.get("READY") else "CLEAR" if items else "NO_WORK_ORDERS",
+        "work_order_count": len(items),
+        "started_count": int(state_counts.get("STARTED") or 0),
+        "ready_count": int(state_counts.get("READY") or 0),
+        "state_counts": state_counts,
+        "top_work_order": items[0] if items else None,
+        "items": items[:10],
+        "next_action": (
+            "Finish the started implementation checklist."
+            if state_counts.get("STARTED")
+            else "Start the top work order manually when ready."
+            if state_counts.get("READY")
+            else "No implementation work order is ready."
+        ),
+    }
+
+
 def _build_rule_promotion_gate(
     simulator: dict,
     watchdog: dict,
@@ -15864,7 +15997,7 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
                 kv_rows = {
                     str(r["key"]): str(r["value"] or "")
                     for r in conn.execute(
-                        "SELECT key, value FROM kv_store WHERE key IN ('narrative_trending','provider_escalation_outcome_alerts','provider_escalation_outcome_autorun','provider_escalation_review_states','provider_escalation_patch_states')"
+                        "SELECT key, value FROM kv_store WHERE key IN ('narrative_trending','provider_escalation_outcome_alerts','provider_escalation_outcome_autorun','provider_escalation_review_states','provider_escalation_patch_states','provider_escalation_work_order_states')"
                     ).fetchall()
                 }
             except Exception:
@@ -16014,6 +16147,10 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
         provider_escalation_accuracy,
         kv_rows.get(_PROVIDER_ESCALATION_PATCH_STATES_KEY),
     )
+    provider_escalation_work_orders = _build_provider_escalation_work_orders(
+        provider_escalation_patch_plans,
+        kv_rows.get(_PROVIDER_ESCALATION_WORK_ORDER_STATES_KEY),
+    )
     rule_promotion_gate = _build_rule_promotion_gate(
         rule_simulator,
         data_watchdog,
@@ -16075,6 +16212,8 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
         next_actions.append(str(provider_escalation_review_queue.get("next_action") or "Review escalation alert groups."))
     if int(provider_escalation_patch_plans.get("ready_count") or 0):
         next_actions.append(str(provider_escalation_patch_plans.get("next_action") or "Review escalation patch plans."))
+    if int(provider_escalation_work_orders.get("ready_count") or 0) or int(provider_escalation_work_orders.get("started_count") or 0):
+        next_actions.append(str(provider_escalation_work_orders.get("next_action") or "Review escalation work orders."))
     if int(provider_escalation_accuracy.get("missed_n") or 0):
         next_actions.append(str(provider_escalation_accuracy.get("next_action") or "Review missed escalation outcomes."))
     if int(provider_escalation_maturity.get("due_now_count") or 0):
@@ -16134,6 +16273,7 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
         "provider_escalation_alerts": provider_escalation_alerts,
         "provider_escalation_review_queue": provider_escalation_review_queue,
         "provider_escalation_patch_plans": provider_escalation_patch_plans,
+        "provider_escalation_work_orders": provider_escalation_work_orders,
         "provider_escalation_outcome_autorun": outcome_autorun,
         "rule_promotion_gate": rule_promotion_gate,
         "missed_runner_clusters": missed_runner_clusters,
@@ -18665,6 +18805,60 @@ async def home_provider_escalation_patch_decision(
             conn.execute(
                 "INSERT OR REPLACE INTO kv_store (key, value) VALUES (?, ?)",
                 (_PROVIDER_ESCALATION_PATCH_STATES_KEY, json.dumps(states, separators=(",", ":"))),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return {
+            "ok": True,
+            "group_key": group_key,
+            "state": state,
+            "updated_at": now,
+            "operator_note": note,
+            "manual_only": True,
+        }
+
+    try:
+        return await _aio.to_thread(_run)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post("/provider-escalation-work-order/decision")
+async def home_provider_escalation_work_order_decision(
+    body: dict,
+    _: str = Depends(get_current_user),
+):
+    import asyncio as _aio
+
+    state = str(body.get("state") or body.get("work_order_state") or body.get("action") or "").strip().upper()
+    aliases = {"START": "STARTED", "DONE": "COMPLETE", "READY_TO_START": "READY"}
+    state = aliases.get(state, state)
+    if state not in _PROVIDER_ESCALATION_WORK_ORDER_STATES:
+        raise HTTPException(status_code=422, detail=f"state must be one of {sorted(_PROVIDER_ESCALATION_WORK_ORDER_STATES)}")
+    group_key = str(body.get("group_key") or "").strip()
+    if not group_key:
+        raise HTTPException(status_code=422, detail="group_key is required")
+    note = str(body.get("operator_note") or body.get("note") or "").strip()[:500] or None
+
+    def _run() -> dict:
+        now = datetime.now(timezone.utc).isoformat()
+        conn = _dj_conn()
+        try:
+            conn.execute("CREATE TABLE IF NOT EXISTS kv_store (key TEXT PRIMARY KEY, value TEXT)")
+            row = conn.execute(
+                "SELECT value FROM kv_store WHERE key=?",
+                (_PROVIDER_ESCALATION_WORK_ORDER_STATES_KEY,),
+            ).fetchone()
+            states = _work_order_state_map(row["value"] if row else None)
+            states[group_key] = {
+                "state": state,
+                "updated_at": now,
+                "note": note,
+            }
+            conn.execute(
+                "INSERT OR REPLACE INTO kv_store (key, value) VALUES (?, ?)",
+                (_PROVIDER_ESCALATION_WORK_ORDER_STATES_KEY, json.dumps(states, separators=(",", ":"))),
             )
             conn.commit()
         finally:
