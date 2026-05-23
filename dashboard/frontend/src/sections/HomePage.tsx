@@ -3961,12 +3961,15 @@ export function ProviderRecoveryPanel({ audit }: { audit: SystemAuditData | unde
 function GoodBuyBoardPanel({ board }: { board: GoodBuyBoardV2 | undefined }) {
   if (!board) return null
 
+  const buyable = board.buyable ?? []
+  const wait = board.wait ?? []
+  const blocked = board.blocked ?? []
   const statusTone =
     board.status === 'BUYABLE' ? '#00d48a'
     : board.status === 'WAIT' ? '#f59e0b'
     : board.status === 'BLOCKED' ? '#ef4444'
     : '#7f95a8'
-  const primary = board.buyable?.[0] ?? board.wait?.[0] ?? board.blocked?.[0] ?? null
+  const primary = buyable[0] ?? wait[0] ?? blocked[0] ?? null
 
   const StatePill = ({ item }: { item: GoodBuyItem }) => {
     const tone =
@@ -4148,7 +4151,7 @@ function GoodBuyBoardPanel({ board }: { board: GoodBuyBoardV2 | undefined }) {
       {primary && <GoodBuyRow item={primary} />}
 
       <div className="good-buy-grid" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 10 }}>
-        {(board.buyable.length ? board.buyable.slice(1, 4) : board.wait.slice(0, 4)).map(item => (
+        {(buyable.length ? buyable.slice(1, 4) : wait.slice(0, 4)).map(item => (
           <GoodBuyRow key={`${item.state}-${item.mint}`} item={item} compact />
         ))}
       </div>
@@ -4176,6 +4179,37 @@ function DailyCryptoBriefPanel({ data, loading }: { data?: DailyCryptoBriefData;
     data.status === 'WATCH' ? '#00d48a'
     : data.status === 'LOCK_REVIEW' ? '#ef4444'
     : '#f59e0b'
+  const safety = data.safety ?? {
+    execution_lock: 'UNKNOWN',
+    execution_intents: 0,
+    executed_intents: 0,
+    open_memecoin_trades: null,
+    intent_modes: {},
+    authority_verdicts: {},
+  }
+  const freshness = data.data_freshness ?? {
+    rows: 0,
+    freshness_counts: {},
+    confidence_counts: {},
+    stale_high_quality: [],
+  }
+  const decision = data.decision_quality ?? {
+    journal_count: 0,
+    surface_counts: {},
+    action_counts: {},
+    outcome_counts: {},
+    missed_runner_count: 0,
+    weak_buy_count: 0,
+  }
+  const paper = data.paper_pilot ?? {
+    opened_count: 0,
+    status_counts: {},
+    outcome_counts: {},
+  }
+  const missedRunners = data.top_missed_runners ?? []
+  const weakBuyCalls = data.weak_buy_calls ?? []
+  const paperMovers = data.top_paper_movers ?? []
+  const nextActions = data.next_actions ?? []
   const countText = (counts: Record<string, number>, keys: string[]) =>
     keys.map(key => `${key.toLowerCase()} ${counts[key] ?? 0}`).join(' · ')
   const Metric = ({ label, value, valueTone = '#d7e1ea' }: { label: string; value: string; valueTone?: string }) => (
@@ -4255,12 +4289,12 @@ function DailyCryptoBriefPanel({ data, loading }: { data?: DailyCryptoBriefData;
       </div>
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 8 }}>
-        <Metric label="LOCK" value={data.safety.execution_lock} valueTone={data.safety.execution_lock === 'LOCKED' ? '#00d48a' : '#ef4444'} />
-        <Metric label="INTENTS" value={`${data.safety.execution_intents}/${data.safety.executed_intents} exec`} valueTone={data.safety.executed_intents ? '#ef4444' : '#60a5fa'} />
-        <Metric label="DATA" value={countText(data.data_freshness.freshness_counts, ['LIVE', 'RECENT', 'STALE'])} valueTone={(data.data_freshness.freshness_counts.STALE ?? 0) > (data.data_freshness.freshness_counts.LIVE ?? 0) + (data.data_freshness.freshness_counts.RECENT ?? 0) ? '#f59e0b' : '#00d48a'} />
-        <Metric label="DECISIONS" value={`${data.decision_quality.journal_count} · ${fmtPct(data.decision_quality.avg_max_return_pct)}`} />
-        <Metric label="MISSED/WEAK" value={`${data.decision_quality.missed_runner_count}/${data.decision_quality.weak_buy_count}`} valueTone={data.decision_quality.missed_runner_count || data.decision_quality.weak_buy_count ? '#f59e0b' : '#00d48a'} />
-        <Metric label="PAPER" value={`${data.paper_pilot.opened_count} · max ${fmtPct(data.paper_pilot.avg_max_return_pct)}`} valueTone="#a78bfa" />
+        <Metric label="LOCK" value={safety.execution_lock} valueTone={safety.execution_lock === 'LOCKED' ? '#00d48a' : '#ef4444'} />
+        <Metric label="INTENTS" value={`${safety.execution_intents}/${safety.executed_intents} exec`} valueTone={safety.executed_intents ? '#ef4444' : '#60a5fa'} />
+        <Metric label="DATA" value={countText(freshness.freshness_counts, ['LIVE', 'RECENT', 'STALE'])} valueTone={(freshness.freshness_counts.STALE ?? 0) > (freshness.freshness_counts.LIVE ?? 0) + (freshness.freshness_counts.RECENT ?? 0) ? '#f59e0b' : '#00d48a'} />
+        <Metric label="DECISIONS" value={`${decision.journal_count} · ${fmtPct(decision.avg_max_return_pct)}`} />
+        <Metric label="MISSED/WEAK" value={`${decision.missed_runner_count}/${decision.weak_buy_count}`} valueTone={decision.missed_runner_count || decision.weak_buy_count ? '#f59e0b' : '#00d48a'} />
+        <Metric label="PAPER" value={`${paper.opened_count} · max ${fmtPct(paper.avg_max_return_pct)}`} valueTone="#a78bfa" />
       </div>
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 14 }}>
@@ -4268,10 +4302,10 @@ function DailyCryptoBriefPanel({ data, loading }: { data?: DailyCryptoBriefData;
           <span style={{ ...MONO, fontSize: 8, color: '#f59e0b', fontWeight: 900, letterSpacing: '0.14em' }}>
             MISSED RUNNERS
           </span>
-          {(data.top_missed_runners || []).slice(0, 4).map((item, i) => (
+          {missedRunners.slice(0, 4).map((item, i) => (
             <TokenLine key={`missed-${item.symbol}-${i}`} item={item} tone="#f59e0b" />
           ))}
-          {data.top_missed_runners.length === 0 && (
+          {missedRunners.length === 0 && (
             <div style={{ ...MONO, fontSize: 8, color: '#7f95a8', paddingTop: 8 }}>none in this window</div>
           )}
         </div>
@@ -4279,7 +4313,7 @@ function DailyCryptoBriefPanel({ data, loading }: { data?: DailyCryptoBriefData;
           <span style={{ ...MONO, fontSize: 8, color: '#60a5fa', fontWeight: 900, letterSpacing: '0.14em' }}>
             PAPER MOVERS
           </span>
-          {(data.top_paper_movers || []).slice(0, 4).map((item, i) => (
+          {paperMovers.slice(0, 4).map((item, i) => (
             <TokenLine key={`paper-${item.symbol}-${i}`} item={item} tone="#60a5fa" />
           ))}
         </div>
@@ -4287,18 +4321,18 @@ function DailyCryptoBriefPanel({ data, loading }: { data?: DailyCryptoBriefData;
           <span style={{ ...MONO, fontSize: 8, color: '#ef4444', fontWeight: 900, letterSpacing: '0.14em' }}>
             WEAK BUY CALLS
           </span>
-          {(data.weak_buy_calls || []).slice(0, 4).map((item, i) => (
+          {weakBuyCalls.slice(0, 4).map((item, i) => (
             <TokenLine key={`weak-${item.symbol}-${i}`} item={item} tone="#ef4444" />
           ))}
-          {data.weak_buy_calls.length === 0 && (
+          {weakBuyCalls.length === 0 && (
             <div style={{ ...MONO, fontSize: 8, color: '#7f95a8', paddingTop: 8 }}>none in this window</div>
           )}
         </div>
       </div>
 
-      {data.next_actions.length > 0 && (
+      {nextActions.length > 0 && (
         <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-          {data.next_actions.slice(0, 4).map((action, i) => (
+          {nextActions.slice(0, 4).map((action, i) => (
             <span key={`daily-action-${i}`} style={{
               ...MONO,
               fontSize: 8,
