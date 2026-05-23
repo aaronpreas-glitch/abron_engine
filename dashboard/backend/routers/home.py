@@ -12818,6 +12818,8 @@ def _good_buy_gate(row: dict, provider_context: dict, memory_index: dict[str, di
     symbol = str(row.get("symbol") or "").strip().upper()
     mint = str(row.get("mint") or "").strip()
     market_source = str(row.get("market_source") or "").strip().lower()
+    source_text = str(row.get("lane_sources") or "").strip().lower()
+    is_spot_rotation = "spot_basket" in source_text
     age_minutes = _gb_age_minutes(row.get("updated_at"))
 
     liquidity = _gb_float(row.get("liquidity"))
@@ -12923,6 +12925,19 @@ def _good_buy_gate(row: dict, provider_context: dict, memory_index: dict[str, di
     elif change_24h < -15:
         warnings.append("weak_24h_trend")
 
+    if is_spot_rotation:
+        if change_24h < 0 or change_1h < 1.5 or pressure < 78 or buy_pressure < 70 or volume_1h < 50_000:
+            warnings.append("spot_rotation_needs_confirmation")
+    else:
+        if change_1h < 0 and pressure < 80:
+            warnings.append("meme_momentum_not_confirmed")
+        if change_24h < -8 and change_1h < 0:
+            warnings.append("meme_pullback_not_confirmed")
+        if change_1h >= 4 and buy_pressure < 55:
+            warnings.append("spike_without_buy_pressure")
+        if pressure < 72 and buy_pressure < 62:
+            warnings.append("thin_momentum_confirmation")
+
     memory = {}
     if memory_index:
         memory = dict(memory_index.get(mint) or memory_index.get(symbol) or {})
@@ -12962,6 +12977,11 @@ def _good_buy_gate(row: dict, provider_context: dict, memory_index: dict[str, di
         "volume_watch",
         "risk_watch",
         "pressure_watch",
+        "spot_rotation_needs_confirmation",
+        "meme_momentum_not_confirmed",
+        "meme_pullback_not_confirmed",
+        "spike_without_buy_pressure",
+        "thin_momentum_confirmation",
         "identity_asserted_not_live_confirmed",
     }
 
@@ -13207,6 +13227,11 @@ _STRICT_BUY_WARNINGS = {
     "volume_watch",
     "risk_watch",
     "pressure_watch",
+    "spot_rotation_needs_confirmation",
+    "meme_momentum_not_confirmed",
+    "meme_pullback_not_confirmed",
+    "spike_without_buy_pressure",
+    "thin_momentum_confirmation",
     "identity_asserted_not_live_confirmed",
 }
 
@@ -13245,7 +13270,19 @@ def _failure_detail(key: str) -> dict:
         category, severity, priority = "quality", "BLOCKER", 34
         unlock = "Wait for risk and quality scores to move back above clean-buy thresholds."
         why = "The setup is close, but the structural quality is still below the buy bar."
-    elif norm.startswith("pressure") or norm.startswith("sell_pressure") or norm.startswith("weak_24h") or norm.startswith("sharp_1h"):
+    elif (
+        norm.startswith("pressure")
+        or norm.startswith("sell_pressure")
+        or norm.startswith("weak_24h")
+        or norm.startswith("sharp_1h")
+        or norm in {
+            "spot_rotation_needs_confirmation",
+            "meme_momentum_not_confirmed",
+            "meme_pullback_not_confirmed",
+            "spike_without_buy_pressure",
+            "thin_momentum_confirmation",
+        }
+    ):
         category, severity, priority = "momentum", "TRIGGER", 40
         unlock = "Wait for pressure to recover and the short-term chart to stop weakening."
         why = "The coin may be good, but the current tape is not clean enough yet."
