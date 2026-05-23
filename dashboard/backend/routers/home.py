@@ -14836,8 +14836,8 @@ def _build_provider_escalation_accuracy(escalation_rows: list[dict]) -> dict:
     def _finish(bucket: dict[str, dict]) -> list[dict]:
         out = []
         for item in bucket.values():
-            sample = max(1, int(item.get("correct") or 0) + int(item.get("missed") or 0))
-            item["accuracy_pct"] = round((int(item.get("correct") or 0) / sample) * 100.0, 1)
+            judged = int(item.get("correct") or 0) + int(item.get("missed") or 0)
+            item["accuracy_pct"] = round((int(item.get("correct") or 0) / judged) * 100.0, 1) if judged else None
             out.append(item)
         out.sort(key=lambda x: (int(x.get("missed") or 0), int(x.get("sample_n") or 0)), reverse=True)
         return out[:8]
@@ -14876,7 +14876,8 @@ def _build_rule_promotion_gate(
     score = _gb_float((freshness_sla or {}).get("score"))
     provider_hit_rate = _gb_float((provider_reliability or {}).get("repair_hit_rate_pct"), 100.0)
     escalation_sample = int((escalation_accuracy or {}).get("sample_n") or 0)
-    escalation_accuracy_pct = _gb_float((escalation_accuracy or {}).get("accuracy_pct"), 100.0)
+    escalation_accuracy_raw = (escalation_accuracy or {}).get("accuracy_pct")
+    escalation_accuracy_pct = _gb_float(escalation_accuracy_raw, 100.0)
     escalation_missed = int((escalation_accuracy or {}).get("missed_n") or 0)
     if not top:
         status = "NO_RULE"
@@ -14907,7 +14908,7 @@ def _build_rule_promotion_gate(
             "data_status": data_status or "UNKNOWN",
             "freshness_sla_status": sla_status or "UNKNOWN",
             "provider_repair_hit_rate_pct": provider_hit_rate,
-            "escalation_accuracy_pct": escalation_accuracy_pct,
+            "escalation_accuracy_pct": _nullable_float(escalation_accuracy_raw),
             "escalation_sample_n": escalation_sample,
         },
     }
