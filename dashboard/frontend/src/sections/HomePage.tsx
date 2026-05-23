@@ -607,6 +607,47 @@ interface DailyCryptoBriefData {
       }
       next_action?: string | null
     }
+    evidence_maturation?: {
+      status?: string
+      blocker_breakdown?: {
+        status?: string
+        blocker_count?: number
+        items?: Array<{
+          blocker?: string | null
+          detail?: string | null
+          clears_when?: string | null
+        }>
+        next_action?: string | null
+      }
+      maturation_queue?: {
+        status?: string
+        queued_count?: number
+        by_window?: Record<string, number>
+      }
+      due_outcome_runner?: {
+        status?: string
+        read_only?: boolean
+        due_count?: number
+        due_1h?: number
+        due_4h?: number
+        due_24h?: number
+        next_action?: string | null
+      }
+      workbench_auto_refresh?: {
+        status?: string
+        previous_gate_status?: string | null
+        current_gate_status?: string | null
+        previous_work_order_state?: string | null
+        current_work_order_state?: string | null
+        auto_ready?: boolean
+      }
+      daily_evidence_delta?: {
+        status?: string
+        changes?: Record<string, unknown>
+        next_action?: string | null
+      }
+      next_action?: string | null
+    }
     next_action?: string | null
   }
   data_watchdog?: {
@@ -5137,6 +5178,12 @@ function DailyCryptoBriefPanel({
     const replayWorkbenchOrder = replayWorkbench.manual_work_order ?? {}
     const replayWorkbenchTarget = replayWorkbench.target_code_map?.items?.[0]
     const replayWorkbenchRecipe = replayWorkbench.replay_test_recipe?.commands?.[0]
+    const replayMaturation = replayLab.evidence_maturation ?? {}
+    const replayMaturationBlocker = replayMaturation.blocker_breakdown?.items?.[0]
+    const replayMaturationQueue = replayMaturation.maturation_queue ?? {}
+    const replayMaturationRunner = replayMaturation.due_outcome_runner ?? {}
+    const replayMaturationDelta = replayMaturation.daily_evidence_delta ?? {}
+    const replayDeltaChanges = replayMaturationDelta.changes ?? {}
     const watchdog = data.data_watchdog ?? {}
     const freshnessSla = data.freshness_sla ?? {}
     const providerReliability = data.provider_reliability ?? {}
@@ -5531,6 +5578,22 @@ function DailyCryptoBriefPanel({
               {replayWorkbenchTarget
                 ? `${replayWorkbenchTarget.file || 'file'} · ${replayWorkbenchTarget.function || 'function'}`
                 : replayWorkbenchRecipe?.label || replayWorkbench.next_action || 'No target map yet.'}
+            </div>
+          </div>
+
+          <div style={{ border: `1px solid ${(replayMaturationQueue.queued_count ?? 0) ? 'rgba(245,158,11,0.24)' : 'rgba(96,165,250,0.16)'}`, borderRadius: 10, padding: 10, background: (replayMaturationQueue.queued_count ?? 0) ? 'rgba(245,158,11,0.03)' : 'rgba(96,165,250,0.02)' }}>
+            <span style={{ ...MONO, fontSize: 8, color: (replayMaturationQueue.queued_count ?? 0) ? '#f59e0b' : '#60a5fa', fontWeight: 900, letterSpacing: '0.14em' }}>
+              EVIDENCE MATURATION
+            </span>
+            <div style={{ ...MONO, fontSize: 10, color: '#d7e1ea', marginTop: 7, lineHeight: 1.45 }}>
+              {replayMaturation.status || 'WATCHING'} · due {replayMaturationRunner.due_count ?? 0} · blockers {replayMaturation.blocker_breakdown?.blocker_count ?? 0}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              1h {replayMaturationRunner.due_1h ?? 0} · 4h {replayMaturationRunner.due_4h ?? 0} · 24h {replayMaturationRunner.due_24h ?? 0} · {String(replayMaturation.workbench_auto_refresh?.status || 'baseline').replace(/_/g, ' ').toLowerCase()}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#9db7ce', marginTop: 5, lineHeight: 1.45 }}>
+              {replayMaturationBlocker?.detail
+                || `delta ready ${String(replayDeltaChanges.replay_ready_count ?? 0)} · 24h ${String(replayDeltaChanges.with_24h ?? 0)} · net ${String(replayDeltaChanges.net_score ?? 0)}`}
             </div>
           </div>
 

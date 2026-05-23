@@ -41,6 +41,7 @@ _PROVIDER_ESCALATION_PATCH_STATES_KEY = "provider_escalation_patch_states"
 _PROVIDER_ESCALATION_WORK_ORDER_STATES_KEY = "provider_escalation_work_order_states"
 _LIVE_CONTEXT_MISSION_STATES_KEY = "live_context_mission_states"
 _LIVE_CONTEXT_MISSION_OUTCOME_JOURNAL_KEY = "live_context_mission_outcome_journal"
+_REPLAY_EVIDENCE_SNAPSHOT_KEY = "replay_evidence_snapshot"
 _PROVIDER_ESCALATION_REVIEW_OPEN_STATES = {
     "OPEN",
     "ACKNOWLEDGED",
@@ -15094,6 +15095,289 @@ def _build_replay_patch_workbench(replay_lab: dict) -> dict:
     }
 
 
+def _replay_evidence_snapshot(raw_value: str | None) -> dict:
+    if not raw_value:
+        path = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "..", "..", "data_storage", "replay_evidence_snapshot.json")
+        )
+        try:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as fh:
+                    raw_value = fh.read()
+        except Exception:
+            raw_value = None
+    try:
+        payload = json.loads(raw_value or "{}")
+        return dict(payload) if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def _current_replay_evidence_snapshot(replay_lab: dict, now: datetime) -> dict:
+    timeline = dict((replay_lab or {}).get("decision_timeline") or {})
+    windows = dict(((replay_lab or {}).get("forward_outcome_windows") or {}).get("summary") or {})
+    simulation = dict((replay_lab or {}).get("rule_simulation_engine") or {})
+    top = dict(simulation.get("top_candidate") or {})
+    gate = dict((replay_lab or {}).get("promotion_gate") or {})
+    workbench = dict((replay_lab or {}).get("patch_workbench") or {})
+    order = dict(workbench.get("manual_work_order") or {})
+    return {
+        "ts": now.isoformat(),
+        "status": replay_lab.get("status"),
+        "decision_count": int(timeline.get("decision_count") or 0),
+        "replay_ready_count": int(timeline.get("replay_ready_count") or 0),
+        "with_1h": int(windows.get("with_1h") or 0),
+        "with_4h": int(windows.get("with_4h") or 0),
+        "with_24h": int(windows.get("with_24h") or 0),
+        "top_rule_key": top.get("key"),
+        "top_rule_label": top.get("label"),
+        "sample_n": int(simulation.get("sample_n") or 0),
+        "benefit_n": int(top.get("benefit_n") or 0),
+        "harm_n": int(top.get("harm_n") or 0),
+        "net_score": int(top.get("net_score") or 0),
+        "gate_status": gate.get("status"),
+        "gate_blockers": list(gate.get("blockers") or []),
+        "work_order_state": order.get("state"),
+    }
+
+
+def _build_replay_evidence_blocker_breakdown(replay_lab: dict) -> dict:
+    gate = dict((replay_lab or {}).get("promotion_gate") or {})
+    simulation = dict((replay_lab or {}).get("rule_simulation_engine") or {})
+    top = dict(simulation.get("top_candidate") or {})
+    blockers = list(gate.get("blockers") or [])
+    requirements = dict(gate.get("requirements") or {})
+    sample_n = int(simulation.get("sample_n") or 0)
+    net = int(top.get("net_score") or 0)
+    benefit = int(top.get("benefit_n") or 0)
+    harm = int(top.get("harm_n") or 0)
+    items = []
+    for blocker in blockers:
+        if blocker == "replay_sample_below_30":
+            detail = f"Replay sample is {sample_n}/{requirements.get('sample_min') or 30}."
+            clears = "More decisions need 1h/4h/24h outcome evidence."
+        elif blocker == "net_score_below_10":
+            detail = f"Top rule net score is {net}/{requirements.get('net_score_min') or 10}."
+            clears = "More saved/rescued decisions or fewer harm rows are needed."
+        elif blocker == "benefit_not_2x_harm":
+            detail = f"Benefit/harm is {benefit}/{harm}; needs at least 2x and minimum benefit."
+            clears = "Let more touched examples mature before implementation."
+        elif blocker == "harm_requires_stronger_edge":
+            detail = f"Harm is {harm}, so the edge must be stronger than current net {net}."
+            clears = "Reduce false positives/damaged buys or increase rescued/saved count."
+        elif blocker == "freshness_sla_not_ok":
+            detail = f"Freshness SLA is {requirements.get('freshness_sla_status') or 'UNKNOWN'}."
+            clears = "Repair provider freshness before trusting replay promotion."
+        elif blocker == "execution_lock_not_clean":
+            detail = "Execution lock/safety context is not clean."
+            clears = "Keep live execution locked and review safety before any patch talk."
+        else:
+            detail = blocker.replace("_", " ")
+            clears = "Collect more replay evidence."
+        items.append({
+            "blocker": blocker,
+            "detail": detail,
+            "clears_when": clears,
+        })
+    return {
+        "status": "BLOCKED" if items else "CLEAR" if top else "NO_RULE",
+        "blocker_count": len(items),
+        "items": items,
+        "next_action": (
+            "Queue the rows that can mature the blocking evidence."
+            if items
+            else "Replay gate has no evidence blockers."
+        ),
+    }
+
+
+def _build_replay_maturation_queue(replay_lab: dict, now: datetime) -> dict:
+    timeline_items = list(((replay_lab or {}).get("decision_timeline") or {}).get("items") or [])
+    top_key = str((((replay_lab or {}).get("rule_simulation_engine") or {}).get("top_candidate") or {}).get("key") or "")
+    top_examples = list(((((replay_lab or {}).get("patch_workbench") or {}).get("candidate_drilldown") or {}).get("touched_examples") or []))
+    top_ids = {str(item.get("decision_id")) for item in top_examples if item.get("decision_id") is not None}
+    queue = []
+    for item in timeline_items:
+        ts = _gb_parse_ts(item.get("ts"))
+        if not ts:
+            continue
+        age_h = max(0.0, (now - ts).total_seconds() / 3600.0)
+        outcome = dict(item.get("outcome") or {})
+        due_windows = []
+        if age_h >= 1 and outcome.get("return_1h_pct") is None:
+            due_windows.append("1h")
+        if age_h >= 4 and outcome.get("return_4h_pct") is None:
+            due_windows.append("4h")
+        if age_h >= 24 and outcome.get("return_24h_pct") is None:
+            due_windows.append("24h")
+        if not due_windows:
+            continue
+        priority = 30.0
+        decision_id = str(item.get("decision_id"))
+        if "24h" in due_windows:
+            priority += 40.0
+        if decision_id in top_ids:
+            priority += 30.0
+        if outcome.get("bullish") or outcome.get("weak"):
+            priority += 10.0
+        queue.append({
+            "decision_id": item.get("decision_id"),
+            "symbol": item.get("symbol"),
+            "mint": item.get("mint"),
+            "ts": item.get("ts"),
+            "age_hours": round(age_h, 2),
+            "due_windows": due_windows,
+            "priority_score": round(priority, 1),
+            "top_rule_key": top_key or None,
+            "reason": "Top replay candidate row needs mature windows." if decision_id in top_ids else "Decision has due forward outcome windows.",
+        })
+    queue.sort(key=lambda row: _gb_float(row.get("priority_score")), reverse=True)
+    by_window: dict[str, int] = {}
+    for item in queue:
+        for window in item.get("due_windows") or []:
+            by_window[window] = by_window.get(window, 0) + 1
+    return {
+        "status": "DUE" if queue else "CLEAR",
+        "queued_count": len(queue),
+        "by_window": by_window,
+        "items": queue[:30],
+        "next_action": (
+            "Run the read-only due outcome check for queued replay rows."
+            if queue
+            else "No replay evidence rows are due right now."
+        ),
+    }
+
+
+def _build_replay_due_outcome_runner(maturation_queue: dict) -> dict:
+    items = list((maturation_queue or {}).get("items") or [])
+    due_24h = sum(1 for item in items if "24h" in set(item.get("due_windows") or []))
+    due_4h = sum(1 for item in items if "4h" in set(item.get("due_windows") or []))
+    due_1h = sum(1 for item in items if "1h" in set(item.get("due_windows") or []))
+    status = "READY_READ_ONLY" if items else "NOT_DUE"
+    return {
+        "status": status,
+        "read_only": True,
+        "due_count": len(items),
+        "due_1h": due_1h,
+        "due_4h": due_4h,
+        "due_24h": due_24h,
+        "would_check_decision_ids": [item.get("decision_id") for item in items[:20]],
+        "runner_note": (
+            "This does not execute trades or re-arm buying; it only identifies outcome windows that are due for refresh."
+            if items
+            else "No due windows to refresh."
+        ),
+        "next_action": (
+            "Let the existing outcome trackers fill due windows, then Daily Brief will refresh the workbench."
+            if items
+            else "Wait for more outcome windows to mature."
+        ),
+    }
+
+
+def _build_replay_workbench_auto_refresh(replay_lab: dict, previous_snapshot: dict, current_snapshot: dict) -> dict:
+    previous_state = previous_snapshot.get("work_order_state")
+    current_state = current_snapshot.get("work_order_state")
+    previous_gate = previous_snapshot.get("gate_status")
+    current_gate = current_snapshot.get("gate_status")
+    changed = bool(previous_snapshot) and (previous_state != current_state or previous_gate != current_gate)
+    return {
+        "status": "UPDATED" if changed else "UNCHANGED" if previous_snapshot else "BASELINE_CAPTURED",
+        "previous_gate_status": previous_gate,
+        "current_gate_status": current_gate,
+        "previous_work_order_state": previous_state,
+        "current_work_order_state": current_state,
+        "auto_ready": current_state == "READY_FOR_IMPLEMENTATION",
+        "next_action": (
+            "Workbench state changed; review the new gate before any patch."
+            if changed
+            else "Workbench will move automatically when evidence clears the gate."
+        ),
+    }
+
+
+def _build_replay_daily_evidence_delta(previous_snapshot: dict, current_snapshot: dict) -> dict:
+    if not previous_snapshot:
+        return {
+            "status": "BASELINE",
+            "changes": {},
+            "next_action": "Baseline captured; future briefs will show evidence deltas.",
+        }
+    numeric_keys = ["decision_count", "replay_ready_count", "with_1h", "with_4h", "with_24h", "sample_n", "benefit_n", "harm_n", "net_score"]
+    changes = {
+        key: int(current_snapshot.get(key) or 0) - int(previous_snapshot.get(key) or 0)
+        for key in numeric_keys
+    }
+    previous_blockers = set(previous_snapshot.get("gate_blockers") or [])
+    current_blockers = set(current_snapshot.get("gate_blockers") or [])
+    changes["cleared_blockers"] = sorted(previous_blockers - current_blockers)
+    changes["new_blockers"] = sorted(current_blockers - previous_blockers)
+    changes["top_rule_changed"] = previous_snapshot.get("top_rule_key") != current_snapshot.get("top_rule_key")
+    changed = any(v for k, v in changes.items() if k not in {"top_rule_changed"}) or bool(changes["top_rule_changed"])
+    return {
+        "status": "CHANGED" if changed else "UNCHANGED",
+        "previous_ts": previous_snapshot.get("ts"),
+        "current_ts": current_snapshot.get("ts"),
+        "changes": changes,
+        "next_action": (
+            "Review evidence deltas before changing any rule."
+            if changed
+            else "No replay evidence moved since the previous brief."
+        ),
+    }
+
+
+def _persist_replay_evidence_snapshot(snapshot: dict) -> None:
+    path = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "..", "data_storage", "replay_evidence_snapshot.json")
+    )
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(snapshot, fh, separators=(",", ":"))
+        os.replace(tmp, path)
+    except Exception:
+        pass
+    try:
+        conn = _dj_conn()
+        try:
+            conn.execute("CREATE TABLE IF NOT EXISTS kv_store (key TEXT PRIMARY KEY, value TEXT)")
+            conn.execute(
+                "INSERT OR REPLACE INTO kv_store (key, value) VALUES (?, ?)",
+                (_REPLAY_EVIDENCE_SNAPSHOT_KEY, json.dumps(snapshot, separators=(",", ":"))),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        return
+
+
+def _attach_replay_evidence_maturation(replay_lab: dict, raw_previous_snapshot: str | None, now: datetime) -> dict:
+    previous = _replay_evidence_snapshot(raw_previous_snapshot)
+    current = _current_replay_evidence_snapshot(replay_lab, now)
+    blocker_breakdown = _build_replay_evidence_blocker_breakdown(replay_lab)
+    maturation_queue = _build_replay_maturation_queue(replay_lab, now)
+    due_runner = _build_replay_due_outcome_runner(maturation_queue)
+    auto_refresh = _build_replay_workbench_auto_refresh(replay_lab, previous, current)
+    daily_delta = _build_replay_daily_evidence_delta(previous, current)
+    out = dict(replay_lab or {})
+    out["evidence_maturation"] = {
+        "status": "DUE" if int(maturation_queue.get("queued_count") or 0) else "WATCHING",
+        "blocker_breakdown": blocker_breakdown,
+        "maturation_queue": maturation_queue,
+        "due_outcome_runner": due_runner,
+        "workbench_auto_refresh": auto_refresh,
+        "daily_evidence_delta": daily_delta,
+        "current_snapshot": current,
+        "next_action": due_runner.get("next_action") or blocker_breakdown.get("next_action"),
+    }
+    _persist_replay_evidence_snapshot(current)
+    return out
+
+
 def _build_replay_outcome_lab(
     journal_rows: list[dict],
     signal_rows: list[dict],
@@ -18193,7 +18477,7 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
                 kv_rows = {
                     str(r["key"]): str(r["value"] or "")
                     for r in conn.execute(
-                        "SELECT key, value FROM kv_store WHERE key IN ('narrative_trending','provider_escalation_outcome_alerts','provider_escalation_outcome_autorun','provider_escalation_review_states','provider_escalation_patch_states','provider_escalation_work_order_states','live_context_mission_states','live_context_mission_outcome_journal')"
+                        "SELECT key, value FROM kv_store WHERE key IN ('narrative_trending','provider_escalation_outcome_alerts','provider_escalation_outcome_autorun','provider_escalation_review_states','provider_escalation_patch_states','provider_escalation_work_order_states','live_context_mission_states','live_context_mission_outcome_journal','replay_evidence_snapshot')"
                     ).fetchall()
                 }
             except Exception:
@@ -18332,6 +18616,11 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
         freshness_sla,
         lock_ok,
         lookback_hours,
+    )
+    replay_outcome_lab = _attach_replay_evidence_maturation(
+        replay_outcome_lab,
+        kv_rows.get(_REPLAY_EVIDENCE_SNAPSHOT_KEY),
+        now,
     )
     provider_reliability = _build_provider_reliability_scorecard(repair_rows)
     provider_failure_drilldown = _build_provider_failure_drilldown(repair_rows)
