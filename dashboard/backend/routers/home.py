@@ -13925,6 +13925,251 @@ def _build_buy_decision_learning(current_decision: dict | None = None) -> dict:
     }
 
 
+def _build_daily_crypto_brief(lookback_hours: int = 24) -> dict:
+    """One read-only surface for the daily build loop."""
+    lookback_hours = max(1, min(72, int(lookback_hours or 24)))
+    now = datetime.now(timezone.utc)
+    since = now - timedelta(hours=lookback_hours)
+
+    def _in_window(value) -> bool:
+        ts = _gb_parse_ts(value)
+        return bool(ts and ts >= since)
+
+    def _avg_key(rows: list[dict], key: str) -> float | None:
+        return _avg([_nullable_float(row.get(key)) for row in rows])
+
+    def _row_age_min(row: dict) -> float | None:
+        ts = _gb_parse_ts(row.get("updated_at"))
+        if not ts:
+            return None
+        return round(max(0.0, (now - ts).total_seconds() / 60.0), 1)
+
+    try:
+        conn = _dj_conn()
+        try:
+            intelligence_rows = [
+                dict(r) for r in conn.execute(
+                    """
+                    SELECT symbol, updated_at, data_freshness, data_confidence,
+                           market_source, quality_score, risk_score, pressure_score,
+                           volume_24h_usd, liquidity
+                    FROM token_intelligence_current
+                    WHERE mint IS NOT NULL AND TRIM(mint) != ''
+                    ORDER BY updated_at DESC
+                    LIMIT 600
+                    """
+                ).fetchall()
+            ]
+            journal_rows = [
+                dict(r) for r in conn.execute(
+                    """
+                    SELECT created_ts, source_surface, symbol, mint, recommended_action,
+                           priority, reason, resolution_status, outcome_label,
+                           outcome_1h_pct, outcome_4h_pct, outcome_24h_pct, max_return_pct
+                    FROM decision_journal
+                    ORDER BY id DESC
+                    LIMIT 1800
+                    """
+                ).fetchall()
+            ]
+            paper_rows = [
+                dict(r) for r in conn.execute(
+                    """
+                    SELECT entry_ts, symbol, status, outcome_label, return_1h_pct,
+                           return_4h_pct, return_24h_pct, max_return_pct
+                    FROM memecoin_entry_paper_trades
+                    ORDER BY id DESC
+                    LIMIT 1500
+                    """
+                ).fetchall()
+            ]
+            intent_rows = [
+                dict(r) for r in conn.execute(
+                    """
+                    SELECT ts_utc, source, lane, action_type, mode, authority_verdict,
+                           executed, execution_result
+                    FROM execution_intents
+                    ORDER BY id DESC
+                    LIMIT 600
+                    """
+                ).fetchall()
+            ]
+            open_trade_count = int(conn.execute(
+                "SELECT COUNT(*) FROM memecoin_trades WHERE UPPER(COALESCE(status, ''))='OPEN'"
+            ).fetchone()[0] or 0)
+        finally:
+            conn.close()
+    except Exception as exc:
+        return {
+            "generated_at": now.isoformat(),
+            "lookback_hours": lookback_hours,
+            "status": "ERROR",
+            "headline": f"Daily crypto brief unavailable: {exc}",
+            "safety": {"execution_lock": "UNKNOWN", "open_memecoin_trades": None},
+            "data_freshness": {},
+            "decision_quality": {},
+            "paper_pilot": {},
+            "top_missed_runners": [],
+            "weak_buy_calls": [],
+            "top_paper_movers": [],
+            "next_actions": ["Fix the daily brief data read before tuning rules."],
+        }
+
+    journal_24h = [r for r in journal_rows if _in_window(r.get("created_ts"))]
+    paper_24h = [r for r in paper_rows if _in_window(r.get("entry_ts"))]
+    intents_24h = [r for r in intent_rows if _in_window(r.get("ts_utc"))]
+
+    freshness_counts: dict[str, int] = {}
+    confidence_counts: dict[str, int] = {}
+    for row in intelligence_rows:
+        freshness_counts[str(row.get("data_freshness") or "UNKNOWN").upper()] = freshness_counts.get(str(row.get("data_freshness") or "UNKNOWN").upper(), 0) + 1
+        confidence_counts[str(row.get("data_confidence") or "UNKNOWN").upper()] = confidence_counts.get(str(row.get("data_confidence") or "UNKNOWN").upper(), 0) + 1
+    freshest = intelligence_rows[0] if intelligence_rows else {}
+    stale_high_quality = [
+        {
+            "symbol": row.get("symbol"),
+            "age_minutes": _row_age_min(row),
+            "quality_score": row.get("quality_score"),
+            "pressure_score": row.get("pressure_score"),
+            "market_source": row.get("market_source"),
+        }
+        for row in intelligence_rows
+        if str(row.get("data_freshness") or "").upper() == "STALE"
+        and _gb_float(row.get("quality_score")) >= 75
+    ][:8]
+
+    outcome_counts: dict[str, int] = {}
+    action_counts: dict[str, int] = {}
+    surface_counts: dict[str, int] = {}
+    for row in journal_24h:
+        outcome_counts[str(row.get("outcome_label") or "PENDING").upper()] = outcome_counts.get(str(row.get("outcome_label") or "PENDING").upper(), 0) + 1
+        action_counts[str(row.get("recommended_action") or "UNKNOWN").upper()] = action_counts.get(str(row.get("recommended_action") or "UNKNOWN").upper(), 0) + 1
+        surface_counts[str(row.get("source_surface") or "UNKNOWN").upper()] = surface_counts.get(str(row.get("source_surface") or "UNKNOWN").upper(), 0) + 1
+
+    bullish_labels = {"BIG_RUNNER", "GOOD_RUNNER", "GOOD_BUY"}
+    weak_labels = {"BAD_BUY", "WEAK_BUY", "FLAT"}
+    missed = []
+    weak_buys = []
+    for row in journal_24h:
+        action = str(row.get("recommended_action") or "").upper()
+        label = str(row.get("outcome_label") or "").upper()
+        item = {
+            "symbol": row.get("symbol"),
+            "surface": row.get("source_surface"),
+            "action": action,
+            "priority": row.get("priority"),
+            "outcome_label": label or None,
+            "max_return_pct": _nullable_float(row.get("max_return_pct")),
+            "reason": str(row.get("reason") or "")[:180],
+        }
+        if action != "BUY" and label in bullish_labels:
+            missed.append(item)
+        elif action == "BUY" and label in weak_labels:
+            weak_buys.append(item)
+    missed.sort(key=lambda x: _gb_float(x.get("max_return_pct")), reverse=True)
+    weak_buys.sort(key=lambda x: _gb_float(x.get("max_return_pct")), reverse=True)
+
+    paper_outcomes: dict[str, int] = {}
+    paper_status: dict[str, int] = {}
+    for row in paper_24h:
+        paper_outcomes[str(row.get("outcome_label") or "PENDING").upper()] = paper_outcomes.get(str(row.get("outcome_label") or "PENDING").upper(), 0) + 1
+        paper_status[str(row.get("status") or "UNKNOWN").upper()] = paper_status.get(str(row.get("status") or "UNKNOWN").upper(), 0) + 1
+    paper_movers = [
+        {
+            "symbol": row.get("symbol"),
+            "status": row.get("status"),
+            "outcome_label": row.get("outcome_label"),
+            "max_return_pct": _nullable_float(row.get("max_return_pct")),
+            "return_1h_pct": _nullable_float(row.get("return_1h_pct")),
+            "return_4h_pct": _nullable_float(row.get("return_4h_pct")),
+            "return_24h_pct": _nullable_float(row.get("return_24h_pct")),
+        }
+        for row in paper_24h
+    ]
+    paper_movers.sort(key=lambda x: _gb_float(x.get("max_return_pct")), reverse=True)
+
+    intent_modes: dict[str, int] = {}
+    intent_verdicts: dict[str, int] = {}
+    executed_count = 0
+    for row in intents_24h:
+        intent_modes[str(row.get("mode") or "UNKNOWN").upper()] = intent_modes.get(str(row.get("mode") or "UNKNOWN").upper(), 0) + 1
+        intent_verdicts[str(row.get("authority_verdict") or "UNKNOWN").upper()] = intent_verdicts.get(str(row.get("authority_verdict") or "UNKNOWN").upper(), 0) + 1
+        executed_count += int(row.get("executed") or 0)
+
+    live_rows = int(freshness_counts.get("LIVE", 0))
+    recent_rows = int(freshness_counts.get("RECENT", 0))
+    stale_rows = int(freshness_counts.get("STALE", 0))
+    lock_ok = executed_count == 0 and all(str(row.get("mode") or "").upper() == "OBSERVE" for row in intents_24h) and open_trade_count == 0
+    data_ok = (live_rows + recent_rows) >= stale_rows and not stale_high_quality
+    missed_count = len(missed)
+    weak_count = len(weak_buys)
+    if lock_ok and data_ok and missed_count <= 3:
+        status = "WATCH"
+        headline = "Daily crypto brief is stable; keep improving missed-runner timing before any re-arm talk."
+    elif not lock_ok:
+        status = "LOCK_REVIEW"
+        headline = "Execution safety needs review before anything else."
+    else:
+        status = "PATCH_QUEUE"
+        headline = "Daily brief found useful learning work: missed runners, weak calls, or stale coverage need attention."
+
+    next_actions = []
+    if not lock_ok:
+        next_actions.append("Review execution lock before changing signal rules.")
+    if stale_high_quality:
+        next_actions.append("Refresh stale high-quality token intelligence rows first.")
+    if missed_count:
+        next_actions.append("Review missed-runner blockers and scout-only timing.")
+    if weak_count:
+        next_actions.append("Tighten clean-buy filters that produced flat or weak calls.")
+    if not next_actions:
+        next_actions.append("Keep collecting paper outcomes; no urgent rule patch from this window.")
+
+    return {
+        "generated_at": now.isoformat(),
+        "lookback_hours": lookback_hours,
+        "status": status,
+        "headline": headline,
+        "safety": {
+            "execution_lock": "LOCKED" if lock_ok else "REVIEW",
+            "open_memecoin_trades": open_trade_count,
+            "execution_intents": len(intents_24h),
+            "executed_intents": executed_count,
+            "intent_modes": intent_modes,
+            "authority_verdicts": intent_verdicts,
+        },
+        "data_freshness": {
+            "rows": len(intelligence_rows),
+            "freshest_updated_at": freshest.get("updated_at"),
+            "freshest_age_minutes": _row_age_min(freshest) if freshest else None,
+            "freshness_counts": freshness_counts,
+            "confidence_counts": confidence_counts,
+            "stale_high_quality": stale_high_quality,
+        },
+        "decision_quality": {
+            "journal_count": len(journal_24h),
+            "surface_counts": surface_counts,
+            "action_counts": action_counts,
+            "outcome_counts": outcome_counts,
+            "avg_max_return_pct": _avg_key(journal_24h, "max_return_pct"),
+            "missed_runner_count": missed_count,
+            "weak_buy_count": weak_count,
+        },
+        "paper_pilot": {
+            "opened_count": len(paper_24h),
+            "status_counts": paper_status,
+            "outcome_counts": paper_outcomes,
+            "avg_max_return_pct": _avg_key(paper_24h, "max_return_pct"),
+            "avg_1h_pct": _avg_key(paper_24h, "return_1h_pct"),
+            "avg_4h_pct": _avg_key(paper_24h, "return_4h_pct"),
+        },
+        "top_missed_runners": missed[:8],
+        "weak_buy_calls": weak_buys[:8],
+        "top_paper_movers": paper_movers[:10],
+        "next_actions": next_actions[:5],
+    }
+
+
 def _good_buy_rank_score(item: dict) -> float:
     """Rank Home's best-buy list by buy quality, not generic visibility."""
     metrics = dict(item.get("metrics") or {})
@@ -15502,6 +15747,21 @@ async def home_good_buy_board(_: str = Depends(get_current_user), limit: int = 8
             lambda: _build_good_buy_board_v2(limit),
             fresh_s=20,
             stale_s=300,
+            wait_timeout_s=6,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=504, detail=str(exc))
+
+
+@router.get("/daily-crypto-brief")
+async def home_daily_crypto_brief(_: str = Depends(get_current_user), lookback_hours: int = 24):
+    """Daily read-only intelligence brief for the build loop."""
+    try:
+        return await snapshot_or_build(
+            f"home:daily-crypto-brief:{int(lookback_hours)}",
+            lambda: _build_daily_crypto_brief(lookback_hours),
+            fresh_s=120,
+            stale_s=900,
             wait_timeout_s=6,
         )
     except Exception as exc:

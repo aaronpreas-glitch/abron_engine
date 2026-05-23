@@ -87,6 +87,70 @@ interface AIAnalystData {
   do_not_change_yet: string[]
 }
 
+interface DailyBriefTokenItem {
+  symbol: string | null
+  surface?: string | null
+  action?: string | null
+  priority?: string | null
+  outcome_label?: string | null
+  max_return_pct?: number | null
+  reason?: string | null
+  status?: string | null
+  return_1h_pct?: number | null
+  return_4h_pct?: number | null
+  return_24h_pct?: number | null
+}
+
+interface DailyCryptoBriefData {
+  generated_at: string
+  lookback_hours: number
+  status: string
+  headline: string
+  safety: {
+    execution_lock: string
+    open_memecoin_trades: number | null
+    execution_intents: number
+    executed_intents: number
+    intent_modes: Record<string, number>
+    authority_verdicts: Record<string, number>
+  }
+  data_freshness: {
+    rows: number
+    freshest_updated_at?: string | null
+    freshest_age_minutes?: number | null
+    freshness_counts: Record<string, number>
+    confidence_counts: Record<string, number>
+    stale_high_quality: Array<{
+      symbol: string | null
+      age_minutes?: number | null
+      quality_score?: number | null
+      pressure_score?: number | null
+      market_source?: string | null
+    }>
+  }
+  decision_quality: {
+    journal_count: number
+    surface_counts: Record<string, number>
+    action_counts: Record<string, number>
+    outcome_counts: Record<string, number>
+    avg_max_return_pct?: number | null
+    missed_runner_count: number
+    weak_buy_count: number
+  }
+  paper_pilot: {
+    opened_count: number
+    status_counts: Record<string, number>
+    outcome_counts: Record<string, number>
+    avg_max_return_pct?: number | null
+    avg_1h_pct?: number | null
+    avg_4h_pct?: number | null
+  }
+  top_missed_runners: DailyBriefTokenItem[]
+  weak_buy_calls: DailyBriefTokenItem[]
+  top_paper_movers: DailyBriefTokenItem[]
+  next_actions: string[]
+}
+
 // /api/home/brief — checks items have `name`, `label`, `pass`, `value`, `detail`
 interface ReadinessCheck {
   name: string
@@ -4098,6 +4162,161 @@ function GoodBuyBoardPanel({ board }: { board: GoodBuyBoardV2 | undefined }) {
   )
 }
 
+function DailyCryptoBriefPanel({ data, loading }: { data?: DailyCryptoBriefData; loading: boolean }) {
+  if (loading && !data) {
+    return (
+      <div style={{ ...MONO, fontSize: 8, color: 'var(--chrome)', padding: '8px 0' }}>
+        building daily crypto brief…
+      </div>
+    )
+  }
+  if (!data) return null
+
+  const tone =
+    data.status === 'WATCH' ? '#00d48a'
+    : data.status === 'LOCK_REVIEW' ? '#ef4444'
+    : '#f59e0b'
+  const countText = (counts: Record<string, number>, keys: string[]) =>
+    keys.map(key => `${key.toLowerCase()} ${counts[key] ?? 0}`).join(' · ')
+  const Metric = ({ label, value, valueTone = '#d7e1ea' }: { label: string; value: string; valueTone?: string }) => (
+    <div style={{
+      border: '1px solid rgba(255,255,255,0.08)',
+      background: 'rgba(255,255,255,0.025)',
+      borderRadius: 8,
+      padding: '8px 10px',
+      minHeight: 54,
+      display: 'flex',
+      flexDirection: 'column',
+      justifyContent: 'center',
+      gap: 4,
+    }}>
+      <span style={{ ...MONO, fontSize: 7, color: '#7f95a8', letterSpacing: '0.14em' }}>{label}</span>
+      <span style={{ ...MONO, fontSize: 13, color: valueTone, fontWeight: 900 }}>{value}</span>
+    </div>
+  )
+  const TokenLine = ({ item, tone }: { item: DailyBriefTokenItem; tone: string }) => (
+    <div style={{
+      display: 'grid',
+      gridTemplateColumns: '86px 76px 1fr',
+      gap: 8,
+      alignItems: 'center',
+      padding: '7px 0',
+      borderTop: '1px solid rgba(255,255,255,0.055)',
+    }}>
+      <span style={{ ...MONO, fontSize: 10, color: '#f3f7fb', fontWeight: 900, overflow: 'hidden', textOverflow: 'ellipsis' }}>
+        {item.symbol || 'UNKNOWN'}
+      </span>
+      <span style={{ ...MONO, fontSize: 8, color: tone }}>
+        {fmtPct(item.max_return_pct)}
+      </span>
+      <span style={{ ...MONO, fontSize: 8, color: '#8ca0b3', lineHeight: 1.45, overflow: 'hidden', textOverflow: 'ellipsis' }}>
+        {(item.priority || item.outcome_label || item.status || 'tracking').replace(/_/g, ' ').toLowerCase()}
+        {item.reason ? ` · ${item.reason}` : ''}
+      </span>
+    </div>
+  )
+
+  return (
+    <div style={{
+      border: `1px solid ${tone}28`,
+      borderTop: `2px solid ${tone}`,
+      borderRadius: 16,
+      padding: 16,
+      background: 'linear-gradient(180deg, rgba(5,10,18,0.78), rgba(3,7,13,0.72))',
+      display: 'flex',
+      flexDirection: 'column',
+      gap: 12,
+    }}>
+      <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12, flexWrap: 'wrap' }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 5, minWidth: 260, flex: 1 }}>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+            <span style={{ ...MONO, fontSize: 9, color: tone, fontWeight: 900, letterSpacing: '0.16em' }}>
+              DAILY CRYPTO BRIEF
+            </span>
+            <span style={{
+              ...MONO,
+              fontSize: 8,
+              color: tone,
+              background: `${tone}12`,
+              border: `1px solid ${tone}28`,
+              borderRadius: 999,
+              padding: '2px 8px',
+            }}>
+              {data.status.replace(/_/g, ' ')}
+            </span>
+            <span style={{ ...MONO, fontSize: 8, color: '#7f95a8' }}>
+              {data.lookback_hours}h · {fmtAge(data.generated_at)}
+            </span>
+          </div>
+          <span style={{ ...MONO, fontSize: 9, color: '#b6c7d8', lineHeight: 1.55 }}>
+            {data.headline}
+          </span>
+        </div>
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 8 }}>
+        <Metric label="LOCK" value={data.safety.execution_lock} valueTone={data.safety.execution_lock === 'LOCKED' ? '#00d48a' : '#ef4444'} />
+        <Metric label="INTENTS" value={`${data.safety.execution_intents}/${data.safety.executed_intents} exec`} valueTone={data.safety.executed_intents ? '#ef4444' : '#60a5fa'} />
+        <Metric label="DATA" value={countText(data.data_freshness.freshness_counts, ['LIVE', 'RECENT', 'STALE'])} valueTone={(data.data_freshness.freshness_counts.STALE ?? 0) > (data.data_freshness.freshness_counts.LIVE ?? 0) + (data.data_freshness.freshness_counts.RECENT ?? 0) ? '#f59e0b' : '#00d48a'} />
+        <Metric label="DECISIONS" value={`${data.decision_quality.journal_count} · ${fmtPct(data.decision_quality.avg_max_return_pct)}`} />
+        <Metric label="MISSED/WEAK" value={`${data.decision_quality.missed_runner_count}/${data.decision_quality.weak_buy_count}`} valueTone={data.decision_quality.missed_runner_count || data.decision_quality.weak_buy_count ? '#f59e0b' : '#00d48a'} />
+        <Metric label="PAPER" value={`${data.paper_pilot.opened_count} · max ${fmtPct(data.paper_pilot.avg_max_return_pct)}`} valueTone="#a78bfa" />
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 14 }}>
+        <div>
+          <span style={{ ...MONO, fontSize: 8, color: '#f59e0b', fontWeight: 900, letterSpacing: '0.14em' }}>
+            MISSED RUNNERS
+          </span>
+          {(data.top_missed_runners || []).slice(0, 4).map((item, i) => (
+            <TokenLine key={`missed-${item.symbol}-${i}`} item={item} tone="#f59e0b" />
+          ))}
+          {data.top_missed_runners.length === 0 && (
+            <div style={{ ...MONO, fontSize: 8, color: '#7f95a8', paddingTop: 8 }}>none in this window</div>
+          )}
+        </div>
+        <div>
+          <span style={{ ...MONO, fontSize: 8, color: '#60a5fa', fontWeight: 900, letterSpacing: '0.14em' }}>
+            PAPER MOVERS
+          </span>
+          {(data.top_paper_movers || []).slice(0, 4).map((item, i) => (
+            <TokenLine key={`paper-${item.symbol}-${i}`} item={item} tone="#60a5fa" />
+          ))}
+        </div>
+        <div>
+          <span style={{ ...MONO, fontSize: 8, color: '#ef4444', fontWeight: 900, letterSpacing: '0.14em' }}>
+            WEAK BUY CALLS
+          </span>
+          {(data.weak_buy_calls || []).slice(0, 4).map((item, i) => (
+            <TokenLine key={`weak-${item.symbol}-${i}`} item={item} tone="#ef4444" />
+          ))}
+          {data.weak_buy_calls.length === 0 && (
+            <div style={{ ...MONO, fontSize: 8, color: '#7f95a8', paddingTop: 8 }}>none in this window</div>
+          )}
+        </div>
+      </div>
+
+      {data.next_actions.length > 0 && (
+        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+          {data.next_actions.slice(0, 4).map((action, i) => (
+            <span key={`daily-action-${i}`} style={{
+              ...MONO,
+              fontSize: 8,
+              color: '#d7e1ea',
+              background: 'rgba(96,165,250,0.08)',
+              border: '1px solid rgba(96,165,250,0.18)',
+              borderRadius: 999,
+              padding: '3px 8px',
+            }}>
+              {action}
+            </span>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
 function EntryWatchHomeStrip({
   status,
   replay,
@@ -6763,6 +6982,13 @@ export function HomePage() {
     staleTime: 20_000,
   })
 
+  const dailyBriefQ = useQuery<DailyCryptoBriefData>({
+    queryKey: ['home-daily-crypto-brief'],
+    queryFn: () => api.get('/home/daily-crypto-brief?lookback_hours=24').then(r => r.data),
+    refetchInterval: slowBudgetedInterval(180_000),
+    staleTime: 60_000,
+  })
+
   const earlyRunnersQ = useQuery<EarlyRunnersData>({
     queryKey: ['home-early-runners'],
     queryFn: () => api.get('/home/early-runners?limit=8&lookback_hours=24').then(r => r.data),
@@ -6906,6 +7132,7 @@ export function HomePage() {
       bestActionQ.data?.generated_at,
       summary.data?.generated_at ?? null,
       actionBoardQ.data?.generated_at ?? null,
+      dailyBriefQ.data?.generated_at ?? null,
       earlyRunnersQ.data?.generated_at ?? null,
       convictionRecoveryQ.data?.generated_at ?? null,
       runnerReviewQ.data?.generated_at ?? null,
@@ -6959,15 +7186,22 @@ export function HomePage() {
       />
 
       <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+        <span style={{ ...MONO, fontSize: 8, color: '#2dd4bf', letterSpacing: '0.16em', fontWeight: 900 }}>
+          1 · DAILY CRYPTO BRIEF
+        </span>
+        <DailyCryptoBriefPanel data={dailyBriefQ.data} loading={dailyBriefQ.isLoading} />
+      </div>
+
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
         <span style={{ ...MONO, fontSize: 8, color: '#00d48a', letterSpacing: '0.16em', fontWeight: 900 }}>
-          1 · BEST BUYS
+          2 · BEST BUYS
         </span>
         <GoodBuyBoardPanel board={actionBoardQ.data?.good_buy_board_v2} />
       </div>
 
       <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
         <span style={{ ...MONO, fontSize: 8, color: '#60a5fa', letterSpacing: '0.16em', fontWeight: 900 }}>
-          2 · REASONING + CA REVIEW
+          3 · REASONING + CA REVIEW
         </span>
         <MemecoinResearchDossierPanel
           data={memecoinResearchQ.data}
@@ -6979,7 +7213,7 @@ export function HomePage() {
 
       <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
         <span style={{ ...MONO, fontSize: 8, color: '#f59e0b', letterSpacing: '0.16em', fontWeight: 900 }}>
-          3 · ENTRY TRIGGERS
+          4 · ENTRY TRIGGERS
         </span>
         <EntryWatchHomeStrip
           status={watchToEntry}
@@ -7002,7 +7236,7 @@ export function HomePage() {
 
       <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
         <span style={{ ...MONO, fontSize: 8, color: '#8fb7dc', letterSpacing: '0.16em', fontWeight: 900 }}>
-          4 · FULL QUEUE
+          5 · FULL QUEUE
         </span>
         <ActionBoardPanel data={actionBoardQ.data} loading={actionBoardQ.isLoading} scannerDiag={scannerDiagQ.data} reinfBySymbol={reinfBySymbol} />
       </div>
