@@ -1244,7 +1244,7 @@ def _route_repair_escalation(conn, event: dict, event_id: int | None) -> None:
                    source_event_id=COALESCE(?, source_event_id),
                    raw_json=?
              WHERE mint=?
-               AND escalation_status IN ('QUEUED','WATCHING','FORCE_REFRESH_REQUESTED','STALE_REVIEW')
+               AND escalation_status IN ('QUEUED','WATCHING','FORCE_REFRESH_REQUESTED','STALE_REVIEW','REVIEW_COMPLETE_STILL_BLOCKED')
             """,
             (now, status, now, event_id, json.dumps(event, separators=(",", ":")), mint),
         )
@@ -1274,7 +1274,7 @@ def _route_repair_escalation(conn, event: dict, event_id: int | None) -> None:
             failure_class=excluded.failure_class,
             repair_status=excluded.repair_status,
             escalation_status=CASE
-                WHEN provider_repair_escalations.escalation_status IN ('DISMISSED','RESOLVED_REPAIRED') THEN provider_repair_escalations.escalation_status
+                WHEN provider_repair_escalations.escalation_status IN ('DISMISSED','RESOLVED_REPAIRED','REVIEW_COMPLETE_STILL_BLOCKED') THEN provider_repair_escalations.escalation_status
                 ELSE excluded.escalation_status
             END,
             priority_score=MAX(COALESCE(provider_repair_escalations.priority_score, 0), COALESCE(excluded.priority_score, 0)),
@@ -1283,11 +1283,11 @@ def _route_repair_escalation(conn, event: dict, event_id: int | None) -> None:
             reason=excluded.reason,
             source_event_id=excluded.source_event_id,
             operator_decision=CASE
-                WHEN provider_repair_escalations.escalation_status IN ('DISMISSED','RESOLVED_REPAIRED') THEN provider_repair_escalations.operator_decision
+                WHEN provider_repair_escalations.escalation_status IN ('DISMISSED','RESOLVED_REPAIRED','REVIEW_COMPLETE_STILL_BLOCKED') THEN provider_repair_escalations.operator_decision
                 ELSE excluded.operator_decision
             END,
             outcome_label=CASE
-                WHEN provider_repair_escalations.escalation_status IN ('DISMISSED','RESOLVED_REPAIRED') THEN provider_repair_escalations.outcome_label
+                WHEN provider_repair_escalations.escalation_status IN ('DISMISSED','RESOLVED_REPAIRED','REVIEW_COMPLETE_STILL_BLOCKED') THEN provider_repair_escalations.outcome_label
                 ELSE excluded.outcome_label
             END,
             last_action_ts=excluded.last_action_ts,
