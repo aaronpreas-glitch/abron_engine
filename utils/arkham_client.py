@@ -25,6 +25,7 @@ _BASE_URL = os.getenv("ARKHAM_API_BASE_URL", "https://api.arkm.com").rstrip("/")
 _TIMEOUT_S = float(os.getenv("ARKHAM_TIMEOUT_S", "15") or 15)
 _CACHE_HOURS = float(os.getenv("ARKHAM_CACHE_HOURS", "24") or 24)
 _FLOW_WINDOW = os.getenv("ARKHAM_TOP_FLOW_WINDOW", "24h").strip() or "24h"
+_LOG_PAYMENT_REQUIRED = os.getenv("ARKHAM_LOG_PAYMENT_REQUIRED", "false").lower() == "true"
 
 
 def is_arkham_configured() -> bool:
@@ -386,15 +387,21 @@ def enrich_token(token_mint: str, chain: str = "solana", force: bool = False) ->
             "updated_ts_utc": datetime.now(timezone.utc).isoformat(),
         }
     except Exception as exc:
-        log.warning("[ARKHAM] enrich_token failed for %s: %s", token_mint, exc)
+        error_text = str(exc)
+        payment_required = "402" in error_text or "payment required" in error_text.lower()
+        if payment_required:
+            if _LOG_PAYMENT_REQUIRED:
+                log.info("[ARKHAM] entitlement missing for %s; enrichment skipped", token_mint)
+        else:
+            log.warning("[ARKHAM] enrich_token failed for %s: %s", token_mint, exc)
         data = {
             "token_mint": token_mint,
             "chain": chain,
-            "status": "ERROR",
+            "status": "ENTITLEMENT_REQUIRED" if payment_required else "ERROR",
             "signal_quality": "NONE",
             "signal_score": 0.0,
             "updated_ts_utc": datetime.now(timezone.utc).isoformat(),
-            "last_error": str(exc)[:300],
+            "last_error": ("arkham_payment_required" if payment_required else error_text[:300]),
         }
 
     with get_conn() as conn:
