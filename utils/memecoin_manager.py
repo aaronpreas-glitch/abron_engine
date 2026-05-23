@@ -3697,6 +3697,15 @@ def buy_memecoin(                          # Patch 272: lifecycle context params
             "token_amount": sim_tokens,
             "dry_run":      True,
         }
+    # Final live-send guard: real memecoin buys require an explicit third opt-in.
+    if os.getenv("MEMECOIN_LIVE_EXECUTION_CONFIRMED", "false").lower() != "true":
+        logger.warning(
+            "LIVE_MEMECOIN_BUY_BLOCKED %s amount=%.2f reason=live_execution_not_confirmed",
+            symbol,
+            amount_usd,
+        )
+        return {"success": False, "error": "live_execution_not_confirmed"}
+
     # ── LIVE path — only reached when MEMECOIN_DRY_RUN=false ─────────────────
 
     sol_price = _fetch_sol_price()
