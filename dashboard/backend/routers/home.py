@@ -15517,9 +15517,43 @@ def _build_provider_escalation_execution_packs(work_orders: dict) -> dict:
                 else "Press START on the work order before implementation begins."
             ),
         })
+    for pack in packs:
+        evidence = dict(pack.get("evidence_bundle") or {})
+        risk = str(pack.get("risk_label") or "").upper()
+        state = str(pack.get("state") or "").upper()
+        benefit = int(evidence.get("simulated_benefit_n") or 0)
+        weak_risk = int(evidence.get("weak_buy_risk_n") or 0)
+        max_return = _gb_float(evidence.get("max_return_pct"))
+        avg_1h = _gb_float(evidence.get("avg_1h_pct"))
+        confidence = _gb_float(evidence.get("confidence_score"))
+        active_bonus = 12.0 if state == "ACTIVE" else 4.0 if state == "READY" else 0.0
+        impact_score = min(45.0, benefit * 12.0 + max(0.0, max_return) * 0.45 + max(0.0, avg_1h) * 0.25)
+        confidence_score = min(35.0, confidence * 0.35)
+        safety_score = 14.0 if str(evidence.get("gate_status") or "").upper() == "READY_FOR_MANUAL_REVIEW" else 6.0
+        risk_penalty = weak_risk * 14.0
+        if risk == "EXECUTION_SENSITIVE":
+            risk_penalty += 18.0
+        elif risk == "RULE_TUNING":
+            risk_penalty += 8.0
+        elif risk == "SCOUT_ONLY":
+            risk_penalty += 4.0
+        priority_score = round(max(0.0, min(100.0, impact_score + confidence_score + safety_score + active_bonus - risk_penalty)), 1)
+        pack["priority_score"] = priority_score
+        pack["score_breakdown"] = {
+            "impact": round(impact_score, 1),
+            "confidence": round(confidence_score, 1),
+            "safety": round(safety_score, 1),
+            "state_bonus": round(active_bonus, 1),
+            "risk_penalty": round(risk_penalty, 1),
+        }
+        pack["mission_rank_reason"] = (
+            f"score {priority_score} · benefit {benefit}/risk {weak_risk} · "
+            f"conf {round(confidence, 1)} · max {round(max_return, 1)}%"
+        )
     packs.sort(
         key=lambda x: (
             1 if x.get("state") == "ACTIVE" else 0,
+            _gb_float(x.get("priority_score")),
             _gb_float(((x.get("evidence_bundle") or {}).get("confidence_score"))),
             _gb_float(((x.get("evidence_bundle") or {}).get("max_return_pct"))),
         ),
@@ -15531,6 +15565,11 @@ def _build_provider_escalation_execution_packs(work_orders: dict) -> dict:
         "pack_count": len(packs),
         "active_count": len(active),
         "top_pack": packs[0] if packs else None,
+        "scoring": {
+            "method": "impact + confidence + safety + state - risk",
+            "top_score": packs[0].get("priority_score") if packs else None,
+            "scored_count": len(packs),
+        },
         "items": packs[:8],
         "next_action": (
             "Use the active execution pack as the coding handoff."
@@ -15539,6 +15578,242 @@ def _build_provider_escalation_execution_packs(work_orders: dict) -> dict:
             if packs
             else "No execution pack is ready."
         ),
+    }
+
+
+def _build_provider_post_patch_outcome_tracker(work_orders: dict, escalation_rows: list[dict]) -> dict:
+    completed_orders = [
+        dict(order) for order in list((work_orders or {}).get("items") or [])
+        if str(order.get("state") or "").upper() == "COMPLETE"
+    ]
+    items = []
+    correct_labels = {"BLOCK_CORRECT", "SUPPRESSION_CORRECT", "REPAIR_RESOLVED"}
+    miss_labels = {"BLOCK_MISSED_RUNNER", "SUPPRESSION_TOO_AGGRESSIVE"}
+    for order in completed_orders:
+        plan = dict(order.get("source_plan") or {})
+        failure = str(plan.get("failure_class") or "").lower()
+        lane = str(plan.get("lane") or "").upper()
+        completed_at = _gb_parse_ts(order.get("state_updated_at"))
+        matched = []
+        for row in escalation_rows or []:
+            if failure and str(row.get("failure_class") or "").lower() != failure:
+                continue
+            if lane and str(row.get("escalation_lane") or "").upper() != lane:
+                continue
+            outcome_ts = _gb_parse_ts(row.get("outcome_check_ts") or row.get("outcome_alert_ts") or row.get("updated_ts"))
+            if completed_at and outcome_ts and outcome_ts < completed_at:
+                continue
+            correctness = str(row.get("blocker_correctness") or "").upper()
+            if not correctness:
+                continue
+            matched.append(dict(row))
+        correct = sum(1 for row in matched if str(row.get("blocker_correctness") or "").upper() in correct_labels)
+        missed = sum(1 for row in matched if str(row.get("blocker_correctness") or "").upper() in miss_labels)
+        pending = sum(1 for row in matched if str(row.get("blocker_correctness") or "").upper() in {"PENDING", "PENDING_OUTCOME"})
+        judged = correct + missed
+        status = (
+            "REGRESSION_REVIEW" if missed
+            else "IMPROVING" if correct and not missed
+            else "WAITING_OUTCOMES" if pending or not judged
+            else "TRACKING"
+        )
+        items.append({
+            "group_key": order.get("group_key"),
+            "status": status,
+            "risk_label": order.get("risk_label"),
+            "target_subsystem": order.get("target_subsystem"),
+            "completed_at": order.get("state_updated_at"),
+            "sample_n": judged,
+            "correct_n": correct,
+            "missed_n": missed,
+            "pending_n": pending,
+            "accuracy_pct": round((correct / max(1, judged)) * 100.0, 1) if judged else None,
+            "max_return_pct": _nullable_float(max([_gb_float(row.get("outcome_max_return_pct")) for row in matched], default=0.0)),
+            "symbols": [
+                str(row.get("symbol") or "").upper()
+                for row in matched[:6]
+                if str(row.get("symbol") or "").strip()
+            ],
+            "next_action": (
+                "Freeze related promotions and inspect the regression."
+                if missed
+                else "Keep collecting 24h/48h outcomes for this completed patch."
+                if not judged
+                else "Patch outcome is improving; keep monitoring for drift."
+            ),
+        })
+    items.sort(
+        key=lambda x: (
+            1 if x.get("status") == "REGRESSION_REVIEW" else 0,
+            int(x.get("sample_n") or 0),
+            _gb_float(x.get("max_return_pct")),
+        ),
+        reverse=True,
+    )
+    regression_count = sum(1 for item in items if item.get("status") == "REGRESSION_REVIEW")
+    improving_count = sum(1 for item in items if item.get("status") == "IMPROVING")
+    return {
+        "status": "REGRESSION_REVIEW" if regression_count else "TRACKING" if items else "NO_COMPLETED_PATCHES",
+        "tracked_count": len(items),
+        "regression_count": regression_count,
+        "improving_count": improving_count,
+        "top": items[0] if items else None,
+        "items": items[:8],
+        "next_action": (
+            "Review post-patch regressions before starting another mission."
+            if regression_count
+            else "Keep completed patch outcomes under observation."
+            if items
+            else "Complete a work order to start post-patch tracking."
+        ),
+    }
+
+
+def _build_provider_regression_guard(
+    post_patch_tracker: dict,
+    escalation_accuracy: dict,
+    review_queue: dict,
+    execution_packs: dict,
+) -> dict:
+    items = []
+    for item in list((post_patch_tracker or {}).get("items") or []):
+        if str(item.get("status") or "").upper() == "REGRESSION_REVIEW":
+            group_key = str(item.get("group_key") or "")
+            failure, _, lane = group_key.partition(":")
+            items.append({
+                "source": "post_patch",
+                "group_key": group_key,
+                "failure_class": failure or None,
+                "lane": lane or None,
+                "severity": "HIGH",
+                "reason": f"Completed patch produced {item.get('missed_n') or 0} missed escalation outcomes.",
+                "freeze": True,
+            })
+    for failure in list((escalation_accuracy or {}).get("frozen_failure_classes") or []):
+        items.append({
+            "source": "escalation_accuracy",
+            "group_key": str(failure),
+            "failure_class": str(failure),
+            "lane": None,
+            "severity": "MEDIUM",
+            "reason": "Escalation accuracy has missed-runner evidence for this failure class.",
+            "freeze": True,
+        })
+    for lane in list((escalation_accuracy or {}).get("frozen_lanes") or []):
+        items.append({
+            "source": "escalation_accuracy",
+            "group_key": str(lane),
+            "failure_class": None,
+            "lane": str(lane),
+            "severity": "MEDIUM",
+            "reason": "Escalation accuracy has missed-runner evidence for this lane.",
+            "freeze": True,
+        })
+    top_pack = dict((execution_packs or {}).get("top_pack") or {})
+    weak_risk = int(((top_pack.get("evidence_bundle") or {}).get("weak_buy_risk_n")) or 0)
+    benefit = int(((top_pack.get("evidence_bundle") or {}).get("simulated_benefit_n")) or 0)
+    if top_pack and weak_risk > benefit:
+        items.append({
+            "source": "pack_score",
+            "group_key": top_pack.get("group_key"),
+            "failure_class": None,
+            "lane": None,
+            "severity": "HIGH",
+            "reason": "Top execution pack carries more weak-buy risk than simulated benefit.",
+            "freeze": True,
+        })
+    seen = set()
+    deduped = []
+    for item in items:
+        key = (item.get("source"), item.get("group_key"), item.get("failure_class"), item.get("lane"))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return {
+        "status": "ACTIVE" if deduped else "CLEAR",
+        "freeze_count": len(deduped),
+        "frozen_failure_classes": sorted({str(item.get("failure_class")) for item in deduped if item.get("failure_class")}),
+        "frozen_lanes": sorted({str(item.get("lane")) for item in deduped if item.get("lane")}),
+        "items": deduped[:10],
+        "next_action": (
+            "Freeze similar promotions until regression evidence is reviewed."
+            if deduped
+            else "No regression freeze is active."
+        ),
+    }
+
+
+def _build_daily_top_mission(
+    execution_packs: dict,
+    post_patch_tracker: dict,
+    regression_guard: dict,
+    daily_build_score: dict,
+) -> dict:
+    top_pack = dict((execution_packs or {}).get("top_pack") or {})
+    if str((regression_guard or {}).get("status") or "").upper() == "ACTIVE":
+        return {
+            "status": "REGRESSION_GUARD",
+            "mission_type": "REGRESSION_REVIEW",
+            "title": "Review regression guard before new build work",
+            "priority_score": 100,
+            "pack_key": top_pack.get("pack_key"),
+            "group_key": top_pack.get("group_key"),
+            "headline": (regression_guard or {}).get("next_action"),
+            "expected_upside": "Prevents weak-buy or missed-runner regressions from becoming future promotions.",
+            "proof": "Clear or classify the active regression guard items.",
+            "workbench_pack": top_pack or None,
+            "next_action": (regression_guard or {}).get("next_action"),
+        }
+    if top_pack:
+        evidence = dict(top_pack.get("evidence_bundle") or {})
+        first_recipe = (top_pack.get("replay_test_recipe") or [{}])[0]
+        first_target = (top_pack.get("target_code_map") or [{}])[0]
+        return {
+            "status": "ACTIVE" if top_pack.get("state") == "ACTIVE" else "READY",
+            "mission_type": "EXECUTION_PACK",
+            "title": f"{str(top_pack.get('risk_label') or 'PACK').replace('_', ' ')} mission",
+            "priority_score": top_pack.get("priority_score"),
+            "pack_key": top_pack.get("pack_key"),
+            "group_key": top_pack.get("group_key"),
+            "headline": top_pack.get("next_action"),
+            "expected_upside": evidence.get("why_it_matters"),
+            "proof": first_recipe.get("label") or "Run the replay recipe and completion criteria.",
+            "target": {
+                "subsystem": top_pack.get("target_subsystem"),
+                "file": first_target.get("file"),
+                "function": first_target.get("function"),
+            },
+            "workbench_pack": top_pack,
+            "next_action": top_pack.get("next_action"),
+        }
+    if str((post_patch_tracker or {}).get("status") or "").upper() not in {"NO_COMPLETED_PATCHES", ""}:
+        top = dict((post_patch_tracker or {}).get("top") or {})
+        return {
+            "status": "TRACKING",
+            "mission_type": "POST_PATCH_TRACKING",
+            "title": "Track shipped patch outcomes",
+            "priority_score": 55,
+            "pack_key": None,
+            "group_key": top.get("group_key"),
+            "headline": (post_patch_tracker or {}).get("next_action"),
+            "expected_upside": "Confirms whether shipped patches actually improved the blocker loop.",
+            "proof": "Wait for enough 24h/48h outcomes to classify improvement or regression.",
+            "workbench_pack": None,
+            "next_action": (post_patch_tracker or {}).get("next_action"),
+        }
+    return {
+        "status": "OBSERVE",
+        "mission_type": "BUILD_FOCUS",
+        "title": str((daily_build_score or {}).get("focus") or "OBSERVE").replace("_", " ").title(),
+        "priority_score": daily_build_score.get("score"),
+        "pack_key": None,
+        "group_key": None,
+        "headline": daily_build_score.get("next_action") or "Keep collecting outcomes.",
+        "expected_upside": "Keeps the daily improvement loop pointed at the strongest available signal.",
+        "proof": "Daily Brief remains locked and continues collecting fresh outcomes.",
+        "workbench_pack": None,
+        "next_action": daily_build_score.get("next_action"),
     }
 
 
@@ -16314,6 +16589,19 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
         provider_escalation_accuracy,
     )
     daily_build_hooks = _build_daily_build_hooks(outcome_autopsy, rule_simulator, data_watchdog, lock_ok, rule_promotion_gate)
+    provider_post_patch_outcomes = _build_provider_post_patch_outcome_tracker(provider_escalation_work_orders, escalation_rows)
+    provider_regression_guard = _build_provider_regression_guard(
+        provider_post_patch_outcomes,
+        provider_escalation_accuracy,
+        provider_escalation_review_queue,
+        provider_escalation_execution_packs,
+    )
+    daily_top_mission = _build_daily_top_mission(
+        provider_escalation_execution_packs,
+        provider_post_patch_outcomes,
+        provider_regression_guard,
+        daily_build_score,
+    )
     if lock_ok and data_ok and missed_count <= 3:
         status = "WATCH"
         headline = "Daily crypto brief is stable; keep improving missed-runner timing before any re-arm talk."
@@ -16333,6 +16621,12 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
         next_actions.append(str(daily_build_hooks.get("next_patch")))
     if daily_build_score.get("next_action"):
         next_actions.append(str(daily_build_score.get("next_action")))
+    if daily_top_mission.get("next_action"):
+        next_actions.append(str(daily_top_mission.get("next_action")))
+    if str(provider_regression_guard.get("status") or "").upper() == "ACTIVE":
+        next_actions.append(str(provider_regression_guard.get("next_action") or "Review regression guard."))
+    if str(provider_post_patch_outcomes.get("status") or "").upper() == "REGRESSION_REVIEW":
+        next_actions.append(str(provider_post_patch_outcomes.get("next_action") or "Review post-patch outcomes."))
     if int(provider_escalation_queue.get("active_count") or 0):
         next_actions.append(str(provider_escalation_queue.get("next_action") or "Work the provider escalation queue."))
     if str((outcome_autorun or {}).get("status") or "").upper() in {"ERROR", "UNAVAILABLE"}:
@@ -16406,11 +16700,14 @@ def _build_daily_crypto_brief(lookback_hours: int = 24, outcome_autorun: dict | 
         "provider_escalation_patch_plans": provider_escalation_patch_plans,
         "provider_escalation_work_orders": provider_escalation_work_orders,
         "provider_escalation_execution_packs": provider_escalation_execution_packs,
+        "provider_post_patch_outcomes": provider_post_patch_outcomes,
+        "provider_regression_guard": provider_regression_guard,
         "provider_escalation_outcome_autorun": outcome_autorun,
         "rule_promotion_gate": rule_promotion_gate,
         "missed_runner_clusters": missed_runner_clusters,
         "catalyst_context": catalyst_context,
         "daily_build_score": daily_build_score,
+        "daily_top_mission": daily_top_mission,
         "paper_to_pilot_gate": paper_gate,
         "daily_build_hooks": daily_build_hooks,
         "next_actions": next_actions[:5],

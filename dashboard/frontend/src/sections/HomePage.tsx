@@ -242,6 +242,15 @@ interface ProviderEscalationExecutionPack {
   work_order_state?: string | null
   risk_label?: string | null
   target_subsystem?: string | null
+  priority_score?: number | null
+  score_breakdown?: {
+    impact?: number | null
+    confidence?: number | null
+    safety?: number | null
+    state_bonus?: number | null
+    risk_penalty?: number | null
+  }
+  mission_rank_reason?: string | null
   evidence_bundle?: {
     symbols?: string[]
     mints?: string[]
@@ -259,6 +268,25 @@ interface ProviderEscalationExecutionPack {
   replay_test_recipe?: Array<{ key?: string; label?: string; command?: string }>
   target_code_map?: Array<{ file?: string | null; function?: string | null; expected_change?: string | null }>
   completion_criteria?: string[]
+  next_action?: string | null
+}
+
+interface DailyTopMission {
+  status?: string
+  mission_type?: string
+  title?: string | null
+  priority_score?: number | null
+  pack_key?: string | null
+  group_key?: string | null
+  headline?: string | null
+  expected_upside?: string | null
+  proof?: string | null
+  target?: {
+    subsystem?: string | null
+    file?: string | null
+    function?: string | null
+  }
+  workbench_pack?: ProviderEscalationExecutionPack | null
   next_action?: string | null
 }
 
@@ -564,8 +592,47 @@ interface DailyCryptoBriefData {
     status?: string
     pack_count?: number
     active_count?: number
+    scoring?: {
+      method?: string
+      top_score?: number | null
+      scored_count?: number
+    }
     top_pack?: ProviderEscalationExecutionPack | null
     items?: ProviderEscalationExecutionPack[]
+    next_action?: string | null
+  }
+  provider_post_patch_outcomes?: {
+    status?: string
+    tracked_count?: number
+    regression_count?: number
+    improving_count?: number
+    top?: {
+      group_key?: string | null
+      status?: string | null
+      sample_n?: number
+      correct_n?: number
+      missed_n?: number
+      pending_n?: number
+      accuracy_pct?: number | null
+      max_return_pct?: number | null
+      next_action?: string | null
+    } | null
+    next_action?: string | null
+  }
+  provider_regression_guard?: {
+    status?: string
+    freeze_count?: number
+    frozen_failure_classes?: string[]
+    frozen_lanes?: string[]
+    items?: Array<{
+      source?: string | null
+      group_key?: string | null
+      failure_class?: string | null
+      lane?: string | null
+      severity?: string | null
+      reason?: string | null
+      freeze?: boolean
+    }>
     next_action?: string | null
   }
   provider_escalation_outcome_autorun?: {
@@ -628,6 +695,7 @@ interface DailyCryptoBriefData {
     components?: Record<string, number>
     next_action?: string | null
   }
+  daily_top_mission?: DailyTopMission
   paper_to_pilot_gate?: {
     status?: string
     sample_n?: number
@@ -4748,11 +4816,14 @@ function DailyCryptoBriefPanel({
     const escalationPatchPlans = data.provider_escalation_patch_plans ?? {}
     const escalationWorkOrders = data.provider_escalation_work_orders ?? {}
     const escalationExecutionPacks = data.provider_escalation_execution_packs ?? {}
+    const postPatchOutcomes = data.provider_post_patch_outcomes ?? {}
+    const regressionGuard = data.provider_regression_guard ?? {}
     const escalationAutorun = data.provider_escalation_outcome_autorun ?? {}
     const ruleGate = data.rule_promotion_gate ?? {}
     const missedClusters = data.missed_runner_clusters ?? {}
     const catalystContext = data.catalyst_context ?? {}
     const buildScore = data.daily_build_score ?? {}
+    const topMission = data.daily_top_mission ?? {}
     const pilotGate = data.paper_to_pilot_gate ?? {}
     const providerRows = watchdog.by_source ?? []
     const refreshTargets = watchdog.refresh_priority ?? []
@@ -4770,20 +4841,25 @@ function DailyCryptoBriefPanel({
     const topEscalationPatch = escalationPatchPlans.top_plan ?? escalationPatchPlans.items?.[0]
     const topEscalationWorkOrder = escalationWorkOrders.top_work_order ?? escalationWorkOrders.items?.[0]
     const topEscalationExecutionPack = escalationExecutionPacks.top_pack ?? escalationExecutionPacks.items?.[0]
-    const executionPackEvidence = topEscalationExecutionPack?.evidence_bundle ?? {}
-    const executionPackRecipe = topEscalationExecutionPack?.replay_test_recipe ?? []
-    const executionPackTargets = topEscalationExecutionPack?.target_code_map ?? []
-    const executionPackCriteria = topEscalationExecutionPack?.completion_criteria ?? []
+    const workbenchPack = topMission.workbench_pack ?? topEscalationExecutionPack
+    const executionPackEvidence = workbenchPack?.evidence_bundle ?? {}
+    const executionPackRecipe = workbenchPack?.replay_test_recipe ?? []
+    const executionPackTargets = workbenchPack?.target_code_map ?? []
+    const executionPackCriteria = workbenchPack?.completion_criteria ?? []
     const executionPackTone =
-      topEscalationExecutionPack?.state === 'ACTIVE' ? '#00d48a'
-      : topEscalationExecutionPack ? '#f59e0b'
+      regressionGuard.status === 'ACTIVE' ? '#ef4444'
+      : workbenchPack?.state === 'ACTIVE' ? '#00d48a'
+      : workbenchPack ? '#f59e0b'
       : '#60a5fa'
     const executionPackState =
-      topEscalationExecutionPack?.state === 'ACTIVE' ? 'IMPLEMENTING'
-      : topEscalationExecutionPack?.state === 'READY' ? 'READY TO START'
+      regressionGuard.status === 'ACTIVE' ? 'GUARDED'
+      : workbenchPack?.state === 'ACTIVE' ? 'IMPLEMENTING'
+      : workbenchPack?.state === 'READY' ? 'READY TO START'
       : 'WAITING'
     const executionPackTarget = executionPackTargets[0]
     const executionPackRecipeStep = executionPackRecipe[0]
+    const topPostPatch = postPatchOutcomes.top
+    const topRegression = regressionGuard.items?.[0]
     const buildHooks = data.daily_build_hooks ?? {}
     const countText = (counts: Record<string, number>, keys: string[]) =>
       keys.map(key => `${key.toLowerCase()} ${counts[key] ?? 0}`).join(' · ')
@@ -4912,7 +4988,7 @@ function DailyCryptoBriefPanel({
           borderLeft: `3px solid ${executionPackTone}`,
           borderRadius: 10,
           padding: 12,
-          background: topEscalationExecutionPack ? `${executionPackTone}08` : 'rgba(96,165,250,0.018)',
+          background: workbenchPack || topMission.status ? `${executionPackTone}08` : 'rgba(96,165,250,0.018)',
           display: 'flex',
           flexDirection: 'column',
           gap: 12,
@@ -4921,27 +4997,29 @@ function DailyCryptoBriefPanel({
             <div style={{ display: 'flex', flexDirection: 'column', gap: 5, minWidth: 260, flex: 1 }}>
               <div style={{ display: 'flex', gap: 7, alignItems: 'center', flexWrap: 'wrap' }}>
                 <span style={{ ...MONO, fontSize: 8, color: executionPackTone, fontWeight: 900, letterSpacing: '0.14em' }}>
-                  OPERATOR WORKBENCH
+                  DAILY TOP MISSION
                 </span>
                 <span style={{ ...MONO, fontSize: 8, color: executionPackTone, background: `${executionPackTone}12`, border: `1px solid ${executionPackTone}28`, borderRadius: 999, padding: '2px 8px' }}>
-                  {executionPackState}
+                  {String(topMission.mission_type || executionPackState).replace(/_/g, ' ')}
                 </span>
                 <span style={{ ...MONO, fontSize: 8, color: '#7f95a8' }}>
-                  packs {escalationExecutionPacks.pack_count ?? 0} · active {escalationExecutionPacks.active_count ?? 0}
+                  score {fmtFixed(topMission.priority_score ?? workbenchPack?.priority_score, 0)} · packs {escalationExecutionPacks.pack_count ?? 0} · active {escalationExecutionPacks.active_count ?? 0}
                 </span>
               </div>
               <span style={{ ...MONO, fontSize: 11, color: '#d7e1ea', lineHeight: 1.45, fontWeight: 900 }}>
-                {topEscalationExecutionPack
-                  ? topEscalationExecutionPack.next_action || 'Use this pack as the implementation handoff.'
-                  : escalationExecutionPacks.next_action || 'Start a ready work order to activate an execution pack.'}
+                {topMission.headline
+                  || (workbenchPack
+                    ? workbenchPack.next_action || 'Use this pack as the implementation handoff.'
+                    : escalationExecutionPacks.next_action || 'Start a ready work order to activate an execution pack.')}
               </span>
               <span style={{ ...MONO, fontSize: 8, color: '#8ca0b3', lineHeight: 1.5 }}>
-                {topEscalationExecutionPack
-                  ? executionPackEvidence.why_it_matters || 'Pack is carrying evidence, target map, replay test, and completion criteria.'
-                  : 'No pack is active yet. Promote a patch plan into a work order, then start the work order here.'}
+                {topMission.expected_upside
+                  || (workbenchPack
+                    ? executionPackEvidence.why_it_matters || 'Pack is carrying evidence, target map, replay test, and completion criteria.'
+                    : 'No pack is active yet. Promote a patch plan into a work order, then start the work order here.')}
               </span>
             </div>
-            {topEscalationExecutionPack && onEscalationWorkOrderAction && (
+            {workbenchPack && onEscalationWorkOrderAction && (
               <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
                 {([
                   ['STARTED', 'START'],
@@ -4952,8 +5030,8 @@ function DailyCryptoBriefPanel({
                     key={`execution-pack-workbench-${state}`}
                     type="button"
                     className="mini-btn"
-                    disabled={pendingEscalationWorkOrderKey === topEscalationExecutionPack.group_key}
-                    onClick={() => onEscalationWorkOrderAction(topEscalationWorkOrder ?? { group_key: topEscalationExecutionPack.group_key }, state)}
+                    disabled={pendingEscalationWorkOrderKey === workbenchPack.group_key}
+                    onClick={() => onEscalationWorkOrderAction(topEscalationWorkOrder ?? { group_key: workbenchPack.group_key }, state)}
                     style={{ fontSize: 7, padding: '5px 8px' }}
                   >
                     {label}
@@ -4963,11 +5041,13 @@ function DailyCryptoBriefPanel({
             )}
           </div>
 
-          {topEscalationExecutionPack ? (
+          {workbenchPack ? (
             <>
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))', gap: 10 }}>
-                <WorkbenchItem label="TARGET" value={`${topEscalationExecutionPack.target_subsystem || 'subsystem'} · ${String(topEscalationExecutionPack.risk_label || 'risk').replace(/_/g, ' ').toLowerCase()}`} tone={executionPackTone} />
+                <WorkbenchItem label="MISSION" value={`${topMission.title || 'daily build mission'} · ${String(topMission.status || executionPackState).replace(/_/g, ' ').toLowerCase()}`} tone={executionPackTone} />
+                <WorkbenchItem label="TARGET" value={`${workbenchPack.target_subsystem || topMission.target?.subsystem || 'subsystem'} · ${String(workbenchPack.risk_label || 'risk').replace(/_/g, ' ').toLowerCase()}`} tone={executionPackTone} />
                 <WorkbenchItem label="EVIDENCE" value={`${(executionPackEvidence.symbols ?? []).slice(0, 3).join(', ') || 'system'} · max ${fmtPct(executionPackEvidence.max_return_pct)} · conf ${fmtFixed(executionPackEvidence.confidence_score, 0)}`} />
+                <WorkbenchItem label="SCORE" value={`${fmtFixed(workbenchPack.priority_score, 0)} · ${workbenchPack.mission_rank_reason || 'ranked by impact, confidence, safety, and risk'}`} />
                 <WorkbenchItem label="BENEFIT/RISK" value={`${executionPackEvidence.simulated_benefit_n ?? 0} / ${executionPackEvidence.weak_buy_risk_n ?? 0} · ${executionPackEvidence.gate_status || 'gate unknown'}`} />
                 <WorkbenchItem label="PATCH TARGET" value={executionPackTarget ? `${executionPackTarget.file || 'file'} · ${executionPackTarget.function || 'function'}` : 'target map pending'} />
               </div>
@@ -4978,7 +5058,7 @@ function DailyCryptoBriefPanel({
                     REPLAY TEST
                   </span>
                   <div style={{ ...MONO, fontSize: 9, color: '#d7e1ea', marginTop: 6, lineHeight: 1.45 }}>
-                    {executionPackRecipeStep?.label || 'Replay recipe pending.'}
+                    {topMission.proof || executionPackRecipeStep?.label || 'Replay recipe pending.'}
                   </div>
                   <pre style={{
                     ...MONO,
@@ -5283,7 +5363,7 @@ function DailyCryptoBriefPanel({
             </div>
             <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
               {topEscalationExecutionPack
-                ? `${String(topEscalationExecutionPack.risk_label || 'risk').replace(/_/g, ' ').toLowerCase()} · conf ${fmtFixed(topEscalationExecutionPack.evidence_bundle?.confidence_score, 0)} · benefit ${topEscalationExecutionPack.evidence_bundle?.simulated_benefit_n ?? 0}/risk ${topEscalationExecutionPack.evidence_bundle?.weak_buy_risk_n ?? 0}`
+                ? `score ${fmtFixed(topEscalationExecutionPack.priority_score, 0)} · ${String(topEscalationExecutionPack.risk_label || 'risk').replace(/_/g, ' ').toLowerCase()} · benefit ${topEscalationExecutionPack.evidence_bundle?.simulated_benefit_n ?? 0}/risk ${topEscalationExecutionPack.evidence_bundle?.weak_buy_risk_n ?? 0}`
                 : escalationExecutionPacks.next_action || 'No active execution pack.'}
             </div>
             {topEscalationExecutionPack?.replay_test_recipe?.[0]?.label && (
@@ -5291,6 +5371,34 @@ function DailyCryptoBriefPanel({
                 {topEscalationExecutionPack.replay_test_recipe[0].label}
               </div>
             )}
+          </div>
+
+          <div style={{ border: `1px solid ${(postPatchOutcomes.regression_count ?? 0) ? 'rgba(239,68,68,0.24)' : (postPatchOutcomes.tracked_count ?? 0) ? 'rgba(0,212,138,0.2)' : 'rgba(96,165,250,0.16)'}`, borderRadius: 10, padding: 10, background: (postPatchOutcomes.regression_count ?? 0) ? 'rgba(239,68,68,0.03)' : (postPatchOutcomes.tracked_count ?? 0) ? 'rgba(0,212,138,0.025)' : 'rgba(96,165,250,0.02)' }}>
+            <span style={{ ...MONO, fontSize: 8, color: (postPatchOutcomes.regression_count ?? 0) ? '#ef4444' : (postPatchOutcomes.tracked_count ?? 0) ? '#00d48a' : '#60a5fa', fontWeight: 900, letterSpacing: '0.14em' }}>
+              PATCH OUTCOMES
+            </span>
+            <div style={{ ...MONO, fontSize: 10, color: '#d7e1ea', marginTop: 7, lineHeight: 1.45 }}>
+              {postPatchOutcomes.status || 'NO_COMPLETED_PATCHES'} · tracked {postPatchOutcomes.tracked_count ?? 0} · regress {postPatchOutcomes.regression_count ?? 0}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              {topPostPatch
+                ? `${topPostPatch.group_key || 'patch'} · sample ${topPostPatch.sample_n ?? 0} · correct ${topPostPatch.correct_n ?? 0}/miss ${topPostPatch.missed_n ?? 0}`
+                : postPatchOutcomes.next_action || 'Complete a work order to begin patch tracking.'}
+            </div>
+          </div>
+
+          <div style={{ border: `1px solid ${(regressionGuard.freeze_count ?? 0) ? 'rgba(239,68,68,0.26)' : 'rgba(0,212,138,0.16)'}`, borderRadius: 10, padding: 10, background: (regressionGuard.freeze_count ?? 0) ? 'rgba(239,68,68,0.035)' : 'rgba(0,212,138,0.02)' }}>
+            <span style={{ ...MONO, fontSize: 8, color: (regressionGuard.freeze_count ?? 0) ? '#ef4444' : '#00d48a', fontWeight: 900, letterSpacing: '0.14em' }}>
+              REGRESSION GUARD
+            </span>
+            <div style={{ ...MONO, fontSize: 10, color: '#d7e1ea', marginTop: 7, lineHeight: 1.45 }}>
+              {regressionGuard.status || 'CLEAR'} · freezes {regressionGuard.freeze_count ?? 0}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              {topRegression
+                ? `${String(topRegression.source || 'guard').replace(/_/g, ' ')} · ${topRegression.reason || 'freeze active'}`
+                : regressionGuard.next_action || 'No regression freeze is active.'}
+            </div>
           </div>
 
           <div style={{ border: `1px solid ${(escalationMaturity.overdue_count ?? 0) ? 'rgba(239,68,68,0.24)' : (escalationMaturity.due_now_count ?? 0) ? 'rgba(245,158,11,0.24)' : 'rgba(96,165,250,0.18)'}`, borderRadius: 10, padding: 10, background: (escalationMaturity.overdue_count ?? 0) ? 'rgba(239,68,68,0.03)' : (escalationMaturity.due_now_count ?? 0) ? 'rgba(245,158,11,0.03)' : 'rgba(96,165,250,0.025)' }}>
