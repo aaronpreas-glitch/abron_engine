@@ -360,6 +360,8 @@ interface DailyCryptoBriefData {
     correctness_counts?: Record<string, number>
     by_lane?: Array<{ key?: string; sample_n?: number; correct?: number; missed?: number; pending?: number; accuracy_pct?: number | null }>
     by_failure?: Array<{ key?: string; sample_n?: number; correct?: number; missed?: number; pending?: number; accuracy_pct?: number | null }>
+    frozen_failure_classes?: string[]
+    frozen_lanes?: string[]
     missed_examples?: Array<{
       symbol?: string | null
       mint?: string | null
@@ -367,6 +369,15 @@ interface DailyCryptoBriefData {
       failure_class?: string | null
       correctness?: string | null
       max_return_pct?: number | null
+      return_1h_pct?: number | null
+      return_4h_pct?: number | null
+      return_24h_pct?: number | null
+      outcome_source?: string | null
+      outcome_1h_status?: string | null
+      outcome_4h_status?: string | null
+      outcome_24h_status?: string | null
+      alert_kind?: string | null
+      alert_ts?: string | null
       reason?: string | null
     }>
     next_action?: string | null
@@ -388,6 +399,20 @@ interface DailyCryptoBriefData {
       correctness?: string | null
     }>
     next_action?: string | null
+  }
+  provider_escalation_alerts?: {
+    status?: string
+    count?: number
+    items?: Array<{
+      ts_utc?: string | null
+      kind?: string | null
+      severity?: string | null
+      symbol?: string | null
+      mint?: string | null
+      message?: string | null
+      row_id?: number | null
+      data?: Record<string, unknown>
+    }>
   }
   rule_promotion_gate?: {
     status?: string
@@ -4535,6 +4560,7 @@ function DailyCryptoBriefPanel({
     const escalationQueue = data.provider_escalation_queue ?? {}
     const escalationAccuracy = data.provider_escalation_accuracy ?? {}
     const escalationMaturity = data.provider_escalation_maturity ?? {}
+    const escalationAlerts = data.provider_escalation_alerts ?? {}
     const ruleGate = data.rule_promotion_gate ?? {}
     const missedClusters = data.missed_runner_clusters ?? {}
     const catalystContext = data.catalyst_context ?? {}
@@ -4551,6 +4577,7 @@ function DailyCryptoBriefPanel({
     const topEscalation = escalationQueue.items?.[0]
     const topEscalationMiss = escalationAccuracy.missed_examples?.[0]
     const nextEscalationDue = escalationMaturity.next_due?.[0]
+    const topEscalationAlert = escalationAlerts.items?.[0]
     const buildHooks = data.daily_build_hooks ?? {}
     const countText = (counts: Record<string, number>, keys: string[]) =>
       keys.map(key => `${key.toLowerCase()} ${counts[key] ?? 0}`).join(' · ')
@@ -4779,8 +4806,22 @@ function DailyCryptoBriefPanel({
             </div>
             <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
               {topEscalationMiss
-                ? `${topEscalationMiss.symbol || 'UNKNOWN'} · ${String(topEscalationMiss.correctness || 'missed').replace(/_/g, ' ').toLowerCase()} · max ${fmtPct(topEscalationMiss.max_return_pct)}`
+                ? `${topEscalationMiss.symbol || 'UNKNOWN'} · ${String(topEscalationMiss.failure_class || 'blocker').replace(/_/g, ' ')} · max ${fmtPct(topEscalationMiss.max_return_pct)} · 1h ${fmtPct(topEscalationMiss.return_1h_pct)}`
                 : `correct ${escalationAccuracy.correct_n ?? 0} · missed ${escalationAccuracy.missed_n ?? 0} · pending ${escalationAccuracy.pending_n ?? 0}`}
+            </div>
+          </div>
+
+          <div style={{ border: `1px solid ${(escalationAlerts.count ?? 0) ? 'rgba(239,68,68,0.24)' : 'rgba(96,165,250,0.16)'}`, borderRadius: 10, padding: 10, background: (escalationAlerts.count ?? 0) ? 'rgba(239,68,68,0.03)' : 'rgba(96,165,250,0.02)' }}>
+            <span style={{ ...MONO, fontSize: 8, color: (escalationAlerts.count ?? 0) ? '#ef4444' : '#60a5fa', fontWeight: 900, letterSpacing: '0.14em' }}>
+              ESCALATION EVIDENCE
+            </span>
+            <div style={{ ...MONO, fontSize: 10, color: '#d7e1ea', marginTop: 7, lineHeight: 1.45 }}>
+              {escalationAlerts.status || 'CLEAR'} · alerts {escalationAlerts.count ?? 0}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              {topEscalationAlert
+                ? `${topEscalationAlert.symbol || 'SYSTEM'} · ${String(topEscalationAlert.kind || 'alert').replace(/_/g, ' ').toLowerCase()} · ${fmtAge(topEscalationAlert.ts_utc || null)}`
+                : `freeze ${(escalationAccuracy.frozen_failure_classes ?? []).slice(0, 2).join(', ') || 'none'}`}
             </div>
           </div>
 

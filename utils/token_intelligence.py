@@ -266,6 +266,8 @@ def _ensure_tables(conn) -> None:
             ("outcome_24h_correctness", "TEXT"),
             ("next_outcome_check_ts", "TEXT"),
             ("next_outcome_horizon", "TEXT"),
+            ("outcome_alert_kind", "TEXT"),
+            ("outcome_alert_ts", "TEXT"),
         ]:
             if col not in cols:
                 conn.execute(f"ALTER TABLE provider_repair_escalations ADD COLUMN {col} {col_type}")
@@ -1638,15 +1640,18 @@ def _apply_escalation_horizon_schedule(row: dict, outcome: dict, now: datetime) 
         updates[f"{prefix}_check_ts"] = now.isoformat()
         updates[f"{prefix}_correctness"] = classified.get("correctness")
 
-    final_correctness = (
-        updates.get("outcome_24h_correctness")
-        or row.get("outcome_24h_correctness")
-        or updates.get("outcome_4h_correctness")
-        or row.get("outcome_4h_correctness")
-        or updates.get("outcome_1h_correctness")
-        or row.get("outcome_1h_correctness")
-        or "PENDING_OUTCOME"
-    )
+    h1_correctness = updates.get("outcome_1h_correctness") or row.get("outcome_1h_correctness")
+    h4_correctness = updates.get("outcome_4h_correctness") or row.get("outcome_4h_correctness")
+    h24_correctness = updates.get("outcome_24h_correctness") or row.get("outcome_24h_correctness")
+    miss_labels = {"BLOCK_MISSED_RUNNER", "SUPPRESSION_TOO_AGGRESSIVE"}
+    if h24_correctness in miss_labels or h4_correctness in miss_labels or h1_correctness in miss_labels:
+        final_correctness = next(x for x in (h24_correctness, h4_correctness, h1_correctness) if x in miss_labels)
+    elif h24_correctness and h24_correctness != "PENDING_OUTCOME":
+        final_correctness = h24_correctness
+    elif h4_correctness and h4_correctness != "PENDING_OUTCOME":
+        final_correctness = h4_correctness
+    else:
+        final_correctness = "PENDING_OUTCOME"
     final_status = "COMPLETE" if (
         updates.get("outcome_24h_status")
         or row.get("outcome_24h_status")
@@ -1676,12 +1681,84 @@ def _apply_escalation_horizon_schedule(row: dict, outcome: dict, now: datetime) 
     return updates
 
 
+def _provider_escalation_alert_payload(conn) -> list[dict]:
+    try:
+        row = conn.execute("SELECT value FROM kv_store WHERE key='provider_escalation_outcome_alerts'").fetchone()
+        payload = json.loads(row[0]) if row and row[0] else []
+        return payload if isinstance(payload, list) else []
+    except Exception:
+        return []
+
+
+def _emit_provider_escalation_alert(
+    conn,
+    *,
+    kind: str,
+    severity: str,
+    symbol: str | None,
+    mint: str | None,
+    message: str,
+    row_id: int | None = None,
+    data: dict | None = None,
+) -> bool:
+    now = _now_iso()
+    kind = str(kind or "ESCALATION_ALERT").upper()
+    symbol = str(symbol or "").strip().upper() or None
+    mint = str(mint or "").strip() or None
+    key = f"{kind}:{row_id or mint or symbol or 'global'}"
+    alerts = _provider_escalation_alert_payload(conn)
+    if any(str(item.get("key") or "") == key for item in alerts):
+        return False
+    item = {
+        "key": key,
+        "kind": kind,
+        "severity": str(severity or "WATCH").upper(),
+        "symbol": symbol,
+        "mint": mint,
+        "message": str(message or "")[:500],
+        "ts_utc": now,
+        "row_id": row_id,
+        "data": dict(data or {}),
+    }
+    alerts.insert(0, item)
+    conn.execute(
+        "INSERT OR REPLACE INTO kv_store (key, value) VALUES (?, ?)",
+        ("provider_escalation_outcome_alerts", json.dumps(alerts[:60], separators=(",", ":"))),
+    )
+    if row_id:
+        try:
+            conn.execute(
+                """
+                UPDATE provider_repair_escalations
+                   SET outcome_alert_kind=?,
+                       outcome_alert_ts=?
+                 WHERE id=?
+                """,
+                (kind, now, int(row_id)),
+            )
+        except Exception:
+            pass
+    try:
+        if kind in {"BLOCK_MISSED_RUNNER", "SUPPRESSION_TOO_AGGRESSIVE", "ESCALATION_OUTCOME_OVERDUE", "ESCALATION_ACCURACY_REVIEW"}:
+            from utils.telegram_alerts import send_telegram_sync, should_rate_limit  # type: ignore
+
+            if not should_rate_limit(f"provider_escalation:{key}", 4 * 3600):
+                send_telegram_sync("Provider Escalation Alert", item["message"], emoji="!")
+    except Exception:
+        pass
+    return True
+
+
 def evaluate_provider_escalation_outcomes(limit: int = 120) -> dict:
     """Backtest reviewed provider escalations against later market outcomes."""
     now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
     stale_cutoff = (now - timedelta(minutes=55)).isoformat()
+    overdue_cutoff = (now - timedelta(minutes=30)).isoformat()
     checked = 0
     updated = 0
+    due_checked = 0
+    alerts_emitted = 0
     counts: dict[str, int] = {}
     try:
         with _get_conn() as conn:
@@ -1699,17 +1776,25 @@ def evaluate_provider_escalation_outcomes(limit: int = 120) -> dict:
                     )
                       AND (
                         outcome_check_ts IS NULL
-                        OR outcome_status='PENDING'
+                        OR (next_outcome_check_ts IS NOT NULL AND next_outcome_check_ts <= ?)
                         OR outcome_check_ts < ?
                       )
-                    ORDER BY COALESCE(last_action_ts, updated_ts, created_ts) DESC
+                    ORDER BY
+                        CASE WHEN next_outcome_check_ts IS NOT NULL AND next_outcome_check_ts <= ? THEN 1 ELSE 0 END DESC,
+                        COALESCE(next_outcome_check_ts, last_action_ts, updated_ts, created_ts) ASC
                     LIMIT ?
                     """,
-                    (stale_cutoff, max(1, int(limit))),
+                    (now_iso, stale_cutoff, now_iso, max(1, int(limit))),
                 ).fetchall()
             ]
             for row in rows:
                 checked += 1
+                row_id = int(row.get("id") or 0)
+                row_due_ts = str(row.get("next_outcome_check_ts") or "")
+                row_due_now = bool(row_due_ts and row_due_ts <= now_iso)
+                row_overdue = bool(row_due_ts and row_due_ts <= overdue_cutoff)
+                if row_due_now:
+                    due_checked += 1
                 outcome = _latest_escalation_outcome(conn, row)
                 classification = _classify_escalation_correctness(row, outcome, now)
                 horizon_updates = _apply_escalation_horizon_schedule(row, outcome, now)
@@ -1770,9 +1855,64 @@ def evaluate_provider_escalation_outcomes(limit: int = 120) -> dict:
                     ),
                 )
                 updated += 1
+                alert_kind = None
+                if correctness in {"BLOCK_MISSED_RUNNER", "SUPPRESSION_TOO_AGGRESSIVE"}:
+                    alert_kind = correctness
+                elif row_overdue:
+                    alert_kind = "ESCALATION_OUTCOME_OVERDUE"
+                if alert_kind:
+                    emitted = _emit_provider_escalation_alert(
+                        conn,
+                        kind=alert_kind,
+                        severity="CRITICAL" if "MISSED" in alert_kind or "AGGRESSIVE" in alert_kind else "WATCH",
+                        symbol=row.get("symbol"),
+                        mint=row.get("mint"),
+                        row_id=row_id,
+                        message=(
+                            f"{row.get('symbol') or 'UNKNOWN'} {alert_kind.replace('_', ' ').lower()} - "
+                            f"{row.get('failure_class') or 'unknown'} - "
+                            f"max {round(_f(out_row.get('max_return_pct')), 1)}% - "
+                            f"horizon {row.get('next_outcome_horizon') or 'outcome'}"
+                        ),
+                        data={
+                            "failure_class": row.get("failure_class"),
+                            "lane": row.get("escalation_lane"),
+                            "max_return_pct": out_row.get("max_return_pct"),
+                            "return_1h_pct": out_row.get("return_1h_pct"),
+                            "return_4h_pct": out_row.get("return_4h_pct"),
+                            "return_24h_pct": out_row.get("return_24h_pct"),
+                            "next_outcome_horizon": row.get("next_outcome_horizon"),
+                        },
+                    )
+                    alerts_emitted += 1 if emitted else 0
+            try:
+                judged = conn.execute(
+                    """
+                    SELECT blocker_correctness
+                    FROM provider_repair_escalations
+                    WHERE blocker_correctness IS NOT NULL
+                      AND blocker_correctness NOT IN ('PENDING_OUTCOME','PENDING')
+                    """
+                ).fetchall()
+                total = len(judged)
+                missed = sum(1 for r in judged if str(r["blocker_correctness"] or "").upper() in {"BLOCK_MISSED_RUNNER", "SUPPRESSION_TOO_AGGRESSIVE"})
+                accuracy = round(((total - missed) / max(1, total)) * 100.0, 1) if total else None
+                if total >= 5 and (missed > 0 or _f(accuracy, 100.0) < 70.0):
+                    emitted = _emit_provider_escalation_alert(
+                        conn,
+                        kind="ESCALATION_ACCURACY_REVIEW",
+                        severity="CRITICAL",
+                        symbol=None,
+                        mint=None,
+                        message=f"Escalation accuracy review required - accuracy {accuracy}% - missed {missed}/{total}.",
+                        data={"accuracy_pct": accuracy, "missed_n": missed, "sample_n": total},
+                    )
+                    alerts_emitted += 1 if emitted else 0
+            except Exception:
+                pass
     except Exception as exc:
-        return {"checked": checked, "updated": updated, "counts": counts, "error": str(exc)}
-    return {"checked": checked, "updated": updated, "counts": counts}
+        return {"checked": checked, "updated": updated, "due_checked": due_checked, "alerts_emitted": alerts_emitted, "counts": counts, "error": str(exc)}
+    return {"checked": checked, "updated": updated, "due_checked": due_checked, "alerts_emitted": alerts_emitted, "counts": counts}
 
 
 def _record_live_confirmation_status(payload: dict) -> None:

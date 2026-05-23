@@ -14822,6 +14822,15 @@ def _build_provider_escalation_accuracy(escalation_rows: list[dict]) -> dict:
                 "failure_class": failure,
                 "correctness": correctness,
                 "max_return_pct": _nullable_float(row.get("outcome_max_return_pct")),
+                "return_1h_pct": _nullable_float(row.get("outcome_return_1h_pct")),
+                "return_4h_pct": _nullable_float(row.get("outcome_return_4h_pct")),
+                "return_24h_pct": _nullable_float(row.get("outcome_return_24h_pct")),
+                "outcome_source": row.get("outcome_source"),
+                "outcome_1h_status": row.get("outcome_1h_status"),
+                "outcome_4h_status": row.get("outcome_4h_status"),
+                "outcome_24h_status": row.get("outcome_24h_status"),
+                "alert_kind": row.get("outcome_alert_kind"),
+                "alert_ts": row.get("outcome_alert_ts"),
                 "reason": row.get("outcome_reason"),
             })
     correct = sum(1 for row in complete if str(row.get("blocker_correctness") or "").upper() in correct_labels)
@@ -14852,6 +14861,16 @@ def _build_provider_escalation_accuracy(escalation_rows: list[dict]) -> dict:
         "correctness_counts": correctness_counts,
         "by_lane": _finish(lane_stats),
         "by_failure": _finish(failure_stats),
+        "frozen_failure_classes": sorted({
+            str(row.get("failure_class") or "unknown").lower()
+            for row in complete
+            if str(row.get("blocker_correctness") or "").upper() in miss_labels
+        }),
+        "frozen_lanes": sorted({
+            str(row.get("escalation_lane") or "UNKNOWN").upper()
+            for row in complete
+            if str(row.get("blocker_correctness") or "").upper() in miss_labels
+        }),
         "missed_examples": examples,
         "next_action": (
             "Inspect missed escalation blocks before trusting provider suppression."
@@ -14933,6 +14952,37 @@ def _build_provider_escalation_maturity(escalation_rows: list[dict], now: dateti
     }
 
 
+def _build_provider_escalation_alerts(raw_value: str | None) -> dict:
+    try:
+        rows = json.loads(raw_value or "[]")
+        if not isinstance(rows, list):
+            rows = []
+    except Exception:
+        rows = []
+    important = []
+    for item in rows[:20]:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("kind") or "").upper()
+        if kind not in {"BLOCK_MISSED_RUNNER", "SUPPRESSION_TOO_AGGRESSIVE", "ESCALATION_OUTCOME_OVERDUE", "ESCALATION_ACCURACY_REVIEW"}:
+            continue
+        important.append({
+            "ts_utc": item.get("ts_utc"),
+            "kind": kind,
+            "severity": item.get("severity"),
+            "symbol": item.get("symbol"),
+            "mint": item.get("mint"),
+            "message": item.get("message"),
+            "row_id": item.get("row_id"),
+            "data": item.get("data") if isinstance(item.get("data"), dict) else {},
+        })
+    return {
+        "status": "ACTIVE" if important else "CLEAR",
+        "count": len(important),
+        "items": important[:10],
+    }
+
+
 def _build_rule_promotion_gate(
     simulator: dict,
     watchdog: dict,
@@ -14949,6 +14999,8 @@ def _build_rule_promotion_gate(
     escalation_accuracy_raw = (escalation_accuracy or {}).get("accuracy_pct")
     escalation_accuracy_pct = _gb_float(escalation_accuracy_raw, 100.0)
     escalation_missed = int((escalation_accuracy or {}).get("missed_n") or 0)
+    frozen_failures = list((escalation_accuracy or {}).get("frozen_failure_classes") or [])
+    frozen_lanes = list((escalation_accuracy or {}).get("frozen_lanes") or [])
     if not top:
         status = "NO_RULE"
         reason = "No simulator candidate has enough outcome evidence."
@@ -14958,7 +15010,10 @@ def _build_rule_promotion_gate(
     elif provider_hit_rate < 35 and int((provider_reliability or {}).get("attempts_24h") or 0) >= 8:
         status = "BLOCKED_PROVIDER_REPAIR"
         reason = "Provider repair hit rate is too weak to trust rule promotion."
-    elif escalation_sample >= 5 and (escalation_missed > 0 or escalation_accuracy_pct < 70):
+    elif escalation_missed > 0:
+        status = "BLOCKED_ESCALATION_MISS"
+        reason = "A provider escalation blocker missed a runner; freeze this blocker class until reviewed."
+    elif escalation_sample >= 5 and escalation_accuracy_pct < 70:
         status = "BLOCKED_ESCALATION_ACCURACY"
         reason = "Escalation backtests show missed runners or weak blocker correctness."
     elif int(top.get("net_score") or 0) < 8:
@@ -14980,6 +15035,8 @@ def _build_rule_promotion_gate(
             "provider_repair_hit_rate_pct": provider_hit_rate,
             "escalation_accuracy_pct": _nullable_float(escalation_accuracy_raw),
             "escalation_sample_n": escalation_sample,
+            "frozen_failure_classes": frozen_failures,
+            "frozen_lanes": frozen_lanes,
         },
     }
 
@@ -15339,7 +15396,8 @@ def _build_daily_crypto_brief(lookback_hours: int = 24) -> dict:
                                outcome_1h_status, outcome_1h_check_ts, outcome_1h_correctness,
                                outcome_4h_status, outcome_4h_check_ts, outcome_4h_correctness,
                                outcome_24h_status, outcome_24h_check_ts, outcome_24h_correctness,
-                               next_outcome_check_ts, next_outcome_horizon
+                               next_outcome_check_ts, next_outcome_horizon,
+                               outcome_alert_kind, outcome_alert_ts
                         FROM provider_repair_escalations
                         WHERE created_ts >= ?
                            OR updated_ts >= ?
@@ -15356,7 +15414,7 @@ def _build_daily_crypto_brief(lookback_hours: int = 24) -> dict:
                 kv_rows = {
                     str(r["key"]): str(r["value"] or "")
                     for r in conn.execute(
-                        "SELECT key, value FROM kv_store WHERE key IN ('narrative_trending')"
+                        "SELECT key, value FROM kv_store WHERE key IN ('narrative_trending','provider_escalation_outcome_alerts')"
                     ).fetchall()
                 }
             except Exception:
@@ -15494,6 +15552,7 @@ def _build_daily_crypto_brief(lookback_hours: int = 24) -> dict:
     provider_escalation_queue = _build_provider_escalation_queue(escalation_rows, now)
     provider_escalation_accuracy = _build_provider_escalation_accuracy(escalation_rows)
     provider_escalation_maturity = _build_provider_escalation_maturity(escalation_rows, now)
+    provider_escalation_alerts = _build_provider_escalation_alerts(kv_rows.get("provider_escalation_outcome_alerts"))
     rule_promotion_gate = _build_rule_promotion_gate(
         rule_simulator,
         data_watchdog,
@@ -15552,6 +15611,8 @@ def _build_daily_crypto_brief(lookback_hours: int = 24) -> dict:
         next_actions.append(str(provider_escalation_accuracy.get("next_action") or "Review missed escalation outcomes."))
     if int(provider_escalation_maturity.get("due_now_count") or 0):
         next_actions.append(str(provider_escalation_maturity.get("next_action") or "Run due escalation outcome checks."))
+    if int(provider_escalation_alerts.get("count") or 0):
+        next_actions.append("Review provider escalation outcome alerts before rule promotion.")
     if missed_count:
         next_actions.append("Review missed-runner blockers and scout-only timing.")
     if weak_count:
@@ -15602,6 +15663,7 @@ def _build_daily_crypto_brief(lookback_hours: int = 24) -> dict:
         "provider_escalation_queue": provider_escalation_queue,
         "provider_escalation_accuracy": provider_escalation_accuracy,
         "provider_escalation_maturity": provider_escalation_maturity,
+        "provider_escalation_alerts": provider_escalation_alerts,
         "rule_promotion_gate": rule_promotion_gate,
         "missed_runner_clusters": missed_runner_clusters,
         "catalyst_context": catalyst_context,
