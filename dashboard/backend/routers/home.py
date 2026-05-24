@@ -18993,6 +18993,279 @@ def _build_provider_truth_miss_accumulator_score(
     }
 
 
+def _provider_truth_timeline_event_id(item: dict, event_type: str, ts_value) -> str:
+    key = _provider_truth_queue_key(item)
+    ts = str(ts_value or "").strip()
+    return f"{key}:{str(event_type or '').upper()}:{ts}" if key and ts else ""
+
+
+def _build_provider_truth_miss_evidence_timeline(
+    matcher: dict,
+    queue: dict,
+    refresh: dict,
+    now: datetime,
+) -> dict:
+    kv_key = "provider_truth_miss_evidence_timeline"
+    previous = _freshness_kv_read(kv_key)
+    events_by_id = {
+        str(event.get("event_id") or ""): dict(event)
+        for event in list((previous or {}).get("events") or [])
+        if str(event.get("event_id") or "")
+    }
+    pattern = dict((queue or {}).get("pattern") or (matcher or {}).get("pattern") or {})
+
+    for item in list((queue or {}).get("items") or []):
+        item = dict(item)
+        event_id = _provider_truth_timeline_event_id(item, "QUEUED_MATCH", item.get("first_seen_at"))
+        if not event_id or event_id in events_by_id:
+            continue
+        events_by_id[event_id] = {
+            "event_id": event_id,
+            "event_type": "QUEUED_MATCH",
+            "ts_utc": item.get("first_seen_at") or now.isoformat(),
+            "key": _provider_truth_queue_key(item),
+            "symbol": item.get("symbol"),
+            "mint": item.get("mint"),
+            "patch_type": item.get("patch_type") or pattern.get("patch_type"),
+            "source": item.get("source"),
+            "preferred_source": item.get("preferred_source") or pattern.get("preferred_source"),
+            "current_source": item.get("current_source"),
+            "route": item.get("route"),
+            "failure_class": item.get("failure_class"),
+            "similarity_score": item.get("similarity_score"),
+            "evidence_outcome": item.get("evidence_outcome"),
+            "quality": item.get("current_quality"),
+            "pressure": item.get("current_pressure"),
+            "freshness": item.get("current_freshness"),
+            "confidence": item.get("current_confidence"),
+            "marketcap": item.get("current_marketcap"),
+            "liquidity": item.get("current_liquidity"),
+            "refresh_count": int(item.get("refresh_count") or 0),
+        }
+
+    for item in list((refresh or {}).get("items") or []):
+        item = dict(item)
+        event_id = _provider_truth_timeline_event_id(item, "EVIDENCE_REFRESH", item.get("last_refresh_at"))
+        if not event_id or event_id in events_by_id:
+            continue
+        events_by_id[event_id] = {
+            "event_id": event_id,
+            "event_type": "EVIDENCE_REFRESH",
+            "ts_utc": item.get("last_refresh_at") or now.isoformat(),
+            "key": _provider_truth_queue_key(item),
+            "symbol": item.get("symbol"),
+            "mint": item.get("mint"),
+            "patch_type": item.get("patch_type") or pattern.get("patch_type"),
+            "source": item.get("source"),
+            "preferred_source": item.get("preferred_source") or pattern.get("preferred_source"),
+            "current_source": item.get("current_source"),
+            "route": item.get("route"),
+            "failure_class": item.get("failure_class"),
+            "similarity_score": item.get("similarity_score"),
+            "evidence_outcome": item.get("evidence_outcome") or item.get("status"),
+            "quality": item.get("current_quality"),
+            "pressure": item.get("current_pressure"),
+            "freshness": item.get("current_freshness"),
+            "confidence": item.get("current_confidence"),
+            "marketcap": item.get("current_marketcap"),
+            "liquidity": item.get("current_liquidity"),
+            "refresh_count": int(item.get("refresh_count") or 0),
+        }
+
+    events = list(events_by_id.values())
+    events.sort(key=lambda x: _gb_parse_ts(x.get("ts_utc")) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    events = events[:500]
+    refresh_events = [event for event in events if str(event.get("event_type") or "").upper() == "EVIDENCE_REFRESH"]
+    payload = {
+        "status": "TRACKING" if events else "EMPTY",
+        "updated_at": now.isoformat(),
+        "pattern": pattern,
+        "event_count": len(events),
+        "refresh_event_count": len(refresh_events),
+        "queued_event_count": len(events) - len(refresh_events),
+        "latest_event_at": events[0].get("ts_utc") if events else None,
+        "events": events,
+        "items": events[:20],
+        "next_action": (
+            "Score before/after evidence changes from the replay timeline."
+            if events
+            else "Timeline will begin once a similar miss is queued or refreshed."
+        ),
+    }
+    _freshness_kv_write(kv_key, payload)
+    return payload
+
+
+def _build_provider_truth_before_after_score(timeline: dict, now: datetime) -> dict:
+    grouped: dict[str, list[dict]] = {}
+    for event in list((timeline or {}).get("events") or []):
+        key = str(event.get("key") or _provider_truth_queue_key(event) or "")
+        if key:
+            grouped.setdefault(key, []).append(dict(event))
+
+    items = []
+    improved = 0
+    worsened = 0
+    unchanged = 0
+    for key, events in grouped.items():
+        events.sort(key=lambda x: _gb_parse_ts(x.get("ts_utc")) or datetime.min.replace(tzinfo=timezone.utc))
+        first = events[0]
+        latest = events[-1]
+        first_quality = _gb_float(first.get("quality"))
+        latest_quality = _gb_float(latest.get("quality"))
+        first_pressure = _gb_float(first.get("pressure"))
+        latest_pressure = _gb_float(latest.get("pressure"))
+        quality_delta = round(latest_quality - first_quality, 1)
+        pressure_delta = round(latest_pressure - first_pressure, 1)
+        marketcap_delta_pct = _gb_pct(_gb_float(latest.get("marketcap")), _gb_float(first.get("marketcap")))
+        first_outcome = str(first.get("evidence_outcome") or "").upper()
+        latest_outcome = str(latest.get("evidence_outcome") or "").upper()
+
+        if latest_outcome == "EVIDENCE_BENEFIT" and first_outcome != "EVIDENCE_BENEFIT":
+            direction = "IMPROVED"
+        elif latest_outcome == "EVIDENCE_RISK" and first_outcome != "EVIDENCE_RISK":
+            direction = "WORSENED"
+        elif quality_delta >= 8 or pressure_delta >= 8 or _gb_float(marketcap_delta_pct) >= 15:
+            direction = "IMPROVED"
+        elif quality_delta <= -8 or pressure_delta <= -8 or _gb_float(marketcap_delta_pct) <= -25:
+            direction = "WORSENED"
+        else:
+            direction = "UNCHANGED"
+
+        if direction == "IMPROVED":
+            improved += 1
+        elif direction == "WORSENED":
+            worsened += 1
+        else:
+            unchanged += 1
+
+        items.append({
+            "key": key,
+            "symbol": latest.get("symbol") or first.get("symbol"),
+            "mint": latest.get("mint") or first.get("mint"),
+            "event_count": len(events),
+            "first_seen_at": first.get("ts_utc"),
+            "latest_seen_at": latest.get("ts_utc"),
+            "first_outcome": first_outcome or None,
+            "latest_outcome": latest_outcome or None,
+            "first_quality": _nullable_float(first.get("quality")),
+            "latest_quality": _nullable_float(latest.get("quality")),
+            "quality_delta": quality_delta,
+            "first_pressure": _nullable_float(first.get("pressure")),
+            "latest_pressure": _nullable_float(latest.get("pressure")),
+            "pressure_delta": pressure_delta,
+            "marketcap_delta_pct": marketcap_delta_pct,
+            "direction": direction,
+        })
+
+    items.sort(key=lambda x: (
+        1 if x.get("direction") == "IMPROVED" else 0,
+        _gb_float(x.get("event_count")),
+        _gb_float(x.get("quality_delta")),
+    ), reverse=True)
+    sample_n = len(items)
+    status = "IMPROVING" if improved > worsened and improved else "DEGRADING" if worsened > improved else "TRACKING" if sample_n else "EMPTY"
+    return {
+        "status": status,
+        "sample_n": sample_n,
+        "improved_count": improved,
+        "worsened_count": worsened,
+        "unchanged_count": unchanged,
+        "items": items[:20],
+        "next_action": (
+            "Use before/after evidence to update the patch confidence curve."
+            if sample_n
+            else "Need timeline events before before/after scoring can run."
+        ),
+        "updated_at": now.isoformat(),
+    }
+
+
+def _build_provider_truth_patch_confidence_curve(
+    accumulator_score: dict,
+    timeline: dict,
+    before_after: dict,
+    now: datetime,
+) -> dict:
+    events = sorted(
+        list((timeline or {}).get("events") or []),
+        key=lambda x: _gb_parse_ts(x.get("ts_utc")) or datetime.min.replace(tzinfo=timezone.utc),
+    )
+    points = []
+    latest_outcome_by_key: dict[str, str] = {}
+    for event in events:
+        key = str(event.get("key") or _provider_truth_queue_key(event) or "")
+        outcome = str(event.get("evidence_outcome") or "").upper()
+        if key and outcome in {"EVIDENCE_BENEFIT", "EVIDENCE_RISK", "EVIDENCE_NEUTRAL"}:
+            latest_outcome_by_key[key] = outcome
+        benefit = len([v for v in latest_outcome_by_key.values() if v == "EVIDENCE_BENEFIT"])
+        risk = len([v for v in latest_outcome_by_key.values() if v == "EVIDENCE_RISK"])
+        neutral = len([v for v in latest_outcome_by_key.values() if v == "EVIDENCE_NEUTRAL"])
+        sample = max(1, len(latest_outcome_by_key))
+        progress_score = min(40.0, (sample / max(1, int((accumulator_score or {}).get("needed_sample_n") or 3))) * 40.0)
+        edge_score = max(-30.0, min(35.0, ((benefit - risk) / sample) * 35.0))
+        confidence = round(max(0.0, min(100.0, 25.0 + progress_score + edge_score)), 1)
+        points.append({
+            "ts_utc": event.get("ts_utc"),
+            "sample_n": sample,
+            "benefit_count": benefit,
+            "risk_count": risk,
+            "neutral_count": neutral,
+            "confidence_score": confidence,
+        })
+
+    if not points:
+        sample = int((accumulator_score or {}).get("sample_n") or 0)
+        benefit = int((accumulator_score or {}).get("benefit_count") or 0)
+        risk = int((accumulator_score or {}).get("risk_count") or 0)
+        neutral = int((accumulator_score or {}).get("neutral_count") or 0)
+        if sample <= 0:
+            confidence = 0.0
+        else:
+            progress_score = min(40.0, (sample / max(1, int((accumulator_score or {}).get("needed_sample_n") or 3))) * 40.0)
+            edge_score = max(-30.0, min(35.0, ((benefit - risk) / max(1, sample)) * 35.0))
+            confidence = round(max(0.0, min(100.0, 25.0 + progress_score + edge_score)), 1)
+        points.append({
+            "ts_utc": now.isoformat(),
+            "sample_n": sample,
+            "benefit_count": benefit,
+            "risk_count": risk,
+            "neutral_count": neutral,
+            "confidence_score": confidence,
+        })
+
+    latest = points[-1]
+    previous = points[-2] if len(points) >= 2 else None
+    delta = round(_gb_float(latest.get("confidence_score")) - _gb_float((previous or {}).get("confidence_score"), _gb_float(latest.get("confidence_score"))), 1)
+    improved = int((before_after or {}).get("improved_count") or 0)
+    worsened = int((before_after or {}).get("worsened_count") or 0)
+    if delta >= 5 or improved > worsened:
+        trend = "STRENGTHENING"
+    elif delta <= -5 or worsened > improved:
+        trend = "WEAKENING"
+    elif int(latest.get("sample_n") or 0) <= 0:
+        trend = "WAITING"
+    else:
+        trend = "FLAT"
+    return {
+        "status": "TRACKING" if events or int(latest.get("sample_n") or 0) > 0 else "WAITING",
+        "trend": trend,
+        "confidence_score": latest.get("confidence_score"),
+        "confidence_delta": delta,
+        "point_count": len(points),
+        "latest_point": latest,
+        "points": points[-20:],
+        "next_action": (
+            "Confidence curve is strengthening; keep collecting until manual review gates are met."
+            if trend == "STRENGTHENING"
+            else "Confidence curve is weakening; do not loosen provider-truth policy."
+            if trend == "WEAKENING"
+            else "Keep collecting timeline points before trusting the curve."
+        ),
+        "updated_at": now.isoformat(),
+    }
+
+
 def _build_provider_truth_miss_evidence_accumulator(
     miss_review: dict,
     miss_repair_workbench: dict,
@@ -19013,6 +19286,9 @@ def _build_provider_truth_miss_evidence_accumulator(
         learning_score,
         now,
     )
+    timeline = _build_provider_truth_miss_evidence_timeline(matcher, queue_after_refresh, refresh, now)
+    before_after = _build_provider_truth_before_after_score(timeline, now)
+    confidence_curve = _build_provider_truth_patch_confidence_curve(score, timeline, before_after, now)
     return {
         "status": score.get("status"),
         "readiness_state": score.get("readiness_state"),
@@ -19020,6 +19296,9 @@ def _build_provider_truth_miss_evidence_accumulator(
         "evidence_queue": queue_after_refresh,
         "due_evidence_refresh": refresh,
         "accumulator_score": score,
+        "evidence_timeline": timeline,
+        "before_after_score": before_after,
+        "patch_confidence_curve": confidence_curve,
         "next_action": score.get("next_action"),
     }
 
@@ -19390,6 +19669,9 @@ def _build_dashboard_provider_truth_panel(
     miss_evidence_accumulator = dict(miss_evidence_accumulator or {})
     miss_evidence_queue = dict(miss_evidence_accumulator.get("evidence_queue") or {})
     miss_evidence_score = dict(miss_evidence_accumulator.get("accumulator_score") or {})
+    miss_evidence_timeline = dict(miss_evidence_accumulator.get("evidence_timeline") or {})
+    miss_evidence_before_after = dict(miss_evidence_accumulator.get("before_after_score") or {})
+    miss_evidence_curve = dict(miss_evidence_accumulator.get("patch_confidence_curve") or {})
     status = (
         "BLOCKED"
         if str((agreement_layer or {}).get("status") or "").upper() == "BLOCKED"
@@ -19450,6 +19732,14 @@ def _build_dashboard_provider_truth_panel(
         "miss_evidence_queued_count": int(miss_evidence_score.get("queued_count") or miss_evidence_queue.get("queued_count") or 0),
         "miss_evidence_due_count": int(miss_evidence_score.get("due_count") or miss_evidence_queue.get("due_count") or 0),
         "miss_evidence_next_refresh_at": miss_evidence_queue.get("next_refresh_at"),
+        "miss_timeline_event_count": int(miss_evidence_timeline.get("event_count") or 0),
+        "miss_timeline_refresh_count": int(miss_evidence_timeline.get("refresh_event_count") or 0),
+        "miss_before_after_status": miss_evidence_before_after.get("status"),
+        "miss_before_after_improved_count": int(miss_evidence_before_after.get("improved_count") or 0),
+        "miss_before_after_worsened_count": int(miss_evidence_before_after.get("worsened_count") or 0),
+        "miss_confidence_score": miss_evidence_curve.get("confidence_score"),
+        "miss_confidence_trend": miss_evidence_curve.get("trend"),
+        "miss_confidence_point_count": int(miss_evidence_curve.get("point_count") or 0),
         "top_symbol": top_agreement.get("symbol"),
         "top_status": top_agreement.get("status"),
         "top_best_source": top_arbitration.get("best_source"),

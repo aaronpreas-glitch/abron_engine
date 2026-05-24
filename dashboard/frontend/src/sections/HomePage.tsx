@@ -1109,6 +1109,26 @@ interface DailyCryptoBriefData {
         due_count?: number
         refreshed_count?: number
       }
+      evidence_timeline?: {
+        status?: string
+        event_count?: number
+        refresh_event_count?: number
+        latest_event_at?: string | null
+      }
+      before_after_score?: {
+        status?: string
+        sample_n?: number
+        improved_count?: number
+        worsened_count?: number
+        unchanged_count?: number
+      }
+      patch_confidence_curve?: {
+        status?: string
+        trend?: string
+        confidence_score?: number | null
+        confidence_delta?: number | null
+        point_count?: number
+      }
       next_action?: string | null
     }
     dashboard_provider_truth_panel?: {
@@ -1160,6 +1180,14 @@ interface DailyCryptoBriefData {
       miss_evidence_queued_count?: number
       miss_evidence_due_count?: number
       miss_evidence_next_refresh_at?: string | null
+      miss_timeline_event_count?: number
+      miss_timeline_refresh_count?: number
+      miss_before_after_status?: string | null
+      miss_before_after_improved_count?: number
+      miss_before_after_worsened_count?: number
+      miss_confidence_score?: number | null
+      miss_confidence_trend?: string | null
+      miss_confidence_point_count?: number
       top_symbol?: string | null
       top_status?: string
       top_best_source?: string | null
@@ -5822,6 +5850,9 @@ function DailyCryptoBriefPanel({
     const providerTruthMissEvidence = providerTruth.provider_truth_miss_evidence_accumulator ?? {}
     const providerTruthMissEvidenceScore = providerTruthMissEvidence.accumulator_score ?? {}
     const providerTruthMissEvidenceQueue = providerTruthMissEvidence.evidence_queue ?? {}
+    const providerTruthMissEvidenceTimeline = providerTruthMissEvidence.evidence_timeline ?? {}
+    const providerTruthMissBeforeAfter = providerTruthMissEvidence.before_after_score ?? {}
+    const providerTruthMissCurve = providerTruthMissEvidence.patch_confidence_curve ?? {}
     const topProviderTruthItem = providerTruthAgreement.items?.[0]
     const topProviderTruthSource = providerTruthSourceMap.providers?.[0]
     const topFallbackRoute = providerTruthFallback.routes?.[0]
@@ -6388,6 +6419,9 @@ function DailyCryptoBriefPanel({
             </div>
             <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
               evidence {providerTruthPanel.miss_evidence_sample_n ?? providerTruthMissEvidenceScore.sample_n ?? 0}/{providerTruthPanel.miss_evidence_needed_n ?? providerTruthMissEvidenceScore.needed_sample_n ?? 3} · queued {providerTruthPanel.miss_evidence_queued_count ?? providerTruthMissEvidenceQueue.queued_count ?? 0} · due {providerTruthPanel.miss_evidence_due_count ?? providerTruthMissEvidenceQueue.due_count ?? 0} · {String(providerTruthPanel.miss_evidence_readiness || providerTruthMissEvidence.readiness_state || providerTruthMissEvidenceScore.readiness_state || 'watch more').replace(/_/g, ' ').toLowerCase()}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              timeline {providerTruthPanel.miss_timeline_event_count ?? providerTruthMissEvidenceTimeline.event_count ?? 0} · refresh {providerTruthPanel.miss_timeline_refresh_count ?? providerTruthMissEvidenceTimeline.refresh_event_count ?? 0} · before/after +{providerTruthPanel.miss_before_after_improved_count ?? providerTruthMissBeforeAfter.improved_count ?? 0}/-{providerTruthPanel.miss_before_after_worsened_count ?? providerTruthMissBeforeAfter.worsened_count ?? 0} · curve {fmtFixed(providerTruthPanel.miss_confidence_score ?? providerTruthMissCurve.confidence_score, 0)} {String(providerTruthPanel.miss_confidence_trend || providerTruthMissCurve.trend || 'waiting').replace(/_/g, ' ').toLowerCase()}
             </div>
             <div style={{ ...MONO, fontSize: 8, color: '#9db7ce', marginTop: 5, lineHeight: 1.45 }}>
               {topFallbackRoute?.symbol
