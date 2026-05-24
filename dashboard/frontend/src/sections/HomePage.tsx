@@ -1183,6 +1183,36 @@ interface DailyCryptoBriefData {
         manual_only?: boolean
         auto_apply_enabled?: boolean
       }
+      approval_evidence_summary?: {
+        status?: string
+        evidence_count?: number
+        benefit_count?: number
+        risk_count?: number
+        neutral_count?: number
+        top_items?: Array<{
+          symbol?: string | null
+          evidence_outcome?: string | null
+          quality?: number | null
+          pressure?: number | null
+        }>
+      }
+      risk_explanation?: {
+        status?: string
+        risk_zero?: boolean
+        risk_count?: number
+        reasons?: string[]
+        would_become_nonzero_if?: string[]
+      }
+      approval_consequences?: {
+        status?: string
+        consequence_count?: number
+      }
+      decision_audit_trail?: {
+        status?: string
+        event_count?: number
+        latest_state?: string | null
+        latest_event_at?: string | null
+      }
       next_action?: string | null
     }
     dashboard_provider_truth_panel?: {
@@ -1259,6 +1289,16 @@ interface DailyCryptoBriefData {
       miss_work_order_checklist_passed?: number
       miss_work_order_checklist_total?: number
       miss_work_order_recipe_count?: number
+      miss_approval_evidence_status?: string | null
+      miss_approval_evidence_count?: number
+      miss_approval_top_symbol?: string | null
+      miss_approval_top_outcome?: string | null
+      miss_risk_status?: string | null
+      miss_risk_zero?: boolean
+      miss_risk_count?: number
+      miss_consequence_count?: number
+      miss_audit_event_count?: number
+      miss_audit_latest_state?: string | null
       top_symbol?: string | null
       top_status?: string
       top_best_source?: string | null
@@ -5936,6 +5976,11 @@ function DailyCryptoBriefPanel({
     const providerTruthMissTargetMap = providerTruthMissEvidence.patch_target_map ?? {}
     const providerTruthMissChecklist = providerTruthMissEvidence.implementation_checklist ?? {}
     const providerTruthMissSimulation = providerTruthMissEvidence.simulation_test_recipe ?? {}
+    const providerTruthMissApprovalEvidence = providerTruthMissEvidence.approval_evidence_summary ?? {}
+    const providerTruthMissTopApprovalEvidence = providerTruthMissApprovalEvidence.top_items?.[0]
+    const providerTruthMissRiskExplanation = providerTruthMissEvidence.risk_explanation ?? {}
+    const providerTruthMissConsequences = providerTruthMissEvidence.approval_consequences ?? {}
+    const providerTruthMissAudit = providerTruthMissEvidence.decision_audit_trail ?? {}
     const topProviderTruthItem = providerTruthAgreement.items?.[0]
     const topProviderTruthSource = providerTruthSourceMap.providers?.[0]
     const topFallbackRoute = providerTruthFallback.routes?.[0]
@@ -6511,6 +6556,9 @@ function DailyCryptoBriefPanel({
             </div>
             <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
               work order {String(providerTruthPanel.miss_work_order_status || providerTruthMissWorkOrder.status || 'blocked by approval').replace(/_/g, ' ').toLowerCase()} · targets {providerTruthPanel.miss_work_order_target_count ?? providerTruthMissWorkOrder.target_count ?? providerTruthMissTargetMap.target_count ?? 0} · checklist {providerTruthPanel.miss_work_order_checklist_passed ?? providerTruthMissWorkOrder.checklist_passed ?? providerTruthMissChecklist.passed_required ?? 0}/{providerTruthPanel.miss_work_order_checklist_total ?? providerTruthMissWorkOrder.checklist_total ?? providerTruthMissChecklist.total_required ?? 0} · tests {providerTruthPanel.miss_work_order_recipe_count ?? providerTruthMissWorkOrder.recipe_count ?? providerTruthMissSimulation.recipe_count ?? 0}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              approval evidence {providerTruthPanel.miss_approval_evidence_count ?? providerTruthMissApprovalEvidence.evidence_count ?? 0} · top {providerTruthPanel.miss_approval_top_symbol || providerTruthMissTopApprovalEvidence?.symbol || 'none'} {String(providerTruthPanel.miss_approval_top_outcome || providerTruthMissTopApprovalEvidence?.evidence_outcome || 'waiting').replace(/_/g, ' ').toLowerCase()} · risk {providerTruthPanel.miss_risk_zero ?? providerTruthMissRiskExplanation.risk_zero ? 'zero' : 'review'} · consequences {providerTruthPanel.miss_consequence_count ?? providerTruthMissConsequences.consequence_count ?? 0} · audit {providerTruthPanel.miss_audit_event_count ?? providerTruthMissAudit.event_count ?? 0}
             </div>
             {(providerTruthPanel.miss_review_key || providerTruthMissReviewPacket.review_key) && onProviderTruthMissReviewAction && (
               <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 8 }}>

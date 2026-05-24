@@ -40,6 +40,7 @@ _PROVIDER_ESCALATION_REVIEW_STATES_KEY = "provider_escalation_review_states"
 _PROVIDER_ESCALATION_PATCH_STATES_KEY = "provider_escalation_patch_states"
 _PROVIDER_ESCALATION_WORK_ORDER_STATES_KEY = "provider_escalation_work_order_states"
 _PROVIDER_TRUTH_MISS_REVIEW_STATES_KEY = "provider_truth_miss_review_states"
+_PROVIDER_TRUTH_MISS_REVIEW_AUDIT_KEY = "provider_truth_miss_review_audit"
 _LIVE_CONTEXT_MISSION_STATES_KEY = "live_context_mission_states"
 _LIVE_CONTEXT_MISSION_OUTCOME_JOURNAL_KEY = "live_context_mission_outcome_journal"
 _REPLAY_EVIDENCE_SNAPSHOT_KEY = "replay_evidence_snapshot"
@@ -19807,6 +19808,201 @@ def _build_provider_truth_policy_work_order(
     }
 
 
+def _build_provider_truth_approval_evidence_summary(
+    review_packet: dict,
+    accumulator_score: dict,
+    timeline: dict,
+    dry_run_preview: dict,
+    now: datetime,
+) -> dict:
+    evidence = []
+    latest_event_by_key: dict[str, dict] = {}
+    for event in list((timeline or {}).get("events") or []):
+        key = str(event.get("key") or _provider_truth_queue_key(event) or "")
+        if not key:
+            continue
+        prev = latest_event_by_key.get(key)
+        if not prev or (_gb_parse_ts(event.get("ts_utc")) or datetime.min.replace(tzinfo=timezone.utc)) > (_gb_parse_ts(prev.get("ts_utc")) or datetime.min.replace(tzinfo=timezone.utc)):
+            latest_event_by_key[key] = dict(event)
+
+    for item in list((accumulator_score or {}).get("items") or []):
+        item = dict(item)
+        key = str(item.get("key") or _provider_truth_queue_key(item) or "")
+        event = latest_event_by_key.get(key, {})
+        outcome = str(item.get("evidence_outcome") or event.get("evidence_outcome") or "").upper()
+        evidence.append({
+            "key": key or None,
+            "symbol": item.get("symbol") or event.get("symbol"),
+            "mint": item.get("mint") or event.get("mint"),
+            "evidence_outcome": outcome or None,
+            "evidence_source": item.get("evidence_source") or "ACCUMULATED_REVIEW",
+            "current_source": item.get("current_source") or event.get("current_source"),
+            "source": item.get("source") or event.get("source"),
+            "quality": item.get("current_quality") if item.get("current_quality") is not None else event.get("quality"),
+            "pressure": item.get("current_pressure") if item.get("current_pressure") is not None else event.get("pressure"),
+            "freshness": item.get("current_freshness") or event.get("freshness"),
+            "confidence": item.get("current_confidence") or event.get("confidence"),
+            "similarity_score": item.get("similarity_score") or event.get("similarity_score"),
+            "latest_event_at": event.get("ts_utc"),
+            "operator_read": (
+                "Supports the patch candidate."
+                if outcome == "EVIDENCE_BENEFIT"
+                else "Would block the patch if it appeared as risk."
+                if outcome == "EVIDENCE_RISK"
+                else "Neutral; useful for context but not approval weight."
+            ),
+        })
+
+    if not evidence:
+        for item in list((dry_run_preview or {}).get("items") or [])[:8]:
+            item = dict(item)
+            evidence.append({
+                "key": _provider_truth_queue_key(item) or None,
+                "symbol": item.get("symbol"),
+                "mint": item.get("mint"),
+                "evidence_outcome": item.get("evidence_outcome"),
+                "current_source": item.get("current_source"),
+                "source": item.get("source"),
+                "quality": item.get("quality"),
+                "pressure": item.get("pressure"),
+                "latest_event_at": None,
+                "operator_read": "Dry-run preview item.",
+            })
+
+    benefit_items = [item for item in evidence if str(item.get("evidence_outcome") or "").upper() == "EVIDENCE_BENEFIT"]
+    risk_items = [item for item in evidence if str(item.get("evidence_outcome") or "").upper() == "EVIDENCE_RISK"]
+    neutral_items = [item for item in evidence if str(item.get("evidence_outcome") or "").upper() == "EVIDENCE_NEUTRAL"]
+    return {
+        "status": "READY" if evidence else "EMPTY",
+        "review_key": (review_packet or {}).get("review_key"),
+        "evidence_count": len(evidence),
+        "benefit_count": len(benefit_items),
+        "risk_count": len(risk_items),
+        "neutral_count": len(neutral_items),
+        "top_items": sorted(evidence, key=lambda x: (_gb_float(x.get("similarity_score")), _gb_float(x.get("quality")), _gb_float(x.get("pressure"))), reverse=True)[:8],
+        "next_action": (
+            "Review the top evidence examples before approving, holding, or rejecting."
+            if evidence
+            else "No approval evidence examples are available yet."
+        ),
+        "updated_at": now.isoformat(),
+    }
+
+
+def _build_provider_truth_risk_explanation(
+    accumulator_score: dict,
+    dry_run_preview: dict,
+    before_after: dict,
+    confidence_curve: dict,
+    post_approval_watchdog: dict,
+    now: datetime,
+) -> dict:
+    accumulator_risk = int((accumulator_score or {}).get("risk_count") or 0)
+    dry_run_risk = int((dry_run_preview or {}).get("would_risk_count") or 0)
+    worsened = int((before_after or {}).get("worsened_count") or 0)
+    trend = str((confidence_curve or {}).get("trend") or "").upper()
+    confidence = _gb_float((confidence_curve or {}).get("confidence_score"))
+    watchdog_freeze = bool((post_approval_watchdog or {}).get("freeze_triggered"))
+    risk_zero = bool(accumulator_risk == 0 and dry_run_risk == 0 and worsened == 0 and trend != "WEAKENING" and not watchdog_freeze)
+    return {
+        "status": "RISK_ZERO" if risk_zero else "RISK_PRESENT",
+        "risk_zero": risk_zero,
+        "risk_count": accumulator_risk + dry_run_risk,
+        "reasons": [
+            f"Accumulator risk items: {accumulator_risk}.",
+            f"Dry-run would-risk items: {dry_run_risk}.",
+            f"Before/after worsened items: {worsened}.",
+            f"Confidence curve trend: {trend or 'WAITING'} at {round(confidence, 1)}.",
+            f"Watchdog freeze triggered: {bool(watchdog_freeze)}.",
+        ],
+        "would_become_nonzero_if": [
+            "A refreshed evidence item becomes EVIDENCE_RISK.",
+            "The dry-run preview marks any candidate WOULD_KEEP_BLOCKED because of patch risk.",
+            "Before/after scoring detects a worsened token after the patch idea.",
+            "Confidence curve turns WEAKENING or falls below the watchdog floor.",
+            "Any approval-state watchdog auto-freeze is triggered.",
+        ],
+        "next_action": (
+            "Risk is currently zero; approval is still manual and implementation remains separate."
+            if risk_zero
+            else "Risk is nonzero; hold or reject instead of approving implementation."
+        ),
+        "updated_at": now.isoformat(),
+    }
+
+
+def _build_provider_truth_approval_consequences(
+    review_packet: dict,
+    approval_gate: dict,
+    policy_work_order: dict,
+    now: datetime,
+) -> dict:
+    review_key = (review_packet or {}).get("review_key")
+    packet_status = str((review_packet or {}).get("status") or "").upper()
+    can_approve = packet_status == "READY_FOR_OPERATOR_REVIEW"
+    items = [
+        {
+            "state": "APPROVED_FOR_IMPLEMENTATION",
+            "label": "Approve",
+            "enabled": can_approve,
+            "state_change": "approval_state becomes APPROVED_FOR_IMPLEMENTATION",
+            "what_happens": "Work order can move to READY_AFTER_APPROVAL if guardrails still pass.",
+            "what_does_not_happen": "No provider policy is auto-applied and live buying remains locked.",
+        },
+        {
+            "state": "NEEDS_MORE_EVIDENCE",
+            "label": "Hold",
+            "enabled": True,
+            "state_change": "approval_state becomes NEEDS_MORE_EVIDENCE",
+            "what_happens": "Work order remains blocked while evidence continues accumulating.",
+            "what_does_not_happen": "No implementation work should start.",
+        },
+        {
+            "state": "REJECTED",
+            "label": "Reject",
+            "enabled": True,
+            "state_change": "approval_state becomes REJECTED",
+            "what_happens": "Current packet is closed unless future evidence creates a new review case.",
+            "what_does_not_happen": "No patch target is implemented.",
+        },
+    ]
+    return {
+        "status": "READY" if review_key else "NO_REVIEW_PACKET",
+        "review_key": review_key,
+        "current_approval_state": (approval_gate or {}).get("approval_state"),
+        "current_work_order_status": (policy_work_order or {}).get("status"),
+        "consequence_count": len(items),
+        "items": items,
+        "next_action": "Read button consequences before recording an approval decision.",
+        "updated_at": now.isoformat(),
+    }
+
+
+def _build_provider_truth_decision_audit_trail(review_packet: dict, now: datetime) -> dict:
+    review_key = str((review_packet or {}).get("review_key") or "").strip()
+    payload = _freshness_kv_read(_PROVIDER_TRUTH_MISS_REVIEW_AUDIT_KEY)
+    events = [
+        dict(event) for event in list((payload or {}).get("events") or [])
+        if not review_key or str(event.get("review_key") or "") == review_key
+    ]
+    events.sort(key=lambda x: _gb_parse_ts(x.get("ts_utc")) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    latest = events[0] if events else {}
+    return {
+        "status": "TRACKING" if events else "EMPTY",
+        "review_key": review_key or None,
+        "event_count": len(events),
+        "latest_state": latest.get("state"),
+        "latest_event_at": latest.get("ts_utc"),
+        "events": events[:20],
+        "next_action": (
+            "Approval decision history is available for audit."
+            if events
+            else "No approval decisions have been recorded for this review packet."
+        ),
+        "updated_at": now.isoformat(),
+    }
+
+
 def _build_provider_truth_miss_evidence_accumulator(
     miss_review: dict,
     miss_repair_workbench: dict,
@@ -19874,6 +20070,28 @@ def _build_provider_truth_miss_evidence_accumulator(
         post_approval_watchdog,
         now,
     )
+    approval_evidence_summary = _build_provider_truth_approval_evidence_summary(
+        review_packet,
+        score,
+        timeline,
+        dry_run_preview,
+        now,
+    )
+    risk_explanation = _build_provider_truth_risk_explanation(
+        score,
+        dry_run_preview,
+        before_after,
+        confidence_curve,
+        post_approval_watchdog,
+        now,
+    )
+    approval_consequences = _build_provider_truth_approval_consequences(
+        review_packet,
+        approval_gate,
+        policy_work_order,
+        now,
+    )
+    decision_audit_trail = _build_provider_truth_decision_audit_trail(review_packet, now)
     return {
         "status": score.get("status"),
         "readiness_state": score.get("readiness_state"),
@@ -19892,6 +20110,10 @@ def _build_provider_truth_miss_evidence_accumulator(
         "implementation_checklist": implementation_checklist,
         "simulation_test_recipe": simulation_recipe,
         "policy_patch_work_order": policy_work_order,
+        "approval_evidence_summary": approval_evidence_summary,
+        "risk_explanation": risk_explanation,
+        "approval_consequences": approval_consequences,
+        "decision_audit_trail": decision_audit_trail,
         "next_action": policy_work_order.get("next_action") or approval_gate.get("next_action") or score.get("next_action"),
     }
 
@@ -20273,6 +20495,11 @@ def _build_dashboard_provider_truth_panel(
     miss_target_map = dict(miss_evidence_accumulator.get("patch_target_map") or {})
     miss_checklist = dict(miss_evidence_accumulator.get("implementation_checklist") or {})
     miss_simulation = dict(miss_evidence_accumulator.get("simulation_test_recipe") or {})
+    miss_approval_evidence = dict(miss_evidence_accumulator.get("approval_evidence_summary") or {})
+    miss_risk_explanation = dict(miss_evidence_accumulator.get("risk_explanation") or {})
+    miss_consequences = dict(miss_evidence_accumulator.get("approval_consequences") or {})
+    miss_decision_audit = dict(miss_evidence_accumulator.get("decision_audit_trail") or {})
+    miss_top_evidence = (list(miss_approval_evidence.get("top_items") or []) or [{}])[0]
     status = (
         "BLOCKED"
         if str((agreement_layer or {}).get("status") or "").upper() == "BLOCKED"
@@ -20358,6 +20585,16 @@ def _build_dashboard_provider_truth_panel(
         "miss_work_order_checklist_passed": int(miss_work_order.get("checklist_passed") or miss_checklist.get("passed_required") or 0),
         "miss_work_order_checklist_total": int(miss_work_order.get("checklist_total") or miss_checklist.get("total_required") or 0),
         "miss_work_order_recipe_count": int(miss_work_order.get("recipe_count") or miss_simulation.get("recipe_count") or 0),
+        "miss_approval_evidence_status": miss_approval_evidence.get("status"),
+        "miss_approval_evidence_count": int(miss_approval_evidence.get("evidence_count") or 0),
+        "miss_approval_top_symbol": miss_top_evidence.get("symbol"),
+        "miss_approval_top_outcome": miss_top_evidence.get("evidence_outcome"),
+        "miss_risk_status": miss_risk_explanation.get("status"),
+        "miss_risk_zero": bool(miss_risk_explanation.get("risk_zero")),
+        "miss_risk_count": int(miss_risk_explanation.get("risk_count") or 0),
+        "miss_consequence_count": int(miss_consequences.get("consequence_count") or 0),
+        "miss_audit_event_count": int(miss_decision_audit.get("event_count") or 0),
+        "miss_audit_latest_state": miss_decision_audit.get("latest_state"),
         "top_symbol": top_agreement.get("symbol"),
         "top_status": top_agreement.get("status"),
         "top_best_source": top_arbitration.get("best_source"),
@@ -26281,6 +26518,29 @@ async def home_provider_truth_miss_review_decision(
             "packet_status": packet_status or None,
         }
         _freshness_kv_write(_PROVIDER_TRUTH_MISS_REVIEW_STATES_KEY, states)
+        audit = _freshness_kv_read(_PROVIDER_TRUTH_MISS_REVIEW_AUDIT_KEY)
+        events = list((audit or {}).get("events") or [])
+        event = {
+            "event_id": f"{review_key}:{state}:{now}",
+            "ts_utc": now,
+            "review_key": review_key,
+            "state": state,
+            "packet_status": packet_status or None,
+            "operator_note": note,
+            "manual_only": True,
+            "policy_auto_apply": False,
+        }
+        events.append(event)
+        events = events[-500:]
+        _freshness_kv_write(
+            _PROVIDER_TRUTH_MISS_REVIEW_AUDIT_KEY,
+            {
+                "status": "TRACKING",
+                "updated_at": now,
+                "event_count": len(events),
+                "events": events,
+            },
+        )
         return {
             "ok": True,
             "review_key": review_key,
@@ -26289,6 +26549,7 @@ async def home_provider_truth_miss_review_decision(
             "operator_note": note,
             "manual_only": True,
             "policy_auto_apply": False,
+            "audit_event": event,
         }
 
     try:
