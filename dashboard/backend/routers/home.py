@@ -41,6 +41,7 @@ _PROVIDER_ESCALATION_PATCH_STATES_KEY = "provider_escalation_patch_states"
 _PROVIDER_ESCALATION_WORK_ORDER_STATES_KEY = "provider_escalation_work_order_states"
 _PROVIDER_TRUTH_MISS_REVIEW_STATES_KEY = "provider_truth_miss_review_states"
 _PROVIDER_TRUTH_MISS_REVIEW_AUDIT_KEY = "provider_truth_miss_review_audit"
+_PROVIDER_TRUTH_RISK_RECHECK_QUEUE_KEY = "provider_truth_risk_recheck_queue"
 _LIVE_CONTEXT_MISSION_STATES_KEY = "live_context_mission_states"
 _LIVE_CONTEXT_MISSION_OUTCOME_JOURNAL_KEY = "live_context_mission_outcome_journal"
 _REPLAY_EVIDENCE_SNAPSHOT_KEY = "replay_evidence_snapshot"
@@ -53,7 +54,14 @@ _PROVIDER_ESCALATION_REVIEW_OPEN_STATES = {
 _PROVIDER_ESCALATION_REVIEW_CLOSED_STATES = {"FALSE_ALARM", "RESOLVED"}
 _PROVIDER_ESCALATION_PATCH_STATES = {"WATCH", "NEEDS_MORE_DATA", "READY_FOR_IMPLEMENTATION"}
 _PROVIDER_ESCALATION_WORK_ORDER_STATES = {"READY", "STARTED", "BLOCKED", "COMPLETE"}
-_PROVIDER_TRUTH_MISS_REVIEW_STATES = {"PENDING_REVIEW", "APPROVED_FOR_IMPLEMENTATION", "NEEDS_MORE_EVIDENCE", "REJECTED", "AUTO_FROZEN"}
+_PROVIDER_TRUTH_MISS_REVIEW_STATES = {
+    "PENDING_REVIEW",
+    "CLEARED_FOR_REVIEW",
+    "APPROVED_FOR_IMPLEMENTATION",
+    "NEEDS_MORE_EVIDENCE",
+    "REJECTED",
+    "AUTO_FROZEN",
+}
 _LIVE_CONTEXT_MISSION_STATES = {
     "NEW",
     "INVESTIGATING",
@@ -19422,6 +19430,8 @@ def _build_provider_truth_approval_gate(review_packet: dict, now: datetime) -> d
         "next_action": (
             "Approved for manual implementation review only; do not auto-apply provider policy."
             if policy_change_allowed
+            else "Risk cleared; packet is back in manual operator review and still needs explicit approval."
+            if state == "CLEARED_FOR_REVIEW"
             else "Review packet is frozen after regression; collect fresh evidence before implementation."
             if state == "AUTO_FROZEN"
             else "Operator approval is required before implementation can begin."
@@ -20067,6 +20077,349 @@ def _build_provider_truth_risk_cause_classifier(risk_case_drilldown: dict, now: 
     }
 
 
+def _provider_truth_risk_resolution_definition(cause: str) -> dict:
+    cause_key = str(cause or "PATCH_RISK_FLAG").strip().upper() or "PATCH_RISK_FLAG"
+    definitions = {
+        "SOURCE_MISMATCH": {
+            "label": "Source mismatch",
+            "clearing_action": "Confirm the preferred current source on fresh live/recent data before loosening provider precedence.",
+            "evidence_required": [
+                "Current source is not unknown/cache.",
+                "Freshness is LIVE or RECENT.",
+                "Confidence is not LOW.",
+                "Dry-run no longer keeps the row blocked.",
+            ],
+            "recheck_minutes": 30,
+        },
+        "WEAK_QUALITY": {
+            "label": "Weak quality",
+            "clearing_action": "Wait until quality and pressure recover above the provider-truth safety floor.",
+            "evidence_required": [
+                "Quality is at least 65.",
+                "Pressure is at least 35.",
+                "Before/after does not worsen.",
+            ],
+            "recheck_minutes": 60,
+        },
+        "DATA_STALE": {
+            "label": "Stale data",
+            "clearing_action": "Refresh the candidate from live/recent market data before reviewing the patch again.",
+            "evidence_required": [
+                "Freshness is LIVE or RECENT.",
+                "Latest evidence timestamp refreshes.",
+                "Dry-run risk remains zero after refresh.",
+            ],
+            "recheck_minutes": 20,
+        },
+        "LOW_CONFIDENCE": {
+            "label": "Low confidence",
+            "clearing_action": "Require non-low confidence from the refreshed source before this hold can clear.",
+            "evidence_required": [
+                "Confidence is MEDIUM or HIGH.",
+                "Provider agreement remains stable.",
+                "No new risk evidence appears.",
+            ],
+            "recheck_minutes": 60,
+        },
+        "WEAKENING_TREND": {
+            "label": "Weakening trend",
+            "clearing_action": "Let the confidence curve stabilize before returning this packet to operator review.",
+            "evidence_required": [
+                "Confidence trend is not WEAKENING.",
+                "Before/after has zero worsened cases.",
+                "Watchdog freeze is not triggered.",
+            ],
+            "recheck_minutes": 90,
+        },
+        "PATCH_RISK_FLAG": {
+            "label": "Patch risk flag",
+            "clearing_action": "Manually inspect the flagged case and require a clean dry-run before review resumes.",
+            "evidence_required": [
+                "Risk case is absent from the latest drilldown.",
+                "Dry-run would-risk count is zero.",
+                "Operator can explain why the prior risk no longer applies.",
+            ],
+            "recheck_minutes": 120,
+        },
+    }
+    return {"cause": cause_key, **definitions.get(cause_key, definitions["PATCH_RISK_FLAG"])}
+
+
+def _build_provider_truth_risk_resolution_playbook(
+    risk_cause_classifier: dict,
+    risk_case_drilldown: dict,
+    now: datetime,
+) -> dict:
+    cause_counts = dict((risk_cause_classifier or {}).get("cause_counts") or {})
+    if not cause_counts and int((risk_case_drilldown or {}).get("risk_count") or 0) > 0:
+        cause_counts = {"PATCH_RISK_FLAG": int((risk_case_drilldown or {}).get("risk_count") or 0)}
+    items = []
+    for cause, count in sorted(cause_counts.items(), key=lambda kv: (-int(kv[1] or 0), str(kv[0]))):
+        definition = _provider_truth_risk_resolution_definition(cause)
+        items.append({
+            **definition,
+            "active_count": int(count or 0),
+            "status": "ACTIVE" if int(count or 0) > 0 else "CLEAR",
+        })
+    return {
+        "status": "ACTIVE" if items else "CLEAR",
+        "playbook_count": len(items),
+        "items": items,
+        "top_action": (items[0].get("clearing_action") if items else "No risk causes are active."),
+        "next_action": (
+            "Use the playbook to clear each active risk cause before review resumes."
+            if items
+            else "No risk resolution playbook is needed."
+        ),
+        "updated_at": now.isoformat(),
+    }
+
+
+def _risk_recheck_delay_minutes(causes: list[str]) -> int:
+    delays = [
+        int(_provider_truth_risk_resolution_definition(cause).get("recheck_minutes") or 120)
+        for cause in causes
+    ]
+    return min(delays) if delays else 120
+
+
+def _build_provider_truth_risk_evidence_recheck_queue(
+    review_packet: dict,
+    approval_gate: dict,
+    risk_case_drilldown: dict,
+    risk_resolution_playbook: dict,
+    now: datetime,
+) -> dict:
+    review_key = str((review_packet or {}).get("review_key") or "").strip()
+    risk_items = [dict(item) for item in list((risk_case_drilldown or {}).get("items") or [])]
+    if not review_key:
+        return {
+            "status": "NO_REVIEW_PACKET",
+            "review_key": None,
+            "queued_count": 0,
+            "due_count": 0,
+            "items": [],
+            "next_action": "No review packet is available for risk rechecks.",
+            "updated_at": now.isoformat(),
+        }
+
+    payload = _freshness_kv_read(_PROVIDER_TRUTH_RISK_RECHECK_QUEUE_KEY)
+    previous_items = {
+        str(item.get("queue_key") or ""): dict(item)
+        for item in list((payload or {}).get("items") or [])
+        if str(item.get("queue_key") or "")
+    }
+    active_review_state = str((approval_gate or {}).get("approval_state") or "").upper()
+    queued = []
+    for item in risk_items:
+        risk_key = str(item.get("key") or _provider_truth_queue_key(item) or item.get("symbol") or "risk").strip()
+        queue_key = f"{review_key}:{risk_key}"
+        previous = previous_items.get(queue_key, {})
+        causes = list(item.get("causes") or _provider_truth_risk_causes(item))
+        delay = _risk_recheck_delay_minutes(causes)
+        previous_due = _gb_parse_ts(previous.get("next_recheck_at"))
+        due_now = False
+        if previous_due:
+            next_recheck = previous_due
+        else:
+            next_recheck = now + timedelta(minutes=delay)
+        if previous_due and previous_due <= now:
+            due_now = True
+        queued.append({
+            "queue_key": queue_key,
+            "review_key": review_key,
+            "risk_key": risk_key,
+            "symbol": item.get("symbol"),
+            "mint": item.get("mint"),
+            "risk_source": item.get("risk_source"),
+            "causes": causes,
+            "status": "WAITING_RECHECK",
+            "recheck_reason": (risk_resolution_playbook or {}).get("top_action"),
+            "last_seen_at": now.isoformat(),
+            "next_recheck_at": next_recheck.isoformat(),
+            "due": due_now,
+            "recheck_minutes": delay,
+        })
+
+    old_other_reviews = [
+        dict(item) for item in list((payload or {}).get("items") or [])
+        if str(item.get("review_key") or "") != review_key
+    ][-200:]
+    stored = old_other_reviews + queued
+    _freshness_kv_write(
+        _PROVIDER_TRUTH_RISK_RECHECK_QUEUE_KEY,
+        {
+            "status": "TRACKING",
+            "updated_at": now.isoformat(),
+            "items": stored[-300:],
+        },
+    )
+    due_count = len([item for item in queued if item.get("due")])
+    next_times = [_gb_parse_ts(item.get("next_recheck_at")) for item in queued]
+    next_times = [ts for ts in next_times if ts]
+    return {
+        "status": "TRACKING" if queued else "CLEAR",
+        "review_key": review_key,
+        "approval_state": active_review_state or None,
+        "queued_count": len(queued),
+        "due_count": due_count,
+        "next_recheck_at": min(next_times).isoformat() if next_times else None,
+        "items": queued[:20],
+        "next_action": (
+            "Risk evidence rechecks are queued for held cases."
+            if queued
+            else "No active risk cases need rechecks."
+        ),
+        "updated_at": now.isoformat(),
+    }
+
+
+def _build_provider_truth_hold_aging_escalation(
+    review_packet: dict,
+    approval_gate: dict,
+    risk_case_drilldown: dict,
+    evidence_recheck_queue: dict,
+    now: datetime,
+) -> dict:
+    review_key = str((review_packet or {}).get("review_key") or "").strip()
+    approval_state = str((approval_gate or {}).get("approval_state") or "").upper()
+    updated_at = _gb_parse_ts((approval_gate or {}).get("state_updated_at"))
+    age_hours = round(max(0.0, (now - updated_at).total_seconds() / 3600.0), 2) if updated_at else None
+    risk_count = int((risk_case_drilldown or {}).get("risk_count") or 0)
+    due_count = int((evidence_recheck_queue or {}).get("due_count") or 0)
+    stale = bool(age_hours is not None and age_hours >= 24 and approval_state == "NEEDS_MORE_EVIDENCE")
+    escalation = "ESCALATE_MANUAL_REVIEW" if stale and risk_count > 0 else "RECHECK_DUE" if due_count > 0 else "NONE"
+    status = "STALE_HOLD" if stale else "ACTIVE_HOLD" if approval_state == "NEEDS_MORE_EVIDENCE" else "CLEAR"
+    if stale and risk_count > 0 and review_key:
+        audit = _freshness_kv_read(_PROVIDER_TRUTH_MISS_REVIEW_AUDIT_KEY)
+        events = list((audit or {}).get("events") or [])
+        recent_stale = False
+        for event in reversed(events[-80:]):
+            if str(event.get("review_key") or "") != review_key:
+                continue
+            if str(event.get("state") or "").upper() != "STALE_HOLD_ESCALATION":
+                continue
+            event_ts = _gb_parse_ts(event.get("ts_utc"))
+            if event_ts and (now - event_ts).total_seconds() < 6 * 3600:
+                recent_stale = True
+                break
+        if not recent_stale:
+            events.append({
+                "event_id": f"{review_key}:STALE_HOLD_ESCALATION:{now.isoformat()}",
+                "ts_utc": now.isoformat(),
+                "review_key": review_key,
+                "state": "STALE_HOLD_ESCALATION",
+                "risk_count": risk_count,
+                "hold_age_hours": age_hours,
+                "operator_note": "Hold aged past 24h with active risk cases; manual escalation required.",
+                "manual_only": True,
+                "policy_auto_apply": False,
+            })
+            _freshness_kv_write(
+                _PROVIDER_TRUTH_MISS_REVIEW_AUDIT_KEY,
+                {
+                    "status": "TRACKING",
+                    "updated_at": now.isoformat(),
+                    "event_count": len(events[-500:]),
+                    "events": events[-500:],
+                },
+            )
+    return {
+        "status": status,
+        "review_key": review_key or None,
+        "approval_state": approval_state or None,
+        "hold_age_hours": age_hours,
+        "risk_count": risk_count,
+        "due_recheck_count": due_count,
+        "escalation": escalation,
+        "stale_after_hours": 24,
+        "next_action": (
+            "Manual review should inspect this stale hold before it remains blocked longer."
+            if stale
+            else "Run due evidence rechecks for this hold."
+            if due_count > 0
+            else "Hold is fresh; continue scheduled rechecks."
+            if approval_state == "NEEDS_MORE_EVIDENCE"
+            else "No active hold aging action is needed."
+        ),
+        "updated_at": now.isoformat(),
+    }
+
+
+def _apply_provider_truth_clear_to_review_state(
+    review_packet: dict,
+    approval_gate: dict,
+    risk_clear_requirements: dict,
+    hold_aging_escalation: dict,
+    now: datetime,
+) -> dict:
+    review_key = str((review_packet or {}).get("review_key") or "").strip()
+    if not review_key:
+        return dict(approval_gate or {})
+    packet_ready = str((review_packet or {}).get("status") or "").upper() == "READY_FOR_OPERATOR_REVIEW"
+    current_state = str((approval_gate or {}).get("approval_state") or "").upper()
+    clear = str((risk_clear_requirements or {}).get("status") or "").upper() == "CLEAR"
+    stale = str((hold_aging_escalation or {}).get("status") or "").upper() == "STALE_HOLD"
+    if not (packet_ready and clear and current_state == "NEEDS_MORE_EVIDENCE" and not stale):
+        out = dict(approval_gate or {})
+        out["clear_to_review_applied"] = False
+        out["risk_clear_status"] = (risk_clear_requirements or {}).get("status")
+        return out
+
+    states = _freshness_kv_read(_PROVIDER_TRUTH_MISS_REVIEW_STATES_KEY)
+    previous = dict(states.get(review_key) or {})
+    if str(previous.get("state") or "").upper() != "CLEARED_FOR_REVIEW":
+        note = "Auto-cleared back to operator review after all risk-clear requirements passed."
+        states[review_key] = {
+            **previous,
+            "state": "CLEARED_FOR_REVIEW",
+            "updated_at": now.isoformat(),
+            "note": note,
+            "auto_cleared": True,
+            "risk_count": 0,
+        }
+        _freshness_kv_write(_PROVIDER_TRUTH_MISS_REVIEW_STATES_KEY, states)
+        audit = _freshness_kv_read(_PROVIDER_TRUTH_MISS_REVIEW_AUDIT_KEY)
+        events = list((audit or {}).get("events") or [])
+        events.append({
+            "event_id": f"{review_key}:CLEARED_FOR_REVIEW:{now.isoformat()}",
+            "ts_utc": now.isoformat(),
+            "review_key": review_key,
+            "state": "CLEARED_FOR_REVIEW",
+            "packet_status": (review_packet or {}).get("status"),
+            "risk_count": 0,
+            "operator_note": note,
+            "manual_only": True,
+            "policy_auto_apply": False,
+            "auto_cleared": True,
+        })
+        _freshness_kv_write(
+            _PROVIDER_TRUTH_MISS_REVIEW_AUDIT_KEY,
+            {
+                "status": "TRACKING",
+                "updated_at": now.isoformat(),
+                "event_count": len(events[-500:]),
+                "events": events[-500:],
+            },
+        )
+
+    out = dict(approval_gate or {})
+    out.update({
+        "status": "PENDING",
+        "approval_state": "CLEARED_FOR_REVIEW",
+        "state_updated_at": now.isoformat(),
+        "operator_note": states.get(review_key, {}).get("note"),
+        "policy_change_allowed": False,
+        "auto_apply_enabled": False,
+        "clear_to_review_applied": True,
+        "risk_blocked": False,
+        "risk_count": 0,
+        "risk_clear_status": "CLEAR",
+        "next_action": "Risk cleared; packet can return to manual operator review.",
+    })
+    return out
+
+
 def _apply_provider_truth_auto_hold_approval_state(
     review_packet: dict,
     approval_gate: dict,
@@ -20333,6 +20686,11 @@ def _build_provider_truth_miss_evidence_accumulator(
         now,
     )
     risk_cause_classifier = _build_provider_truth_risk_cause_classifier(risk_case_drilldown, now)
+    risk_resolution_playbook = _build_provider_truth_risk_resolution_playbook(
+        risk_cause_classifier,
+        risk_case_drilldown,
+        now,
+    )
     risk_explanation = _build_provider_truth_risk_explanation(
         score,
         dry_run_preview,
@@ -20374,6 +20732,46 @@ def _build_provider_truth_miss_evidence_accumulator(
         dry_run_preview,
         now,
     )
+    evidence_recheck_queue = _build_provider_truth_risk_evidence_recheck_queue(
+        review_packet,
+        approval_gate,
+        risk_case_drilldown,
+        risk_resolution_playbook,
+        now,
+    )
+    hold_aging_escalation = _build_provider_truth_hold_aging_escalation(
+        review_packet,
+        approval_gate,
+        risk_case_drilldown,
+        evidence_recheck_queue,
+        now,
+    )
+    approval_gate = _apply_provider_truth_clear_to_review_state(
+        review_packet,
+        approval_gate,
+        risk_clear_requirements,
+        hold_aging_escalation,
+        now,
+    )
+    if approval_gate.get("clear_to_review_applied"):
+        dry_run_preview = _build_provider_truth_dry_run_policy_preview(review_packet, approval_gate, score, matcher, now)
+        post_approval_watchdog = _build_provider_truth_post_approval_watchdog(
+            review_packet,
+            approval_gate,
+            dry_run_preview,
+            score,
+            before_after,
+            confidence_curve,
+            now,
+        )
+        risk_explanation = _build_provider_truth_risk_explanation(
+            score,
+            dry_run_preview,
+            before_after,
+            confidence_curve,
+            post_approval_watchdog,
+            now,
+        )
     patch_target_map = _build_provider_truth_patch_target_map(review_packet, approval_gate, now)
     implementation_checklist = _build_provider_truth_implementation_checklist(
         review_packet,
@@ -20427,6 +20825,9 @@ def _build_provider_truth_miss_evidence_accumulator(
         "risk_explanation": risk_explanation,
         "risk_case_drilldown": risk_case_drilldown,
         "risk_cause_classifier": risk_cause_classifier,
+        "risk_resolution_playbook": risk_resolution_playbook,
+        "risk_evidence_recheck_queue": evidence_recheck_queue,
+        "hold_aging_escalation": hold_aging_escalation,
         "risk_clear_requirements": risk_clear_requirements,
         "approval_consequences": approval_consequences,
         "decision_audit_trail": decision_audit_trail,
@@ -20815,6 +21216,9 @@ def _build_dashboard_provider_truth_panel(
     miss_risk_explanation = dict(miss_evidence_accumulator.get("risk_explanation") or {})
     miss_risk_cases = dict(miss_evidence_accumulator.get("risk_case_drilldown") or {})
     miss_risk_classifier = dict(miss_evidence_accumulator.get("risk_cause_classifier") or {})
+    miss_risk_playbook = dict(miss_evidence_accumulator.get("risk_resolution_playbook") or {})
+    miss_risk_recheck = dict(miss_evidence_accumulator.get("risk_evidence_recheck_queue") or {})
+    miss_hold_aging = dict(miss_evidence_accumulator.get("hold_aging_escalation") or {})
     miss_risk_clear = dict(miss_evidence_accumulator.get("risk_clear_requirements") or {})
     miss_consequences = dict(miss_evidence_accumulator.get("approval_consequences") or {})
     miss_decision_audit = dict(miss_evidence_accumulator.get("decision_audit_trail") or {})
@@ -20917,6 +21321,17 @@ def _build_dashboard_provider_truth_panel(
         "miss_top_risk_source": miss_top_risk_case.get("risk_source"),
         "miss_primary_risk_cause": miss_risk_classifier.get("primary_cause"),
         "miss_auto_hold_applied": bool(miss_approval_gate.get("auto_hold_applied")),
+        "miss_clear_to_review_applied": bool(miss_approval_gate.get("clear_to_review_applied")),
+        "miss_risk_playbook_status": miss_risk_playbook.get("status"),
+        "miss_risk_playbook_count": int(miss_risk_playbook.get("playbook_count") or 0),
+        "miss_risk_top_action": miss_risk_playbook.get("top_action"),
+        "miss_risk_recheck_status": miss_risk_recheck.get("status"),
+        "miss_risk_recheck_queued_count": int(miss_risk_recheck.get("queued_count") or 0),
+        "miss_risk_recheck_due_count": int(miss_risk_recheck.get("due_count") or 0),
+        "miss_risk_recheck_next_at": miss_risk_recheck.get("next_recheck_at"),
+        "miss_hold_aging_status": miss_hold_aging.get("status"),
+        "miss_hold_age_hours": miss_hold_aging.get("hold_age_hours"),
+        "miss_hold_escalation": miss_hold_aging.get("escalation"),
         "miss_risk_clear_status": miss_risk_clear.get("status"),
         "miss_risk_clear_passed": int(miss_risk_clear.get("passed_count") or 0),
         "miss_risk_clear_total": int(miss_risk_clear.get("total_count") or 0),
@@ -26820,6 +27235,8 @@ async def home_provider_truth_miss_review_decision(
     aliases = {
         "APPROVE": "APPROVED_FOR_IMPLEMENTATION",
         "APPROVED": "APPROVED_FOR_IMPLEMENTATION",
+        "CLEAR": "CLEARED_FOR_REVIEW",
+        "CLEARED": "CLEARED_FOR_REVIEW",
         "HOLD": "NEEDS_MORE_EVIDENCE",
         "MORE_EVIDENCE": "NEEDS_MORE_EVIDENCE",
         "REJECT": "REJECTED",

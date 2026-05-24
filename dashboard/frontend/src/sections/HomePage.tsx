@@ -128,7 +128,7 @@ type ProviderEscalationAction = 'DISMISS' | 'KEEP_WATCHING' | 'FORCE_REFRESH'
 type ProviderEscalationReviewState = 'ACKNOWLEDGED' | 'RULE_PATCH_NEEDED' | 'DATA_PATCH_NEEDED' | 'FALSE_ALARM' | 'RESOLVED'
 type ProviderEscalationPatchState = 'WATCH' | 'NEEDS_MORE_DATA' | 'READY_FOR_IMPLEMENTATION'
 type ProviderEscalationWorkOrderState = 'READY' | 'STARTED' | 'BLOCKED' | 'COMPLETE'
-type ProviderTruthMissReviewState = 'PENDING_REVIEW' | 'APPROVED_FOR_IMPLEMENTATION' | 'NEEDS_MORE_EVIDENCE' | 'REJECTED' | 'AUTO_FROZEN'
+type ProviderTruthMissReviewState = 'PENDING_REVIEW' | 'CLEARED_FOR_REVIEW' | 'APPROVED_FOR_IMPLEMENTATION' | 'NEEDS_MORE_EVIDENCE' | 'REJECTED' | 'AUTO_FROZEN'
 type LiveContextMissionState = 'NEW' | 'INVESTIGATING' | 'RESOLVED_COVERED' | 'RESOLVED_IGNORED' | 'NEEDS_SOURCE'
 
 interface ProviderEscalationItem {
@@ -1145,6 +1145,7 @@ interface DailyCryptoBriefData {
         policy_change_allowed?: boolean
         auto_apply_enabled?: boolean
         auto_hold_applied?: boolean
+        clear_to_review_applied?: boolean
       }
       dry_run_policy_preview?: {
         status?: string
@@ -1218,6 +1219,22 @@ interface DailyCryptoBriefData {
         risk_count?: number
         primary_cause?: string | null
         cause_counts?: Record<string, number>
+      }
+      risk_resolution_playbook?: {
+        status?: string
+        playbook_count?: number
+        top_action?: string | null
+      }
+      risk_evidence_recheck_queue?: {
+        status?: string
+        queued_count?: number
+        due_count?: number
+        next_recheck_at?: string | null
+      }
+      hold_aging_escalation?: {
+        status?: string
+        hold_age_hours?: number | null
+        escalation?: string | null
       }
       risk_clear_requirements?: {
         status?: string
@@ -1322,6 +1339,17 @@ interface DailyCryptoBriefData {
       miss_top_risk_source?: string | null
       miss_primary_risk_cause?: string | null
       miss_auto_hold_applied?: boolean
+      miss_clear_to_review_applied?: boolean
+      miss_risk_playbook_status?: string | null
+      miss_risk_playbook_count?: number
+      miss_risk_top_action?: string | null
+      miss_risk_recheck_status?: string | null
+      miss_risk_recheck_queued_count?: number
+      miss_risk_recheck_due_count?: number
+      miss_risk_recheck_next_at?: string | null
+      miss_hold_aging_status?: string | null
+      miss_hold_age_hours?: number | null
+      miss_hold_escalation?: string | null
       miss_risk_clear_status?: string | null
       miss_risk_clear_passed?: number
       miss_risk_clear_total?: number
@@ -6011,6 +6039,9 @@ function DailyCryptoBriefPanel({
     const providerTruthMissRiskCases = providerTruthMissEvidence.risk_case_drilldown ?? {}
     const providerTruthMissTopRiskCase = providerTruthMissRiskCases.top_case ?? null
     const providerTruthMissRiskClassifier = providerTruthMissEvidence.risk_cause_classifier ?? {}
+    const providerTruthMissRiskPlaybook = providerTruthMissEvidence.risk_resolution_playbook ?? {}
+    const providerTruthMissRiskRecheck = providerTruthMissEvidence.risk_evidence_recheck_queue ?? {}
+    const providerTruthMissHoldAging = providerTruthMissEvidence.hold_aging_escalation ?? {}
     const providerTruthMissRiskClear = providerTruthMissEvidence.risk_clear_requirements ?? {}
     const providerTruthMissConsequences = providerTruthMissEvidence.approval_consequences ?? {}
     const providerTruthMissAudit = providerTruthMissEvidence.decision_audit_trail ?? {}
@@ -6595,6 +6626,9 @@ function DailyCryptoBriefPanel({
             </div>
             <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
               risk cases {providerTruthPanel.miss_risk_case_count ?? providerTruthMissRiskCases.risk_count ?? 0} · top {providerTruthPanel.miss_top_risk_symbol || providerTruthMissTopRiskCase?.symbol || 'none'} · cause {String(providerTruthPanel.miss_primary_risk_cause || providerTruthMissRiskClassifier.primary_cause || 'clear').replace(/_/g, ' ').toLowerCase()} · auto-hold {(providerTruthPanel.miss_auto_hold_applied || providerTruthMissApprovalGate.auto_hold_applied) ? 'on' : 'off'} · clear {providerTruthPanel.miss_risk_clear_passed ?? providerTruthMissRiskClear.passed_count ?? 0}/{providerTruthPanel.miss_risk_clear_total ?? providerTruthMissRiskClear.total_count ?? 0}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              playbook {providerTruthPanel.miss_risk_playbook_count ?? providerTruthMissRiskPlaybook.playbook_count ?? 0} · recheck {providerTruthPanel.miss_risk_recheck_due_count ?? providerTruthMissRiskRecheck.due_count ?? 0}/{providerTruthPanel.miss_risk_recheck_queued_count ?? providerTruthMissRiskRecheck.queued_count ?? 0} · hold {String(providerTruthPanel.miss_hold_aging_status || providerTruthMissHoldAging.status || 'clear').replace(/_/g, ' ').toLowerCase()} {fmtFixed(providerTruthPanel.miss_hold_age_hours ?? providerTruthMissHoldAging.hold_age_hours, 1)}h · clear-review {(providerTruthPanel.miss_clear_to_review_applied || providerTruthMissApprovalGate.clear_to_review_applied) ? 'ready' : String(providerTruthPanel.miss_risk_clear_status || providerTruthMissRiskClear.status || 'blocked').replace(/_/g, ' ').toLowerCase()}
             </div>
             {(providerTruthPanel.miss_review_key || providerTruthMissReviewPacket.review_key) && onProviderTruthMissReviewAction && (
               <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 8 }}>
