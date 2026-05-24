@@ -1251,6 +1251,30 @@ interface DailyCryptoBriefData {
         latest_state?: string | null
         latest_event_at?: string | null
       }
+      hold_outcome_journal?: {
+        status?: string
+        entry_count?: number
+        review_entry_count?: number
+        latest_outcome?: string | null
+      }
+      cause_accuracy_scoring?: {
+        status?: string
+        sample_n?: number
+        top_cause?: string | null
+        top_score?: number | null
+      }
+      clear_requirement_backtest?: {
+        status?: string
+        sample_n?: number
+        would_release_count?: number
+        would_block_count?: number
+        unsafe_release_count?: number
+      }
+      policy_tuning_suggestions?: {
+        status?: string
+        suggestion_count?: number
+        top_suggestion?: string | null
+      }
       next_action?: string | null
     }
     dashboard_provider_truth_panel?: {
@@ -1356,6 +1380,21 @@ interface DailyCryptoBriefData {
       miss_consequence_count?: number
       miss_audit_event_count?: number
       miss_audit_latest_state?: string | null
+      miss_hold_journal_status?: string | null
+      miss_hold_journal_entry_count?: number
+      miss_hold_journal_latest_outcome?: string | null
+      miss_cause_accuracy_status?: string | null
+      miss_cause_accuracy_sample_n?: number
+      miss_cause_accuracy_top_cause?: string | null
+      miss_cause_accuracy_top_score?: number | null
+      miss_clear_backtest_status?: string | null
+      miss_clear_backtest_sample_n?: number
+      miss_clear_backtest_release_count?: number
+      miss_clear_backtest_block_count?: number
+      miss_clear_backtest_unsafe_count?: number
+      miss_policy_tuning_status?: string | null
+      miss_policy_tuning_suggestion_count?: number
+      miss_policy_tuning_top_suggestion?: string | null
       top_symbol?: string | null
       top_status?: string
       top_best_source?: string | null
@@ -6045,6 +6084,10 @@ function DailyCryptoBriefPanel({
     const providerTruthMissRiskClear = providerTruthMissEvidence.risk_clear_requirements ?? {}
     const providerTruthMissConsequences = providerTruthMissEvidence.approval_consequences ?? {}
     const providerTruthMissAudit = providerTruthMissEvidence.decision_audit_trail ?? {}
+    const providerTruthMissHoldJournal = providerTruthMissEvidence.hold_outcome_journal ?? {}
+    const providerTruthMissCauseAccuracy = providerTruthMissEvidence.cause_accuracy_scoring ?? {}
+    const providerTruthMissClearBacktest = providerTruthMissEvidence.clear_requirement_backtest ?? {}
+    const providerTruthMissPolicyTuning = providerTruthMissEvidence.policy_tuning_suggestions ?? {}
     const topProviderTruthItem = providerTruthAgreement.items?.[0]
     const topProviderTruthSource = providerTruthSourceMap.providers?.[0]
     const topFallbackRoute = providerTruthFallback.routes?.[0]
@@ -6629,6 +6672,9 @@ function DailyCryptoBriefPanel({
             </div>
             <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
               playbook {providerTruthPanel.miss_risk_playbook_count ?? providerTruthMissRiskPlaybook.playbook_count ?? 0} · recheck {providerTruthPanel.miss_risk_recheck_due_count ?? providerTruthMissRiskRecheck.due_count ?? 0}/{providerTruthPanel.miss_risk_recheck_queued_count ?? providerTruthMissRiskRecheck.queued_count ?? 0} · hold {String(providerTruthPanel.miss_hold_aging_status || providerTruthMissHoldAging.status || 'clear').replace(/_/g, ' ').toLowerCase()} {fmtFixed(providerTruthPanel.miss_hold_age_hours ?? providerTruthMissHoldAging.hold_age_hours, 1)}h · clear-review {(providerTruthPanel.miss_clear_to_review_applied || providerTruthMissApprovalGate.clear_to_review_applied) ? 'ready' : String(providerTruthPanel.miss_risk_clear_status || providerTruthMissRiskClear.status || 'blocked').replace(/_/g, ' ').toLowerCase()}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              outcomes {providerTruthPanel.miss_hold_journal_entry_count ?? providerTruthMissHoldJournal.entry_count ?? 0} · latest {String(providerTruthPanel.miss_hold_journal_latest_outcome || providerTruthMissHoldJournal.latest_outcome || 'waiting').replace(/_/g, ' ').toLowerCase()} · cause score {String(providerTruthPanel.miss_cause_accuracy_top_cause || providerTruthMissCauseAccuracy.top_cause || 'none').replace(/_/g, ' ').toLowerCase()} {fmtFixed(providerTruthPanel.miss_cause_accuracy_top_score ?? providerTruthMissCauseAccuracy.top_score, 0)} · backtest {String(providerTruthPanel.miss_clear_backtest_status || providerTruthMissClearBacktest.status || 'no sample').replace(/_/g, ' ').toLowerCase()} · tune {providerTruthPanel.miss_policy_tuning_suggestion_count ?? providerTruthMissPolicyTuning.suggestion_count ?? 0}
             </div>
             {(providerTruthPanel.miss_review_key || providerTruthMissReviewPacket.review_key) && onProviderTruthMissReviewAction && (
               <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 8 }}>

@@ -42,6 +42,7 @@ _PROVIDER_ESCALATION_WORK_ORDER_STATES_KEY = "provider_escalation_work_order_sta
 _PROVIDER_TRUTH_MISS_REVIEW_STATES_KEY = "provider_truth_miss_review_states"
 _PROVIDER_TRUTH_MISS_REVIEW_AUDIT_KEY = "provider_truth_miss_review_audit"
 _PROVIDER_TRUTH_RISK_RECHECK_QUEUE_KEY = "provider_truth_risk_recheck_queue"
+_PROVIDER_TRUTH_HOLD_OUTCOME_JOURNAL_KEY = "provider_truth_hold_outcome_journal"
 _LIVE_CONTEXT_MISSION_STATES_KEY = "live_context_mission_states"
 _LIVE_CONTEXT_MISSION_OUTCOME_JOURNAL_KEY = "live_context_mission_outcome_journal"
 _REPLAY_EVIDENCE_SNAPSHOT_KEY = "replay_evidence_snapshot"
@@ -20637,6 +20638,355 @@ def _build_provider_truth_decision_audit_trail(review_packet: dict, now: datetim
     }
 
 
+def _provider_truth_hold_outcome_label(
+    approval_state: str,
+    risk_count: int,
+    clear_status: str,
+    hold_status: str,
+) -> str:
+    state = str(approval_state or "").upper()
+    clear = str(clear_status or "").upper()
+    hold = str(hold_status or "").upper()
+    if state == "APPROVED_FOR_IMPLEMENTATION" and risk_count > 0:
+        return "UNSAFE_APPROVAL_ATTEMPT"
+    if state == "CLEARED_FOR_REVIEW" and risk_count == 0 and clear == "CLEAR":
+        return "CLEARED_BACK_TO_REVIEW"
+    if state == "APPROVED_FOR_IMPLEMENTATION" and risk_count == 0 and clear == "CLEAR":
+        return "APPROVED_AFTER_CLEAR"
+    if state == "REJECTED" and risk_count > 0:
+        return "RISK_REJECTED"
+    if state == "AUTO_FROZEN" and risk_count > 0:
+        return "RISK_FROZEN"
+    if hold == "STALE_HOLD" and risk_count > 0:
+        return "STALE_RISK_HOLD"
+    if state == "NEEDS_MORE_EVIDENCE" and risk_count > 0:
+        return "ACTIVE_RISK_HOLD"
+    if state == "NEEDS_MORE_EVIDENCE" and risk_count == 0 and clear == "CLEAR":
+        return "CLEAR_BUT_STILL_HELD"
+    return "OBSERVING"
+
+
+def _build_provider_truth_hold_outcome_journal(
+    review_packet: dict,
+    approval_gate: dict,
+    risk_case_drilldown: dict,
+    risk_cause_classifier: dict,
+    risk_clear_requirements: dict,
+    hold_aging_escalation: dict,
+    decision_audit_trail: dict,
+    now: datetime,
+) -> dict:
+    review_key = str((review_packet or {}).get("review_key") or "").strip()
+    payload = _freshness_kv_read(_PROVIDER_TRUTH_HOLD_OUTCOME_JOURNAL_KEY)
+    entries = [dict(item) for item in list((payload or {}).get("entries") or [])]
+    if not review_key:
+        return {
+            "status": "NO_REVIEW_PACKET",
+            "review_key": None,
+            "entry_count": len(entries),
+            "latest_outcome": None,
+            "items": entries[-20:],
+            "next_action": "No provider-truth review packet is available for outcome journaling.",
+            "updated_at": now.isoformat(),
+        }
+
+    risk_count = int((risk_case_drilldown or {}).get("risk_count") or 0)
+    clear_status = str((risk_clear_requirements or {}).get("status") or "WAITING").upper()
+    approval_state = str((approval_gate or {}).get("approval_state") or "PENDING_REVIEW").upper()
+    hold_status = str((hold_aging_escalation or {}).get("status") or "CLEAR").upper()
+    cause_counts = dict((risk_cause_classifier or {}).get("cause_counts") or {})
+    causes = [str(cause).upper() for cause in cause_counts.keys()]
+    if not causes:
+        previous_for_review = [
+            dict(item) for item in entries
+            if str(item.get("review_key") or "") == review_key and list(item.get("causes") or [])
+        ]
+        if previous_for_review:
+            causes = [str(cause).upper() for cause in list(previous_for_review[-1].get("causes") or [])]
+    latest_audit_state = (decision_audit_trail or {}).get("latest_state")
+    outcome = _provider_truth_hold_outcome_label(approval_state, risk_count, clear_status, hold_status)
+    signature = "|".join([
+        review_key,
+        approval_state,
+        str(risk_count),
+        clear_status,
+        hold_status,
+        outcome,
+        ",".join(sorted(causes)),
+    ])
+    existing_signatures = {str(item.get("signature") or "") for item in entries}
+    if signature not in existing_signatures:
+        entry = {
+            "journal_key": f"{review_key}:{len(entries) + 1}",
+            "signature": signature,
+            "ts_utc": now.isoformat(),
+            "review_key": review_key,
+            "approval_state": approval_state,
+            "packet_status": (review_packet or {}).get("status"),
+            "risk_count": risk_count,
+            "clear_status": clear_status,
+            "clear_passed": int((risk_clear_requirements or {}).get("passed_count") or 0),
+            "clear_total": int((risk_clear_requirements or {}).get("total_count") or 0),
+            "hold_status": hold_status,
+            "hold_age_hours": (hold_aging_escalation or {}).get("hold_age_hours"),
+            "hold_escalation": (hold_aging_escalation or {}).get("escalation"),
+            "causes": causes,
+            "primary_cause": (risk_cause_classifier or {}).get("primary_cause") or (causes[0] if causes else None),
+            "top_symbol": (dict((risk_case_drilldown or {}).get("top_case") or {})).get("symbol"),
+            "latest_audit_state": latest_audit_state,
+            "outcome_label": outcome,
+            "manual_only": True,
+            "policy_auto_apply": False,
+        }
+        entries.append(entry)
+        entries = entries[-500:]
+        _freshness_kv_write(
+            _PROVIDER_TRUTH_HOLD_OUTCOME_JOURNAL_KEY,
+            {
+                "status": "TRACKING",
+                "updated_at": now.isoformat(),
+                "entry_count": len(entries),
+                "entries": entries,
+            },
+        )
+    latest = entries[-1] if entries else {}
+    review_entries = [
+        dict(item) for item in entries
+        if str(item.get("review_key") or "") == review_key
+    ]
+    return {
+        "status": "TRACKING" if entries else "EMPTY",
+        "review_key": review_key,
+        "entry_count": len(entries),
+        "review_entry_count": len(review_entries),
+        "latest_outcome": latest.get("outcome_label"),
+        "latest_state": latest.get("approval_state"),
+        "latest_at": latest.get("ts_utc"),
+        "items": list(reversed(review_entries[-20:])),
+        "all_items": entries[-200:],
+        "next_action": (
+            "Outcome observations are being journaled for later scoring."
+            if entries
+            else "No hold/review outcomes have been observed yet."
+        ),
+        "updated_at": now.isoformat(),
+    }
+
+
+def _build_provider_truth_cause_accuracy_scoring(hold_outcome_journal: dict, now: datetime) -> dict:
+    rows = [dict(item) for item in list((hold_outcome_journal or {}).get("all_items") or (hold_outcome_journal or {}).get("items") or [])]
+    by_cause: dict[str, dict] = {}
+    protective_labels = {"ACTIVE_RISK_HOLD", "STALE_RISK_HOLD", "RISK_REJECTED", "RISK_FROZEN"}
+    cleared_labels = {"CLEARED_BACK_TO_REVIEW", "APPROVED_AFTER_CLEAR", "CLEAR_BUT_STILL_HELD"}
+    unsafe_labels = {"UNSAFE_APPROVAL_ATTEMPT"}
+    for row in rows:
+        causes = [str(cause).upper() for cause in list(row.get("causes") or [])]
+        if not causes:
+            causes = ["UNCLASSIFIED"]
+        outcome = str(row.get("outcome_label") or "").upper()
+        for cause in causes:
+            bucket = by_cause.setdefault(cause, {
+                "cause": cause,
+                "observed_count": 0,
+                "protective_count": 0,
+                "cleared_count": 0,
+                "unsafe_count": 0,
+            })
+            bucket["observed_count"] += 1
+            if outcome in protective_labels:
+                bucket["protective_count"] += 1
+            if outcome in cleared_labels:
+                bucket["cleared_count"] += 1
+            if outcome in unsafe_labels:
+                bucket["unsafe_count"] += 1
+    items = []
+    for bucket in by_cause.values():
+        observed = max(1, int(bucket.get("observed_count") or 0))
+        protective = int(bucket.get("protective_count") or 0)
+        unsafe = int(bucket.get("unsafe_count") or 0)
+        score = round(max(0.0, min(100.0, ((protective - unsafe) / observed) * 100.0)), 1)
+        items.append({
+            **bucket,
+            "accuracy_score": score,
+            "read": (
+                "protective"
+                if score >= 60
+                else "noisy"
+                if score <= 20 and observed >= 3
+                else "building_sample"
+            ),
+        })
+    items.sort(key=lambda x: (_gb_float(x.get("accuracy_score")), int(x.get("observed_count") or 0)), reverse=True)
+    return {
+        "status": "SCORING" if items else "NO_SAMPLE",
+        "cause_count": len(items),
+        "sample_n": len(rows),
+        "top_cause": (items[0].get("cause") if items else None),
+        "top_score": (items[0].get("accuracy_score") if items else None),
+        "items": items[:20],
+        "next_action": (
+            "Use cause scores as evidence, not automatic policy changes."
+            if items
+            else "Keep collecting hold outcomes before scoring causes."
+        ),
+        "updated_at": now.isoformat(),
+    }
+
+
+def _build_provider_truth_clear_requirement_backtest(
+    hold_outcome_journal: dict,
+    risk_clear_requirements: dict,
+    now: datetime,
+) -> dict:
+    rows = [dict(item) for item in list((hold_outcome_journal or {}).get("all_items") or (hold_outcome_journal or {}).get("items") or [])]
+    release_rows = [
+        row for row in rows
+        if str(row.get("clear_status") or "").upper() == "CLEAR"
+        and int(row.get("risk_count") or 0) == 0
+    ]
+    blocked_rows = [
+        row for row in rows
+        if str(row.get("clear_status") or "").upper() == "BLOCKED"
+        or int(row.get("risk_count") or 0) > 0
+    ]
+    stale_block_rows = [
+        row for row in blocked_rows
+        if str(row.get("hold_status") or "").upper() == "STALE_HOLD"
+    ]
+    unsafe_release_rows = [
+        row for row in release_rows
+        if str(row.get("outcome_label") or "").upper() == "UNSAFE_APPROVAL_ATTEMPT"
+    ]
+    total = len(rows)
+    current_passed = int((risk_clear_requirements or {}).get("passed_count") or 0)
+    current_total = int((risk_clear_requirements or {}).get("total_count") or 0)
+    if unsafe_release_rows:
+        verdict = "TOO_LOOSE"
+    elif stale_block_rows:
+        verdict = "POSSIBLY_TOO_STRICT"
+    elif release_rows or blocked_rows:
+        verdict = "BALANCED_SO_FAR"
+    else:
+        verdict = "NO_SAMPLE"
+    return {
+        "status": verdict,
+        "sample_n": total,
+        "would_release_count": len(release_rows),
+        "would_block_count": len(blocked_rows),
+        "stale_block_count": len(stale_block_rows),
+        "unsafe_release_count": len(unsafe_release_rows),
+        "current_passed": current_passed,
+        "current_total": current_total,
+        "items": [
+            {
+                "name": "release_when_clear",
+                "passed": len(unsafe_release_rows) == 0,
+                "value": len(release_rows),
+                "risk": len(unsafe_release_rows),
+            },
+            {
+                "name": "block_when_risk_present",
+                "passed": len(blocked_rows) >= len(unsafe_release_rows),
+                "value": len(blocked_rows),
+                "risk": len(stale_block_rows),
+            },
+            {
+                "name": "current_clear_progress",
+                "passed": current_passed == current_total and current_total > 0,
+                "value": f"{current_passed}/{current_total}" if current_total else "0/0",
+                "risk": 0 if current_passed == current_total and current_total > 0 else current_total - current_passed,
+            },
+        ],
+        "next_action": (
+            "Tighten clear requirements before any release."
+            if unsafe_release_rows
+            else "Check whether stale blocks need faster rechecks or clearer evidence thresholds."
+            if stale_block_rows
+            else "Backtest is acceptable so far; keep collecting outcomes."
+            if total
+            else "No outcomes exist yet for clear-rule backtesting."
+        ),
+        "updated_at": now.isoformat(),
+    }
+
+
+def _build_provider_truth_policy_tuning_suggestions(
+    cause_accuracy_scoring: dict,
+    clear_requirement_backtest: dict,
+    now: datetime,
+) -> dict:
+    suggestions = []
+    for item in list((cause_accuracy_scoring or {}).get("items") or []):
+        cause = str(item.get("cause") or "UNCLASSIFIED").upper()
+        observed = int(item.get("observed_count") or 0)
+        score = _gb_float(item.get("accuracy_score"))
+        if observed < 3:
+            suggestions.append({
+                "suggestion": f"COLLECT_MORE_{cause}",
+                "cause": cause,
+                "priority": "LOW",
+                "manual_only": True,
+                "auto_apply": False,
+                "reason": f"{cause} has only {observed} scored observation(s).",
+            })
+        elif score >= 70:
+            suggestions.append({
+                "suggestion": f"KEEP_STRICT_{cause}",
+                "cause": cause,
+                "priority": "MEDIUM",
+                "manual_only": True,
+                "auto_apply": False,
+                "reason": f"{cause} is acting as a useful protective signal.",
+            })
+        elif score <= 20:
+            suggestions.append({
+                "suggestion": f"REVIEW_NOISY_{cause}",
+                "cause": cause,
+                "priority": "MEDIUM",
+                "manual_only": True,
+                "auto_apply": False,
+                "reason": f"{cause} may be too noisy; inspect before changing thresholds.",
+            })
+    backtest_status = str((clear_requirement_backtest or {}).get("status") or "").upper()
+    if backtest_status == "TOO_LOOSE":
+        suggestions.insert(0, {
+            "suggestion": "TIGHTEN_CLEAR_REQUIREMENTS",
+            "cause": None,
+            "priority": "HIGH",
+            "manual_only": True,
+            "auto_apply": False,
+            "reason": "Backtest found a release with unresolved risk.",
+        })
+    elif backtest_status == "POSSIBLY_TOO_STRICT":
+        suggestions.insert(0, {
+            "suggestion": "REVIEW_STALE_HOLD_THRESHOLDS",
+            "cause": None,
+            "priority": "MEDIUM",
+            "manual_only": True,
+            "auto_apply": False,
+            "reason": "Backtest found stale blocked holds; consider faster rechecks, not auto-approval.",
+        })
+    if not suggestions:
+        suggestions.append({
+            "suggestion": "KEEP_COLLECTING_OUTCOMES",
+            "cause": None,
+            "priority": "LOW",
+            "manual_only": True,
+            "auto_apply": False,
+            "reason": "Not enough outcome evidence exists for policy tuning.",
+        })
+    return {
+        "status": "READY" if suggestions else "EMPTY",
+        "suggestion_count": len(suggestions),
+        "top_suggestion": suggestions[0].get("suggestion") if suggestions else None,
+        "items": suggestions[:12],
+        "manual_only": True,
+        "auto_apply_enabled": False,
+        "next_action": "Review suggestions manually; no policy tuning is auto-applied.",
+        "updated_at": now.isoformat(),
+    }
+
+
 def _build_provider_truth_miss_evidence_accumulator(
     miss_review: dict,
     miss_repair_workbench: dict,
@@ -20803,6 +21153,27 @@ def _build_provider_truth_miss_evidence_accumulator(
         now,
     )
     decision_audit_trail = _build_provider_truth_decision_audit_trail(review_packet, now)
+    hold_outcome_journal = _build_provider_truth_hold_outcome_journal(
+        review_packet,
+        approval_gate,
+        risk_case_drilldown,
+        risk_cause_classifier,
+        risk_clear_requirements,
+        hold_aging_escalation,
+        decision_audit_trail,
+        now,
+    )
+    cause_accuracy_scoring = _build_provider_truth_cause_accuracy_scoring(hold_outcome_journal, now)
+    clear_requirement_backtest = _build_provider_truth_clear_requirement_backtest(
+        hold_outcome_journal,
+        risk_clear_requirements,
+        now,
+    )
+    policy_tuning_suggestions = _build_provider_truth_policy_tuning_suggestions(
+        cause_accuracy_scoring,
+        clear_requirement_backtest,
+        now,
+    )
     return {
         "status": score.get("status"),
         "readiness_state": score.get("readiness_state"),
@@ -20831,6 +21202,10 @@ def _build_provider_truth_miss_evidence_accumulator(
         "risk_clear_requirements": risk_clear_requirements,
         "approval_consequences": approval_consequences,
         "decision_audit_trail": decision_audit_trail,
+        "hold_outcome_journal": hold_outcome_journal,
+        "cause_accuracy_scoring": cause_accuracy_scoring,
+        "clear_requirement_backtest": clear_requirement_backtest,
+        "policy_tuning_suggestions": policy_tuning_suggestions,
         "next_action": policy_work_order.get("next_action") or approval_gate.get("next_action") or score.get("next_action"),
     }
 
@@ -21222,6 +21597,10 @@ def _build_dashboard_provider_truth_panel(
     miss_risk_clear = dict(miss_evidence_accumulator.get("risk_clear_requirements") or {})
     miss_consequences = dict(miss_evidence_accumulator.get("approval_consequences") or {})
     miss_decision_audit = dict(miss_evidence_accumulator.get("decision_audit_trail") or {})
+    miss_hold_journal = dict(miss_evidence_accumulator.get("hold_outcome_journal") or {})
+    miss_cause_accuracy = dict(miss_evidence_accumulator.get("cause_accuracy_scoring") or {})
+    miss_clear_backtest = dict(miss_evidence_accumulator.get("clear_requirement_backtest") or {})
+    miss_policy_tuning = dict(miss_evidence_accumulator.get("policy_tuning_suggestions") or {})
     miss_top_evidence = (list(miss_approval_evidence.get("top_items") or []) or [{}])[0]
     miss_top_risk_case = dict(miss_risk_cases.get("top_case") or {})
     status = (
@@ -21338,6 +21717,21 @@ def _build_dashboard_provider_truth_panel(
         "miss_consequence_count": int(miss_consequences.get("consequence_count") or 0),
         "miss_audit_event_count": int(miss_decision_audit.get("event_count") or 0),
         "miss_audit_latest_state": miss_decision_audit.get("latest_state"),
+        "miss_hold_journal_status": miss_hold_journal.get("status"),
+        "miss_hold_journal_entry_count": int(miss_hold_journal.get("entry_count") or 0),
+        "miss_hold_journal_latest_outcome": miss_hold_journal.get("latest_outcome"),
+        "miss_cause_accuracy_status": miss_cause_accuracy.get("status"),
+        "miss_cause_accuracy_sample_n": int(miss_cause_accuracy.get("sample_n") or 0),
+        "miss_cause_accuracy_top_cause": miss_cause_accuracy.get("top_cause"),
+        "miss_cause_accuracy_top_score": miss_cause_accuracy.get("top_score"),
+        "miss_clear_backtest_status": miss_clear_backtest.get("status"),
+        "miss_clear_backtest_sample_n": int(miss_clear_backtest.get("sample_n") or 0),
+        "miss_clear_backtest_release_count": int(miss_clear_backtest.get("would_release_count") or 0),
+        "miss_clear_backtest_block_count": int(miss_clear_backtest.get("would_block_count") or 0),
+        "miss_clear_backtest_unsafe_count": int(miss_clear_backtest.get("unsafe_release_count") or 0),
+        "miss_policy_tuning_status": miss_policy_tuning.get("status"),
+        "miss_policy_tuning_suggestion_count": int(miss_policy_tuning.get("suggestion_count") or 0),
+        "miss_policy_tuning_top_suggestion": miss_policy_tuning.get("top_suggestion"),
         "top_symbol": top_agreement.get("symbol"),
         "top_status": top_agreement.get("status"),
         "top_best_source": top_arbitration.get("best_source"),
