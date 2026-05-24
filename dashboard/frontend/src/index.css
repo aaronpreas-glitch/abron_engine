@@ -847,6 +847,314 @@ a:hover { color: var(--text); }
   gap: 18px;
 }
 
+.cockpit-v2 {
+  display: grid;
+  grid-template-columns: minmax(0, 1.45fr) minmax(260px, 0.55fr);
+  gap: 18px;
+  padding: 18px;
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 8px;
+  background:
+    linear-gradient(135deg, rgba(8,13,21,0.94), rgba(5,8,13,0.84)),
+    rgba(0,0,0,0.18);
+}
+
+.cockpit-v2-main {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.cockpit-v2-kicker {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 8px;
+  font-weight: 900;
+  letter-spacing: 0.16em;
+}
+
+.cockpit-v2-kicker span {
+  display: inline-flex;
+  align-items: center;
+  min-height: 23px;
+  padding: 3px 8px;
+  border: 1px solid;
+  border-radius: 999px;
+  letter-spacing: 0.10em;
+}
+
+.cockpit-v2-title {
+  font-family: Inter, system-ui, sans-serif;
+  font-size: clamp(30px, 4vw, 58px);
+  line-height: 0.95;
+  font-weight: 760;
+  letter-spacing: 0;
+}
+
+.cockpit-v2-subline {
+  max-width: 920px;
+  color: #b4c6de;
+  font-family: Inter, system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.cockpit-v2-identity,
+.cockpit-v2-metrics {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.cockpit-v2-identity {
+  padding-top: 2px;
+}
+
+.cockpit-label {
+  margin-bottom: 3px;
+  color: var(--dim);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 8px;
+  font-weight: 800;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+}
+
+.cockpit-symbol {
+  color: var(--text);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 19px;
+  font-weight: 900;
+  letter-spacing: 0.04em;
+}
+
+.cockpit-value {
+  color: #d7e1ea;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.cockpit-v2-metrics span {
+  display: inline-flex;
+  gap: 5px;
+  color: #6f879d;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+}
+
+.cockpit-v2-metrics b {
+  color: #d7e1ea;
+  font-weight: 900;
+}
+
+.cockpit-v2-unlock {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 11px 12px;
+  border: 1px solid rgba(245,158,11,0.18);
+  border-radius: 8px;
+  background: rgba(245,158,11,0.045);
+  color: #d7c199;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  line-height: 1.55;
+}
+
+.cockpit-v2-blockers {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.cockpit-v2-blockers span {
+  padding: 3px 7px;
+  border: 1px solid rgba(245,158,11,0.22);
+  border-radius: 999px;
+  background: rgba(245,158,11,0.07);
+  color: #fbbf24;
+  font-size: 8px;
+}
+
+.cockpit-v2-blockers span.danger {
+  border-color: rgba(239,68,68,0.34);
+  background: rgba(239,68,68,0.12);
+  color: #ffb4b4;
+}
+
+.cockpit-v2-rail {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 10px;
+  min-width: 0;
+}
+
+.cockpit-v2-stat {
+  min-width: 0;
+  padding: 11px 12px;
+  border: 1px solid rgba(255,255,255,0.07);
+  border-radius: 8px;
+  background: rgba(255,255,255,0.035);
+}
+
+.cockpit-v2-stat span,
+.cockpit-v2-stat small {
+  display: block;
+  color: var(--dim);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 8px;
+  letter-spacing: 0.08em;
+}
+
+.cockpit-v2-stat b {
+  display: block;
+  margin: 5px 0;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 15px;
+  font-weight: 900;
+  letter-spacing: 0.03em;
+}
+
+.cockpit-v2-note {
+  padding: 10px 12px;
+  border: 1px solid rgba(167,139,250,0.16);
+  border-radius: 8px;
+  background: rgba(167,139,250,0.045);
+  color: #b9a8ff;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 8px;
+  line-height: 1.5;
+}
+
+.closest-v2 {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid rgba(255,255,255,0.075);
+  border-radius: 8px;
+  background: rgba(8,13,21,0.56);
+}
+
+.closest-v2-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.closest-v2-head span,
+.closest-v2-head b {
+  display: block;
+  color: #d7e1ea;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+  font-weight: 900;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+}
+
+.closest-v2-head small {
+  display: block;
+  margin-top: 5px;
+  color: #6f879d;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 8px;
+  line-height: 1.45;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.closest-v2-list {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.closest-v2-row {
+  display: grid;
+  grid-template-columns: 28px minmax(170px, 1fr) minmax(240px, 0.85fr) auto;
+  align-items: center;
+  gap: 10px;
+  min-height: 48px;
+  padding: 8px 10px;
+  border: 1px solid rgba(255,255,255,0.06);
+  border-left: 3px solid #7f95a8;
+  border-radius: 6px;
+  background: rgba(0,0,0,0.20);
+}
+
+.closest-v2-rank {
+  color: #506276;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  font-weight: 900;
+}
+
+.closest-v2-token {
+  min-width: 0;
+}
+
+.closest-v2-token div {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.closest-v2-token b {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 13px;
+  font-weight: 900;
+  letter-spacing: 0.04em;
+}
+
+.closest-v2-token span {
+  color: #8ca0b3;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 8px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.closest-v2-token small {
+  display: block;
+  margin-top: 3px;
+  overflow: hidden;
+  color: #6f879d;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 8px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.closest-v2-facts {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.closest-v2-facts span {
+  color: #8ca0b3;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 8px;
+  white-space: nowrap;
+}
+
+.closest-v2-empty {
+  color: #7f95a8;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+}
+
 /* ─────────────────────────────────────────────────
    ABRONS OS SHELL
 ───────────────────────────────────────────────── */
@@ -1269,12 +1577,27 @@ a:hover { color: var(--text); }
 @media (max-width: 980px) {
   .operator-hero-grid,
   .operator-setup-grid,
-  .home-command-grid {
+  .home-command-grid,
+  .cockpit-v2 {
     grid-template-columns: 1fr !important;
   }
 
   .operator-stats-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+  }
+
+  .cockpit-v2-rail {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .closest-v2-row {
+    grid-template-columns: 24px minmax(0, 1fr);
+  }
+
+  .closest-v2-facts,
+  .closest-v2-row > button {
+    grid-column: 2;
+    justify-content: flex-start;
   }
 }
 
@@ -1291,6 +1614,19 @@ a:hover { color: var(--text); }
 
   .operator-stats-grid {
     grid-template-columns: 1fr !important;
+  }
+
+  .cockpit-v2 {
+    padding: 14px;
+  }
+
+  .cockpit-v2-rail {
+    grid-template-columns: 1fr;
+  }
+
+  .home-workbench-launcher {
+    align-items: flex-start;
+    flex-direction: column;
   }
 
   .nav-tabs-row {

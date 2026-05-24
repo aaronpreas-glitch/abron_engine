@@ -3953,6 +3953,22 @@ function BrokenDataBanner({ blockers, compact = false }: {
   )
 }
 
+function humanizeSignal(value?: string | null) {
+  return String(value || '')
+    .replace(/_/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase()
+}
+
+function collectGoodBuyRows(board?: GoodBuyBoardV2 | null, limit = 6) {
+  const rows: Array<{ item: GoodBuyItem; bucket: 'BUYABLE' | 'WAIT' | 'BLOCKED' }> = []
+  for (const item of board?.buyable ?? []) rows.push({ item, bucket: 'BUYABLE' })
+  for (const item of board?.wait ?? []) rows.push({ item, bucket: 'WAIT' })
+  for (const item of board?.blocked ?? []) rows.push({ item, bucket: 'BLOCKED' })
+  return rows.slice(0, limit)
+}
+
 // ── System card colors ────────────────────────────────────────────────────────
 
 const C = {
@@ -9697,6 +9713,201 @@ function MemecoinResearchDossierPanel({
   )
 }
 
+function CockpitV2Hero({
+  board,
+  bestAction,
+  summary,
+  heat,
+  freshness,
+  audit,
+}: {
+  board: ActionBoardData | undefined
+  bestAction: BestActionData | undefined
+  summary: HomeSummary | undefined
+  heat: SpeculationHeatData | undefined
+  freshness: { label: string; tone: string; updatedAt: string | null }
+  audit: SystemAuditData | undefined
+}) {
+  const goodBoard = board?.good_buy_board_v2
+  const backendBuyDecision = board?.buy_decision_v1 ?? goodBoard?.buy_decision_v1 ?? null
+  const headline = board?.headline
+  const actionTop = headline?.top_candidate ?? board?.ready_now?.[0] ?? board?.best_blocked?.[0] ?? board?.watchlist?.[0] ?? null
+  const primary = goodBoard?.buyable?.[0] ?? goodBoard?.wait?.[0] ?? goodBoard?.blocked?.[0] ?? null
+  const activeBlockers = [
+    ...(backendBuyDecision?.failures ?? []),
+    ...(primary?.blockers ?? []),
+    ...(primary?.warnings ?? []),
+    ...(primary?.execution_ticket?.blockers ?? []),
+    ...(actionTop?.blockers ?? []),
+  ]
+  const brokenData = hasBrokenMarketData(activeBlockers)
+  const isReady = Boolean(!brokenData && (backendBuyDecision?.is_buy_now || primary?.state === 'BUYABLE'))
+  const hasCandidate = Boolean(primary || actionTop || bestAction)
+  const tone = brokenData ? '#ef4444' : isReady ? '#00d48a' : hasCandidate ? '#f59e0b' : '#7f95a8'
+  const symbol = primary?.symbol || actionTop?.symbol || bestAction?.asset || null
+  const address = primary?.mint || actionTop?.token_address || bestAction?.token_address || null
+  const lane = primary?.lane || actionTop?.system || bestAction?.arm || 'MEMECOINS'
+  const verdict = brokenData
+    ? 'DO NOT ACT'
+    : isReady
+      ? 'READY, LOCKED'
+      : hasCandidate
+        ? 'WAIT'
+        : 'NO CLEAN BUY'
+  const title = brokenData
+    ? 'Data broken'
+    : isReady
+      ? `Review ${symbol || 'setup'}`
+      : hasCandidate
+        ? `Wait on ${symbol || 'the board'}`
+        : 'Stand down'
+  const reason = brokenData
+    ? 'Market data is stale or contradictory. Confirm chart and CA manually before trusting this row.'
+    : backendBuyDecision?.reason
+      || primary?.headline
+      || actionTop?.reason
+      || bestAction?.reason
+      || 'The engine is watching, but nothing has cleared the full buy gate yet.'
+  const unlock = brokenData
+    ? 'Fresh live market payload plus consistent flow metrics.'
+    : primary?.execution_ticket?.entry?.instruction
+      || activeBlockers.find(Boolean)?.replace(/_/g, ' ')
+      || actionTop?.unlock_hint
+      || 'A clean trigger, fresh data, and authority alignment.'
+  const metrics = primary?.metrics
+  const dataConfidence = audit?.runtime?.data_confidence
+  const heatLabel = heat ? `${heat.heat_state} ${fmtFixed(heat.heat_score, 0)}` : '—'
+  const readyCount = goodBoard?.summary?.buyable ?? board?.summary?.ready_now_count ?? 0
+  const waitCount = goodBoard?.summary?.wait ?? 0
+  const blockedCount = goodBoard?.summary?.blocked ?? board?.summary?.blocked_count ?? 0
+
+  const cockpitStats = [
+    { label: 'Execution', value: 'Locked', tone: '#f59e0b', note: 'manual only' },
+    { label: 'Data', value: dataConfidence?.status || freshness.label, tone: dataConfidence?.status === 'LOW' ? '#ef4444' : dataConfidence?.status === 'HIGH' ? '#00d48a' : freshness.tone, note: dataConfidence?.issues?.[0] || freshness.updatedAt ? fmtAge(freshness.updatedAt) : 'warming' },
+    { label: 'Board', value: `${readyCount}/${waitCount}/${blockedCount}`, tone: readyCount ? '#00d48a' : waitCount ? '#f59e0b' : '#7f95a8', note: 'ready/wait/block' },
+    { label: 'Heat', value: heatLabel, tone: heat?.heat_state === 'OVERHEATED' ? '#ef4444' : heat?.heat_state === 'HOT' ? '#f59e0b' : '#00d48a', note: heat?.momentum ? heat.momentum.toLowerCase() : 'context' },
+  ]
+
+  return (
+    <section className="cockpit-v2" style={{ borderColor: `${tone}33`, boxShadow: `0 0 0 1px ${tone}08 inset, 0 20px 70px rgba(0,0,0,0.28)` }}>
+      <div className="cockpit-v2-main">
+        <div className="cockpit-v2-kicker" style={{ color: tone }}>
+          TODAY'S DECISION
+          <span style={{ borderColor: `${tone}40`, background: `${tone}12`, color: tone }}>{verdict}</span>
+        </div>
+        <div className="cockpit-v2-title" style={{ color: tone }}>{title}</div>
+        <div className="cockpit-v2-subline">{reason}</div>
+        <BrokenDataBanner blockers={activeBlockers} />
+
+        <div className="cockpit-v2-identity">
+          <div>
+            <div className="cockpit-label">Best Name</div>
+            <div className="cockpit-symbol">{symbol || 'None'}</div>
+          </div>
+          <div>
+            <div className="cockpit-label">Lane</div>
+            <div className="cockpit-value">{String(lane).replace(/_/g, ' + ')}</div>
+          </div>
+          <div>
+            <div className="cockpit-label">Score</div>
+            <div className="cockpit-value">{fmtFixed(primary?.good_buy_score ?? actionTop?.priority_score, 0)}</div>
+          </div>
+          <TokenAddressChip value={address} size="roomy" />
+        </div>
+
+        <div className="cockpit-v2-metrics">
+          <span>MC <b>{fmtUsd(metrics?.marketcap_usd)}</b></span>
+          <span>LIQ <b>{fmtUsd(metrics?.liquidity_usd)}</b></span>
+          <span>VOL <b>{fmtUsd(metrics?.volume_24h_usd)}</b></span>
+          <span>1H <b style={{ color: (metrics?.change_1h_pct ?? 0) >= 0 ? '#00d48a' : '#ef4444' }}>{fmtPct(metrics?.change_1h_pct)}</b></span>
+          <span>DATA <b style={{ color: brokenData ? '#ef4444' : primary?.data?.data_freshness === 'LIVE' ? '#00d48a' : '#f59e0b' }}>{primary?.data?.data_freshness || '—'}</b></span>
+        </div>
+
+        <div className="cockpit-v2-unlock">
+          <div className="cockpit-label" style={{ color: brokenData ? '#ef4444' : '#f59e0b' }}>
+            {isReady ? 'Before You Touch It' : 'What Unlocks It'}
+          </div>
+          <div>{unlock}</div>
+          {activeBlockers.length > 0 && (
+            <div className="cockpit-v2-blockers">
+              {activeBlockers.slice(0, 3).map((blocker, i) => (
+                <span key={`${blocker}-${i}`} className={hasBrokenMarketData([blocker]) ? 'danger' : ''}>
+                  {humanizeSignal(blocker)}
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+
+      <aside className="cockpit-v2-rail">
+        {cockpitStats.map((stat) => (
+          <div className="cockpit-v2-stat" key={stat.label}>
+            <span>{stat.label}</span>
+            <b style={{ color: stat.tone }}>{stat.value}</b>
+            <small>{stat.note}</small>
+          </div>
+        ))}
+        <div className="cockpit-v2-note">
+          {summary?.memecoins?.wr_pct != null
+            ? `Learning sample: ${summary.memecoins.outcomes}/${summary.memecoins.next_milestone} outcomes · WR ${summary.memecoins.wr_pct}%`
+            : 'Outcome learning continues in the background.'}
+        </div>
+      </aside>
+    </section>
+  )
+}
+
+function ClosestNamesV2Panel({ board }: { board: GoodBuyBoardV2 | undefined }) {
+  const rows = collectGoodBuyRows(board, 7)
+  if (!board || rows.length === 0) {
+    return (
+      <section className="closest-v2">
+        <div className="closest-v2-empty">No ranked names yet. The engine is waiting for fresh candidates.</div>
+      </section>
+    )
+  }
+
+  return (
+    <section className="closest-v2">
+      <div className="closest-v2-head">
+        <div>
+          <span>Closest Names</span>
+          <small>{board.headline}</small>
+        </div>
+        <b>{board.status}</b>
+      </div>
+      <div className="closest-v2-list">
+        {rows.map(({ item, bucket }, index) => {
+          const allBlockers = [...(item.blockers ?? []), ...(item.warnings ?? []), ...(item.execution_ticket?.blockers ?? [])]
+          const broken = hasBrokenMarketData(allBlockers)
+          const tone = broken ? '#ef4444' : bucket === 'BUYABLE' ? '#00d48a' : bucket === 'WAIT' ? '#f59e0b' : '#7f95a8'
+          const blocker = allBlockers[0] || item.strengths?.[0] || item.headline
+          return (
+            <div className="closest-v2-row" key={`${item.mint}-${bucket}`} style={{ borderLeftColor: tone }}>
+              <div className="closest-v2-rank">{index + 1}</div>
+              <div className="closest-v2-token">
+                <div>
+                  <b style={{ color: tone }}>{item.symbol}</b>
+                  <span>{bucket === 'BUYABLE' ? 'Ready, locked' : bucket === 'WAIT' ? 'Wait' : 'Blocked'}</span>
+                </div>
+                <small>{humanizeSignal(blocker)}</small>
+              </div>
+              <div className="closest-v2-facts">
+                <span>MC {fmtUsd(item.metrics.marketcap_usd)}</span>
+                <span>LIQ {fmtUsd(item.metrics.liquidity_usd)}</span>
+                <span>1H {fmtPct(item.metrics.change_1h_pct)}</span>
+                <span>Score {fmtFixed(item.good_buy_score, 0)}</span>
+              </div>
+              <TokenAddressChip value={item.mint} />
+            </div>
+          )
+        })}
+      </div>
+    </section>
+  )
+}
+
 function OperatorCommandHero({
   board,
   bestAction,
@@ -10244,6 +10455,8 @@ void [
   MiniBar,
   ReadinessSnapshot,
   DecisionJournalPanel,
+  GoodBuyBoardPanel,
+  OperatorCommandHero,
 ]
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -10706,10 +10919,9 @@ export function HomePage() {
         </div>
       </div>
 
-      <OperatorCommandHero
+      <CockpitV2Hero
         board={actionBoardQ.data}
         bestAction={bestActionQ.data}
-        analyst={aiAnalystQ.data}
         summary={s}
         heat={speculationHeatQ.data}
         freshness={homeFreshness}
@@ -10721,7 +10933,7 @@ export function HomePage() {
           <span className="home-section-title" style={{ color: '#00d48a' }}>Closest Names</span>
           <span className="home-section-meta">clean entry, waitlist, or blocked</span>
         </div>
-        <GoodBuyBoardPanel board={actionBoardQ.data?.good_buy_board_v2} />
+        <ClosestNamesV2Panel board={actionBoardQ.data?.good_buy_board_v2} />
       </section>
 
       <section className="home-section-shell">
