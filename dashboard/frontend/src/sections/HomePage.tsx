@@ -10258,6 +10258,8 @@ export function HomePage() {
   const [pendingEscalationWorkOrderKey, setPendingEscalationWorkOrderKey] = React.useState<string | null>(null)
   const [pendingLiveContextMissionKey, setPendingLiveContextMissionKey] = React.useState<string | null>(null)
   const [pendingProviderTruthMissReviewKey, setPendingProviderTruthMissReviewKey] = React.useState<string | null>(null)
+  const [showResearchDesk, setShowResearchDesk] = React.useState(false)
+  const [showEngineWorkbench, setShowEngineWorkbench] = React.useState(false)
   const [homeQueryStage, setHomeQueryStage] = React.useState(0)
 
   React.useEffect(() => {
@@ -10300,6 +10302,7 @@ export function HomePage() {
   const dailyBriefQ = useQuery<DailyCryptoBriefData>({
     queryKey: ['home-daily-crypto-brief'],
     queryFn: () => api.get('/home/daily-crypto-brief?lookback_hours=24').then(r => r.data),
+    enabled: showEngineWorkbench,
     retry: 1,
     refetchInterval: slowBudgetedInterval(180_000),
     staleTime: 60_000,
@@ -10308,7 +10311,7 @@ export function HomePage() {
   const earlyRunnersQ = useQuery<EarlyRunnersData>({
     queryKey: ['home-early-runners'],
     queryFn: () => api.get('/home/early-runners?limit=8&lookback_hours=24').then(r => r.data),
-    enabled: homeQueryStage >= 2,
+    enabled: showResearchDesk,
     retry: 1,
     refetchInterval: liveBudgetedInterval(45_000),
     staleTime: 10_000,
@@ -10317,7 +10320,7 @@ export function HomePage() {
   const convictionRecoveryQ = useQuery<ConvictionRecoveryData>({
     queryKey: ['home-conviction-recovery'],
     queryFn: () => api.get('/home/conviction-recovery?limit=10').then(r => r.data),
-    enabled: homeQueryStage >= 3,
+    enabled: showResearchDesk,
     retry: 1,
     refetchInterval: slowBudgetedInterval(120_000),
     staleTime: 30_000,
@@ -10326,7 +10329,7 @@ export function HomePage() {
   const runnerReviewQ = useQuery<RunnerReviewData>({
     queryKey: ['home-runner-review'],
     queryFn: () => api.get('/home/runner-review?limit=8').then(r => r.data),
-    enabled: homeQueryStage >= 2,
+    enabled: showResearchDesk,
     retry: 1,
     refetchInterval: liveBudgetedInterval(45_000),
     staleTime: 15_000,
@@ -10335,7 +10338,7 @@ export function HomePage() {
   const memecoinResearchQ = useQuery<MemecoinResearchData>({
     queryKey: ['home-memecoin-research'],
     queryFn: () => api.get('/home/memecoin-research?limit=10').then(r => r.data),
-    enabled: homeQueryStage >= 3,
+    enabled: showResearchDesk,
     retry: 1,
     refetchInterval: slowBudgetedInterval(180_000),
     staleTime: 60_000,
@@ -10610,7 +10613,7 @@ export function HomePage() {
   }>({
     queryKey: ['confluence-reinforcement'],
     queryFn:  () => api.get('/confluence/reinforcement').then(r => r.data),
-    enabled: homeQueryStage >= 1,
+    enabled: showEngineWorkbench,
     retry: 1,
     refetchInterval: liveBudgetedInterval(60_000),
     staleTime: 30_000,
@@ -10620,7 +10623,7 @@ export function HomePage() {
   const scannerDiagQ = useQuery<HomeScannerDiag>({
     queryKey:        ['scanner-diagnostics'],
     queryFn:         () => api.get('/memecoins/scanner-diagnostics').then(r => r.data),
-    enabled:         homeQueryStage >= 3,
+    enabled:         showEngineWorkbench,
     retry:           1,
     refetchInterval: slowBudgetedInterval(120_000),
     staleTime:       60_000,
@@ -10628,7 +10631,7 @@ export function HomePage() {
   const speculationHeatQ = useQuery<SpeculationHeatData>({
     queryKey: ['home-speculation-heat'],
     queryFn: () => api.get('/home/speculation-heat').then(r => r.data),
-    enabled: homeQueryStage >= 3,
+    enabled: homeQueryStage >= 2,
     retry: 1,
     refetchInterval: slowBudgetedInterval(120_000),
     staleTime: 60_000,
@@ -10636,7 +10639,7 @@ export function HomePage() {
   const aiAnalystQ = useQuery<AIAnalystData>({
     queryKey: ['home-ai-analyst'],
     queryFn: () => api.get('/home/ai-analyst').then(r => r.data),
-    enabled: homeQueryStage >= 4,
+    enabled: showEngineWorkbench,
     retry: 1,
     refetchInterval: slowBudgetedInterval(300_000),
     staleTime: 120_000,
@@ -10699,7 +10702,7 @@ export function HomePage() {
           <h1 className="home-title">Command Cockpit</h1>
         </div>
         <div className="home-intro-copy">
-          Memecoins, spot, provider truth, outcome learning, and operator decisions in one place.
+          One decision first. Deep research and engine internals stay tucked away until you need them.
         </div>
       </div>
 
@@ -10713,56 +10716,18 @@ export function HomePage() {
         audit={systemAuditQ.data}
       />
 
-      <div className="home-primary-grid">
-        <section className="home-section-shell">
-          <div className="home-section-header">
-            <span className="home-section-title" style={{ color: '#2dd4bf' }}>Operator Brief</span>
-            <span className="home-section-meta">decisions, provider truth, closeout</span>
-          </div>
-          <DailyCryptoBriefPanel
-            data={dailyBriefQ.data}
-            loading={dailyBriefQ.isLoading}
-            onEscalationAction={recordProviderEscalationDecision}
-            onEscalationReviewAction={recordProviderEscalationReviewDecision}
-            onEscalationPatchAction={recordProviderEscalationPatchDecision}
-            onEscalationWorkOrderAction={recordProviderEscalationWorkOrderDecision}
-            onLiveContextMissionAction={recordLiveContextMissionDecision}
-            onProviderTruthMissReviewAction={recordProviderTruthMissReviewDecision}
-            pendingEscalationId={pendingEscalationId}
-            pendingEscalationReviewKey={pendingEscalationReviewKey}
-            pendingEscalationPatchKey={pendingEscalationPatchKey}
-            pendingEscalationWorkOrderKey={pendingEscalationWorkOrderKey}
-            pendingLiveContextMissionKey={pendingLiveContextMissionKey}
-            pendingProviderTruthMissReviewKey={pendingProviderTruthMissReviewKey}
-          />
-        </section>
-
-        <section className="home-section-shell">
-          <div className="home-section-header">
-            <span className="home-section-title" style={{ color: '#00d48a' }}>Best Buy Board</span>
-            <span className="home-section-meta">clean entry first</span>
-          </div>
-          <GoodBuyBoardPanel board={actionBoardQ.data?.good_buy_board_v2} />
-        </section>
-      </div>
-
       <section className="home-section-shell">
         <div className="home-section-header">
-          <span className="home-section-title" style={{ color: '#60a5fa' }}>Research + CA Review</span>
-          <span className="home-section-meta">identity, catalyst, wallet cluster, deployability</span>
+          <span className="home-section-title" style={{ color: '#00d48a' }}>Closest Names</span>
+          <span className="home-section-meta">clean entry, waitlist, or blocked</span>
         </div>
-        <MemecoinResearchDossierPanel
-          data={memecoinResearchQ.data}
-          loading={memecoinResearchQ.isLoading}
-          onManualDecision={recordMemecoinManualDecision}
-          pendingManualMint={pendingManualMint}
-        />
+        <GoodBuyBoardPanel board={actionBoardQ.data?.good_buy_board_v2} />
       </section>
 
       <section className="home-section-shell">
         <div className="home-section-header">
           <span className="home-section-title" style={{ color: '#f59e0b' }}>Entry Triggers</span>
-          <span className="home-section-meta">last blocker, replay, runner coverage</span>
+          <span className="home-section-meta">what needs to clear before action</span>
         </div>
         <EntryWatchHomeStrip
           status={watchToEntry}
@@ -10771,30 +10736,101 @@ export function HomePage() {
         />
       </section>
 
-      <EstablishedRunnerReviewPanel
-        data={runnerReviewQ.data}
-        loading={runnerReviewQ.isLoading}
-        onDecision={recordRunnerDecision}
-        pendingMint={pendingRunnerMint}
-      />
-
-      <div className="home-command-grid" style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: 16 }}>
-        <EarlyRunnerRadarPanel data={earlyRunnersQ.data} loading={earlyRunnersQ.isLoading} />
-        <ConvictionRecoveryPanel data={convictionRecoveryQ.data} loading={convictionRecoveryQ.isLoading} />
-      </div>
-
-      <section className="home-section-shell">
-        <div className="home-section-header">
-          <span className="home-section-title" style={{ color: '#8fb7dc' }}>Full Queue</span>
-          <span className="home-section-meta">scanner candidates and blocked leaders</span>
+      <div className="home-workbench-launcher">
+        <div>
+          <div style={{ ...MONO, fontSize: 9, color: '#d7e1ea', fontWeight: 900, letterSpacing: '0.13em' }}>
+            DEEP WORKBENCH
+          </div>
+          <div style={{ ...MONO, fontSize: 8, color: '#6f879d', marginTop: 4, lineHeight: 1.5 }}>
+            Open these only when you want research, review queues, runner logs, or scanner internals.
+          </div>
         </div>
-        <ActionBoardPanel data={actionBoardQ.data} loading={actionBoardQ.isLoading} scannerDiag={scannerDiagQ.data} reinfBySymbol={reinfBySymbol} />
-      </section>
-
-      <div className="home-command-grid" style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: 16 }}>
-        <AnalystMemoPanel data={aiAnalystQ.data} loading={aiAnalystQ.isLoading} />
-        <HomeTalkTrack heat={speculationHeatQ.data} bestAction={bestActionQ.data} />
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+          <button
+            type="button"
+            className={showResearchDesk ? 'workbench-toggle active' : 'workbench-toggle'}
+            onClick={() => setShowResearchDesk((value) => !value)}
+          >
+            {showResearchDesk ? 'Hide' : 'Open'} Research Desk
+          </button>
+          <button
+            type="button"
+            className={showEngineWorkbench ? 'workbench-toggle active' : 'workbench-toggle'}
+            onClick={() => setShowEngineWorkbench((value) => !value)}
+          >
+            {showEngineWorkbench ? 'Hide' : 'Open'} Engine Detail
+          </button>
+        </div>
       </div>
+
+      {showResearchDesk && (
+        <div className="home-workbench-stack">
+          <section className="home-section-shell">
+            <div className="home-section-header">
+              <span className="home-section-title" style={{ color: '#60a5fa' }}>Research + CA Review</span>
+              <span className="home-section-meta">identity, catalyst, wallet cluster, deployability</span>
+            </div>
+            <MemecoinResearchDossierPanel
+              data={memecoinResearchQ.data}
+              loading={memecoinResearchQ.isLoading}
+              onManualDecision={recordMemecoinManualDecision}
+              pendingManualMint={pendingManualMint}
+            />
+          </section>
+
+          <EstablishedRunnerReviewPanel
+            data={runnerReviewQ.data}
+            loading={runnerReviewQ.isLoading}
+            onDecision={recordRunnerDecision}
+            pendingMint={pendingRunnerMint}
+          />
+
+          <div className="home-command-grid" style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: 16 }}>
+            <EarlyRunnerRadarPanel data={earlyRunnersQ.data} loading={earlyRunnersQ.isLoading} />
+            <ConvictionRecoveryPanel data={convictionRecoveryQ.data} loading={convictionRecoveryQ.isLoading} />
+          </div>
+        </div>
+      )}
+
+      {showEngineWorkbench && (
+        <div className="home-workbench-stack">
+          <section className="home-section-shell">
+            <div className="home-section-header">
+              <span className="home-section-title" style={{ color: '#2dd4bf' }}>Operator Brief</span>
+              <span className="home-section-meta">decisions, provider truth, closeout</span>
+            </div>
+            <DailyCryptoBriefPanel
+              data={dailyBriefQ.data}
+              loading={dailyBriefQ.isLoading}
+              onEscalationAction={recordProviderEscalationDecision}
+              onEscalationReviewAction={recordProviderEscalationReviewDecision}
+              onEscalationPatchAction={recordProviderEscalationPatchDecision}
+              onEscalationWorkOrderAction={recordProviderEscalationWorkOrderDecision}
+              onLiveContextMissionAction={recordLiveContextMissionDecision}
+              onProviderTruthMissReviewAction={recordProviderTruthMissReviewDecision}
+              pendingEscalationId={pendingEscalationId}
+              pendingEscalationReviewKey={pendingEscalationReviewKey}
+              pendingEscalationPatchKey={pendingEscalationPatchKey}
+              pendingEscalationWorkOrderKey={pendingEscalationWorkOrderKey}
+              pendingLiveContextMissionKey={pendingLiveContextMissionKey}
+              pendingProviderTruthMissReviewKey={pendingProviderTruthMissReviewKey}
+            />
+          </section>
+
+          <section className="home-section-shell">
+            <div className="home-section-header">
+              <span className="home-section-title" style={{ color: '#8fb7dc' }}>Full Queue</span>
+              <span className="home-section-meta">scanner candidates and blocked leaders</span>
+            </div>
+            <ActionBoardPanel data={actionBoardQ.data} loading={actionBoardQ.isLoading} scannerDiag={scannerDiagQ.data} reinfBySymbol={reinfBySymbol} />
+          </section>
+
+          <div className="home-command-grid" style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: 16 }}>
+            <AnalystMemoPanel data={aiAnalystQ.data} loading={aiAnalystQ.isLoading} />
+            <HomeTalkTrack heat={speculationHeatQ.data} bestAction={bestActionQ.data} />
+          </div>
+        </div>
+      )}
 
       {/*
         Backend health, provider recovery, posture, and readiness surfaces still run

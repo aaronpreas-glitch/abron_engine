@@ -805,6 +805,48 @@ a:hover { color: var(--text); }
   font-size: 7px;
 }
 
+.home-workbench-launcher {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 12px 14px;
+  border: 1px solid rgba(255,255,255,0.075);
+  border-radius: 8px;
+  background: rgba(8, 13, 21, 0.58);
+}
+
+.workbench-toggle {
+  min-height: 30px;
+  padding: 5px 10px;
+  border: 1px solid rgba(96,165,250,0.22);
+  border-radius: 6px;
+  background: rgba(96,165,250,0.055);
+  color: #8fb7dc;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  white-space: nowrap;
+}
+
+.workbench-toggle:hover {
+  color: #d7e1ea;
+  border-color: rgba(96,165,250,0.36);
+  background: rgba(96,165,250,0.10);
+}
+
+.workbench-toggle.active {
+  color: #00d48a;
+  border-color: rgba(0,212,138,0.34);
+  background: rgba(0,212,138,0.08);
+}
+
+.home-workbench-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
 /* ─────────────────────────────────────────────────
    ABRONS OS SHELL
 ───────────────────────────────────────────────── */
