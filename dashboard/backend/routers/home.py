@@ -18443,6 +18443,169 @@ def _build_provider_truth_miss_review(
     }
 
 
+def _build_provider_truth_miss_repair_workbench(
+    miss_review: dict,
+    learning_score: dict,
+    truth_memory: dict,
+    intelligence_rows: list[dict],
+    now: datetime,
+) -> dict:
+    top = dict((miss_review or {}).get("top_case") or {})
+    if not top:
+        return {
+            "status": "NO_CANDIDATE",
+            "readiness_state": "NOT_READY",
+            "candidate_replay": {"status": "NO_CANDIDATE", "sample_n": 0, "would_fix_count": 0, "risk_count": 0, "items": []},
+            "benefit_risk": {"benefit_count": 0, "risk_count": 0, "net_benefit": 0},
+            "guardrail_checklist": [],
+            "next_action": "No provider-truth miss repair candidate is active.",
+        }
+
+    patch = dict(top.get("patch_candidate") or {})
+    patch_type = str(patch.get("patch_type") or top.get("repair_kind") or "UNKNOWN").upper()
+    current_by_key = _provider_truth_current_by_key(intelligence_rows)
+    source = _provider_truth_learning_source(top.get("source"))
+    preferred_source = _provider_source_key(top.get("current_source"))
+    route = str(top.get("route") or "").upper()
+
+    replay_items = []
+    would_fix = 0
+    risk = 0
+    neutral = 0
+    false_confirm_risk = 0
+    for row in list((truth_memory or {}).get("items") or []):
+        row = dict(row)
+        if str(row.get("confirmation_status") or "").upper() != "UNRESOLVED":
+            continue
+        current = _provider_truth_current_for_row(row, current_by_key)
+        row_source = _provider_truth_learning_source(row.get("new_source") or row.get("current_source"))
+        current_source = _provider_source_key(current.get("market_source"))
+        freshness = str(current.get("data_freshness") or "").upper()
+        confidence = str(current.get("data_confidence") or "").upper()
+        quality = _gb_float(current.get("quality_score"))
+        pressure = _gb_float(current.get("pressure_score"))
+        row_route = str(row.get("route") or "").upper()
+        applies = False
+        if patch_type == "SOURCE_PRECEDENCE_UPDATE":
+            applies = bool(
+                row_source == source
+                and current_source == preferred_source
+                and current_source not in {"", "unknown", "cache"}
+                and freshness in {"LIVE", "RECENT"}
+                and confidence != "LOW"
+            )
+        elif patch_type == "FALLBACK_ROUTE_EXPANSION":
+            applies = bool(row_route == route and freshness in {"LIVE", "RECENT"} and confidence != "LOW")
+        elif patch_type == "RETRY_CADENCE_TIGHTEN":
+            applies = bool(row_route == route and quality >= 70 and pressure >= 40)
+        else:
+            applies = bool(row.get("mint") == top.get("mint") or row.get("symbol") == top.get("symbol"))
+        if not applies:
+            continue
+        would_help = quality >= 75 and pressure >= 45 and freshness in {"LIVE", "RECENT"} and confidence != "LOW"
+        would_risk = quality < 65 or confidence == "LOW" or freshness == "STALE" or current_source.startswith("cache")
+        if would_help:
+            would_fix += 1
+            outcome = "WOULD_FIX"
+        elif would_risk:
+            risk += 1
+            false_confirm_risk += 1
+            outcome = "RISK_LOOSEN"
+        else:
+            neutral += 1
+            outcome = "NEUTRAL_REVIEW"
+        replay_items.append({
+            "symbol": row.get("symbol"),
+            "mint": row.get("mint"),
+            "route": row.get("route"),
+            "source": row_source,
+            "current_source": current_source,
+            "current_freshness": current.get("data_freshness"),
+            "current_confidence": current.get("data_confidence"),
+            "current_quality": _nullable_float(current.get("quality_score")),
+            "current_pressure": _nullable_float(current.get("pressure_score")),
+            "outcome": outcome,
+        })
+
+    sample_n = len(replay_items)
+    net_benefit = would_fix - risk
+    candidate_replay = {
+        "status": "RAN" if sample_n else "NO_MATCHES",
+        "patch_type": patch_type,
+        "sample_n": sample_n,
+        "would_fix_count": would_fix,
+        "risk_count": risk,
+        "neutral_count": neutral,
+        "items": replay_items[:12],
+    }
+    benefit_risk = {
+        "benefit_count": would_fix,
+        "risk_count": risk,
+        "false_confirm_risk_count": false_confirm_risk,
+        "neutral_count": neutral,
+        "net_benefit": net_benefit,
+        "benefit_risk_ratio": round(would_fix / max(1, risk), 2) if sample_n else None,
+    }
+    false_confirm_count = int(((learning_score or {}).get("confirmed_score") or {}).get("false_count") or 0)
+    checklist = [
+        {
+            "name": "live_buy_lock",
+            "passed": True,
+            "note": "Workbench is simulation-only and does not re-arm live buying.",
+        },
+        {
+            "name": "sample_size",
+            "passed": sample_n >= 3,
+            "note": f"{sample_n}/3 similar unresolved cases replayed.",
+        },
+        {
+            "name": "benefit_exceeds_risk",
+            "passed": would_fix > risk and would_fix > 0,
+            "note": f"Benefit {would_fix}, risk {risk}, net {net_benefit}.",
+        },
+        {
+            "name": "false_confirm_guard",
+            "passed": false_confirm_count == 0 and false_confirm_risk == 0,
+            "note": f"Historical false confirms {false_confirm_count}; replay false-confirm risk {false_confirm_risk}.",
+        },
+        {
+            "name": "manual_approval_required",
+            "passed": False,
+            "note": "Manual approval is required before any policy change.",
+        },
+    ]
+    hard_passed = all(item.get("passed") for item in checklist if item.get("name") != "manual_approval_required")
+    if not sample_n:
+        readiness = "NOT_READY"
+    elif hard_passed and sample_n >= 3:
+        readiness = "READY_FOR_REVIEW"
+    elif would_fix > 0 and risk == 0:
+        readiness = "WATCH_MORE"
+    else:
+        readiness = "NOT_READY"
+    return {
+        "status": "READY" if readiness == "READY_FOR_REVIEW" else "WATCH" if readiness == "WATCH_MORE" else "BLOCKED",
+        "readiness_state": readiness,
+        "candidate_symbol": top.get("symbol"),
+        "patch_type": patch_type,
+        "candidate_rule": patch.get("candidate_rule"),
+        "candidate_replay": candidate_replay,
+        "benefit_risk": benefit_risk,
+        "guardrail_checklist": checklist,
+        "passed_guardrails": len([item for item in checklist if item.get("passed")]),
+        "total_guardrails": len(checklist),
+        "manual_only": True,
+        "would_change_policy": False,
+        "next_action": (
+            "Candidate has enough simulated evidence for manual patch review."
+            if readiness == "READY_FOR_REVIEW"
+            else "Collect more similar unresolved cases before patching."
+            if readiness == "WATCH_MORE"
+            else "Do not patch; replay evidence is not strong enough."
+        ),
+    }
+
+
 def _provider_truth_retry_delay_minutes(retry_count: int, high_impact: bool) -> int:
     if retry_count <= 0:
         return 0
@@ -18793,6 +18956,7 @@ def _build_dashboard_provider_truth_panel(
     escalation_writer: dict | None = None,
     learning_score: dict | None = None,
     miss_review: dict | None = None,
+    miss_repair_workbench: dict | None = None,
 ) -> dict:
     top_agreement = (list((agreement_layer or {}).get("items") or []) or [{}])[0]
     top_arbitration = dict((arbitration or {}).get("top") or {})
@@ -18803,6 +18967,7 @@ def _build_dashboard_provider_truth_panel(
     escalation_writer = dict(escalation_writer or {})
     learning_score = dict(learning_score or {})
     miss_review = dict(miss_review or {})
+    miss_repair_workbench = dict(miss_repair_workbench or {})
     status = (
         "BLOCKED"
         if str((agreement_layer or {}).get("status") or "").upper() == "BLOCKED"
@@ -18849,11 +19014,16 @@ def _build_dashboard_provider_truth_panel(
         "miss_review_top_symbol": (dict(miss_review.get("top_case") or {})).get("symbol"),
         "miss_review_top_severity": (dict(miss_review.get("top_case") or {})).get("severity"),
         "miss_review_repair_kind": (dict(miss_review.get("top_case") or {})).get("repair_kind"),
+        "miss_workbench_status": miss_repair_workbench.get("status"),
+        "miss_workbench_readiness": miss_repair_workbench.get("readiness_state"),
+        "miss_workbench_benefit_count": int(((miss_repair_workbench.get("benefit_risk") or {}).get("benefit_count")) or 0),
+        "miss_workbench_risk_count": int(((miss_repair_workbench.get("benefit_risk") or {}).get("risk_count")) or 0),
+        "miss_workbench_sample_n": int(((miss_repair_workbench.get("candidate_replay") or {}).get("sample_n")) or 0),
         "top_symbol": top_agreement.get("symbol"),
         "top_status": top_agreement.get("status"),
         "top_best_source": top_arbitration.get("best_source"),
         "top_best_score": top_arbitration.get("best_source_score"),
-        "next_action": miss_review.get("next_action") or queue_health.get("next_action") or (fallback_router or {}).get("next_action") or (agreement_layer or {}).get("next_action"),
+        "next_action": miss_repair_workbench.get("next_action") or miss_review.get("next_action") or queue_health.get("next_action") or (fallback_router or {}).get("next_action") or (agreement_layer or {}).get("next_action"),
     }
 
 
@@ -18903,6 +19073,7 @@ def _build_provider_truth_layer(
     learning_score = _build_provider_truth_learning_score(truth_memory, intelligence_rows, queue_health, outcome_tracking, now)
     source_map = _apply_provider_truth_learning_to_source_map(source_map_base, learning_score)
     miss_review = _build_provider_truth_miss_review(learning_score, truth_memory, queue_health, intelligence_rows, now)
+    miss_repair_workbench = _build_provider_truth_miss_repair_workbench(miss_review, learning_score, truth_memory, intelligence_rows, now)
     truth_panel = _build_dashboard_provider_truth_panel(
         source_map,
         agreement_layer,
@@ -18915,6 +19086,7 @@ def _build_provider_truth_layer(
         escalation_writer,
         learning_score,
         miss_review,
+        miss_repair_workbench,
     )
     return {
         "status": truth_panel.get("status"),
@@ -18929,6 +19101,7 @@ def _build_provider_truth_layer(
         "provider_truth_escalation_writer": escalation_writer,
         "provider_truth_learning_score": learning_score,
         "provider_truth_miss_review": miss_review,
+        "provider_truth_miss_repair_workbench": miss_repair_workbench,
         "dashboard_provider_truth_panel": truth_panel,
         "next_action": truth_panel.get("next_action"),
     }

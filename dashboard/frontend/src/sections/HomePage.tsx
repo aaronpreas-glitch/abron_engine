@@ -1044,6 +1044,37 @@ interface DailyCryptoBriefData {
       }>
       next_action?: string | null
     }
+    provider_truth_miss_repair_workbench?: {
+      status?: string
+      readiness_state?: string
+      candidate_symbol?: string | null
+      patch_type?: string | null
+      candidate_rule?: string | null
+      candidate_replay?: {
+        status?: string
+        sample_n?: number
+        would_fix_count?: number
+        risk_count?: number
+        neutral_count?: number
+      }
+      benefit_risk?: {
+        benefit_count?: number
+        risk_count?: number
+        false_confirm_risk_count?: number
+        net_benefit?: number
+        benefit_risk_ratio?: number | null
+      }
+      guardrail_checklist?: Array<{
+        name?: string
+        passed?: boolean
+        note?: string
+      }>
+      passed_guardrails?: number
+      total_guardrails?: number
+      manual_only?: boolean
+      would_change_policy?: boolean
+      next_action?: string | null
+    }
     dashboard_provider_truth_panel?: {
       status?: string
       headline?: string
@@ -1079,6 +1110,11 @@ interface DailyCryptoBriefData {
       miss_review_top_symbol?: string | null
       miss_review_top_severity?: string | null
       miss_review_repair_kind?: string | null
+      miss_workbench_status?: string | null
+      miss_workbench_readiness?: string | null
+      miss_workbench_benefit_count?: number
+      miss_workbench_risk_count?: number
+      miss_workbench_sample_n?: number
       top_symbol?: string | null
       top_status?: string
       top_best_source?: string | null
@@ -5737,6 +5773,7 @@ function DailyCryptoBriefPanel({
     const providerTruthEscalationWriter = providerTruth.provider_truth_escalation_writer ?? {}
     const providerTruthLearning = providerTruth.provider_truth_learning_score ?? {}
     const providerTruthMissReview = providerTruth.provider_truth_miss_review ?? {}
+    const providerTruthMissWorkbench = providerTruth.provider_truth_miss_repair_workbench ?? {}
     const topProviderTruthItem = providerTruthAgreement.items?.[0]
     const topProviderTruthSource = providerTruthSourceMap.providers?.[0]
     const topFallbackRoute = providerTruthFallback.routes?.[0]
@@ -6298,11 +6335,14 @@ function DailyCryptoBriefPanel({
             <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
               miss review {String(providerTruthPanel.miss_review_status || providerTruthMissReview.status || 'clear').replace(/_/g, ' ').toLowerCase()} · misses {providerTruthPanel.miss_review_count ?? providerTruthMissReview.miss_count ?? 0} · high {providerTruthPanel.miss_review_high_severity_count ?? providerTruthMissReview.high_severity_count ?? 0}
             </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              workbench {String(providerTruthPanel.miss_workbench_readiness || providerTruthMissWorkbench.readiness_state || 'not ready').replace(/_/g, ' ').toLowerCase()} · replay {providerTruthPanel.miss_workbench_sample_n ?? providerTruthMissWorkbench.candidate_replay?.sample_n ?? 0} · benefit/risk {providerTruthPanel.miss_workbench_benefit_count ?? providerTruthMissWorkbench.benefit_risk?.benefit_count ?? 0}/{providerTruthPanel.miss_workbench_risk_count ?? providerTruthMissWorkbench.benefit_risk?.risk_count ?? 0}
+            </div>
             <div style={{ ...MONO, fontSize: 8, color: '#9db7ce', marginTop: 5, lineHeight: 1.45 }}>
               {topFallbackRoute?.symbol
                 ? `${topFallbackRoute.symbol} routes to ${String(topFallbackRoute.route || 'confirmation').replace(/_/g, ' ').toLowerCase()} · ${topFallbackRoute.current_source || 'source'}`
                 : topProviderTruthMiss?.symbol
-                  ? `${topProviderTruthMiss.symbol} miss ${String(topProviderTruthMiss.severity || 'review').toLowerCase()} · ${String(topProviderTruthMiss.repair_kind || providerTruthPanel.miss_review_repair_kind || 'repair').replace(/_/g, ' ').toLowerCase()}`
+                  ? `${topProviderTruthMiss.symbol} miss ${String(topProviderTruthMiss.severity || 'review').toLowerCase()} · ${String(providerTruthMissWorkbench.patch_type || topProviderTruthMiss.repair_kind || providerTruthPanel.miss_review_repair_kind || 'repair').replace(/_/g, ' ').toLowerCase()}`
                 : topProviderTruthQueue?.symbol
                   ? `${topProviderTruthQueue.symbol} queue ${String(topProviderTruthQueue.status || 'tracking').replace(/_/g, ' ').toLowerCase()} · retries ${topProviderTruthQueue.retry_count ?? 0} · age ${fmtFixed(topProviderTruthQueue.age_minutes, 0)}m`
                 : topProviderTruthLearning?.provider
