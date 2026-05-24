@@ -761,6 +761,50 @@ a:hover { color: var(--text); }
   background: rgba(8, 13, 21, 0.68) !important;
 }
 
+.broken-data-banner {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid rgba(239,68,68,0.45);
+  border-left: 3px solid #ef4444;
+  border-radius: 8px;
+  background:
+    linear-gradient(90deg, rgba(239,68,68,0.16), rgba(239,68,68,0.055)),
+    rgba(0,0,0,0.22);
+  color: #ffb4b4;
+  font-family: 'JetBrains Mono', monospace;
+  box-shadow: 0 0 0 1px rgba(239,68,68,0.06) inset;
+}
+
+.broken-data-banner span {
+  color: #ff6b6b;
+  font-size: 9px;
+  font-weight: 900;
+  letter-spacing: 0.14em;
+}
+
+.broken-data-banner small {
+  color: #fca5a5;
+  font-size: 8px;
+  line-height: 1.45;
+}
+
+.broken-data-banner.compact {
+  gap: 3px;
+  padding: 5px 7px;
+  border-radius: 6px;
+}
+
+.broken-data-banner.compact span {
+  font-size: 7px;
+}
+
+.broken-data-banner.compact small {
+  font-size: 7px;
+}
+
 /* ─────────────────────────────────────────────────
    ABRONS OS SHELL
 ───────────────────────────────────────────────── */

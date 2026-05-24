@@ -3916,6 +3916,43 @@ const LANE_SHORT: Record<string, string> = {
   CONFLUENCE: 'CF',
 }
 
+const DATA_BROKEN_KEYS = [
+  'market_payload_stale',
+  'flow_metric_inconsistent',
+  'buy_pressure_metric_inconsistent',
+  'market_data_stale',
+  'data_confidence_low',
+]
+
+function normalizeSignalKey(value?: string | null) {
+  return String(value || '').trim().toLowerCase()
+}
+
+function hasBrokenMarketData(values?: Array<string | null | undefined>) {
+  return (values ?? []).some((value) => {
+    const key = normalizeSignalKey(value)
+    return DATA_BROKEN_KEYS.some((prefix) => key === prefix || key.startsWith(`${prefix}_`) || key.startsWith(prefix))
+      || key.startsWith('snapshot_old_')
+      || key.startsWith('freshness_stale')
+      || key.startsWith('provider_repair_no_market_data')
+      || key.startsWith('provider_repair_dexscreener_no_pair')
+  })
+}
+
+function BrokenDataBanner({ blockers, compact = false }: {
+  blockers?: Array<string | null | undefined>
+  compact?: boolean
+}) {
+  if (!hasBrokenMarketData(blockers)) return null
+  const shown = (blockers ?? []).filter((value) => hasBrokenMarketData([value])).slice(0, compact ? 2 : 4)
+  return (
+    <div className={compact ? 'broken-data-banner compact' : 'broken-data-banner'}>
+      <span>DATA BROKEN - DO NOT ACT</span>
+      {shown.length > 0 && <small>{shown.map((value) => String(value).replace(/_/g, ' ')).join(' · ')}</small>}
+    </div>
+  )
+}
+
 // ── System card colors ────────────────────────────────────────────────────────
 
 const C = {
@@ -4525,6 +4562,8 @@ function ActionBoardPanel({ data, loading, scannerDiag, reinfBySymbol }: {
 
   // Blocked / ready row — answers: what is it? why can't I buy? what needs to change?
   const BlockedRow = ({ item, accent }: { item: ActionBoardItem; accent: string }) => {
+    const brokenData = hasBrokenMarketData(item.blockers)
+    const rowAccent = brokenData ? '#ef4444' : accent
     const proofDemoted = item.proof_state?.includes('DEMOT')
     const proofLabel   = item.proof_state && item.proof_state !== 'OK'
       ? item.proof_state.replace(/_STACK|_SIGNAL/g, '').replace(/_/g, ' ')
@@ -4533,13 +4572,16 @@ function ActionBoardPanel({ data, loading, scannerDiag, reinfBySymbol }: {
     return (
       <div style={{
         display: 'flex', flexDirection: 'column', gap: 5,
-        background: 'rgba(0,0,0,0.2)', borderRadius: 5, padding: '8px 10px',
-        borderLeft: `2px solid ${accent}55`,
+        background: brokenData ? 'rgba(239,68,68,0.075)' : 'rgba(0,0,0,0.2)',
+        borderRadius: 5,
+        padding: '8px 10px',
+        border: brokenData ? '1px solid rgba(239,68,68,0.22)' : '1px solid transparent',
+        borderLeft: `2px solid ${rowAccent}`,
       }}>
         {/* Name + lane + proof state */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
           <LaneChipAB system={item.system} />
-          <span style={{ ...MONO, fontSize: 11, color: accent, fontWeight: 700 }}>
+          <span style={{ ...MONO, fontSize: 11, color: rowAccent, fontWeight: 700 }}>
             {item.symbol ?? item.action}
           </span>
           {item.intended_action && (
@@ -4589,15 +4631,24 @@ function ActionBoardPanel({ data, loading, scannerDiag, reinfBySymbol }: {
             score {item.priority_score}
           </span>
         </div>
+        <BrokenDataBanner blockers={item.blockers} compact />
         {/* Why it's blocked */}
         {(item.blockers ?? []).length > 0 && (
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
             {item.blockers.map((b, i) => (
+              (() => {
+                const isBroken = hasBrokenMarketData([b])
+                return (
               <span key={i} style={{
                 ...MONO, fontSize: 8, fontWeight: 600,
-                color: '#d45555', background: 'rgba(239,68,68,0.10)',
-                border: '1px solid rgba(239,68,68,0.20)', borderRadius: 3, padding: '2px 6px',
+                color: isBroken ? '#ffb4b4' : '#d45555',
+                background: isBroken ? 'rgba(239,68,68,0.18)' : 'rgba(239,68,68,0.10)',
+                border: isBroken ? '1px solid rgba(239,68,68,0.42)' : '1px solid rgba(239,68,68,0.20)',
+                borderRadius: 3,
+                padding: '2px 6px',
               }}>{b}</span>
+                )
+              })()
             ))}
           </div>
         )}
@@ -4615,45 +4666,53 @@ function ActionBoardPanel({ data, loading, scannerDiag, reinfBySymbol }: {
   // Watchlist row — compact, informational
   const WatchRow = ({ item }: { item: ActionBoardItem }) => {
     const lc = LANE_COLOR[item.system] || '#475569'
+    const brokenData = hasBrokenMarketData(item.blockers)
     return (
       <div style={{
-        display: 'flex', alignItems: 'center', gap: 6,
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'stretch',
+        gap: brokenData ? 5 : 0,
         padding: '5px 8px', borderRadius: 4,
-        background: 'rgba(0,0,0,0.15)',
+        background: brokenData ? 'rgba(239,68,68,0.07)' : 'rgba(0,0,0,0.15)',
+        border: brokenData ? '1px solid rgba(239,68,68,0.20)' : '1px solid transparent',
         fontSize: 9, ...MONO,
       }}>
-        <LaneChipAB system={item.system} />
-        <span style={{ color: lc, fontWeight: 700, flexShrink: 0, fontSize: 10 }}>
-          {item.symbol ?? item.action}
-        </span>
-        {item.symbol && relaxedSymbols.has(item.symbol) && (
-          <span style={{
-            ...MONO, fontSize: 7, fontWeight: 700,
-            color: '#c09030', background: 'rgba(245,158,11,0.08)',
-            border: '1px solid rgba(245,158,11,0.20)',
-            borderRadius: 2, padding: '1px 4px', flexShrink: 0,
-          }}>
-            RELAXED{relaxedSymbols.get(item.symbol) ? ` · ${relaxedSymbols.get(item.symbol)}` : ''}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
+          <LaneChipAB system={item.system} />
+          <span style={{ color: brokenData ? '#ef4444' : lc, fontWeight: 700, flexShrink: 0, fontSize: 10 }}>
+            {item.symbol ?? item.action}
           </span>
-        )}
-        {item.symbol && reinfBySymbol?.has(item.symbol) && reinfBySymbol.get(item.symbol) !== 'NONE' && (() => {
-          const rl = reinfBySymbol.get(item.symbol)!
-          const rc = rl === 'STRONG' ? '#00d48a' : rl === 'MODERATE' ? '#60a5fa' : '#f59e0b'
-          return (
+          {item.symbol && relaxedSymbols.has(item.symbol) && (
             <span style={{
-              ...MONO, fontSize: 7, fontWeight: 700, letterSpacing: '0.05em',
-              color: rc, background: `${rc}0a`, border: `1px solid ${rc}28`,
+              ...MONO, fontSize: 7, fontWeight: 700,
+              color: '#c09030', background: 'rgba(245,158,11,0.08)',
+              border: '1px solid rgba(245,158,11,0.20)',
               borderRadius: 2, padding: '1px 4px', flexShrink: 0,
             }}>
-              {rl}
+              RELAXED{relaxedSymbols.get(item.symbol) ? ` · ${relaxedSymbols.get(item.symbol)}` : ''}
             </span>
-          )
-        })()}
-        <DataChip item={item} />
-        <TokenAddressChip value={item.token_address} />
-        <span style={{ color: 'var(--chrome)', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-          {item.reason}
-        </span>
+          )}
+          {item.symbol && reinfBySymbol?.has(item.symbol) && reinfBySymbol.get(item.symbol) !== 'NONE' && (() => {
+            const rl = reinfBySymbol.get(item.symbol)!
+            const rc = rl === 'STRONG' ? '#00d48a' : rl === 'MODERATE' ? '#60a5fa' : '#f59e0b'
+            return (
+              <span style={{
+                ...MONO, fontSize: 7, fontWeight: 700, letterSpacing: '0.05em',
+                color: rc, background: `${rc}0a`, border: `1px solid ${rc}28`,
+                borderRadius: 2, padding: '1px 4px', flexShrink: 0,
+              }}>
+                {rl}
+              </span>
+            )
+          })()}
+          <DataChip item={item} />
+          <TokenAddressChip value={item.token_address} />
+          <span style={{ color: 'var(--chrome)', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {item.reason}
+          </span>
+        </div>
+        <BrokenDataBanner blockers={item.blockers} compact />
       </div>
     )
   }
@@ -5884,14 +5943,28 @@ function GoodBuyBoardPanel({ board }: { board: GoodBuyBoardV2 | undefined }) {
   )
 
   const GoodBuyRow = ({ item, compact = false }: { item: GoodBuyItem; compact?: boolean }) => {
+    const ticket = item.execution_ticket
+    const allBlockers = [
+      ...(item.blockers ?? []),
+      ...(item.warnings ?? []),
+      ...(ticket?.blockers ?? []),
+    ]
+    const dataBroken = hasBrokenMarketData(allBlockers)
     const tone =
-      item.state === 'BUYABLE' ? '#00d48a'
+      dataBroken ? '#ef4444'
+      : item.state === 'BUYABLE' ? '#00d48a'
       : item.state === 'WAIT' ? '#f59e0b'
       : '#ef4444'
-    const reasons = item.state === 'BLOCKED' ? item.blockers : item.warnings.length ? item.warnings : item.strengths
-    const ticket = item.execution_ticket
+    const reasons = dataBroken
+      ? allBlockers
+      : item.state === 'BLOCKED'
+        ? item.blockers
+        : (item.warnings ?? []).length
+          ? item.warnings
+          : item.strengths
     const ticketTone =
-      ticket?.execution_state === 'READY_GUARDED' || ticket?.execution_state === 'READY_MANUAL_CONFIRM' ? '#00d48a'
+      dataBroken ? '#ef4444'
+      : ticket?.execution_state === 'READY_GUARDED' || ticket?.execution_state === 'READY_MANUAL_CONFIRM' ? '#00d48a'
       : ticket?.execution_state === 'AUTHORITY_BLOCKED' || ticket?.execution_state === 'WAIT_CONFIRMATION' ? '#f59e0b'
       : '#ef4444'
     return (
@@ -5919,6 +5992,7 @@ function GoodBuyBoardPanel({ board }: { board: GoodBuyBoardV2 | undefined }) {
         <div style={{ ...MONO, fontSize: compact ? 8 : 9, color: '#b6c7d8', lineHeight: 1.55 }}>
           {item.headline}
         </div>
+        <BrokenDataBanner blockers={allBlockers} compact={compact} />
         <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
           <MiniMetric label="MC" value={fmtUsd(item.metrics.marketcap_usd)} />
           <MiniMetric label="LIQ" value={fmtUsd(item.metrics.liquidity_usd)} />
@@ -5926,7 +6000,7 @@ function GoodBuyBoardPanel({ board }: { board: GoodBuyBoardV2 | undefined }) {
           <MiniMetric label="P" value={fmtFixed(item.metrics.pressure_score, 0)} tone={item.metrics.pressure_score >= 62 ? '#00d48a' : '#f59e0b'} />
           <MiniMetric label="RISK" value={fmtFixed(item.metrics.risk_score, 0)} tone={item.metrics.risk_score >= 75 ? '#00d48a' : '#f59e0b'} />
           <MiniMetric label="1H" value={`${fmtFixed(item.metrics.change_1h_pct, 1)}%`} tone={item.metrics.change_1h_pct >= 0 ? '#00d48a' : '#ef4444'} />
-          <MiniMetric label="DATA" value={`${item.data.data_freshness}/${item.data.identity_status}`} tone={item.data.data_freshness === 'LIVE' && item.data.identity_status === 'RESOLVED' ? '#00d48a' : '#f59e0b'} />
+          <MiniMetric label="DATA" value={`${item.data.data_freshness}/${item.data.identity_status}`} tone={dataBroken ? '#ef4444' : item.data.data_freshness === 'LIVE' && item.data.identity_status === 'RESOLVED' ? '#00d48a' : '#f59e0b'} />
         </div>
         {ticket && (
           <div style={{
@@ -5957,7 +6031,7 @@ function GoodBuyBoardPanel({ board }: { board: GoodBuyBoardV2 | undefined }) {
               <MiniMetric label="LAW" value={ticket.authority?.highest_permitted_action?.replaceAll('_', ' ') || '—'} tone={ticket.executable ? '#00d48a' : '#f59e0b'} />
             </div>
             {!compact && ticket.blockers && ticket.blockers.length > 0 && (
-              <div style={{ ...MONO, fontSize: 8, color: '#9fb3c8', lineHeight: 1.45 }}>
+              <div style={{ ...MONO, fontSize: 8, color: dataBroken ? '#ffb4b4' : '#9fb3c8', lineHeight: 1.45 }}>
                 blocker: {ticket.blockers.slice(0, 3).join(' · ')}
               </div>
             )}
@@ -5966,17 +6040,25 @@ function GoodBuyBoardPanel({ board }: { board: GoodBuyBoardV2 | undefined }) {
         {reasons.length > 0 && (
           <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap' }}>
             {reasons.slice(0, compact ? 3 : 5).map((reason, i) => (
+              (() => {
+                const isBroken = hasBrokenMarketData([reason])
+                const chipColor = isBroken ? '#ffb4b4' : item.state === 'BLOCKED' ? '#ff7777' : item.state === 'WAIT' ? '#fbbf24' : '#6ee7b7'
+                const chipBg = isBroken ? 'rgba(239,68,68,0.18)' : item.state === 'BLOCKED' ? 'rgba(239,68,68,0.10)' : item.state === 'WAIT' ? 'rgba(245,158,11,0.10)' : 'rgba(0,212,138,0.08)'
+                const chipBorder = isBroken ? '1px solid rgba(239,68,68,0.42)' : item.state === 'BLOCKED' ? '1px solid rgba(239,68,68,0.20)' : item.state === 'WAIT' ? '1px solid rgba(245,158,11,0.20)' : '1px solid rgba(0,212,138,0.18)'
+                return (
               <span key={`${item.mint}-${reason}-${i}`} style={{
                 ...MONO,
                 fontSize: 8,
-                color: item.state === 'BLOCKED' ? '#ff7777' : item.state === 'WAIT' ? '#fbbf24' : '#6ee7b7',
-                background: item.state === 'BLOCKED' ? 'rgba(239,68,68,0.10)' : item.state === 'WAIT' ? 'rgba(245,158,11,0.10)' : 'rgba(0,212,138,0.08)',
-                border: item.state === 'BLOCKED' ? '1px solid rgba(239,68,68,0.20)' : item.state === 'WAIT' ? '1px solid rgba(245,158,11,0.20)' : '1px solid rgba(0,212,138,0.18)',
+                color: chipColor,
+                background: chipBg,
+                border: chipBorder,
                 borderRadius: 5,
                 padding: '2px 6px',
               }}>
                 {reason}
               </span>
+                )
+              })()
             ))}
           </div>
         )}
@@ -9749,6 +9831,16 @@ function OperatorCommandHero({
     : goodWaitTop?.blockers?.length
       ? goodWaitTop.blockers
       : top?.blockers ?? []
+  const brokenDataActive = hasBrokenMarketData(activeBlockers)
+    || hasBrokenMarketData(goodBuyTop ? [...(goodBuyTop.blockers ?? []), ...(goodBuyTop.warnings ?? []), ...(goodBuyTop.execution_ticket?.blockers ?? [])] : [])
+    || hasBrokenMarketData(goodWaitTop ? [...(goodWaitTop.blockers ?? []), ...(goodWaitTop.warnings ?? []), ...(goodWaitTop.execution_ticket?.blockers ?? [])] : [])
+  const commandColor = brokenDataActive ? '#ef4444' : stateColor
+  const commandStateLabel = brokenDataActive ? 'Data Broken' : stateLabel
+  const commandBuyVerdict = brokenDataActive ? 'DO NOT ACT' : buyVerdict
+  const commandDecisionLine = brokenDataActive ? 'DATA BROKEN' : decisionLine
+  const commandBuyVerdictSubline = brokenDataActive
+    ? 'Market payload or flow metrics are stale/contradictory. Confirm live chart and CA manually; do not act from this dashboard row.'
+    : buyVerdictSubline
   const unlockText =
     goodBuyTop?.execution_ticket?.entry?.instruction
     || goodWaitTop?.blockers?.[0]
@@ -9816,28 +9908,28 @@ function OperatorCommandHero({
     <div className="operator-command-hero" style={{
       position: 'relative',
       overflow: 'hidden',
-      border: `1px solid ${stateColor}30`,
-      borderTop: `2px solid ${stateColor}`,
+      border: `1px solid ${commandColor}30`,
+      borderTop: `2px solid ${commandColor}`,
       borderRadius: 18,
       padding: 18,
       background:
-        `linear-gradient(90deg, ${stateColor}12, transparent 36%, ${laneColor}10),` +
+        `linear-gradient(90deg, ${commandColor}12, transparent 36%, ${laneColor}10),` +
         'linear-gradient(135deg, rgba(7,12,22,0.94), rgba(3,7,13,0.80) 55%, rgba(3,7,13,0.94))',
-      boxShadow: `0 18px 70px rgba(0,0,0,0.34), 0 0 0 1px ${stateColor}08 inset`,
+      boxShadow: `0 18px 70px rgba(0,0,0,0.34), 0 0 0 1px ${commandColor}08 inset`,
       backdropFilter: 'blur(24px) saturate(160%)',
       WebkitBackdropFilter: 'blur(24px) saturate(160%)',
     }}>
       <div className="operator-hero-grid" style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1.55fr) minmax(320px, 0.9fr)', gap: 18 }}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 14, minWidth: 0 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-            <span style={{ ...MONO, fontSize: 8, color: stateColor, letterSpacing: '0.16em', fontWeight: 800 }}>
+            <span style={{ ...MONO, fontSize: 8, color: commandColor, letterSpacing: '0.16em', fontWeight: 800 }}>
               COMMAND CENTER
             </span>
-            <span className="badge" style={{ color: stateColor, background: `${stateColor}12`, border: `1px solid ${stateColor}30`, fontSize: 8 }}>
-              {stateLabel}
+            <span className="badge" style={{ color: commandColor, background: `${commandColor}12`, border: `1px solid ${commandColor}30`, fontSize: 8 }}>
+              {commandStateLabel}
             </span>
-            <span className="badge" style={{ color: stateColor, background: `${stateColor}12`, border: `1px solid ${stateColor}30`, fontSize: 8 }}>
-              {buyVerdict}
+            <span className="badge" style={{ color: commandColor, background: `${commandColor}12`, border: `1px solid ${commandColor}30`, fontSize: 8 }}>
+              {commandBuyVerdict}
             </span>
             <span className="badge" style={{ color: '#60a5fa', background: 'rgba(96,165,250,0.10)', border: '1px solid rgba(96,165,250,0.24)', fontSize: 8 }}>
               {(bestAction?.focus_mode || 'MEMECOINS_SPOT').replace(/_/g, ' + ')}
@@ -9865,26 +9957,26 @@ function OperatorCommandHero({
               ...MONO,
               fontSize: 28,
               lineHeight: 1.05,
-              color: stateColor,
+              color: commandColor,
               fontWeight: 900,
               letterSpacing: '0.10em',
               textTransform: 'uppercase',
             }}>
-              {decisionLine}
+              {commandDecisionLine}
             </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
               <span style={{
                 ...MONO,
                 fontSize: 11,
-                color: stateColor,
-                background: `${stateColor}10`,
-                border: `1px solid ${stateColor}28`,
+                color: commandColor,
+                background: `${commandColor}10`,
+                border: `1px solid ${commandColor}28`,
                 borderRadius: 8,
                 padding: '6px 9px',
                 fontWeight: 900,
                 letterSpacing: '0.08em',
               }}>
-                {buyVerdict}
+                {commandBuyVerdict}
               </span>
               {bestSymbol && (
                 <span style={{ ...MONO, fontSize: 10, color: '#d7e1ea' }}>
@@ -9894,8 +9986,9 @@ function OperatorCommandHero({
               <TokenAddressChip value={bestAddress} size="roomy" />
             </div>
             <div style={{ ...MONO, fontSize: 10, color: '#d7e1ea', lineHeight: 1.6, maxWidth: 900 }}>
-              {buyVerdictSubline}
+              {commandBuyVerdictSubline}
             </div>
+            <BrokenDataBanner blockers={activeBlockers} />
             {snapshotStale && (
               <div style={{
                 ...MONO,
@@ -9953,8 +10046,8 @@ function OperatorCommandHero({
                   <span style={{ ...MONO, fontSize: 13, color: '#f3f7fb', fontWeight: 800 }}>
                     {bestSymbol || top?.system}
                   </span>
-                  <span className="badge" style={{ color: stateColor, background: `${stateColor}10`, border: `1px solid ${stateColor}25`, fontSize: 8 }}>
-                    {explicitBuy ? goodBuyTop?.state : goodBuyTop ? 'NEEDS_CONFIRMATION' : top?.action_state || top?.state || 'WATCH'}
+                  <span className="badge" style={{ color: commandColor, background: `${commandColor}10`, border: `1px solid ${commandColor}25`, fontSize: 8 }}>
+                    {brokenDataActive ? 'DATA_BROKEN' : explicitBuy ? goodBuyTop?.state : goodBuyTop ? 'NEEDS_CONFIRMATION' : top?.action_state || top?.state || 'WATCH'}
                   </span>
                   {top?.proof_state && (
                     <span className="badge" style={{ color: '#f59e0b', background: 'rgba(245,158,11,0.10)', border: '1px solid rgba(245,158,11,0.24)', fontSize: 8 }}>
@@ -10039,17 +10132,22 @@ function OperatorCommandHero({
                 {activeBlockers.length > 0 && (
                   <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
                     {activeBlockers.slice(0, 4).map((blocker, i) => (
+                      (() => {
+                        const isBroken = hasBrokenMarketData([blocker])
+                        return (
                       <span key={i} style={{
                         ...MONO,
                         fontSize: 8,
-                        color: '#ff7777',
-                        background: 'rgba(239,68,68,0.10)',
-                        border: '1px solid rgba(239,68,68,0.22)',
+                        color: isBroken ? '#ffb4b4' : '#ff7777',
+                        background: isBroken ? 'rgba(239,68,68,0.18)' : 'rgba(239,68,68,0.10)',
+                        border: isBroken ? '1px solid rgba(239,68,68,0.42)' : '1px solid rgba(239,68,68,0.22)',
                         borderRadius: 5,
                         padding: '3px 7px',
                       }}>
                         {blocker}
                       </span>
+                        )
+                      })()
                     ))}
                   </div>
                 )}
