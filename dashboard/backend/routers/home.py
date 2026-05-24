@@ -19931,6 +19931,287 @@ def _build_provider_truth_risk_explanation(
     }
 
 
+def _provider_truth_risk_causes(item: dict) -> list[str]:
+    causes: list[str] = []
+    freshness = str(item.get("freshness") or item.get("current_freshness") or "").upper()
+    confidence = str(item.get("confidence") or item.get("current_confidence") or "").upper()
+    current_source = _provider_source_key(item.get("current_source"))
+    source = _provider_truth_learning_source(item.get("source"))
+    quality = _gb_float(item.get("quality"), _gb_float(item.get("current_quality")))
+    pressure = _gb_float(item.get("pressure"), _gb_float(item.get("current_pressure")))
+    trend = str(item.get("confidence_trend") or "").upper()
+    direction = str(item.get("direction") or "").upper()
+    if freshness == "STALE":
+        causes.append("DATA_STALE")
+    if confidence == "LOW":
+        causes.append("LOW_CONFIDENCE")
+    if current_source in {"", "unknown", "cache"} or (
+        source
+        and current_source
+        and current_source != source
+        and current_source not in {"unknown", "cache"}
+    ):
+        causes.append("SOURCE_MISMATCH")
+    if quality < 65 or pressure < 35:
+        causes.append("WEAK_QUALITY")
+    if trend == "WEAKENING" or direction == "WORSENED":
+        causes.append("WEAKENING_TREND")
+    if not causes:
+        causes.append("PATCH_RISK_FLAG")
+    return list(dict.fromkeys(causes))
+
+
+def _build_provider_truth_risk_case_drilldown(
+    approval_evidence_summary: dict,
+    dry_run_preview: dict,
+    before_after: dict,
+    confidence_curve: dict,
+    now: datetime,
+) -> dict:
+    cases_by_key: dict[str, dict] = {}
+    for item in list((approval_evidence_summary or {}).get("top_items") or []):
+        item = dict(item)
+        if str(item.get("evidence_outcome") or "").upper() != "EVIDENCE_RISK":
+            continue
+        key = str(item.get("key") or _provider_truth_queue_key(item) or f"symbol:{str(item.get('symbol') or 'UNKNOWN').upper()}")
+        cases_by_key[key] = {
+            **item,
+            "key": key,
+            "risk_source": "ACCUMULATED_EVIDENCE",
+            "risk_reason": "Evidence outcome is EVIDENCE_RISK.",
+        }
+
+    for item in list((dry_run_preview or {}).get("items") or []):
+        item = dict(item)
+        if str(item.get("evidence_outcome") or "").upper() != "EVIDENCE_RISK" and str(item.get("simulated_change") or "").upper() != "WOULD_KEEP_BLOCKED":
+            continue
+        key = str(_provider_truth_queue_key(item) or f"symbol:{str(item.get('symbol') or 'UNKNOWN').upper()}")
+        cases_by_key.setdefault(key, {
+            **item,
+            "key": key,
+            "risk_source": "DRY_RUN_PREVIEW",
+            "risk_reason": "Dry-run would keep this candidate blocked.",
+        })
+
+    for item in list((before_after or {}).get("items") or []):
+        item = dict(item)
+        if str(item.get("direction") or "").upper() != "WORSENED":
+            continue
+        key = str(item.get("key") or _provider_truth_queue_key(item) or f"symbol:{str(item.get('symbol') or 'UNKNOWN').upper()}")
+        cases_by_key.setdefault(key, {
+            **item,
+            "key": key,
+            "risk_source": "BEFORE_AFTER",
+            "risk_reason": "Before/after evidence worsened.",
+        })
+
+    if str((confidence_curve or {}).get("trend") or "").upper() == "WEAKENING":
+        cases_by_key["curve:WEAKENING"] = {
+            "key": "curve:WEAKENING",
+            "symbol": "CONFIDENCE_CURVE",
+            "risk_source": "CONFIDENCE_CURVE",
+            "risk_reason": "Patch confidence curve is weakening.",
+            "confidence_trend": (confidence_curve or {}).get("trend"),
+            "confidence_score": (confidence_curve or {}).get("confidence_score"),
+        }
+
+    cases = list(cases_by_key.values())
+    for case in cases:
+        case["causes"] = _provider_truth_risk_causes(case)
+    cases.sort(key=lambda x: (_gb_float(x.get("similarity_score")), _gb_float(x.get("quality")), _gb_float(x.get("pressure"))), reverse=True)
+    return {
+        "status": "ACTIVE" if cases else "CLEAR",
+        "risk_count": len(cases),
+        "items": cases[:20],
+        "top_case": cases[0] if cases else None,
+        "next_action": (
+            "Review the exact risk cases before approval."
+            if cases
+            else "No concrete risk cases are active."
+        ),
+        "updated_at": now.isoformat(),
+    }
+
+
+def _build_provider_truth_risk_cause_classifier(risk_case_drilldown: dict, now: datetime) -> dict:
+    counts: dict[str, int] = {}
+    items = []
+    for case in list((risk_case_drilldown or {}).get("items") or []):
+        case = dict(case)
+        causes = list(case.get("causes") or _provider_truth_risk_causes(case))
+        for cause in causes:
+            counts[cause] = counts.get(cause, 0) + 1
+        items.append({
+            "key": case.get("key"),
+            "symbol": case.get("symbol"),
+            "mint": case.get("mint"),
+            "risk_source": case.get("risk_source"),
+            "primary_cause": causes[0] if causes else "PATCH_RISK_FLAG",
+            "causes": causes,
+            "risk_reason": case.get("risk_reason"),
+        })
+    ranked = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
+    primary = ranked[0][0] if ranked else None
+    return {
+        "status": "CLASSIFIED" if items else "CLEAR",
+        "risk_count": len(items),
+        "primary_cause": primary,
+        "cause_counts": counts,
+        "items": items[:20],
+        "next_action": (
+            f"Clear primary risk cause {primary.replace('_', ' ').lower()} before approval."
+            if primary
+            else "No risk causes are active."
+        ),
+        "updated_at": now.isoformat(),
+    }
+
+
+def _apply_provider_truth_auto_hold_approval_state(
+    review_packet: dict,
+    approval_gate: dict,
+    risk_case_drilldown: dict,
+    risk_cause_classifier: dict,
+    now: datetime,
+) -> dict:
+    review_key = str((review_packet or {}).get("review_key") or "").strip()
+    if not review_key:
+        return dict(approval_gate or {})
+    risk_count = int((risk_case_drilldown or {}).get("risk_count") or 0)
+    if risk_count <= 0:
+        out = dict(approval_gate or {})
+        out["auto_hold_applied"] = False
+        return out
+
+    current_state = str((approval_gate or {}).get("approval_state") or "").upper()
+    if current_state in {"REJECTED", "AUTO_FROZEN"}:
+        out = dict(approval_gate or {})
+        out["auto_hold_applied"] = False
+        out["risk_blocked"] = True
+        return out
+
+    states = _freshness_kv_read(_PROVIDER_TRUTH_MISS_REVIEW_STATES_KEY)
+    previous = dict(states.get(review_key) or {})
+    if str(previous.get("state") or "").upper() != "NEEDS_MORE_EVIDENCE":
+        note = (
+            f"Auto-held by risk drilldown: {risk_count} risk case(s), "
+            f"primary cause {(risk_cause_classifier or {}).get('primary_cause') or 'unknown'}."
+        )
+        states[review_key] = {
+            **previous,
+            "state": "NEEDS_MORE_EVIDENCE",
+            "updated_at": now.isoformat(),
+            "note": note,
+            "auto_hold": True,
+            "risk_count": risk_count,
+        }
+        _freshness_kv_write(_PROVIDER_TRUTH_MISS_REVIEW_STATES_KEY, states)
+        audit = _freshness_kv_read(_PROVIDER_TRUTH_MISS_REVIEW_AUDIT_KEY)
+        events = list((audit or {}).get("events") or [])
+        events.append({
+            "event_id": f"{review_key}:AUTO_HOLD:{now.isoformat()}",
+            "ts_utc": now.isoformat(),
+            "review_key": review_key,
+            "state": "NEEDS_MORE_EVIDENCE",
+            "packet_status": (review_packet or {}).get("status"),
+            "risk_count": risk_count,
+            "primary_risk_cause": (risk_cause_classifier or {}).get("primary_cause"),
+            "operator_note": note,
+            "manual_only": True,
+            "policy_auto_apply": False,
+            "auto_hold": True,
+        })
+        _freshness_kv_write(
+            _PROVIDER_TRUTH_MISS_REVIEW_AUDIT_KEY,
+            {
+                "status": "TRACKING",
+                "updated_at": now.isoformat(),
+                "event_count": len(events[-500:]),
+                "events": events[-500:],
+            },
+        )
+
+    out = dict(approval_gate or {})
+    out.update({
+        "status": "PENDING",
+        "approval_state": "NEEDS_MORE_EVIDENCE",
+        "state_updated_at": now.isoformat(),
+        "operator_note": states.get(review_key, {}).get("note"),
+        "policy_change_allowed": False,
+        "auto_apply_enabled": False,
+        "auto_hold_applied": True,
+        "risk_blocked": True,
+        "risk_count": risk_count,
+        "primary_risk_cause": (risk_cause_classifier or {}).get("primary_cause"),
+        "next_action": "Approval auto-held because active risk cases exist.",
+    })
+    return out
+
+
+def _build_provider_truth_risk_clear_requirements(
+    risk_case_drilldown: dict,
+    risk_cause_classifier: dict,
+    confidence_curve: dict,
+    before_after: dict,
+    dry_run_preview: dict,
+    now: datetime,
+) -> dict:
+    risk_count = int((risk_case_drilldown or {}).get("risk_count") or 0)
+    cause_counts = dict((risk_cause_classifier or {}).get("cause_counts") or {})
+    requirements = [
+        {
+            "key": "risk_cases_clear",
+            "label": "All active risk cases clear",
+            "passed": risk_count == 0,
+            "current": risk_count,
+            "required": 0,
+        },
+        {
+            "key": "dry_run_risk_zero",
+            "label": "Dry-run would-risk count is zero",
+            "passed": int((dry_run_preview or {}).get("would_risk_count") or 0) == 0,
+            "current": int((dry_run_preview or {}).get("would_risk_count") or 0),
+            "required": 0,
+        },
+        {
+            "key": "no_worsened_before_after",
+            "label": "Before/after has no worsened cases",
+            "passed": int((before_after or {}).get("worsened_count") or 0) == 0,
+            "current": int((before_after or {}).get("worsened_count") or 0),
+            "required": 0,
+        },
+        {
+            "key": "confidence_not_weakening",
+            "label": "Confidence curve is not weakening",
+            "passed": str((confidence_curve or {}).get("trend") or "").upper() != "WEAKENING",
+            "current": (confidence_curve or {}).get("trend") or "WAITING",
+            "required": "NOT_WEAKENING",
+        },
+    ]
+    for cause, count in sorted(cause_counts.items(), key=lambda kv: kv[0]):
+        requirements.append({
+            "key": f"cause_clear_{cause.lower()}",
+            "label": f"{cause.replace('_', ' ').title()} cases clear",
+            "passed": int(count or 0) == 0,
+            "current": int(count or 0),
+            "required": 0,
+        })
+    passed = len([item for item in requirements if item.get("passed")])
+    total = len(requirements)
+    return {
+        "status": "CLEAR" if passed == total else "BLOCKED",
+        "passed_count": passed,
+        "total_count": total,
+        "items": requirements,
+        "next_action": (
+            "Risk is clear; approval can return to normal review if evidence remains strong."
+            if passed == total
+            else "Clear every risk requirement before this packet can be approvable again."
+        ),
+        "updated_at": now.isoformat(),
+    }
+
+
 def _build_provider_truth_approval_consequences(
     review_packet: dict,
     approval_gate: dict,
@@ -20037,6 +20318,37 @@ def _build_provider_truth_miss_evidence_accumulator(
     )
     approval_gate = _build_provider_truth_approval_gate(review_packet, now)
     dry_run_preview = _build_provider_truth_dry_run_policy_preview(review_packet, approval_gate, score, matcher, now)
+    approval_evidence_summary = _build_provider_truth_approval_evidence_summary(
+        review_packet,
+        score,
+        timeline,
+        dry_run_preview,
+        now,
+    )
+    risk_case_drilldown = _build_provider_truth_risk_case_drilldown(
+        approval_evidence_summary,
+        dry_run_preview,
+        before_after,
+        confidence_curve,
+        now,
+    )
+    risk_cause_classifier = _build_provider_truth_risk_cause_classifier(risk_case_drilldown, now)
+    risk_explanation = _build_provider_truth_risk_explanation(
+        score,
+        dry_run_preview,
+        before_after,
+        confidence_curve,
+        {},
+        now,
+    )
+    approval_gate = _apply_provider_truth_auto_hold_approval_state(
+        review_packet,
+        approval_gate,
+        risk_case_drilldown,
+        risk_cause_classifier,
+        now,
+    )
+    dry_run_preview = _build_provider_truth_dry_run_policy_preview(review_packet, approval_gate, score, matcher, now)
     post_approval_watchdog = _build_provider_truth_post_approval_watchdog(
         review_packet,
         approval_gate,
@@ -20044,6 +20356,22 @@ def _build_provider_truth_miss_evidence_accumulator(
         score,
         before_after,
         confidence_curve,
+        now,
+    )
+    risk_explanation = _build_provider_truth_risk_explanation(
+        score,
+        dry_run_preview,
+        before_after,
+        confidence_curve,
+        post_approval_watchdog,
+        now,
+    )
+    risk_clear_requirements = _build_provider_truth_risk_clear_requirements(
+        risk_case_drilldown,
+        risk_cause_classifier,
+        confidence_curve,
+        before_after,
+        dry_run_preview,
         now,
     )
     patch_target_map = _build_provider_truth_patch_target_map(review_packet, approval_gate, now)
@@ -20067,21 +20395,6 @@ def _build_provider_truth_miss_evidence_accumulator(
         patch_target_map,
         implementation_checklist,
         simulation_recipe,
-        post_approval_watchdog,
-        now,
-    )
-    approval_evidence_summary = _build_provider_truth_approval_evidence_summary(
-        review_packet,
-        score,
-        timeline,
-        dry_run_preview,
-        now,
-    )
-    risk_explanation = _build_provider_truth_risk_explanation(
-        score,
-        dry_run_preview,
-        before_after,
-        confidence_curve,
         post_approval_watchdog,
         now,
     )
@@ -20112,6 +20425,9 @@ def _build_provider_truth_miss_evidence_accumulator(
         "policy_patch_work_order": policy_work_order,
         "approval_evidence_summary": approval_evidence_summary,
         "risk_explanation": risk_explanation,
+        "risk_case_drilldown": risk_case_drilldown,
+        "risk_cause_classifier": risk_cause_classifier,
+        "risk_clear_requirements": risk_clear_requirements,
         "approval_consequences": approval_consequences,
         "decision_audit_trail": decision_audit_trail,
         "next_action": policy_work_order.get("next_action") or approval_gate.get("next_action") or score.get("next_action"),
@@ -20497,9 +20813,13 @@ def _build_dashboard_provider_truth_panel(
     miss_simulation = dict(miss_evidence_accumulator.get("simulation_test_recipe") or {})
     miss_approval_evidence = dict(miss_evidence_accumulator.get("approval_evidence_summary") or {})
     miss_risk_explanation = dict(miss_evidence_accumulator.get("risk_explanation") or {})
+    miss_risk_cases = dict(miss_evidence_accumulator.get("risk_case_drilldown") or {})
+    miss_risk_classifier = dict(miss_evidence_accumulator.get("risk_cause_classifier") or {})
+    miss_risk_clear = dict(miss_evidence_accumulator.get("risk_clear_requirements") or {})
     miss_consequences = dict(miss_evidence_accumulator.get("approval_consequences") or {})
     miss_decision_audit = dict(miss_evidence_accumulator.get("decision_audit_trail") or {})
     miss_top_evidence = (list(miss_approval_evidence.get("top_items") or []) or [{}])[0]
+    miss_top_risk_case = dict(miss_risk_cases.get("top_case") or {})
     status = (
         "BLOCKED"
         if str((agreement_layer or {}).get("status") or "").upper() == "BLOCKED"
@@ -20592,6 +20912,14 @@ def _build_dashboard_provider_truth_panel(
         "miss_risk_status": miss_risk_explanation.get("status"),
         "miss_risk_zero": bool(miss_risk_explanation.get("risk_zero")),
         "miss_risk_count": int(miss_risk_explanation.get("risk_count") or 0),
+        "miss_risk_case_count": int(miss_risk_cases.get("risk_count") or 0),
+        "miss_top_risk_symbol": miss_top_risk_case.get("symbol"),
+        "miss_top_risk_source": miss_top_risk_case.get("risk_source"),
+        "miss_primary_risk_cause": miss_risk_classifier.get("primary_cause"),
+        "miss_auto_hold_applied": bool(miss_approval_gate.get("auto_hold_applied")),
+        "miss_risk_clear_status": miss_risk_clear.get("status"),
+        "miss_risk_clear_passed": int(miss_risk_clear.get("passed_count") or 0),
+        "miss_risk_clear_total": int(miss_risk_clear.get("total_count") or 0),
         "miss_consequence_count": int(miss_consequences.get("consequence_count") or 0),
         "miss_audit_event_count": int(miss_decision_audit.get("event_count") or 0),
         "miss_audit_latest_state": miss_decision_audit.get("latest_state"),
@@ -26506,6 +26834,9 @@ async def home_provider_truth_miss_review_decision(
     packet_status = str(body.get("packet_status") or "").strip().upper()
     if state == "APPROVED_FOR_IMPLEMENTATION" and packet_status and packet_status != "READY_FOR_OPERATOR_REVIEW":
         raise HTTPException(status_code=422, detail="provider-truth review packet must be READY_FOR_OPERATOR_REVIEW before approval")
+    risk_count = int(_gb_float(body.get("risk_count")))
+    if state == "APPROVED_FOR_IMPLEMENTATION" and risk_count > 0:
+        raise HTTPException(status_code=422, detail="provider-truth review has active risk cases; hold or reject instead")
     note = str(body.get("operator_note") or body.get("note") or "").strip()[:500] or None
 
     def _run() -> dict:
@@ -26516,6 +26847,7 @@ async def home_provider_truth_miss_review_decision(
             "updated_at": now,
             "note": note,
             "packet_status": packet_status or None,
+            "risk_count": risk_count,
         }
         _freshness_kv_write(_PROVIDER_TRUTH_MISS_REVIEW_STATES_KEY, states)
         audit = _freshness_kv_read(_PROVIDER_TRUTH_MISS_REVIEW_AUDIT_KEY)
@@ -26526,6 +26858,7 @@ async def home_provider_truth_miss_review_decision(
             "review_key": review_key,
             "state": state,
             "packet_status": packet_status or None,
+            "risk_count": risk_count,
             "operator_note": note,
             "manual_only": True,
             "policy_auto_apply": False,

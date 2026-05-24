@@ -1144,6 +1144,7 @@ interface DailyCryptoBriefData {
         approval_state?: string
         policy_change_allowed?: boolean
         auto_apply_enabled?: boolean
+        auto_hold_applied?: boolean
       }
       dry_run_policy_preview?: {
         status?: string
@@ -1202,6 +1203,26 @@ interface DailyCryptoBriefData {
         risk_count?: number
         reasons?: string[]
         would_become_nonzero_if?: string[]
+      }
+      risk_case_drilldown?: {
+        status?: string
+        risk_count?: number
+        top_case?: {
+          symbol?: string | null
+          risk_source?: string | null
+          causes?: string[]
+        } | null
+      }
+      risk_cause_classifier?: {
+        status?: string
+        risk_count?: number
+        primary_cause?: string | null
+        cause_counts?: Record<string, number>
+      }
+      risk_clear_requirements?: {
+        status?: string
+        passed_count?: number
+        total_count?: number
       }
       approval_consequences?: {
         status?: string
@@ -1296,6 +1317,14 @@ interface DailyCryptoBriefData {
       miss_risk_status?: string | null
       miss_risk_zero?: boolean
       miss_risk_count?: number
+      miss_risk_case_count?: number
+      miss_top_risk_symbol?: string | null
+      miss_top_risk_source?: string | null
+      miss_primary_risk_cause?: string | null
+      miss_auto_hold_applied?: boolean
+      miss_risk_clear_status?: string | null
+      miss_risk_clear_passed?: number
+      miss_risk_clear_total?: number
       miss_consequence_count?: number
       miss_audit_event_count?: number
       miss_audit_latest_state?: string | null
@@ -5838,7 +5867,7 @@ function DailyCryptoBriefPanel({
   onEscalationPatchAction?: (item: ProviderEscalationPatchPlan, state: ProviderEscalationPatchState) => void
   onEscalationWorkOrderAction?: (item: ProviderEscalationWorkOrder, state: ProviderEscalationWorkOrderState) => void
   onLiveContextMissionAction?: (item: DailyTopMission | LiveOpportunityGap | LiveContextMissionOutcomeItem, state: LiveContextMissionState) => void
-  onProviderTruthMissReviewAction?: (item: { review_key?: string | null; status?: string | null }, state: ProviderTruthMissReviewState) => void
+  onProviderTruthMissReviewAction?: (item: { review_key?: string | null; status?: string | null; risk_count?: number | null }, state: ProviderTruthMissReviewState) => void
   pendingEscalationId?: number | null
   pendingEscalationReviewKey?: string | null
   pendingEscalationPatchKey?: string | null
@@ -5979,6 +6008,10 @@ function DailyCryptoBriefPanel({
     const providerTruthMissApprovalEvidence = providerTruthMissEvidence.approval_evidence_summary ?? {}
     const providerTruthMissTopApprovalEvidence = providerTruthMissApprovalEvidence.top_items?.[0]
     const providerTruthMissRiskExplanation = providerTruthMissEvidence.risk_explanation ?? {}
+    const providerTruthMissRiskCases = providerTruthMissEvidence.risk_case_drilldown ?? {}
+    const providerTruthMissTopRiskCase = providerTruthMissRiskCases.top_case ?? null
+    const providerTruthMissRiskClassifier = providerTruthMissEvidence.risk_cause_classifier ?? {}
+    const providerTruthMissRiskClear = providerTruthMissEvidence.risk_clear_requirements ?? {}
     const providerTruthMissConsequences = providerTruthMissEvidence.approval_consequences ?? {}
     const providerTruthMissAudit = providerTruthMissEvidence.decision_audit_trail ?? {}
     const topProviderTruthItem = providerTruthAgreement.items?.[0]
@@ -6558,7 +6591,10 @@ function DailyCryptoBriefPanel({
               work order {String(providerTruthPanel.miss_work_order_status || providerTruthMissWorkOrder.status || 'blocked by approval').replace(/_/g, ' ').toLowerCase()} · targets {providerTruthPanel.miss_work_order_target_count ?? providerTruthMissWorkOrder.target_count ?? providerTruthMissTargetMap.target_count ?? 0} · checklist {providerTruthPanel.miss_work_order_checklist_passed ?? providerTruthMissWorkOrder.checklist_passed ?? providerTruthMissChecklist.passed_required ?? 0}/{providerTruthPanel.miss_work_order_checklist_total ?? providerTruthMissWorkOrder.checklist_total ?? providerTruthMissChecklist.total_required ?? 0} · tests {providerTruthPanel.miss_work_order_recipe_count ?? providerTruthMissWorkOrder.recipe_count ?? providerTruthMissSimulation.recipe_count ?? 0}
             </div>
             <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
-              approval evidence {providerTruthPanel.miss_approval_evidence_count ?? providerTruthMissApprovalEvidence.evidence_count ?? 0} · top {providerTruthPanel.miss_approval_top_symbol || providerTruthMissTopApprovalEvidence?.symbol || 'none'} {String(providerTruthPanel.miss_approval_top_outcome || providerTruthMissTopApprovalEvidence?.evidence_outcome || 'waiting').replace(/_/g, ' ').toLowerCase()} · risk {providerTruthPanel.miss_risk_zero ?? providerTruthMissRiskExplanation.risk_zero ? 'zero' : 'review'} · consequences {providerTruthPanel.miss_consequence_count ?? providerTruthMissConsequences.consequence_count ?? 0} · audit {providerTruthPanel.miss_audit_event_count ?? providerTruthMissAudit.event_count ?? 0}
+              approval evidence {providerTruthPanel.miss_approval_evidence_count ?? providerTruthMissApprovalEvidence.evidence_count ?? 0} · top {providerTruthPanel.miss_approval_top_symbol || providerTruthMissTopApprovalEvidence?.symbol || 'none'} {String(providerTruthPanel.miss_approval_top_outcome || providerTruthMissTopApprovalEvidence?.evidence_outcome || 'waiting').replace(/_/g, ' ').toLowerCase()} · risk {(providerTruthPanel.miss_risk_zero ?? providerTruthMissRiskExplanation.risk_zero) ? 'zero' : 'review'} · consequences {providerTruthPanel.miss_consequence_count ?? providerTruthMissConsequences.consequence_count ?? 0} · audit {providerTruthPanel.miss_audit_event_count ?? providerTruthMissAudit.event_count ?? 0}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              risk cases {providerTruthPanel.miss_risk_case_count ?? providerTruthMissRiskCases.risk_count ?? 0} · top {providerTruthPanel.miss_top_risk_symbol || providerTruthMissTopRiskCase?.symbol || 'none'} · cause {String(providerTruthPanel.miss_primary_risk_cause || providerTruthMissRiskClassifier.primary_cause || 'clear').replace(/_/g, ' ').toLowerCase()} · auto-hold {(providerTruthPanel.miss_auto_hold_applied || providerTruthMissApprovalGate.auto_hold_applied) ? 'on' : 'off'} · clear {providerTruthPanel.miss_risk_clear_passed ?? providerTruthMissRiskClear.passed_count ?? 0}/{providerTruthPanel.miss_risk_clear_total ?? providerTruthMissRiskClear.total_count ?? 0}
             </div>
             {(providerTruthPanel.miss_review_key || providerTruthMissReviewPacket.review_key) && onProviderTruthMissReviewAction && (
               <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 8 }}>
@@ -6569,6 +6605,7 @@ function DailyCryptoBriefPanel({
                 ] as Array<[ProviderTruthMissReviewState, string]>).map(([state, label]) => {
                   const reviewKey = providerTruthPanel.miss_review_key || providerTruthMissReviewPacket.review_key || null
                   const packetStatus = providerTruthPanel.miss_review_packet_status || providerTruthMissReviewPacket.status || null
+                  const riskCount = providerTruthPanel.miss_risk_case_count ?? providerTruthMissRiskCases.risk_count ?? 0
                   return (
                     <button
                       key={`provider-truth-miss-review-${state}`}
@@ -6576,9 +6613,9 @@ function DailyCryptoBriefPanel({
                       className="mini-btn"
                       disabled={
                         pendingProviderTruthMissReviewKey === reviewKey
-                        || (state === 'APPROVED_FOR_IMPLEMENTATION' && packetStatus !== 'READY_FOR_OPERATOR_REVIEW')
+                        || (state === 'APPROVED_FOR_IMPLEMENTATION' && (packetStatus !== 'READY_FOR_OPERATOR_REVIEW' || riskCount > 0))
                       }
-                      onClick={() => onProviderTruthMissReviewAction({ review_key: reviewKey, status: packetStatus }, state)}
+                      onClick={() => onProviderTruthMissReviewAction({ review_key: reviewKey, status: packetStatus, risk_count: riskCount }, state)}
                       style={{ fontSize: 7, padding: '4px 7px' }}
                     >
                       {label}
@@ -10144,6 +10181,7 @@ export function HomePage() {
       review_key?: string | null
       state: ProviderTruthMissReviewState
       packet_status?: string | null
+      risk_count?: number | null
       operator_note?: string
     }) => api.post('/home/provider-truth-miss-review/decision', payload).then(r => r.data),
     onMutate: (payload) => {
@@ -10158,13 +10196,14 @@ export function HomePage() {
   })
 
   const recordProviderTruthMissReviewDecision = (
-    item: { review_key?: string | null; status?: string | null },
+    item: { review_key?: string | null; status?: string | null; risk_count?: number | null },
     state: ProviderTruthMissReviewState,
   ) => {
     providerTruthMissReviewMutation.mutate({
       review_key: item.review_key,
       state,
       packet_status: item.status,
+      risk_count: item.risk_count,
       operator_note:
         state === 'APPROVED_FOR_IMPLEMENTATION'
           ? 'Operator approved provider-truth miss packet for manual implementation review only.'
