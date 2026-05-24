@@ -18010,6 +18010,278 @@ def _provider_truth_memory_history_by_key(truth_memory: dict) -> dict[str, list[
     return out
 
 
+def _provider_truth_current_by_key(intelligence_rows: list[dict]) -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    for row in list(intelligence_rows or []):
+        mint = str(row.get("mint") or "").strip()
+        symbol = str(row.get("symbol") or "").strip().upper()
+        if mint and mint not in out:
+            out[mint] = dict(row)
+        if symbol and f"symbol:{symbol}" not in out:
+            out[f"symbol:{symbol}"] = dict(row)
+    return out
+
+
+def _provider_truth_current_for_row(row: dict, current_by_key: dict[str, dict]) -> dict:
+    mint = str(row.get("mint") or "").strip()
+    symbol = str(row.get("symbol") or "").strip().upper()
+    return dict(current_by_key.get(mint) or current_by_key.get(f"symbol:{symbol}") or {})
+
+
+def _provider_truth_learning_source(source_value) -> str:
+    source = _provider_source_key(source_value)
+    return "unknown" if source in {"", "unknown", "none"} else source
+
+
+def _build_provider_truth_learning_score(
+    truth_memory: dict,
+    intelligence_rows: list[dict],
+    queue_health: dict | None,
+    outcome_tracking: dict | None,
+    now: datetime,
+) -> dict:
+    current_by_key = _provider_truth_current_by_key(intelligence_rows)
+    provider_stats: dict[str, dict] = {}
+
+    def stat_for(source: str) -> dict:
+        source = _provider_truth_learning_source(source)
+        return provider_stats.setdefault(source, {
+            "provider": source,
+            "sample_n": 0,
+            "positive_n": 0,
+            "negative_n": 0,
+            "confirmed_n": 0,
+            "useful_confirmed_n": 0,
+            "false_confirmed_n": 0,
+            "unresolved_n": 0,
+            "correct_unresolved_n": 0,
+            "missed_unresolved_n": 0,
+            "downgrade_good_n": 0,
+            "downgrade_risky_n": 0,
+            "escalation_good_n": 0,
+            "escalation_noisy_n": 0,
+            "examples": [],
+        })
+
+    confirmed_items = []
+    unresolved_items = []
+    downgrade_items = []
+    escalation_items = []
+    for row in list((truth_memory or {}).get("items") or []):
+        row = dict(row)
+        status = str(row.get("confirmation_status") or "").upper()
+        current = _provider_truth_current_for_row(row, current_by_key)
+        source = _provider_truth_learning_source(row.get("new_source") or row.get("current_source"))
+        item = stat_for(source)
+        item["sample_n"] += 1
+        current_freshness = str(current.get("data_freshness") or "").upper()
+        current_confidence = str(current.get("data_confidence") or "").upper()
+        current_source = _provider_source_key(current.get("market_source"))
+        current_quality = _gb_float(current.get("quality_score"))
+        current_pressure = _gb_float(current.get("pressure_score"))
+        return_pct = _gb_pct(_gb_float(current.get("marketcap")), _gb_float(row.get("new_marketcap")))
+        if status == "CONFIRMED":
+            item["confirmed_n"] += 1
+            useful = (
+                current_freshness in {"LIVE", "RECENT"}
+                and current_confidence != "LOW"
+                and not current_source.startswith("cache")
+                and current_quality >= 50
+            )
+            false_confirm = (
+                current_confidence == "LOW"
+                or current_freshness == "STALE"
+                or current_source.startswith("cache")
+                or (return_pct is not None and return_pct <= -45.0 and current_quality < 55)
+            )
+            label = "USEFUL_CONFIRMED" if useful and not false_confirm else "FALSE_CONFIRMED" if false_confirm else "CONFIRMED_NEEDS_TIME"
+            if label == "USEFUL_CONFIRMED":
+                item["positive_n"] += 1
+                item["useful_confirmed_n"] += 1
+            elif label == "FALSE_CONFIRMED":
+                item["negative_n"] += 1
+                item["false_confirmed_n"] += 1
+            confirmed_items.append({
+                "symbol": row.get("symbol"),
+                "mint": row.get("mint"),
+                "source": source,
+                "label": label,
+                "return_pct": return_pct,
+                "current_freshness": current.get("data_freshness"),
+                "current_confidence": current.get("data_confidence"),
+                "current_quality": _nullable_float(current.get("quality_score")),
+            })
+        elif status == "UNRESOLVED":
+            item["unresolved_n"] += 1
+            missed = (
+                current_freshness in {"LIVE", "RECENT"}
+                and current_confidence != "LOW"
+                and current_quality >= 75
+                and current_pressure >= 45
+            )
+            label = "MISSED_UNRESOLVED" if missed else "CORRECT_UNRESOLVED" if current_quality < 70 or current_confidence == "LOW" or current_freshness == "STALE" else "UNRESOLVED_NEEDS_TIME"
+            if label == "CORRECT_UNRESOLVED":
+                item["positive_n"] += 1
+                item["correct_unresolved_n"] += 1
+            elif label == "MISSED_UNRESOLVED":
+                item["negative_n"] += 1
+                item["missed_unresolved_n"] += 1
+            unresolved_items.append({
+                "symbol": row.get("symbol"),
+                "mint": row.get("mint"),
+                "source": source,
+                "label": label,
+                "current_freshness": current.get("data_freshness"),
+                "current_confidence": current.get("data_confidence"),
+                "current_quality": _nullable_float(current.get("quality_score")),
+                "current_pressure": _nullable_float(current.get("pressure_score")),
+            })
+
+    for queue_item in list((queue_health or {}).get("items") or []):
+        status = str(queue_item.get("status") or "").upper()
+        if status not in {"DOWNGRADED_LOW_IMPACT", "ESCALATE_HIGH_IMPACT"}:
+            continue
+        current = _provider_truth_current_for_row(queue_item, current_by_key)
+        source = _provider_truth_learning_source(queue_item.get("current_source"))
+        item = stat_for(source)
+        item["sample_n"] += 1
+        current_quality = _gb_float(current.get("quality_score"))
+        current_confidence = str(current.get("data_confidence") or "").upper()
+        current_freshness = str(current.get("data_freshness") or "").upper()
+        if status == "DOWNGRADED_LOW_IMPACT":
+            good = current_quality < 70 or current_confidence == "LOW" or current_freshness == "STALE"
+            label = "GOOD_DOWNGRADE" if good else "RISKY_DOWNGRADE"
+            if good:
+                item["positive_n"] += 1
+                item["downgrade_good_n"] += 1
+            else:
+                item["negative_n"] += 1
+                item["downgrade_risky_n"] += 1
+            downgrade_items.append({
+                "symbol": queue_item.get("symbol"),
+                "mint": queue_item.get("mint"),
+                "source": source,
+                "label": label,
+                "retry_count": queue_item.get("retry_count"),
+                "current_quality": _nullable_float(current.get("quality_score")),
+            })
+        else:
+            good = current_quality >= 70 or _gb_float(queue_item.get("priority_score")) >= 80
+            label = "GOOD_ESCALATION" if good else "NOISY_ESCALATION"
+            if good:
+                item["positive_n"] += 1
+                item["escalation_good_n"] += 1
+            else:
+                item["negative_n"] += 1
+                item["escalation_noisy_n"] += 1
+            escalation_items.append({
+                "symbol": queue_item.get("symbol"),
+                "mint": queue_item.get("mint"),
+                "source": source,
+                "label": label,
+                "retry_count": queue_item.get("retry_count"),
+                "current_quality": _nullable_float(current.get("quality_score")),
+            })
+
+    provider_adjustments: dict[str, dict] = {}
+    provider_rows = []
+    positive_total = 0
+    negative_total = 0
+    judged_total = 0
+    for source, item in provider_stats.items():
+        positive = int(item.get("positive_n") or 0)
+        negative = int(item.get("negative_n") or 0)
+        judged = positive + negative
+        learning_score = round((positive / max(1, judged)) * 100.0, 1) if judged else None
+        dampener = min(1.0, judged / 8.0) if judged else 0.0
+        adjustment = round(max(-12.0, min(10.0, ((_gb_float(learning_score, 55.0) - 60.0) * 0.25) * dampener)), 1) if judged else 0.0
+        item["judged_n"] = judged
+        item["learning_score"] = learning_score
+        item["confidence_adjustment"] = adjustment
+        item["trust_delta"] = "UP" if adjustment >= 3 else "DOWN" if adjustment <= -3 else "FLAT"
+        provider_adjustments[source] = {
+            "learning_score": learning_score,
+            "confidence_adjustment": adjustment,
+            "judged_n": judged,
+            "sample_n": int(item.get("sample_n") or 0),
+            "false_confirmed_n": int(item.get("false_confirmed_n") or 0),
+            "missed_unresolved_n": int(item.get("missed_unresolved_n") or 0),
+            "trust_delta": item["trust_delta"],
+        }
+        provider_rows.append(item)
+        positive_total += positive
+        negative_total += negative
+        judged_total += judged
+
+    provider_rows.sort(key=lambda x: (int(x.get("judged_n") or 0), _gb_float(x.get("learning_score"))), reverse=True)
+    accuracy = round((positive_total / max(1, judged_total)) * 100.0, 1) if judged_total else None
+    status = "LEARNING" if judged_total < 8 else "REVIEW" if _gb_float(accuracy, 100.0) < 65 or negative_total else "RELIABLE"
+    return {
+        "status": status,
+        "accuracy_pct": accuracy,
+        "judged_count": judged_total,
+        "positive_count": positive_total,
+        "negative_count": negative_total,
+        "confirmed_score": {
+            "sample_n": len(confirmed_items),
+            "useful_count": len([x for x in confirmed_items if x.get("label") == "USEFUL_CONFIRMED"]),
+            "false_count": len([x for x in confirmed_items if x.get("label") == "FALSE_CONFIRMED"]),
+            "items": confirmed_items[:10],
+        },
+        "unresolved_score": {
+            "sample_n": len(unresolved_items),
+            "correct_count": len([x for x in unresolved_items if x.get("label") == "CORRECT_UNRESOLVED"]),
+            "missed_count": len([x for x in unresolved_items if x.get("label") == "MISSED_UNRESOLVED"]),
+            "items": unresolved_items[:10],
+        },
+        "queue_decision_score": {
+            "downgrade_sample_n": len(downgrade_items),
+            "good_downgrade_count": len([x for x in downgrade_items if x.get("label") == "GOOD_DOWNGRADE"]),
+            "risky_downgrade_count": len([x for x in downgrade_items if x.get("label") == "RISKY_DOWNGRADE"]),
+            "escalation_sample_n": len(escalation_items),
+            "good_escalation_count": len([x for x in escalation_items if x.get("label") == "GOOD_ESCALATION"]),
+            "noisy_escalation_count": len([x for x in escalation_items if x.get("label") == "NOISY_ESCALATION"]),
+            "downgrade_items": downgrade_items[:8],
+            "escalation_items": escalation_items[:8],
+        },
+        "provider_adjustments": provider_adjustments,
+        "providers": provider_rows[:10],
+        "next_action": (
+            "Provider-truth learning has enough evidence to review source confidence changes."
+            if judged_total >= 8
+            else "Keep collecting provider-truth outcomes before trusting confidence adjustments."
+        ),
+    }
+
+
+def _apply_provider_truth_learning_to_source_map(source_map: dict, learning: dict) -> dict:
+    out = copy.deepcopy(source_map or {})
+    adjustments = dict((learning or {}).get("provider_adjustments") or {})
+    providers = []
+    for row in list(out.get("providers") or []):
+        item = dict(row)
+        source = _provider_source_key(item.get("source"))
+        adj = dict(adjustments.get(source) or {})
+        base_score = _gb_float(item.get("confidence_score"))
+        adjustment = _gb_float(adj.get("confidence_adjustment"))
+        final_score = round(max(0.0, min(100.0, base_score + adjustment)), 1)
+        item["base_confidence_score"] = base_score
+        item["confidence_score"] = final_score
+        item["provider_truth_learning_score"] = adj.get("learning_score")
+        item["provider_truth_confidence_adjustment"] = adjustment
+        item["provider_truth_judged_n"] = int(adj.get("judged_n") or 0)
+        item["provider_truth_false_confirmed_n"] = int(adj.get("false_confirmed_n") or 0)
+        item["provider_truth_missed_unresolved_n"] = int(adj.get("missed_unresolved_n") or 0)
+        item["provider_truth_trust_delta"] = adj.get("trust_delta")
+        item["trust_label"] = "TRUSTED" if final_score >= 70 else "PARTIAL" if final_score >= 48 else "WEAK"
+        providers.append(item)
+    providers.sort(key=lambda x: (_gb_float(x.get("confidence_score")), int(x.get("rows") or 0)), reverse=True)
+    out["providers"] = providers
+    out["provider_truth_learning_status"] = (learning or {}).get("status")
+    out["provider_truth_accuracy_pct"] = (learning or {}).get("accuracy_pct")
+    return out
+
+
 def _provider_truth_retry_delay_minutes(retry_count: int, high_impact: bool) -> int:
     if retry_count <= 0:
         return 0
@@ -18358,6 +18630,7 @@ def _build_dashboard_provider_truth_panel(
     outcome_tracking: dict | None = None,
     queue_health: dict | None = None,
     escalation_writer: dict | None = None,
+    learning_score: dict | None = None,
 ) -> dict:
     top_agreement = (list((agreement_layer or {}).get("items") or []) or [{}])[0]
     top_arbitration = dict((arbitration or {}).get("top") or {})
@@ -18366,6 +18639,7 @@ def _build_dashboard_provider_truth_panel(
     outcome_tracking = dict(outcome_tracking or {})
     queue_health = dict(queue_health or {})
     escalation_writer = dict(escalation_writer or {})
+    learning_score = dict(learning_score or {})
     status = (
         "BLOCKED"
         if str((agreement_layer or {}).get("status") or "").upper() == "BLOCKED"
@@ -18401,6 +18675,11 @@ def _build_dashboard_provider_truth_panel(
         "queue_escalated_count": int(queue_health.get("escalated_count") or 0),
         "queue_oldest_age_minutes": queue_health.get("oldest_age_minutes"),
         "escalation_written_count": int(escalation_writer.get("written_count") or 0),
+        "learning_status": learning_score.get("status"),
+        "learning_accuracy_pct": learning_score.get("accuracy_pct"),
+        "learning_judged_count": int(learning_score.get("judged_count") or 0),
+        "learning_positive_count": int(learning_score.get("positive_count") or 0),
+        "learning_negative_count": int(learning_score.get("negative_count") or 0),
         "top_symbol": top_agreement.get("symbol"),
         "top_status": top_agreement.get("status"),
         "top_best_source": top_arbitration.get("best_source"),
@@ -18417,13 +18696,15 @@ def _build_provider_truth_layer(
     provider_reliability: dict,
     repair_rows: list[dict],
 ) -> dict:
-    source_map = _build_provider_source_map(intelligence_rows, data_watchdog, provider_reliability, freshness_repair_loop, journal_rows)
+    now = datetime.now(timezone.utc)
+    truth_memory = _read_provider_truth_memory(now - timedelta(days=7))
+    learning_score = _build_provider_truth_learning_score(truth_memory, intelligence_rows, None, None, now)
+    source_map_base = _build_provider_source_map(intelligence_rows, data_watchdog, provider_reliability, freshness_repair_loop, journal_rows)
+    source_map = _apply_provider_truth_learning_to_source_map(source_map_base, learning_score)
     source_index = {
         _provider_source_key(item.get("source")): item
         for item in list(source_map.get("providers") or [])
     }
-    now = datetime.now(timezone.utc)
-    truth_memory = _read_provider_truth_memory(now - timedelta(days=7))
     targets = _provider_truth_high_impact_targets(freshness_repair_loop, data_watchdog)
     agreement_layer = _build_cross_provider_agreement_layer(targets, intelligence_rows, repair_rows, source_index, truth_memory)
     arbitration = _build_provider_confidence_arbitration(agreement_layer, source_map)
@@ -18450,6 +18731,8 @@ def _build_provider_truth_layer(
         fallback_router = _apply_provider_truth_queue_health_to_router(fallback_router, queue_health)
         escalation_writer = _write_provider_truth_queue_escalations(queue_health, now)
     outcome_tracking = _build_provider_truth_outcome_tracking(truth_memory, intelligence_rows, now)
+    learning_score = _build_provider_truth_learning_score(truth_memory, intelligence_rows, queue_health, outcome_tracking, now)
+    source_map = _apply_provider_truth_learning_to_source_map(source_map_base, learning_score)
     truth_panel = _build_dashboard_provider_truth_panel(
         source_map,
         agreement_layer,
@@ -18460,6 +18743,7 @@ def _build_provider_truth_layer(
         outcome_tracking,
         queue_health,
         escalation_writer,
+        learning_score,
     )
     return {
         "status": truth_panel.get("status"),
@@ -18472,6 +18756,7 @@ def _build_provider_truth_layer(
         "provider_truth_outcome_tracking": outcome_tracking,
         "provider_truth_queue_health": queue_health,
         "provider_truth_escalation_writer": escalation_writer,
+        "provider_truth_learning_score": learning_score,
         "dashboard_provider_truth_panel": truth_panel,
         "next_action": truth_panel.get("next_action"),
     }
