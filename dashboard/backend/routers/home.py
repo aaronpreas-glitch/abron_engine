@@ -20773,6 +20773,99 @@ def _build_provider_truth_hold_outcome_journal(
     }
 
 
+def _provider_truth_source_weight(item: dict, source_index: dict[str, dict] | None = None) -> dict:
+    source = _provider_source_key(item.get("current_source") or item.get("source"))
+    source_meta = dict((source_index or {}).get(source) or {})
+    source_confidence = _gb_float(
+        item.get("source_confidence_score"),
+        _gb_float(source_meta.get("confidence_score"), 45.0),
+    )
+    freshness = str(item.get("freshness") or item.get("current_freshness") or "").upper()
+    confidence = str(item.get("confidence") or item.get("current_confidence") or "").upper()
+    quality = _gb_float(item.get("quality"), _gb_float(item.get("current_quality")))
+    pressure = _gb_float(item.get("pressure"), _gb_float(item.get("current_pressure")))
+    weight = 35.0 + source_confidence * 0.35
+    if freshness == "LIVE":
+        weight += 18.0
+    elif freshness == "RECENT":
+        weight += 9.0
+    elif freshness == "STALE":
+        weight -= 18.0
+    if confidence == "HIGH":
+        weight += 10.0
+    elif confidence == "LOW":
+        weight -= 14.0
+    weight += min(14.0, quality * 0.08)
+    weight += min(8.0, pressure * 0.05)
+    if source.startswith("cache") or source in {"", "unknown"}:
+        weight -= 20.0
+    weight = round(max(0.0, min(100.0, weight)), 1)
+    return {
+        "source": source,
+        "source_confidence_score": round(source_confidence, 1),
+        "freshness": freshness or None,
+        "confidence": confidence or None,
+        "quality": round(quality, 1),
+        "pressure": round(pressure, 1),
+        "evidence_weight": weight,
+        "weight_band": "HIGH" if weight >= 75 else "MEDIUM" if weight >= 45 else "LOW",
+    }
+
+
+def _build_provider_truth_source_trust_weighting(
+    approval_evidence_summary: dict,
+    risk_case_drilldown: dict,
+    dry_run_preview: dict,
+    source_index: dict[str, dict],
+    now: datetime,
+) -> dict:
+    weighted: dict[str, dict] = {}
+    for origin, rows in [
+        ("APPROVAL_EVIDENCE", list((approval_evidence_summary or {}).get("top_items") or [])),
+        ("RISK_CASE", list((risk_case_drilldown or {}).get("items") or [])),
+        ("DRY_RUN", list((dry_run_preview or {}).get("items") or [])),
+    ]:
+        for raw in rows:
+            item = dict(raw)
+            key = str(item.get("key") or _provider_truth_queue_key(item) or f"{origin}:{item.get('symbol') or item.get('mint') or len(weighted)}")
+            weight = _provider_truth_source_weight(item, source_index)
+            previous = weighted.get(key)
+            merged = {
+                "key": key,
+                "origin": origin,
+                "symbol": item.get("symbol"),
+                "mint": item.get("mint"),
+                "risk_source": item.get("risk_source"),
+                "evidence_outcome": item.get("evidence_outcome"),
+                "causes": list(item.get("causes") or _provider_truth_risk_causes(item)),
+                **weight,
+            }
+            if not previous or _gb_float(merged.get("evidence_weight")) > _gb_float(previous.get("evidence_weight")):
+                weighted[key] = merged
+    items = sorted(weighted.values(), key=lambda x: _gb_float(x.get("evidence_weight")), reverse=True)[:30]
+    total_weight = round(sum(_gb_float(item.get("evidence_weight")) for item in items), 1)
+    avg_weight = round(total_weight / max(1, len(items)), 1) if items else None
+    high_count = len([item for item in items if _gb_float(item.get("evidence_weight")) >= 75])
+    low_count = len([item for item in items if _gb_float(item.get("evidence_weight")) < 45])
+    return {
+        "status": "READY" if items else "EMPTY",
+        "item_count": len(items),
+        "total_weight": total_weight,
+        "avg_weight": avg_weight,
+        "high_weight_count": high_count,
+        "low_weight_count": low_count,
+        "top_source": items[0].get("source") if items else None,
+        "top_weight": items[0].get("evidence_weight") if items else None,
+        "items": items,
+        "next_action": (
+            "Use source trust weights to judge evidence strength before tuning thresholds."
+            if items
+            else "No provider-truth evidence is available for source weighting yet."
+        ),
+        "updated_at": now.isoformat(),
+    }
+
+
 def _build_provider_truth_cause_accuracy_scoring(hold_outcome_journal: dict, now: datetime) -> dict:
     rows = [dict(item) for item in list((hold_outcome_journal or {}).get("all_items") or (hold_outcome_journal or {}).get("items") or [])]
     by_cause: dict[str, dict] = {}
@@ -20828,6 +20921,82 @@ def _build_provider_truth_cause_accuracy_scoring(hold_outcome_journal: dict, now
             "Use cause scores as evidence, not automatic policy changes."
             if items
             else "Keep collecting hold outcomes before scoring causes."
+        ),
+        "updated_at": now.isoformat(),
+    }
+
+
+def _build_provider_truth_outcome_weighted_cause_scores(
+    hold_outcome_journal: dict,
+    source_trust_weighting: dict,
+    now: datetime,
+) -> dict:
+    rows = [dict(item) for item in list((hold_outcome_journal or {}).get("all_items") or (hold_outcome_journal or {}).get("items") or [])]
+    evidence_items = list((source_trust_weighting or {}).get("items") or [])
+    cause_weight_hint: dict[str, float] = {}
+    for item in evidence_items:
+        weight = _gb_float(item.get("evidence_weight"))
+        for cause in list(item.get("causes") or []):
+            key = str(cause or "UNCLASSIFIED").upper()
+            cause_weight_hint[key] = max(cause_weight_hint.get(key, 0.0), weight)
+    protective_labels = {"ACTIVE_RISK_HOLD", "STALE_RISK_HOLD", "RISK_REJECTED", "RISK_FROZEN"}
+    cleared_labels = {"CLEARED_BACK_TO_REVIEW", "APPROVED_AFTER_CLEAR", "CLEAR_BUT_STILL_HELD"}
+    unsafe_labels = {"UNSAFE_APPROVAL_ATTEMPT"}
+    buckets: dict[str, dict] = {}
+    for row in rows:
+        causes = [str(cause).upper() for cause in list(row.get("causes") or [])] or ["UNCLASSIFIED"]
+        outcome = str(row.get("outcome_label") or "").upper()
+        risk_count = max(1, int(row.get("risk_count") or 0))
+        base_impact = 1.0 + min(3.0, risk_count * 0.5)
+        if outcome in unsafe_labels:
+            outcome_mult = -2.0
+        elif outcome in protective_labels:
+            outcome_mult = 1.25
+        elif outcome in cleared_labels:
+            outcome_mult = 0.35
+        else:
+            outcome_mult = 0.15
+        for cause in causes:
+            evidence_weight = cause_weight_hint.get(cause, 50.0)
+            weighted_value = round(base_impact * outcome_mult * (evidence_weight / 50.0), 3)
+            bucket = buckets.setdefault(cause, {
+                "cause": cause,
+                "observed_count": 0,
+                "weighted_signal": 0.0,
+                "weighted_abs_signal": 0.0,
+                "max_evidence_weight": 0.0,
+            })
+            bucket["observed_count"] += 1
+            bucket["weighted_signal"] = round(_gb_float(bucket.get("weighted_signal")) + weighted_value, 3)
+            bucket["weighted_abs_signal"] = round(_gb_float(bucket.get("weighted_abs_signal")) + abs(weighted_value), 3)
+            bucket["max_evidence_weight"] = max(_gb_float(bucket.get("max_evidence_weight")), evidence_weight)
+    items = []
+    for bucket in buckets.values():
+        denom = max(0.001, _gb_float(bucket.get("weighted_abs_signal")))
+        weighted_score = round(max(0.0, min(100.0, ((_gb_float(bucket.get("weighted_signal")) / denom) + 1.0) * 50.0)), 1)
+        items.append({
+            **bucket,
+            "weighted_score": weighted_score,
+            "read": (
+                "strong_protective"
+                if weighted_score >= 75
+                else "mixed"
+                if weighted_score >= 40
+                else "risk_of_noise"
+            ),
+        })
+    items.sort(key=lambda x: (_gb_float(x.get("weighted_score")), _gb_float(x.get("max_evidence_weight"))), reverse=True)
+    return {
+        "status": "SCORING" if items else "NO_SAMPLE",
+        "sample_n": len(rows),
+        "cause_count": len(items),
+        "top_cause": items[0].get("cause") if items else None,
+        "top_weighted_score": items[0].get("weighted_score") if items else None,
+        "items": items[:20],
+        "next_action": (
+            "Use weighted cause scores to prioritize manual threshold review."
+            if items
+            else "Keep collecting outcomes and weighted evidence before scoring causes."
         ),
         "updated_at": now.isoformat(),
     }
@@ -20910,6 +21079,69 @@ def _build_provider_truth_clear_requirement_backtest(
     }
 
 
+def _build_provider_truth_weighted_clear_requirements(
+    risk_clear_requirements: dict,
+    risk_case_drilldown: dict,
+    source_trust_weighting: dict,
+    now: datetime,
+) -> dict:
+    risk_items = list((risk_case_drilldown or {}).get("items") or [])
+    weight_by_key = {
+        str(item.get("key") or ""): _gb_float(item.get("evidence_weight"))
+        for item in list((source_trust_weighting or {}).get("items") or [])
+        if str(item.get("key") or "")
+    }
+    high_risk_weight = 0.0
+    medium_risk_weight = 0.0
+    low_risk_weight = 0.0
+    weighted_cases = []
+    for raw in risk_items:
+        item = dict(raw)
+        key = str(item.get("key") or _provider_truth_queue_key(item) or item.get("symbol") or "")
+        weight = weight_by_key.get(key)
+        if weight is None:
+            weight = _gb_float(_provider_truth_source_weight(item).get("evidence_weight"))
+        if weight >= 75:
+            high_risk_weight += weight
+        elif weight >= 45:
+            medium_risk_weight += weight
+        else:
+            low_risk_weight += weight
+        weighted_cases.append({
+            "key": key,
+            "symbol": item.get("symbol"),
+            "risk_source": item.get("risk_source"),
+            "evidence_weight": round(weight, 1),
+            "weight_band": "HIGH" if weight >= 75 else "MEDIUM" if weight >= 45 else "LOW",
+        })
+    high_risk_weight = round(high_risk_weight, 1)
+    medium_risk_weight = round(medium_risk_weight, 1)
+    low_risk_weight = round(low_risk_weight, 1)
+    base_clear = str((risk_clear_requirements or {}).get("status") or "").upper() == "CLEAR"
+    weighted_clear = bool(base_clear and high_risk_weight == 0 and medium_risk_weight <= 0)
+    status = "CLEAR" if weighted_clear else "HIGH_WEIGHT_BLOCKED" if high_risk_weight > 0 else "MEDIUM_WEIGHT_BLOCKED" if medium_risk_weight > 0 else "BASE_REQUIREMENTS_BLOCKED"
+    return {
+        "status": status,
+        "weighted_clear": weighted_clear,
+        "case_count": len(weighted_cases),
+        "high_risk_weight": high_risk_weight,
+        "medium_risk_weight": medium_risk_weight,
+        "low_risk_weight": low_risk_weight,
+        "base_clear_status": (risk_clear_requirements or {}).get("status"),
+        "items": sorted(weighted_cases, key=lambda x: _gb_float(x.get("evidence_weight")), reverse=True)[:20],
+        "next_action": (
+            "High-weight risk remains; do not clear this packet."
+            if high_risk_weight > 0
+            else "Medium-weight risk remains; continue evidence review."
+            if medium_risk_weight > 0
+            else "Only low-weight or no weighted risk remains; base clear rules still control manual review."
+            if not weighted_clear
+            else "Weighted risk is clear; packet may return to manual review if base rules are also clear."
+        ),
+        "updated_at": now.isoformat(),
+    }
+
+
 def _build_provider_truth_policy_tuning_suggestions(
     cause_accuracy_scoring: dict,
     clear_requirement_backtest: dict,
@@ -20987,12 +21219,103 @@ def _build_provider_truth_policy_tuning_suggestions(
     }
 
 
+def _build_provider_truth_weighted_threshold_suggestions(
+    source_trust_weighting: dict,
+    outcome_weighted_cause_scores: dict,
+    weighted_clear_requirements: dict,
+    now: datetime,
+) -> dict:
+    suggestions = []
+    high_weight = _gb_float((weighted_clear_requirements or {}).get("high_risk_weight"))
+    medium_weight = _gb_float((weighted_clear_requirements or {}).get("medium_risk_weight"))
+    low_count = int((source_trust_weighting or {}).get("low_weight_count") or 0)
+    avg_weight = _gb_float((source_trust_weighting or {}).get("avg_weight"))
+    if high_weight > 0:
+        suggestions.append({
+            "suggestion": "KEEP_HIGH_WEIGHT_RISK_BLOCK",
+            "priority": "HIGH",
+            "threshold_area": "risk_clear",
+            "manual_only": True,
+            "auto_apply": False,
+            "reason": f"High-weight unresolved risk totals {round(high_weight, 1)}.",
+        })
+    elif medium_weight > 0:
+        suggestions.append({
+            "suggestion": "REVIEW_MEDIUM_WEIGHT_RISK_CLEARANCE",
+            "priority": "MEDIUM",
+            "threshold_area": "risk_clear",
+            "manual_only": True,
+            "auto_apply": False,
+            "reason": f"Medium-weight unresolved risk totals {round(medium_weight, 1)}.",
+        })
+    for item in list((outcome_weighted_cause_scores or {}).get("items") or [])[:4]:
+        cause = str(item.get("cause") or "UNCLASSIFIED").upper()
+        score = _gb_float(item.get("weighted_score"))
+        observed = int(item.get("observed_count") or 0)
+        if observed < 3:
+            suggestions.append({
+                "suggestion": f"COLLECT_MORE_WEIGHTED_{cause}",
+                "priority": "LOW",
+                "threshold_area": "cause_weight",
+                "manual_only": True,
+                "auto_apply": False,
+                "reason": f"{cause} has {observed} weighted observation(s).",
+            })
+        elif score >= 75:
+            suggestions.append({
+                "suggestion": f"RAISE_TRUST_IN_{cause}",
+                "priority": "MEDIUM",
+                "threshold_area": "cause_weight",
+                "manual_only": True,
+                "auto_apply": False,
+                "reason": f"{cause} has strong weighted protective score {round(score, 1)}.",
+            })
+        elif score < 40:
+            suggestions.append({
+                "suggestion": f"REVIEW_WEIGHT_NOISE_{cause}",
+                "priority": "MEDIUM",
+                "threshold_area": "cause_weight",
+                "manual_only": True,
+                "auto_apply": False,
+                "reason": f"{cause} has weak weighted score {round(score, 1)}.",
+            })
+    if avg_weight and avg_weight < 45 and low_count:
+        suggestions.append({
+            "suggestion": "LOW_TRUST_EVIDENCE_SAMPLE",
+            "priority": "LOW",
+            "threshold_area": "source_trust",
+            "manual_only": True,
+            "auto_apply": False,
+            "reason": f"Average provider-truth evidence weight is {round(avg_weight, 1)} with {low_count} low-weight rows.",
+        })
+    if not suggestions:
+        suggestions.append({
+            "suggestion": "KEEP_WEIGHTING_OBSERVATIONAL",
+            "priority": "LOW",
+            "threshold_area": "source_trust",
+            "manual_only": True,
+            "auto_apply": False,
+            "reason": "Weighted evidence has no threshold change to suggest yet.",
+        })
+    return {
+        "status": "READY",
+        "suggestion_count": len(suggestions),
+        "top_suggestion": suggestions[0].get("suggestion"),
+        "items": suggestions[:12],
+        "manual_only": True,
+        "auto_apply_enabled": False,
+        "next_action": "Review weighted threshold suggestions manually; no auto-apply is enabled.",
+        "updated_at": now.isoformat(),
+    }
+
+
 def _build_provider_truth_miss_evidence_accumulator(
     miss_review: dict,
     miss_repair_workbench: dict,
     learning_score: dict,
     truth_memory: dict,
     intelligence_rows: list[dict],
+    source_index: dict[str, dict] | None,
     now: datetime,
 ) -> dict:
     matcher = _build_provider_truth_miss_similarity_matcher(miss_review, truth_memory, intelligence_rows, now)
@@ -21033,6 +21356,13 @@ def _build_provider_truth_miss_evidence_accumulator(
         dry_run_preview,
         before_after,
         confidence_curve,
+        now,
+    )
+    source_trust_weighting = _build_provider_truth_source_trust_weighting(
+        approval_evidence_summary,
+        risk_case_drilldown,
+        dry_run_preview,
+        source_index or {},
         now,
     )
     risk_cause_classifier = _build_provider_truth_risk_cause_classifier(risk_case_drilldown, now)
@@ -21080,6 +21410,12 @@ def _build_provider_truth_miss_evidence_accumulator(
         confidence_curve,
         before_after,
         dry_run_preview,
+        now,
+    )
+    weighted_clear_requirements = _build_provider_truth_weighted_clear_requirements(
+        risk_clear_requirements,
+        risk_case_drilldown,
+        source_trust_weighting,
         now,
     )
     evidence_recheck_queue = _build_provider_truth_risk_evidence_recheck_queue(
@@ -21164,6 +21500,11 @@ def _build_provider_truth_miss_evidence_accumulator(
         now,
     )
     cause_accuracy_scoring = _build_provider_truth_cause_accuracy_scoring(hold_outcome_journal, now)
+    outcome_weighted_cause_scores = _build_provider_truth_outcome_weighted_cause_scores(
+        hold_outcome_journal,
+        source_trust_weighting,
+        now,
+    )
     clear_requirement_backtest = _build_provider_truth_clear_requirement_backtest(
         hold_outcome_journal,
         risk_clear_requirements,
@@ -21172,6 +21513,12 @@ def _build_provider_truth_miss_evidence_accumulator(
     policy_tuning_suggestions = _build_provider_truth_policy_tuning_suggestions(
         cause_accuracy_scoring,
         clear_requirement_backtest,
+        now,
+    )
+    weighted_threshold_suggestions = _build_provider_truth_weighted_threshold_suggestions(
+        source_trust_weighting,
+        outcome_weighted_cause_scores,
+        weighted_clear_requirements,
         now,
     )
     return {
@@ -21193,6 +21540,7 @@ def _build_provider_truth_miss_evidence_accumulator(
         "simulation_test_recipe": simulation_recipe,
         "policy_patch_work_order": policy_work_order,
         "approval_evidence_summary": approval_evidence_summary,
+        "source_trust_weighting": source_trust_weighting,
         "risk_explanation": risk_explanation,
         "risk_case_drilldown": risk_case_drilldown,
         "risk_cause_classifier": risk_cause_classifier,
@@ -21200,12 +21548,15 @@ def _build_provider_truth_miss_evidence_accumulator(
         "risk_evidence_recheck_queue": evidence_recheck_queue,
         "hold_aging_escalation": hold_aging_escalation,
         "risk_clear_requirements": risk_clear_requirements,
+        "weighted_clear_requirements": weighted_clear_requirements,
         "approval_consequences": approval_consequences,
         "decision_audit_trail": decision_audit_trail,
         "hold_outcome_journal": hold_outcome_journal,
         "cause_accuracy_scoring": cause_accuracy_scoring,
+        "outcome_weighted_cause_scores": outcome_weighted_cause_scores,
         "clear_requirement_backtest": clear_requirement_backtest,
         "policy_tuning_suggestions": policy_tuning_suggestions,
+        "weighted_threshold_suggestions": weighted_threshold_suggestions,
         "next_action": policy_work_order.get("next_action") or approval_gate.get("next_action") or score.get("next_action"),
     }
 
@@ -21588,6 +21939,7 @@ def _build_dashboard_provider_truth_panel(
     miss_checklist = dict(miss_evidence_accumulator.get("implementation_checklist") or {})
     miss_simulation = dict(miss_evidence_accumulator.get("simulation_test_recipe") or {})
     miss_approval_evidence = dict(miss_evidence_accumulator.get("approval_evidence_summary") or {})
+    miss_source_weighting = dict(miss_evidence_accumulator.get("source_trust_weighting") or {})
     miss_risk_explanation = dict(miss_evidence_accumulator.get("risk_explanation") or {})
     miss_risk_cases = dict(miss_evidence_accumulator.get("risk_case_drilldown") or {})
     miss_risk_classifier = dict(miss_evidence_accumulator.get("risk_cause_classifier") or {})
@@ -21595,12 +21947,15 @@ def _build_dashboard_provider_truth_panel(
     miss_risk_recheck = dict(miss_evidence_accumulator.get("risk_evidence_recheck_queue") or {})
     miss_hold_aging = dict(miss_evidence_accumulator.get("hold_aging_escalation") or {})
     miss_risk_clear = dict(miss_evidence_accumulator.get("risk_clear_requirements") or {})
+    miss_weighted_clear = dict(miss_evidence_accumulator.get("weighted_clear_requirements") or {})
     miss_consequences = dict(miss_evidence_accumulator.get("approval_consequences") or {})
     miss_decision_audit = dict(miss_evidence_accumulator.get("decision_audit_trail") or {})
     miss_hold_journal = dict(miss_evidence_accumulator.get("hold_outcome_journal") or {})
     miss_cause_accuracy = dict(miss_evidence_accumulator.get("cause_accuracy_scoring") or {})
+    miss_weighted_cause = dict(miss_evidence_accumulator.get("outcome_weighted_cause_scores") or {})
     miss_clear_backtest = dict(miss_evidence_accumulator.get("clear_requirement_backtest") or {})
     miss_policy_tuning = dict(miss_evidence_accumulator.get("policy_tuning_suggestions") or {})
+    miss_weighted_thresholds = dict(miss_evidence_accumulator.get("weighted_threshold_suggestions") or {})
     miss_top_evidence = (list(miss_approval_evidence.get("top_items") or []) or [{}])[0]
     miss_top_risk_case = dict(miss_risk_cases.get("top_case") or {})
     status = (
@@ -21692,6 +22047,11 @@ def _build_dashboard_provider_truth_panel(
         "miss_approval_evidence_count": int(miss_approval_evidence.get("evidence_count") or 0),
         "miss_approval_top_symbol": miss_top_evidence.get("symbol"),
         "miss_approval_top_outcome": miss_top_evidence.get("evidence_outcome"),
+        "miss_source_weighting_status": miss_source_weighting.get("status"),
+        "miss_source_weighting_item_count": int(miss_source_weighting.get("item_count") or 0),
+        "miss_source_weighting_avg_weight": miss_source_weighting.get("avg_weight"),
+        "miss_source_weighting_top_source": miss_source_weighting.get("top_source"),
+        "miss_source_weighting_top_weight": miss_source_weighting.get("top_weight"),
         "miss_risk_status": miss_risk_explanation.get("status"),
         "miss_risk_zero": bool(miss_risk_explanation.get("risk_zero")),
         "miss_risk_count": int(miss_risk_explanation.get("risk_count") or 0),
@@ -21714,6 +22074,10 @@ def _build_dashboard_provider_truth_panel(
         "miss_risk_clear_status": miss_risk_clear.get("status"),
         "miss_risk_clear_passed": int(miss_risk_clear.get("passed_count") or 0),
         "miss_risk_clear_total": int(miss_risk_clear.get("total_count") or 0),
+        "miss_weighted_clear_status": miss_weighted_clear.get("status"),
+        "miss_weighted_clear_high_risk_weight": miss_weighted_clear.get("high_risk_weight"),
+        "miss_weighted_clear_medium_risk_weight": miss_weighted_clear.get("medium_risk_weight"),
+        "miss_weighted_clear_low_risk_weight": miss_weighted_clear.get("low_risk_weight"),
         "miss_consequence_count": int(miss_consequences.get("consequence_count") or 0),
         "miss_audit_event_count": int(miss_decision_audit.get("event_count") or 0),
         "miss_audit_latest_state": miss_decision_audit.get("latest_state"),
@@ -21724,6 +22088,10 @@ def _build_dashboard_provider_truth_panel(
         "miss_cause_accuracy_sample_n": int(miss_cause_accuracy.get("sample_n") or 0),
         "miss_cause_accuracy_top_cause": miss_cause_accuracy.get("top_cause"),
         "miss_cause_accuracy_top_score": miss_cause_accuracy.get("top_score"),
+        "miss_weighted_cause_status": miss_weighted_cause.get("status"),
+        "miss_weighted_cause_sample_n": int(miss_weighted_cause.get("sample_n") or 0),
+        "miss_weighted_cause_top_cause": miss_weighted_cause.get("top_cause"),
+        "miss_weighted_cause_top_score": miss_weighted_cause.get("top_weighted_score"),
         "miss_clear_backtest_status": miss_clear_backtest.get("status"),
         "miss_clear_backtest_sample_n": int(miss_clear_backtest.get("sample_n") or 0),
         "miss_clear_backtest_release_count": int(miss_clear_backtest.get("would_release_count") or 0),
@@ -21732,6 +22100,9 @@ def _build_dashboard_provider_truth_panel(
         "miss_policy_tuning_status": miss_policy_tuning.get("status"),
         "miss_policy_tuning_suggestion_count": int(miss_policy_tuning.get("suggestion_count") or 0),
         "miss_policy_tuning_top_suggestion": miss_policy_tuning.get("top_suggestion"),
+        "miss_weighted_threshold_status": miss_weighted_thresholds.get("status"),
+        "miss_weighted_threshold_suggestion_count": int(miss_weighted_thresholds.get("suggestion_count") or 0),
+        "miss_weighted_threshold_top_suggestion": miss_weighted_thresholds.get("top_suggestion"),
         "top_symbol": top_agreement.get("symbol"),
         "top_status": top_agreement.get("status"),
         "top_best_source": top_arbitration.get("best_source"),
@@ -21785,6 +22156,10 @@ def _build_provider_truth_layer(
     outcome_tracking = _build_provider_truth_outcome_tracking(truth_memory, intelligence_rows, now)
     learning_score = _build_provider_truth_learning_score(truth_memory, intelligence_rows, queue_health, outcome_tracking, now)
     source_map = _apply_provider_truth_learning_to_source_map(source_map_base, learning_score)
+    source_index = {
+        _provider_source_key(item.get("source")): item
+        for item in list(source_map.get("providers") or [])
+    }
     miss_review = _build_provider_truth_miss_review(learning_score, truth_memory, queue_health, intelligence_rows, now)
     miss_repair_workbench = _build_provider_truth_miss_repair_workbench(miss_review, learning_score, truth_memory, intelligence_rows, now)
     miss_evidence_accumulator = _build_provider_truth_miss_evidence_accumulator(
@@ -21793,6 +22168,7 @@ def _build_provider_truth_layer(
         learning_score,
         truth_memory,
         intelligence_rows,
+        source_index,
         now,
     )
     truth_panel = _build_dashboard_provider_truth_panel(

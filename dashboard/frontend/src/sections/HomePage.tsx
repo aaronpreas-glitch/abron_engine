@@ -1198,6 +1198,13 @@ interface DailyCryptoBriefData {
           pressure?: number | null
         }>
       }
+      source_trust_weighting?: {
+        status?: string
+        item_count?: number
+        avg_weight?: number | null
+        top_source?: string | null
+        top_weight?: number | null
+      }
       risk_explanation?: {
         status?: string
         risk_zero?: boolean
@@ -1241,6 +1248,12 @@ interface DailyCryptoBriefData {
         passed_count?: number
         total_count?: number
       }
+      weighted_clear_requirements?: {
+        status?: string
+        high_risk_weight?: number
+        medium_risk_weight?: number
+        low_risk_weight?: number
+      }
       approval_consequences?: {
         status?: string
         consequence_count?: number
@@ -1263,6 +1276,12 @@ interface DailyCryptoBriefData {
         top_cause?: string | null
         top_score?: number | null
       }
+      outcome_weighted_cause_scores?: {
+        status?: string
+        sample_n?: number
+        top_cause?: string | null
+        top_weighted_score?: number | null
+      }
       clear_requirement_backtest?: {
         status?: string
         sample_n?: number
@@ -1271,6 +1290,11 @@ interface DailyCryptoBriefData {
         unsafe_release_count?: number
       }
       policy_tuning_suggestions?: {
+        status?: string
+        suggestion_count?: number
+        top_suggestion?: string | null
+      }
+      weighted_threshold_suggestions?: {
         status?: string
         suggestion_count?: number
         top_suggestion?: string | null
@@ -1355,6 +1379,11 @@ interface DailyCryptoBriefData {
       miss_approval_evidence_count?: number
       miss_approval_top_symbol?: string | null
       miss_approval_top_outcome?: string | null
+      miss_source_weighting_status?: string | null
+      miss_source_weighting_item_count?: number
+      miss_source_weighting_avg_weight?: number | null
+      miss_source_weighting_top_source?: string | null
+      miss_source_weighting_top_weight?: number | null
       miss_risk_status?: string | null
       miss_risk_zero?: boolean
       miss_risk_count?: number
@@ -1377,6 +1406,10 @@ interface DailyCryptoBriefData {
       miss_risk_clear_status?: string | null
       miss_risk_clear_passed?: number
       miss_risk_clear_total?: number
+      miss_weighted_clear_status?: string | null
+      miss_weighted_clear_high_risk_weight?: number | null
+      miss_weighted_clear_medium_risk_weight?: number | null
+      miss_weighted_clear_low_risk_weight?: number | null
       miss_consequence_count?: number
       miss_audit_event_count?: number
       miss_audit_latest_state?: string | null
@@ -1387,6 +1420,10 @@ interface DailyCryptoBriefData {
       miss_cause_accuracy_sample_n?: number
       miss_cause_accuracy_top_cause?: string | null
       miss_cause_accuracy_top_score?: number | null
+      miss_weighted_cause_status?: string | null
+      miss_weighted_cause_sample_n?: number
+      miss_weighted_cause_top_cause?: string | null
+      miss_weighted_cause_top_score?: number | null
       miss_clear_backtest_status?: string | null
       miss_clear_backtest_sample_n?: number
       miss_clear_backtest_release_count?: number
@@ -1395,6 +1432,9 @@ interface DailyCryptoBriefData {
       miss_policy_tuning_status?: string | null
       miss_policy_tuning_suggestion_count?: number
       miss_policy_tuning_top_suggestion?: string | null
+      miss_weighted_threshold_status?: string | null
+      miss_weighted_threshold_suggestion_count?: number
+      miss_weighted_threshold_top_suggestion?: string | null
       top_symbol?: string | null
       top_status?: string
       top_best_source?: string | null
@@ -6074,6 +6114,7 @@ function DailyCryptoBriefPanel({
     const providerTruthMissSimulation = providerTruthMissEvidence.simulation_test_recipe ?? {}
     const providerTruthMissApprovalEvidence = providerTruthMissEvidence.approval_evidence_summary ?? {}
     const providerTruthMissTopApprovalEvidence = providerTruthMissApprovalEvidence.top_items?.[0]
+    const providerTruthMissSourceWeighting = providerTruthMissEvidence.source_trust_weighting ?? {}
     const providerTruthMissRiskExplanation = providerTruthMissEvidence.risk_explanation ?? {}
     const providerTruthMissRiskCases = providerTruthMissEvidence.risk_case_drilldown ?? {}
     const providerTruthMissTopRiskCase = providerTruthMissRiskCases.top_case ?? null
@@ -6086,8 +6127,11 @@ function DailyCryptoBriefPanel({
     const providerTruthMissAudit = providerTruthMissEvidence.decision_audit_trail ?? {}
     const providerTruthMissHoldJournal = providerTruthMissEvidence.hold_outcome_journal ?? {}
     const providerTruthMissCauseAccuracy = providerTruthMissEvidence.cause_accuracy_scoring ?? {}
+    const providerTruthMissWeightedCause = providerTruthMissEvidence.outcome_weighted_cause_scores ?? {}
     const providerTruthMissClearBacktest = providerTruthMissEvidence.clear_requirement_backtest ?? {}
     const providerTruthMissPolicyTuning = providerTruthMissEvidence.policy_tuning_suggestions ?? {}
+    const providerTruthMissWeightedClear = providerTruthMissEvidence.weighted_clear_requirements ?? {}
+    const providerTruthMissWeightedThresholds = providerTruthMissEvidence.weighted_threshold_suggestions ?? {}
     const topProviderTruthItem = providerTruthAgreement.items?.[0]
     const topProviderTruthSource = providerTruthSourceMap.providers?.[0]
     const topFallbackRoute = providerTruthFallback.routes?.[0]
@@ -6675,6 +6719,9 @@ function DailyCryptoBriefPanel({
             </div>
             <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
               outcomes {providerTruthPanel.miss_hold_journal_entry_count ?? providerTruthMissHoldJournal.entry_count ?? 0} · latest {String(providerTruthPanel.miss_hold_journal_latest_outcome || providerTruthMissHoldJournal.latest_outcome || 'waiting').replace(/_/g, ' ').toLowerCase()} · cause score {String(providerTruthPanel.miss_cause_accuracy_top_cause || providerTruthMissCauseAccuracy.top_cause || 'none').replace(/_/g, ' ').toLowerCase()} {fmtFixed(providerTruthPanel.miss_cause_accuracy_top_score ?? providerTruthMissCauseAccuracy.top_score, 0)} · backtest {String(providerTruthPanel.miss_clear_backtest_status || providerTruthMissClearBacktest.status || 'no sample').replace(/_/g, ' ').toLowerCase()} · tune {providerTruthPanel.miss_policy_tuning_suggestion_count ?? providerTruthMissPolicyTuning.suggestion_count ?? 0}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              source weight {fmtFixed(providerTruthPanel.miss_source_weighting_avg_weight ?? providerTruthMissSourceWeighting.avg_weight, 0)} · top {providerTruthPanel.miss_source_weighting_top_source || providerTruthMissSourceWeighting.top_source || 'none'} {fmtFixed(providerTruthPanel.miss_source_weighting_top_weight ?? providerTruthMissSourceWeighting.top_weight, 0)} · weighted cause {String(providerTruthPanel.miss_weighted_cause_top_cause || providerTruthMissWeightedCause.top_cause || 'none').replace(/_/g, ' ').toLowerCase()} {fmtFixed(providerTruthPanel.miss_weighted_cause_top_score ?? providerTruthMissWeightedCause.top_weighted_score, 0)} · weighted clear {String(providerTruthPanel.miss_weighted_clear_status || providerTruthMissWeightedClear.status || 'waiting').replace(/_/g, ' ').toLowerCase()} · weighted tune {providerTruthPanel.miss_weighted_threshold_suggestion_count ?? providerTruthMissWeightedThresholds.suggestion_count ?? 0}
             </div>
             {(providerTruthPanel.miss_review_key || providerTruthMissReviewPacket.review_key) && onProviderTruthMissReviewAction && (
               <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 8 }}>
