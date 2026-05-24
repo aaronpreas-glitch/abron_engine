@@ -9821,9 +9821,8 @@ function OperatorCommandHero({
       borderRadius: 18,
       padding: 18,
       background:
-        `radial-gradient(circle at 18% 0%, ${stateColor}18 0%, transparent 34%),` +
-        `radial-gradient(circle at 86% 12%, ${laneColor}14 0%, transparent 30%),` +
-        'linear-gradient(135deg, rgba(7,12,22,0.92), rgba(3,7,13,0.78) 55%, rgba(3,7,13,0.92))',
+        `linear-gradient(90deg, ${stateColor}12, transparent 36%, ${laneColor}10),` +
+        'linear-gradient(135deg, rgba(7,12,22,0.94), rgba(3,7,13,0.80) 55%, rgba(3,7,13,0.94))',
       boxShadow: `0 18px 70px rgba(0,0,0,0.34), 0 0 0 1px ${stateColor}08 inset`,
       backdropFilter: 'blur(24px) saturate(160%)',
       WebkitBackdropFilter: 'blur(24px) saturate(160%)',
@@ -10589,33 +10588,21 @@ export function HomePage() {
 
   return (
     <div className="home-page" style={{
-      maxWidth: 1360, margin: '0 auto',
-      padding: '20px 24px 40px',
-      display: 'flex', flexDirection: 'column', gap: 18,
+      maxWidth: 1520, margin: '0 auto',
+      padding: '24px 26px 46px',
+      display: 'flex', flexDirection: 'column', gap: 22,
     }}>
 
-      <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
-        <span style={{ color: 'var(--text)', ...MONO, fontWeight: 700, fontSize: 11, letterSpacing: '0.16em' }}>
-          HOME
-        </span>
-        <span style={{
-          ...MONO,
-          fontSize: 8,
-          color: homeFreshness.tone,
-          background: `${homeFreshness.tone}12`,
-          border: `1px solid ${homeFreshness.tone}28`,
-          borderRadius: 999,
-          padding: '3px 8px',
-          letterSpacing: '0.08em',
-        }}>
-          {homeFreshness.label}
-        </span>
-        <span style={{ color: 'var(--recessed)', ...MONO, fontSize: 9, letterSpacing: '0.04em' }}>
-          memecoins + spot focus · what matters now · what changed
-        </span>
-        <span style={{ color: '#7f95a8', ...MONO, fontSize: 8, marginLeft: 'auto' }}>
-          {homeFreshness.updatedAt ? `updated ${fmtAge(homeFreshness.updatedAt)}` : 'waiting on live reads'}
-        </span>
+      <div className="home-intro">
+        <div>
+          <div style={{ ...MONO, color: homeFreshness.tone, fontSize: 8, fontWeight: 900, letterSpacing: '0.18em', marginBottom: 7 }}>
+            {homeFreshness.label} {homeFreshness.updatedAt ? `· UPDATED ${fmtAge(homeFreshness.updatedAt).toUpperCase()}` : '· WAITING ON LIVE READS'}
+          </div>
+          <h1 className="home-title">Command Cockpit</h1>
+        </div>
+        <div className="home-intro-copy">
+          Memecoins, spot, provider truth, outcome learning, and operator decisions in one place.
+        </div>
       </div>
 
       <OperatorCommandHero
@@ -10628,57 +10615,63 @@ export function HomePage() {
         audit={systemAuditQ.data}
       />
 
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-        <span style={{ ...MONO, fontSize: 8, color: '#2dd4bf', letterSpacing: '0.16em', fontWeight: 900 }}>
-          1 · DAILY CRYPTO BRIEF
-        </span>
-        <DailyCryptoBriefPanel
-          data={dailyBriefQ.data}
-          loading={dailyBriefQ.isLoading}
-          onEscalationAction={recordProviderEscalationDecision}
-          onEscalationReviewAction={recordProviderEscalationReviewDecision}
-          onEscalationPatchAction={recordProviderEscalationPatchDecision}
-          onEscalationWorkOrderAction={recordProviderEscalationWorkOrderDecision}
-          onLiveContextMissionAction={recordLiveContextMissionDecision}
-          onProviderTruthMissReviewAction={recordProviderTruthMissReviewDecision}
-          pendingEscalationId={pendingEscalationId}
-          pendingEscalationReviewKey={pendingEscalationReviewKey}
-          pendingEscalationPatchKey={pendingEscalationPatchKey}
-          pendingEscalationWorkOrderKey={pendingEscalationWorkOrderKey}
-          pendingLiveContextMissionKey={pendingLiveContextMissionKey}
-          pendingProviderTruthMissReviewKey={pendingProviderTruthMissReviewKey}
-        />
+      <div className="home-primary-grid">
+        <section className="home-section-shell">
+          <div className="home-section-header">
+            <span className="home-section-title" style={{ color: '#2dd4bf' }}>Operator Brief</span>
+            <span className="home-section-meta">decisions, provider truth, closeout</span>
+          </div>
+          <DailyCryptoBriefPanel
+            data={dailyBriefQ.data}
+            loading={dailyBriefQ.isLoading}
+            onEscalationAction={recordProviderEscalationDecision}
+            onEscalationReviewAction={recordProviderEscalationReviewDecision}
+            onEscalationPatchAction={recordProviderEscalationPatchDecision}
+            onEscalationWorkOrderAction={recordProviderEscalationWorkOrderDecision}
+            onLiveContextMissionAction={recordLiveContextMissionDecision}
+            onProviderTruthMissReviewAction={recordProviderTruthMissReviewDecision}
+            pendingEscalationId={pendingEscalationId}
+            pendingEscalationReviewKey={pendingEscalationReviewKey}
+            pendingEscalationPatchKey={pendingEscalationPatchKey}
+            pendingEscalationWorkOrderKey={pendingEscalationWorkOrderKey}
+            pendingLiveContextMissionKey={pendingLiveContextMissionKey}
+            pendingProviderTruthMissReviewKey={pendingProviderTruthMissReviewKey}
+          />
+        </section>
+
+        <section className="home-section-shell">
+          <div className="home-section-header">
+            <span className="home-section-title" style={{ color: '#00d48a' }}>Best Buy Board</span>
+            <span className="home-section-meta">clean entry first</span>
+          </div>
+          <GoodBuyBoardPanel board={actionBoardQ.data?.good_buy_board_v2} />
+        </section>
       </div>
 
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-        <span style={{ ...MONO, fontSize: 8, color: '#00d48a', letterSpacing: '0.16em', fontWeight: 900 }}>
-          2 · BEST BUYS
-        </span>
-        <GoodBuyBoardPanel board={actionBoardQ.data?.good_buy_board_v2} />
-      </div>
-
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-        <span style={{ ...MONO, fontSize: 8, color: '#60a5fa', letterSpacing: '0.16em', fontWeight: 900 }}>
-          3 · REASONING + CA REVIEW
-        </span>
+      <section className="home-section-shell">
+        <div className="home-section-header">
+          <span className="home-section-title" style={{ color: '#60a5fa' }}>Research + CA Review</span>
+          <span className="home-section-meta">identity, catalyst, wallet cluster, deployability</span>
+        </div>
         <MemecoinResearchDossierPanel
           data={memecoinResearchQ.data}
           loading={memecoinResearchQ.isLoading}
           onManualDecision={recordMemecoinManualDecision}
           pendingManualMint={pendingManualMint}
         />
-      </div>
+      </section>
 
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-        <span style={{ ...MONO, fontSize: 8, color: '#f59e0b', letterSpacing: '0.16em', fontWeight: 900 }}>
-          4 · ENTRY TRIGGERS
-        </span>
+      <section className="home-section-shell">
+        <div className="home-section-header">
+          <span className="home-section-title" style={{ color: '#f59e0b' }}>Entry Triggers</span>
+          <span className="home-section-meta">last blocker, replay, runner coverage</span>
+        </div>
         <EntryWatchHomeStrip
           status={watchToEntry}
           replay={watchToEntryReplay}
           coverage={establishedRunnerCoverage}
         />
-      </div>
+      </section>
 
       <EstablishedRunnerReviewPanel
         data={runnerReviewQ.data}
@@ -10692,12 +10685,13 @@ export function HomePage() {
         <ConvictionRecoveryPanel data={convictionRecoveryQ.data} loading={convictionRecoveryQ.isLoading} />
       </div>
 
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-        <span style={{ ...MONO, fontSize: 8, color: '#8fb7dc', letterSpacing: '0.16em', fontWeight: 900 }}>
-          5 · FULL QUEUE
-        </span>
+      <section className="home-section-shell">
+        <div className="home-section-header">
+          <span className="home-section-title" style={{ color: '#8fb7dc' }}>Full Queue</span>
+          <span className="home-section-meta">scanner candidates and blocked leaders</span>
+        </div>
         <ActionBoardPanel data={actionBoardQ.data} loading={actionBoardQ.isLoading} scannerDiag={scannerDiagQ.data} reinfBySymbol={reinfBySymbol} />
-      </div>
+      </section>
 
       <div className="home-command-grid" style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: 16 }}>
         <AnalystMemoPanel data={aiAnalystQ.data} loading={aiAnalystQ.isLoading} />

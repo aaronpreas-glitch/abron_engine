@@ -1,5 +1,5 @@
 import { useQuery } from '@tanstack/react-query'
-import { Bell, LogOut } from 'lucide-react'
+import { Activity, Bell, ClipboardList, Home as HomeIcon, LogOut, Radar, ShieldCheck } from 'lucide-react'
 import { Suspense, lazy, useEffect, useRef, useState } from 'react'
 import type { CSSProperties } from 'react'
 import { api, getDashboardRequestMetrics } from './api'
@@ -104,14 +104,14 @@ interface Props {
 
 type Page = 'home' | 'system' | 'memecoins' | 'audit'
 
-const PAGE_LABEL: Record<Page, string> = {
-  home: 'Home',
-  system: 'System',
-  memecoins: 'Memecoins',
-  audit: 'Ops',
+const PAGE_META: Record<Page, { label: string; short: string; icon: typeof HomeIcon }> = {
+  home: { label: 'Command', short: 'Home', icon: HomeIcon },
+  memecoins: { label: 'Signals', short: 'Meme', icon: Radar },
+  system: { label: 'System', short: 'System', icon: ShieldCheck },
+  audit: { label: 'Ops', short: 'Ops', icon: ClipboardList },
 }
 
-const PRIMARY_PAGES: Page[] = ['home', 'system', 'audit']
+const PRIMARY_PAGES: Page[] = ['home', 'memecoins', 'system', 'audit']
 
 export function Terminal({ onLogout }: Props) {
   const [page, setPage] = useState<Page>('home')
@@ -240,149 +240,116 @@ export function Terminal({ onLogout }: Props) {
 
   // ── Layout ────────────────────────────────────────────────────────────────
 
+  const lockLabel = engineOn && !isDryRun ? 'LIVE ENABLED' : isDryRun ? 'SIM LOCKED' : 'ENGINE OFF'
+  const lockTone = engineOn && !isDryRun ? '#00d48a' : isDryRun ? '#f59e0b' : '#ef4444'
+  const ActiveIcon = PAGE_META[page].icon
+
   return (
-    <div className="terminal-shell" style={{
-      minHeight: '100vh',
-      color: '#e2e8f0',
-      fontFamily: 'JetBrains Mono, monospace',
-      fontSize: 12,
-    }}>
-
-      {/* ── Header ── */}
-      <div className="top-bar terminal-top-bar" style={{
-        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-        padding: '0 20px', position: 'sticky', top: 0, zIndex: 10,
-      }}>
-        <div className="terminal-status-strip" style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
-
-          {/* Engine name + status dot */}
-          <div className="brand-lockup" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <span style={{
-              width: 7, height: 7, borderRadius: '50%',
-              background: engineOn && !isDryRun ? '#00d48a' : isDryRun ? '#f59e0b' : '#ef4444',
-              display: 'inline-block',
-              boxShadow: engineOn && !isDryRun ? '0 0 6px #00d48a88' : 'none',
-            }} />
-            <span style={{ color: 'var(--text)', fontWeight: 700, letterSpacing: '0.14em', fontSize: 11 }}>
-              ABRON ENGINE
-            </span>
-          </div>
-
-          <span className="top-sep" style={{ color: 'var(--sep)' }}>|</span>
-
-          {/* Mode pills */}
-          <div className="mode-pill-row" style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-            <ModePill label="PERP" mode={modes?.perp ?? (isDryRun ? 'SIM' : 'LIVE')} />
-            <ModePill label="MEME" mode={modes?.memecoins ?? 'PAPER'} />
-            <ModePill label="SPOT" mode={modes?.spot ?? 'PAPER'} />
-          </div>
-
-          <span className="top-sep" style={{ color: 'var(--sep)' }}>|</span>
-
-          {regime !== '—' && (
-            <>
-              <span style={{
-                color: regime.toLowerCase().includes('bull') ? '#00d48a'
-                  : regime.toLowerCase().includes('bear') ? '#ef4444'
-                  : '#a0aec0',
-                fontSize: 10,
-              }}>
-                {regime.toUpperCase()}
-              </span>
-              <span className="top-sep" style={{ color: 'var(--sep)' }}>|</span>
-            </>
-          )}
-
-          {/* SOL spot */}
-          {solBalance !== null && (
-            <>
-              <span style={{ fontSize: 11 }}>
-                <span style={{ color: 'var(--chrome)' }}>SOL </span>
-                <span style={{ color: '#8a9ab0', fontWeight: 700 }}>{solBalance.toFixed(3)}</span>
-              </span>
-              <span className="top-sep" style={{ color: 'var(--sep)' }}>|</span>
-            </>
-          )}
-
-          {/* PERP PnL */}
-          {hasPerpValue && (
-            <>
-              <span style={{ fontSize: 11 }}>
-                <span style={{ color: 'var(--chrome)' }}>PERP </span>
-                <span style={{ color: perpPnlUsd >= 0 ? '#00d48a' : '#ef4444', fontWeight: 700 }}>
-                  {perpPnlUsd >= 0 ? '+' : ''}${perpPnlUsd.toFixed(2)}
-                </span>
-                <span style={{ color: 'var(--recessed)', fontSize: 10 }}> · ${perpValueUsd.toFixed(0)}</span>
-              </span>
-              <span className="top-sep" style={{ color: 'var(--sep)' }}>|</span>
-            </>
-          )}
-
-          {/* Net total */}
-          {netUsd > 0 && (
-            <span style={{ fontSize: 10, color: 'var(--recessed)' }}>
-              NET <span style={{ color: '#5a7a9a', fontWeight: 700 }}>${netUsd.toLocaleString('en-US', { maximumFractionDigits: 0 })}</span>
-            </span>
-          )}
-
-          <span className="top-sep" style={{ color: 'var(--sep)' }}>|</span>
-          <span
-            title={`Dashboard requests last 60s: ${requestMetrics.requests_60s}; slow: ${requestMetrics.slow_60s}; failed: ${requestMetrics.failed_60s}; inflight: ${requestMetrics.inflight}`}
-            className="ui-health-pill"
-            style={{ color: dashboardTone }}
-          >
-            UI {requestMetrics.requests_60s}/m · {requestMetrics.avg_ms}ms
-          </span>
+    <div className="terminal-shell app-shell">
+      <aside className="app-rail" aria-label="Primary navigation">
+        <div className="rail-brand">
+          <span className="rail-brand-mark">A</span>
+          <span className="rail-brand-text">ABRON</span>
         </div>
 
-        <div className="terminal-nav-strip" style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
-
-          {/* ── Page tabs ── */}
-          <div className="nav-tabs-row">
-            {PRIMARY_PAGES.map(p => (
+        <nav className="rail-nav">
+          {PRIMARY_PAGES.map(p => {
+            const Icon = PAGE_META[p].icon
+            return (
               <button
                 key={p}
                 onClick={() => setPage(p)}
-                className={`nav-tab${page === p ? ' active' : ''}`}
+                className={`rail-nav-button${page === p ? ' active' : ''}`}
+                title={PAGE_META[p].label}
               >
-                {PAGE_LABEL[p]}
+                <Icon size={17} strokeWidth={2.1} />
+                <span>{PAGE_META[p].short}</span>
               </button>
-            ))}
-          </div>
+            )
+          })}
+        </nav>
 
-          <span className="top-sep" style={{ color: 'var(--sep)' }}>|</span>
-
+        <div className="rail-footer">
           {'Notification' in window && (
             <span
               title={`Notifications: ${Notification.permission}`}
-              className="header-icon-status"
-              style={{ color: Notification.permission === 'granted' ? '#00d48a' : '#2d4060' }}
+              className="rail-icon-button"
+              style={{ color: Notification.permission === 'granted' ? '#00d48a' : '#4f6072' }}
             >
-              <Bell size={14} strokeWidth={2.2} />
+              <Bell size={15} strokeWidth={2.2} />
             </span>
           )}
-          <button
-            onClick={onLogout}
-            className="icon-text-button"
-          >
-            <LogOut size={13} strokeWidth={2.2} />
-            LOGOUT
+          <button onClick={onLogout} className="rail-icon-button" title="Logout">
+            <LogOut size={15} strokeWidth={2.2} />
           </button>
         </div>
-      </div>
+      </aside>
 
-      {/* ── Pages ── */}
-      <Suspense fallback={<PageLoadingFallback />}>
-        {page === 'home' ? (
-          <HomePage />
-        ) : page === 'system' ? (
-          <SystemPage />
-        ) : page === 'memecoins' ? (
-          <MemecoinsPage />
-        ) : (
-          <AuditPage />
-        )}
-      </Suspense>
+      <main className="app-main">
+        <header className="app-topbar">
+          <div className="app-title-block">
+            <div className="app-page-kicker">
+              <ActiveIcon size={14} strokeWidth={2.1} />
+              {PAGE_META[page].label}
+            </div>
+            <div className="app-title-row">
+              <span className="app-title">Abrons Engine</span>
+              <span className="app-lock-chip" style={{ color: lockTone, borderColor: `${lockTone}55`, background: `${lockTone}13` }}>
+                <span style={{ width: 6, height: 6, borderRadius: 99, background: lockTone, display: 'inline-block' }} />
+                {lockLabel}
+              </span>
+            </div>
+          </div>
+
+          <div className="app-status-cluster">
+            <div className="mode-pill-row">
+              <ModePill label="PERP" mode={modes?.perp ?? (isDryRun ? 'SIM' : 'LIVE')} />
+              <ModePill label="MEME" mode={modes?.memecoins ?? 'PAPER'} />
+              <ModePill label="SPOT" mode={modes?.spot ?? 'PAPER'} />
+            </div>
+            <div className="app-status-metrics">
+              {regime !== '—' && (
+                <span style={{
+                  color: regime.toLowerCase().includes('bull') ? '#00d48a'
+                    : regime.toLowerCase().includes('bear') ? '#ef4444'
+                    : '#8da5bb',
+                }}>
+                  {regime.toUpperCase()}
+                </span>
+              )}
+              {solBalance !== null && <span>SOL <b>{solBalance.toFixed(3)}</b></span>}
+              {hasPerpValue && (
+                <span>
+                  PERP <b style={{ color: perpPnlUsd >= 0 ? '#00d48a' : '#ef4444' }}>
+                    {perpPnlUsd >= 0 ? '+' : ''}${perpPnlUsd.toFixed(2)}
+                  </b>
+                  <small>${perpValueUsd.toFixed(0)}</small>
+                </span>
+              )}
+              {netUsd > 0 && <span>NET <b>${netUsd.toLocaleString('en-US', { maximumFractionDigits: 0 })}</b></span>}
+              <span
+                title={`Dashboard requests last 60s: ${requestMetrics.requests_60s}; slow: ${requestMetrics.slow_60s}; failed: ${requestMetrics.failed_60s}; inflight: ${requestMetrics.inflight}`}
+                style={{ color: dashboardTone }}
+              >
+                <Activity size={12} strokeWidth={2.2} />
+                UI {requestMetrics.requests_60s}/m · {requestMetrics.avg_ms}ms
+              </span>
+            </div>
+          </div>
+        </header>
+
+        <Suspense fallback={<PageLoadingFallback />}>
+          {page === 'home' ? (
+            <HomePage />
+          ) : page === 'system' ? (
+            <SystemPage />
+          ) : page === 'memecoins' ? (
+            <MemecoinsPage />
+          ) : (
+            <AuditPage />
+          )}
+        </Suspense>
+      </main>
     </div>
   )
 }
