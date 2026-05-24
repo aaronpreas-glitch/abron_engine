@@ -12969,6 +12969,43 @@ def _good_buy_gate(row: dict, provider_context: dict, memory_index: dict[str, di
     elif age_minutes > 45:
         warnings.append(f"snapshot_aging_{int(age_minutes)}m")
 
+    raw_payload = {}
+    try:
+        raw_payload = json.loads(str(row.get("raw_json") or "{}"))
+    except Exception:
+        raw_payload = {}
+    payload_times = []
+    for raw_item in list(raw_payload.get("inputs") or []):
+        if isinstance(raw_item, dict):
+            payload_times.extend([
+                raw_item.get("snapshot_as_of"),
+                raw_item.get("updated_at"),
+                raw_item.get("generated_at"),
+            ])
+    market_payload = raw_payload.get("market") if isinstance(raw_payload.get("market"), dict) else {}
+    payload_times.extend([
+        market_payload.get("snapshot_as_of"),
+        market_payload.get("updated_at"),
+        market_payload.get("generated_at"),
+    ])
+    parsed_payload_times = [_gb_parse_ts(ts) for ts in payload_times if ts]
+    parsed_payload_times = [ts for ts in parsed_payload_times if ts is not None]
+    latest_payload_ts = max(parsed_payload_times) if parsed_payload_times else None
+    row_updated_at = _gb_parse_ts(row.get("updated_at"))
+    if latest_payload_ts is not None:
+        payload_age_hours = max(0.0, (datetime.now(timezone.utc) - latest_payload_ts).total_seconds() / 3600.0)
+        wrapper_gap_hours = (
+            max(0.0, (row_updated_at - latest_payload_ts).total_seconds() / 3600.0)
+            if row_updated_at is not None and row_updated_at > latest_payload_ts
+            else 0.0
+        )
+        if payload_age_hours > 6 or wrapper_gap_hours > 2:
+            blockers.append("market_payload_stale")
+    if volume_1h <= 0 and trade_1h >= 50:
+        blockers.append("flow_metric_inconsistent")
+    if buy_pressure <= 0 and trade_1h >= 50 and pressure >= 70:
+        blockers.append("buy_pressure_metric_inconsistent")
+
     if provider_context.get("hard_block"):
         warnings.append(str(provider_context.get("hard_block")))
 
@@ -13362,10 +13399,18 @@ def _failure_detail(key: str) -> dict:
         category, severity, priority = "identity", "BLOCKER", 5
         unlock = "Wait for resolved identity and a verified contract address."
         why = "The system should not suggest a buy until the ticker maps to the correct CA."
-    elif norm.startswith("freshness_") or norm.startswith("market_data_") or norm.startswith("snapshot_") or norm == "data_confidence_low" or norm.startswith("provider_repair_") or norm.startswith("provider_fallback_"):
+    elif (
+        norm.startswith("freshness_")
+        or norm.startswith("market_data_")
+        or norm.startswith("market_payload_")
+        or norm.startswith("snapshot_")
+        or norm in {"data_confidence_low", "flow_metric_inconsistent", "buy_pressure_metric_inconsistent"}
+        or norm.startswith("provider_repair_")
+        or norm.startswith("provider_fallback_")
+    ):
         category, severity, priority = "freshness", "BLOCKER", 10
-        unlock = "Wait for live market data to refresh or for the provider repair layer to find a trustworthy fallback."
-        why = "Stale, unresolved, or fallback-only provider data can make momentum and liquidity reads false."
+        unlock = "Wait for live market data to refresh and agree with the chart before considering action."
+        why = "Stale, contradictory, or fallback-only provider data can make momentum and liquidity reads false."
     elif norm.startswith("liquidity") or norm.startswith("volume"):
         category, severity, priority = "depth", "BLOCKER", 20
         unlock = "Wait for cleaner liquidity and real volume so the entry is not thin."
