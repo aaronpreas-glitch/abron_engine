@@ -43,6 +43,7 @@ _PROVIDER_TRUTH_MISS_REVIEW_STATES_KEY = "provider_truth_miss_review_states"
 _PROVIDER_TRUTH_MISS_REVIEW_AUDIT_KEY = "provider_truth_miss_review_audit"
 _PROVIDER_TRUTH_RISK_RECHECK_QUEUE_KEY = "provider_truth_risk_recheck_queue"
 _PROVIDER_TRUTH_HOLD_OUTCOME_JOURNAL_KEY = "provider_truth_hold_outcome_journal"
+_PROVIDER_TRUTH_THIRD_SOURCE_QUEUE_KEY = "provider_truth_third_source_queue"
 _LIVE_CONTEXT_MISSION_STATES_KEY = "live_context_mission_states"
 _LIVE_CONTEXT_MISSION_OUTCOME_JOURNAL_KEY = "live_context_mission_outcome_journal"
 _REPLAY_EVIDENCE_SNAPSHOT_KEY = "replay_evidence_snapshot"
@@ -21309,6 +21310,285 @@ def _build_provider_truth_weighted_threshold_suggestions(
     }
 
 
+def _provider_truth_disagreement_outcome(item: dict) -> str:
+    outcome = str(item.get("evidence_outcome") or "").upper()
+    simulated = str(item.get("simulated_change") or "").upper()
+    risk_source = str(item.get("risk_source") or "").upper()
+    if outcome == "EVIDENCE_RISK" or simulated == "WOULD_KEEP_BLOCKED" or risk_source:
+        return "RISK"
+    if outcome == "EVIDENCE_BENEFIT" or simulated == "WOULD_SEND_TO_MANUAL_SECOND_SOURCE_REVIEW":
+        return "BENEFIT"
+    return "NEUTRAL"
+
+
+def _provider_truth_disagreement_cluster_key(item: dict) -> str:
+    mint = str(item.get("mint") or "").strip()
+    symbol = str(item.get("symbol") or "").strip().upper()
+    if mint:
+        return f"mint:{mint}"
+    if symbol:
+        return f"symbol:{symbol}"
+    return str(item.get("key") or _provider_truth_queue_key(item) or "unknown")
+
+
+def _build_provider_truth_disagreement_cluster_detector(
+    approval_evidence_summary: dict,
+    risk_case_drilldown: dict,
+    dry_run_preview: dict,
+    source_index: dict[str, dict],
+    now: datetime,
+) -> dict:
+    rows = []
+    for origin, source_rows in [
+        ("APPROVAL_EVIDENCE", list((approval_evidence_summary or {}).get("top_items") or [])),
+        ("RISK_CASE", list((risk_case_drilldown or {}).get("items") or [])),
+        ("DRY_RUN", list((dry_run_preview or {}).get("items") or [])),
+    ]:
+        for raw in source_rows:
+            item = dict(raw)
+            weight = _provider_truth_source_weight(item, source_index)
+            rows.append({
+                "cluster_key": _provider_truth_disagreement_cluster_key(item),
+                "symbol": item.get("symbol"),
+                "mint": item.get("mint"),
+                "source": weight.get("source"),
+                "origin": origin,
+                "outcome": _provider_truth_disagreement_outcome(item),
+                "evidence_weight": weight.get("evidence_weight"),
+                "weight_band": weight.get("weight_band"),
+                "freshness": weight.get("freshness"),
+                "confidence": weight.get("confidence"),
+                "risk_source": item.get("risk_source"),
+                "causes": list(item.get("causes") or _provider_truth_risk_causes(item)),
+            })
+    clusters: dict[str, dict] = {}
+    for row in rows:
+        key = str(row.get("cluster_key") or "unknown")
+        cluster = clusters.setdefault(key, {
+            "cluster_key": key,
+            "symbol": row.get("symbol"),
+            "mint": row.get("mint"),
+            "sources": set(),
+            "outcome_weights": {"RISK": 0.0, "BENEFIT": 0.0, "NEUTRAL": 0.0},
+            "items": [],
+        })
+        if row.get("source"):
+            cluster["sources"].add(row.get("source"))
+        outcome = str(row.get("outcome") or "NEUTRAL").upper()
+        cluster["outcome_weights"][outcome] = round(_gb_float(cluster["outcome_weights"].get(outcome)) + _gb_float(row.get("evidence_weight")), 1)
+        cluster["items"].append(row)
+
+    out = []
+    for cluster in clusters.values():
+        weights = dict(cluster.get("outcome_weights") or {})
+        risk_weight = _gb_float(weights.get("RISK"))
+        benefit_weight = _gb_float(weights.get("BENEFIT"))
+        neutral_weight = _gb_float(weights.get("NEUTRAL"))
+        source_count = len(cluster.get("sources") or [])
+        high_conflict = bool(risk_weight >= 75 and benefit_weight >= 45)
+        medium_conflict = bool(risk_weight >= 75 and neutral_weight >= 75 and source_count >= 2)
+        source_split = bool(source_count >= 2 and risk_weight > 0 and (benefit_weight > 0 or neutral_weight > 0))
+        if not (high_conflict or medium_conflict or source_split):
+            continue
+        sorted_items = sorted(list(cluster.get("items") or []), key=lambda x: _gb_float(x.get("evidence_weight")), reverse=True)
+        out.append({
+            "cluster_key": cluster.get("cluster_key"),
+            "symbol": cluster.get("symbol"),
+            "mint": cluster.get("mint"),
+            "source_count": source_count,
+            "sources": sorted(str(src) for src in cluster.get("sources") or []),
+            "risk_weight": round(risk_weight, 1),
+            "benefit_weight": round(benefit_weight, 1),
+            "neutral_weight": round(neutral_weight, 1),
+            "conflict_type": "RISK_VS_BENEFIT" if high_conflict else "RISK_VS_NEUTRAL" if medium_conflict else "SOURCE_SPLIT",
+            "severity": "HIGH" if high_conflict else "MEDIUM",
+            "items": sorted_items[:8],
+            "top_source": sorted_items[0].get("source") if sorted_items else None,
+            "top_weight": sorted_items[0].get("evidence_weight") if sorted_items else None,
+        })
+    out.sort(key=lambda x: (_gb_float(x.get("risk_weight")) + _gb_float(x.get("benefit_weight")), _gb_float(x.get("top_weight"))), reverse=True)
+    return {
+        "status": "CONFLICTS" if out else "NO_CONFLICTS",
+        "cluster_count": len(out),
+        "high_severity_count": len([item for item in out if str(item.get("severity") or "").upper() == "HIGH"]),
+        "top_cluster": out[0] if out else None,
+        "items": out[:20],
+        "next_action": (
+            "Run arbitration on high-weight provider disagreements."
+            if out
+            else "No high-weight provider disagreement is active."
+        ),
+        "updated_at": now.isoformat(),
+    }
+
+
+def _build_provider_truth_arbitration_decision_matrix(disagreement_clusters: dict, now: datetime) -> dict:
+    rows = []
+    for cluster in list((disagreement_clusters or {}).get("items") or []):
+        risk_weight = _gb_float(cluster.get("risk_weight"))
+        benefit_weight = _gb_float(cluster.get("benefit_weight"))
+        neutral_weight = _gb_float(cluster.get("neutral_weight"))
+        if risk_weight >= 75 and benefit_weight >= 45:
+            decision = "REQUIRE_THIRD_SOURCE"
+            safe_action = "KEEP_BLOCKED_PENDING_THIRD_SOURCE"
+            reason = "High-weight risk and benefit evidence conflict."
+        elif risk_weight >= 75:
+            decision = "KEEP_BLOCKED"
+            safe_action = "KEEP_BLOCKED"
+            reason = "High-weight risk dominates the disagreement."
+        elif benefit_weight >= 75 and risk_weight < 45:
+            decision = "TRUST_BENEFIT_WITH_MANUAL_REVIEW"
+            safe_action = "MANUAL_REVIEW_ONLY"
+            reason = "Benefit evidence dominates, but approval remains manual."
+        elif neutral_weight >= 75:
+            decision = "REQUIRE_THIRD_SOURCE"
+            safe_action = "KEEP_WATCHING"
+            reason = "Neutral/high-weight evidence conflicts with active risk."
+        else:
+            decision = "KEEP_WATCHING"
+            safe_action = "KEEP_WATCHING"
+            reason = "Conflict weight is not strong enough to change state."
+        rows.append({
+            "cluster_key": cluster.get("cluster_key"),
+            "symbol": cluster.get("symbol"),
+            "mint": cluster.get("mint"),
+            "conflict_type": cluster.get("conflict_type"),
+            "severity": cluster.get("severity"),
+            "risk_weight": risk_weight,
+            "benefit_weight": benefit_weight,
+            "neutral_weight": neutral_weight,
+            "decision": decision,
+            "safe_action": safe_action,
+            "reason": reason,
+            "manual_only": True,
+            "auto_apply": False,
+        })
+    require_third = len([row for row in rows if row.get("decision") == "REQUIRE_THIRD_SOURCE"])
+    blocked = len([row for row in rows if str(row.get("safe_action") or "").startswith("KEEP_BLOCKED")])
+    return {
+        "status": "READY" if rows else "NO_CONFLICTS",
+        "decision_count": len(rows),
+        "require_third_source_count": require_third,
+        "blocked_count": blocked,
+        "top_decision": rows[0] if rows else None,
+        "items": rows[:20],
+        "next_action": (
+            "Queue third-source checks for unresolved high-weight disagreements."
+            if require_third
+            else "Keep blocked disagreements blocked; no third-source check is required."
+            if blocked
+            else "No arbitration action is required."
+        ),
+        "updated_at": now.isoformat(),
+    }
+
+
+def _build_provider_truth_third_source_confirmation_queue(
+    review_packet: dict,
+    arbitration_matrix: dict,
+    now: datetime,
+) -> dict:
+    review_key = str((review_packet or {}).get("review_key") or "").strip()
+    payload = _freshness_kv_read(_PROVIDER_TRUTH_THIRD_SOURCE_QUEUE_KEY)
+    previous_items = {
+        str(item.get("queue_key") or ""): dict(item)
+        for item in list((payload or {}).get("items") or [])
+        if str(item.get("queue_key") or "")
+    }
+    queued = []
+    for row in list((arbitration_matrix or {}).get("items") or []):
+        if str(row.get("decision") or "").upper() != "REQUIRE_THIRD_SOURCE":
+            continue
+        cluster_key = str(row.get("cluster_key") or row.get("symbol") or row.get("mint") or "cluster")
+        queue_key = f"{review_key or 'no-review'}:{cluster_key}:THIRD_SOURCE"
+        previous = previous_items.get(queue_key, {})
+        previous_due = _gb_parse_ts(previous.get("next_check_at"))
+        due_now = bool(previous_due and previous_due <= now)
+        next_check = previous_due if previous_due else now + timedelta(minutes=30)
+        queued.append({
+            "queue_key": queue_key,
+            "review_key": review_key or None,
+            "cluster_key": cluster_key,
+            "symbol": row.get("symbol"),
+            "mint": row.get("mint"),
+            "status": "DUE" if due_now else "WAITING_THIRD_SOURCE",
+            "route": "THIRD_SOURCE_CONFIRMATION",
+            "risk_weight": row.get("risk_weight"),
+            "benefit_weight": row.get("benefit_weight"),
+            "reason": row.get("reason"),
+            "last_seen_at": now.isoformat(),
+            "next_check_at": next_check.isoformat(),
+            "due": due_now,
+            "manual_only": True,
+            "auto_apply": False,
+        })
+    old_other_reviews = [
+        dict(item) for item in list((payload or {}).get("items") or [])
+        if str(item.get("review_key") or "") != review_key
+    ][-200:]
+    stored = old_other_reviews + queued
+    _freshness_kv_write(
+        _PROVIDER_TRUTH_THIRD_SOURCE_QUEUE_KEY,
+        {
+            "status": "TRACKING",
+            "updated_at": now.isoformat(),
+            "items": stored[-300:],
+        },
+    )
+    due_count = len([item for item in queued if item.get("due")])
+    return {
+        "status": "TRACKING" if queued else "EMPTY",
+        "review_key": review_key or None,
+        "queued_count": len(queued),
+        "due_count": due_count,
+        "next_check_at": min([item.get("next_check_at") for item in queued], default=None),
+        "items": queued[:20],
+        "next_action": (
+            "Third-source confirmation is queued for high-weight disagreements."
+            if queued
+            else "No third-source confirmation is needed."
+        ),
+        "updated_at": now.isoformat(),
+    }
+
+
+def _build_provider_truth_manual_arbitration_packet(
+    review_packet: dict,
+    disagreement_clusters: dict,
+    arbitration_matrix: dict,
+    third_source_queue: dict,
+    now: datetime,
+) -> dict:
+    review_key = str((review_packet or {}).get("review_key") or "").strip()
+    top_decision = dict((arbitration_matrix or {}).get("top_decision") or {})
+    status = "READY_FOR_OPERATOR_REVIEW" if int((disagreement_clusters or {}).get("cluster_count") or 0) else "NO_DISAGREEMENT"
+    packet = {
+        "status": status,
+        "review_key": review_key or None,
+        "cluster_count": int((disagreement_clusters or {}).get("cluster_count") or 0),
+        "decision_count": int((arbitration_matrix or {}).get("decision_count") or 0),
+        "third_source_queued_count": int((third_source_queue or {}).get("queued_count") or 0),
+        "top_symbol": top_decision.get("symbol"),
+        "top_decision": top_decision.get("decision"),
+        "top_safe_action": top_decision.get("safe_action"),
+        "operator_summary": (
+            f"{top_decision.get('symbol') or 'Top disagreement'}: {top_decision.get('decision')} because {top_decision.get('reason')}"
+            if top_decision
+            else "No active high-weight provider disagreement."
+        ),
+        "manual_only": True,
+        "auto_apply_enabled": False,
+        "items": list((arbitration_matrix or {}).get("items") or [])[:8],
+        "next_action": (
+            "Review disagreement packet before changing source trust or clearing any hold."
+            if status == "READY_FOR_OPERATOR_REVIEW"
+            else "No manual arbitration packet is needed."
+        ),
+        "updated_at": now.isoformat(),
+    }
+    return packet
+
+
 def _build_provider_truth_miss_evidence_accumulator(
     miss_review: dict,
     miss_repair_workbench: dict,
@@ -21521,6 +21801,26 @@ def _build_provider_truth_miss_evidence_accumulator(
         weighted_clear_requirements,
         now,
     )
+    disagreement_clusters = _build_provider_truth_disagreement_cluster_detector(
+        approval_evidence_summary,
+        risk_case_drilldown,
+        dry_run_preview,
+        source_index or {},
+        now,
+    )
+    arbitration_matrix = _build_provider_truth_arbitration_decision_matrix(disagreement_clusters, now)
+    third_source_queue = _build_provider_truth_third_source_confirmation_queue(
+        review_packet,
+        arbitration_matrix,
+        now,
+    )
+    manual_arbitration_packet = _build_provider_truth_manual_arbitration_packet(
+        review_packet,
+        disagreement_clusters,
+        arbitration_matrix,
+        third_source_queue,
+        now,
+    )
     return {
         "status": score.get("status"),
         "readiness_state": score.get("readiness_state"),
@@ -21557,6 +21857,10 @@ def _build_provider_truth_miss_evidence_accumulator(
         "clear_requirement_backtest": clear_requirement_backtest,
         "policy_tuning_suggestions": policy_tuning_suggestions,
         "weighted_threshold_suggestions": weighted_threshold_suggestions,
+        "disagreement_cluster_detector": disagreement_clusters,
+        "arbitration_decision_matrix": arbitration_matrix,
+        "third_source_confirmation_queue": third_source_queue,
+        "manual_arbitration_packet": manual_arbitration_packet,
         "next_action": policy_work_order.get("next_action") or approval_gate.get("next_action") or score.get("next_action"),
     }
 
@@ -21956,6 +22260,10 @@ def _build_dashboard_provider_truth_panel(
     miss_clear_backtest = dict(miss_evidence_accumulator.get("clear_requirement_backtest") or {})
     miss_policy_tuning = dict(miss_evidence_accumulator.get("policy_tuning_suggestions") or {})
     miss_weighted_thresholds = dict(miss_evidence_accumulator.get("weighted_threshold_suggestions") or {})
+    miss_disagreements = dict(miss_evidence_accumulator.get("disagreement_cluster_detector") or {})
+    miss_arbitration = dict(miss_evidence_accumulator.get("arbitration_decision_matrix") or {})
+    miss_third_source = dict(miss_evidence_accumulator.get("third_source_confirmation_queue") or {})
+    miss_manual_arbitration = dict(miss_evidence_accumulator.get("manual_arbitration_packet") or {})
     miss_top_evidence = (list(miss_approval_evidence.get("top_items") or []) or [{}])[0]
     miss_top_risk_case = dict(miss_risk_cases.get("top_case") or {})
     status = (
@@ -22103,6 +22411,19 @@ def _build_dashboard_provider_truth_panel(
         "miss_weighted_threshold_status": miss_weighted_thresholds.get("status"),
         "miss_weighted_threshold_suggestion_count": int(miss_weighted_thresholds.get("suggestion_count") or 0),
         "miss_weighted_threshold_top_suggestion": miss_weighted_thresholds.get("top_suggestion"),
+        "miss_disagreement_status": miss_disagreements.get("status"),
+        "miss_disagreement_cluster_count": int(miss_disagreements.get("cluster_count") or 0),
+        "miss_disagreement_high_count": int(miss_disagreements.get("high_severity_count") or 0),
+        "miss_arbitration_status": miss_arbitration.get("status"),
+        "miss_arbitration_decision_count": int(miss_arbitration.get("decision_count") or 0),
+        "miss_arbitration_require_third_count": int(miss_arbitration.get("require_third_source_count") or 0),
+        "miss_arbitration_blocked_count": int(miss_arbitration.get("blocked_count") or 0),
+        "miss_third_source_status": miss_third_source.get("status"),
+        "miss_third_source_queued_count": int(miss_third_source.get("queued_count") or 0),
+        "miss_third_source_due_count": int(miss_third_source.get("due_count") or 0),
+        "miss_manual_arbitration_status": miss_manual_arbitration.get("status"),
+        "miss_manual_arbitration_top_decision": miss_manual_arbitration.get("top_decision"),
+        "miss_manual_arbitration_top_action": miss_manual_arbitration.get("top_safe_action"),
         "top_symbol": top_agreement.get("symbol"),
         "top_status": top_agreement.get("status"),
         "top_best_source": top_arbitration.get("best_source"),

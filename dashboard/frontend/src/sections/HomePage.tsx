@@ -1299,6 +1299,27 @@ interface DailyCryptoBriefData {
         suggestion_count?: number
         top_suggestion?: string | null
       }
+      disagreement_cluster_detector?: {
+        status?: string
+        cluster_count?: number
+        high_severity_count?: number
+      }
+      arbitration_decision_matrix?: {
+        status?: string
+        decision_count?: number
+        require_third_source_count?: number
+        blocked_count?: number
+      }
+      third_source_confirmation_queue?: {
+        status?: string
+        queued_count?: number
+        due_count?: number
+      }
+      manual_arbitration_packet?: {
+        status?: string
+        top_decision?: string | null
+        top_safe_action?: string | null
+      }
       next_action?: string | null
     }
     dashboard_provider_truth_panel?: {
@@ -1435,6 +1456,19 @@ interface DailyCryptoBriefData {
       miss_weighted_threshold_status?: string | null
       miss_weighted_threshold_suggestion_count?: number
       miss_weighted_threshold_top_suggestion?: string | null
+      miss_disagreement_status?: string | null
+      miss_disagreement_cluster_count?: number
+      miss_disagreement_high_count?: number
+      miss_arbitration_status?: string | null
+      miss_arbitration_decision_count?: number
+      miss_arbitration_require_third_count?: number
+      miss_arbitration_blocked_count?: number
+      miss_third_source_status?: string | null
+      miss_third_source_queued_count?: number
+      miss_third_source_due_count?: number
+      miss_manual_arbitration_status?: string | null
+      miss_manual_arbitration_top_decision?: string | null
+      miss_manual_arbitration_top_action?: string | null
       top_symbol?: string | null
       top_status?: string
       top_best_source?: string | null
@@ -6132,6 +6166,10 @@ function DailyCryptoBriefPanel({
     const providerTruthMissPolicyTuning = providerTruthMissEvidence.policy_tuning_suggestions ?? {}
     const providerTruthMissWeightedClear = providerTruthMissEvidence.weighted_clear_requirements ?? {}
     const providerTruthMissWeightedThresholds = providerTruthMissEvidence.weighted_threshold_suggestions ?? {}
+    const providerTruthMissDisagreements = providerTruthMissEvidence.disagreement_cluster_detector ?? {}
+    const providerTruthMissArbitration = providerTruthMissEvidence.arbitration_decision_matrix ?? {}
+    const providerTruthMissThirdSource = providerTruthMissEvidence.third_source_confirmation_queue ?? {}
+    const providerTruthMissManualArbitration = providerTruthMissEvidence.manual_arbitration_packet ?? {}
     const topProviderTruthItem = providerTruthAgreement.items?.[0]
     const topProviderTruthSource = providerTruthSourceMap.providers?.[0]
     const topFallbackRoute = providerTruthFallback.routes?.[0]
@@ -6722,6 +6760,9 @@ function DailyCryptoBriefPanel({
             </div>
             <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
               source weight {fmtFixed(providerTruthPanel.miss_source_weighting_avg_weight ?? providerTruthMissSourceWeighting.avg_weight, 0)} · top {providerTruthPanel.miss_source_weighting_top_source || providerTruthMissSourceWeighting.top_source || 'none'} {fmtFixed(providerTruthPanel.miss_source_weighting_top_weight ?? providerTruthMissSourceWeighting.top_weight, 0)} · weighted cause {String(providerTruthPanel.miss_weighted_cause_top_cause || providerTruthMissWeightedCause.top_cause || 'none').replace(/_/g, ' ').toLowerCase()} {fmtFixed(providerTruthPanel.miss_weighted_cause_top_score ?? providerTruthMissWeightedCause.top_weighted_score, 0)} · weighted clear {String(providerTruthPanel.miss_weighted_clear_status || providerTruthMissWeightedClear.status || 'waiting').replace(/_/g, ' ').toLowerCase()} · weighted tune {providerTruthPanel.miss_weighted_threshold_suggestion_count ?? providerTruthMissWeightedThresholds.suggestion_count ?? 0}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              disagreements {providerTruthPanel.miss_disagreement_cluster_count ?? providerTruthMissDisagreements.cluster_count ?? 0} · high {providerTruthPanel.miss_disagreement_high_count ?? providerTruthMissDisagreements.high_severity_count ?? 0} · arbitration {String(providerTruthPanel.miss_arbitration_status || providerTruthMissArbitration.status || 'none').replace(/_/g, ' ').toLowerCase()} · third source {providerTruthPanel.miss_third_source_due_count ?? providerTruthMissThirdSource.due_count ?? 0}/{providerTruthPanel.miss_third_source_queued_count ?? providerTruthMissThirdSource.queued_count ?? 0} · packet {String(providerTruthPanel.miss_manual_arbitration_status || providerTruthMissManualArbitration.status || 'none').replace(/_/g, ' ').toLowerCase()}
             </div>
             {(providerTruthPanel.miss_review_key || providerTruthMissReviewPacket.review_key) && onProviderTruthMissReviewAction && (
               <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 8 }}>
