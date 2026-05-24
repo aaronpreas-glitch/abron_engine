@@ -18606,6 +18606,424 @@ def _build_provider_truth_miss_repair_workbench(
     }
 
 
+def _provider_truth_miss_pattern(top_case: dict) -> dict:
+    top = dict(top_case or {})
+    patch = dict(top.get("patch_candidate") or {})
+    return {
+        "patch_type": str(patch.get("patch_type") or top.get("repair_kind") or "UNKNOWN").upper(),
+        "source": _provider_truth_learning_source(top.get("source")),
+        "preferred_source": _provider_source_key(top.get("current_source")),
+        "route": str(top.get("route") or "").upper(),
+        "failure_class": str(top.get("failure_class") or "").lower(),
+        "symbol": top.get("symbol"),
+        "mint": top.get("mint"),
+    }
+
+
+def _provider_truth_evidence_label(current: dict) -> str:
+    current_source = _provider_source_key(current.get("market_source"))
+    freshness = str(current.get("data_freshness") or "").upper()
+    confidence = str(current.get("data_confidence") or "").upper()
+    quality = _gb_float(current.get("quality_score"))
+    pressure = _gb_float(current.get("pressure_score"))
+    if quality >= 75 and pressure >= 45 and freshness in {"LIVE", "RECENT"} and confidence != "LOW":
+        return "EVIDENCE_BENEFIT"
+    if quality < 65 or confidence == "LOW" or freshness == "STALE" or current_source.startswith("cache"):
+        return "EVIDENCE_RISK"
+    return "EVIDENCE_NEUTRAL"
+
+
+def _build_provider_truth_miss_similarity_matcher(
+    miss_review: dict,
+    truth_memory: dict,
+    intelligence_rows: list[dict],
+    now: datetime,
+) -> dict:
+    top = dict((miss_review or {}).get("top_case") or {})
+    if not top:
+        return {
+            "status": "NO_PATTERN",
+            "pattern": {},
+            "matched_count": 0,
+            "items": [],
+            "next_action": "No provider-truth miss pattern is active.",
+        }
+
+    pattern = _provider_truth_miss_pattern(top)
+    current_by_key = _provider_truth_current_by_key(intelligence_rows)
+    items = []
+    for raw in list((truth_memory or {}).get("items") or []):
+        row = dict(raw)
+        if str(row.get("confirmation_status") or "").upper() != "UNRESOLVED":
+            continue
+        current = _provider_truth_current_for_row(row, current_by_key)
+        row_source = _provider_truth_learning_source(row.get("new_source") or row.get("current_source"))
+        current_source = _provider_source_key(current.get("market_source"))
+        row_route = str(row.get("route") or "").upper()
+        failure_class = str(row.get("failure_class") or "").lower()
+        freshness = str(current.get("data_freshness") or "").upper()
+        confidence = str(current.get("data_confidence") or "").upper()
+        quality = _gb_float(current.get("quality_score"))
+        pressure = _gb_float(current.get("pressure_score"))
+
+        score = 0.0
+        reasons = []
+        if row_source == pattern["source"]:
+            score += 24.0
+            reasons.append("same unresolved source")
+        if current_source == pattern["preferred_source"] and current_source not in {"", "unknown", "cache"}:
+            score += 28.0
+            reasons.append("same preferred live source")
+        if row_route and row_route == pattern["route"]:
+            score += 14.0
+            reasons.append("same route")
+        if failure_class and failure_class == pattern["failure_class"]:
+            score += 10.0
+            reasons.append("same failure class")
+        if freshness in {"LIVE", "RECENT"}:
+            score += 10.0
+            reasons.append("live/recent current data")
+        if confidence != "LOW":
+            score += 7.0
+            reasons.append("non-low current confidence")
+        if quality >= 70:
+            score += 5.0
+            reasons.append("quality above review bar")
+        if pressure >= 40:
+            score += 2.0
+            reasons.append("actionable pressure")
+
+        patch_type = pattern["patch_type"]
+        applies = False
+        if patch_type == "SOURCE_PRECEDENCE_UPDATE":
+            applies = bool(
+                row_source == pattern["source"]
+                and current_source == pattern["preferred_source"]
+                and current_source not in {"", "unknown", "cache"}
+                and freshness in {"LIVE", "RECENT"}
+                and confidence != "LOW"
+            )
+        elif patch_type == "FALLBACK_ROUTE_EXPANSION":
+            applies = bool(row_route == pattern["route"] and freshness in {"LIVE", "RECENT"} and confidence != "LOW")
+        elif patch_type == "RETRY_CADENCE_TIGHTEN":
+            applies = bool(row_route == pattern["route"] and quality >= 70 and pressure >= 40)
+        else:
+            applies = bool(row.get("mint") == pattern["mint"] or row.get("symbol") == pattern["symbol"])
+
+        if not applies and score < 65:
+            continue
+        checked = _gb_parse_ts(row.get("ts_utc"))
+        items.append({
+            "symbol": row.get("symbol"),
+            "mint": row.get("mint"),
+            "source": row_source,
+            "current_source": current_source,
+            "route": row_route or None,
+            "failure_class": failure_class or None,
+            "reason": row.get("reason"),
+            "checked_at": row.get("ts_utc"),
+            "age_minutes": round(max(0.0, (now - checked).total_seconds() / 60.0), 1) if checked else None,
+            "current_freshness": freshness or None,
+            "current_confidence": confidence or None,
+            "current_quality": _nullable_float(current.get("quality_score")),
+            "current_pressure": _nullable_float(current.get("pressure_score")),
+            "current_marketcap": _nullable_float(current.get("marketcap")),
+            "current_liquidity": _nullable_float(current.get("liquidity")),
+            "similarity_score": round(min(100.0, score), 1),
+            "evidence_label": _provider_truth_evidence_label(current),
+            "match_reasons": reasons[:6],
+        })
+
+    items.sort(key=lambda x: (_gb_float(x.get("similarity_score")), _gb_float(x.get("current_marketcap"))), reverse=True)
+    return {
+        "status": "MATCHED" if items else "NO_MATCHES",
+        "pattern": pattern,
+        "matched_count": len(items),
+        "items": items[:20],
+        "next_action": (
+            "Queue matched provider-truth misses for evidence refresh."
+            if items
+            else "Wait for more unresolved misses that match the current repair pattern."
+        ),
+    }
+
+
+def _build_provider_truth_miss_evidence_queue(matcher: dict, now: datetime) -> dict:
+    key = "provider_truth_miss_evidence_queue"
+    if str((matcher or {}).get("status") or "").upper() == "NO_PATTERN":
+        return {
+            "status": "EMPTY",
+            "updated_at": now.isoformat(),
+            "pattern": {},
+            "queued_count": 0,
+            "due_count": 0,
+            "next_refresh_at": None,
+            "items": [],
+            "next_action": "No provider-truth miss evidence is queued.",
+        }
+    previous = _freshness_kv_read(key)
+    previous_items = {
+        _provider_truth_queue_key(item): dict(item)
+        for item in list((previous or {}).get("items") or [])
+        if _provider_truth_queue_key(item)
+    }
+    pattern = dict((matcher or {}).get("pattern") or {})
+    matched_keys = set()
+    for matched in list((matcher or {}).get("items") or []):
+        matched = dict(matched)
+        item_key = _provider_truth_queue_key(matched)
+        if not item_key:
+            continue
+        matched_keys.add(item_key)
+        prev = previous_items.get(item_key) or {}
+        next_refresh_at = prev.get("next_refresh_at") or now.isoformat()
+        status = str(prev.get("status") or "QUEUED").upper()
+        next_ts = _gb_parse_ts(next_refresh_at)
+        if next_ts and next_ts <= now and status in {"QUEUED", "WAITING", "EVIDENCE_NEUTRAL"}:
+            status = "REFRESH_DUE"
+        previous_items[item_key] = {
+            **prev,
+            "key": item_key,
+            "symbol": matched.get("symbol"),
+            "mint": matched.get("mint"),
+            "source": matched.get("source"),
+            "current_source": matched.get("current_source"),
+            "preferred_source": pattern.get("preferred_source"),
+            "patch_type": pattern.get("patch_type"),
+            "route": matched.get("route"),
+            "failure_class": matched.get("failure_class"),
+            "reason": matched.get("reason"),
+            "first_seen_at": prev.get("first_seen_at") or now.isoformat(),
+            "last_seen_at": now.isoformat(),
+            "last_refresh_at": prev.get("last_refresh_at"),
+            "next_refresh_at": next_refresh_at,
+            "status": status,
+            "refresh_count": int(prev.get("refresh_count") or 0),
+            "similarity_score": matched.get("similarity_score"),
+            "current_quality": matched.get("current_quality"),
+            "current_pressure": matched.get("current_pressure"),
+            "current_freshness": matched.get("current_freshness"),
+            "current_confidence": matched.get("current_confidence"),
+            "evidence_outcome": prev.get("evidence_outcome") or matched.get("evidence_label"),
+            "match_reasons": list(matched.get("match_reasons") or []),
+        }
+
+    kept = []
+    for item_key, item in previous_items.items():
+        last_seen = _gb_parse_ts(item.get("last_seen_at"))
+        if item_key not in matched_keys and last_seen and (now - last_seen).total_seconds() > 3 * 86400:
+            continue
+        next_ts = _gb_parse_ts(item.get("next_refresh_at"))
+        status = str(item.get("status") or "QUEUED").upper()
+        if next_ts and next_ts <= now and status in {"QUEUED", "WAITING", "EVIDENCE_NEUTRAL"}:
+            item["status"] = "REFRESH_DUE"
+        kept.append(item)
+
+    kept.sort(key=lambda x: (_gb_parse_ts(x.get("next_refresh_at")) or datetime.max.replace(tzinfo=timezone.utc), -_gb_float(x.get("similarity_score"))))
+    due_count = len([item for item in kept if str(item.get("status") or "").upper() == "REFRESH_DUE"])
+    next_due = next((_gb_parse_ts(item.get("next_refresh_at")) for item in kept if _gb_parse_ts(item.get("next_refresh_at"))), None)
+    payload = {
+        "status": "DUE" if due_count else "QUEUED" if kept else "EMPTY",
+        "updated_at": now.isoformat(),
+        "pattern": pattern,
+        "queued_count": len(kept),
+        "due_count": due_count,
+        "next_refresh_at": next_due.isoformat() if next_due else None,
+        "items": kept[:100],
+        "next_action": (
+            "Refresh due provider-truth evidence items from current intelligence."
+            if due_count
+            else "Keep accumulating similar provider-truth miss evidence."
+            if kept
+            else "No provider-truth miss evidence is queued."
+        ),
+    }
+    _freshness_kv_write(key, payload)
+    return payload
+
+
+def _run_provider_truth_due_evidence_refresh(queue: dict, intelligence_rows: list[dict], now: datetime) -> dict:
+    key = "provider_truth_miss_evidence_queue"
+    current_by_key = _provider_truth_current_by_key(intelligence_rows)
+    items = []
+    refreshed = 0
+    benefit = 0
+    risk = 0
+    neutral = 0
+    for raw in list((queue or {}).get("items") or []):
+        item = dict(raw)
+        status = str(item.get("status") or "").upper()
+        next_ts = _gb_parse_ts(item.get("next_refresh_at"))
+        due = status == "REFRESH_DUE" or (next_ts is not None and next_ts <= now)
+        if not due:
+            items.append(item)
+            continue
+        current = _provider_truth_current_for_row(item, current_by_key)
+        outcome = _provider_truth_evidence_label(current)
+        if outcome == "EVIDENCE_BENEFIT":
+            benefit += 1
+            next_minutes = 180
+        elif outcome == "EVIDENCE_RISK":
+            risk += 1
+            next_minutes = 360
+        else:
+            neutral += 1
+            next_minutes = 60
+        refreshed += 1
+        item.update({
+            "status": outcome,
+            "evidence_outcome": outcome,
+            "last_refresh_at": now.isoformat(),
+            "next_refresh_at": (now + timedelta(minutes=next_minutes)).isoformat(),
+            "refresh_count": int(item.get("refresh_count") or 0) + 1,
+            "current_source": _provider_source_key(current.get("market_source")),
+            "current_freshness": current.get("data_freshness"),
+            "current_confidence": current.get("data_confidence"),
+            "current_quality": _nullable_float(current.get("quality_score")),
+            "current_pressure": _nullable_float(current.get("pressure_score")),
+            "current_marketcap": _nullable_float(current.get("marketcap")),
+            "current_liquidity": _nullable_float(current.get("liquidity")),
+        })
+        items.append(item)
+
+    items.sort(key=lambda x: (_gb_parse_ts(x.get("next_refresh_at")) or datetime.max.replace(tzinfo=timezone.utc), -_gb_float(x.get("similarity_score"))))
+    due_count = len([
+        item for item in items
+        if (_gb_parse_ts(item.get("next_refresh_at")) and _gb_parse_ts(item.get("next_refresh_at")) <= now)
+        or str(item.get("status") or "").upper() == "REFRESH_DUE"
+    ])
+    updated_queue = {
+        **dict(queue or {}),
+        "status": "DUE" if due_count else "QUEUED" if items else "EMPTY",
+        "updated_at": now.isoformat(),
+        "queued_count": len(items),
+        "due_count": due_count,
+        "next_refresh_at": next((_gb_parse_ts(item.get("next_refresh_at")).isoformat() for item in items if _gb_parse_ts(item.get("next_refresh_at"))), None),
+        "items": items[:100],
+    }
+    _freshness_kv_write(key, updated_queue)
+    return {
+        "status": "REFRESHED" if refreshed else "NO_DUE_ITEMS",
+        "read_only": True,
+        "refreshed_count": refreshed,
+        "benefit_count": benefit,
+        "risk_count": risk,
+        "neutral_count": neutral,
+        "due_count": due_count,
+        "queue": updated_queue,
+        "items": [item for item in items if item.get("last_refresh_at") == now.isoformat()][:20],
+        "next_action": (
+            "Use refreshed evidence in the accumulator score."
+            if refreshed
+            else "No provider-truth miss evidence refresh is due yet."
+        ),
+    }
+
+
+def _build_provider_truth_miss_accumulator_score(
+    miss_repair_workbench: dict,
+    matcher: dict,
+    queue: dict,
+    refresh: dict,
+    learning_score: dict,
+    now: datetime,
+) -> dict:
+    evidence_by_key: dict[str, dict] = {}
+    for item in list(((miss_repair_workbench or {}).get("candidate_replay") or {}).get("items") or []):
+        key = _provider_truth_queue_key(item)
+        if not key:
+            continue
+        outcome = str(item.get("outcome") or "").upper()
+        evidence_by_key[key] = {
+            **dict(item),
+            "key": key,
+            "evidence_outcome": "EVIDENCE_BENEFIT" if outcome == "WOULD_FIX" else "EVIDENCE_RISK" if outcome == "RISK_LOOSEN" else "EVIDENCE_NEUTRAL",
+            "evidence_source": "REPLAY",
+        }
+    for item in list((queue or {}).get("items") or []):
+        key = _provider_truth_queue_key(item)
+        if not key:
+            continue
+        outcome = str(item.get("evidence_outcome") or item.get("status") or "").upper()
+        if outcome not in {"EVIDENCE_BENEFIT", "EVIDENCE_RISK", "EVIDENCE_NEUTRAL"}:
+            continue
+        evidence_by_key[key] = {
+            **dict(item),
+            "key": key,
+            "evidence_outcome": outcome,
+            "evidence_source": "ACCUMULATED_REFRESH",
+        }
+
+    evidence = list(evidence_by_key.values())
+    benefit_count = len([item for item in evidence if str(item.get("evidence_outcome")) == "EVIDENCE_BENEFIT"])
+    risk_count = len([item for item in evidence if str(item.get("evidence_outcome")) == "EVIDENCE_RISK"])
+    neutral_count = len([item for item in evidence if str(item.get("evidence_outcome")) == "EVIDENCE_NEUTRAL"])
+    sample_n = len(evidence)
+    needed = 3
+    false_confirm_count = int(((learning_score or {}).get("confirmed_score") or {}).get("false_count") or 0)
+    readiness = "NOT_READY"
+    if sample_n >= needed and benefit_count > risk_count and false_confirm_count == 0:
+        readiness = "READY_FOR_REVIEW"
+    elif benefit_count > 0 and risk_count == 0:
+        readiness = "WATCH_MORE"
+    status = "READY" if readiness == "READY_FOR_REVIEW" else "WATCH" if readiness == "WATCH_MORE" else "BLOCKED"
+    return {
+        "status": status,
+        "readiness_state": readiness,
+        "sample_n": sample_n,
+        "needed_sample_n": needed,
+        "benefit_count": benefit_count,
+        "risk_count": risk_count,
+        "neutral_count": neutral_count,
+        "progress_pct": round(min(100.0, (sample_n / needed) * 100.0), 1),
+        "matched_count": int((matcher or {}).get("matched_count") or 0),
+        "queued_count": int((queue or {}).get("queued_count") or 0),
+        "due_count": int((queue or {}).get("due_count") or 0),
+        "refreshed_count": int((refresh or {}).get("refreshed_count") or 0),
+        "false_confirm_count": false_confirm_count,
+        "items": sorted(evidence, key=lambda x: (_gb_float(x.get("similarity_score")), str(x.get("evidence_outcome") or "")), reverse=True)[:20],
+        "next_action": (
+            "Accumulator has enough evidence for manual provider-truth patch review."
+            if readiness == "READY_FOR_REVIEW"
+            else f"Collect {max(0, needed - sample_n)} more similar evidence item(s) before policy review."
+            if readiness == "WATCH_MORE"
+            else "Do not patch; accumulated evidence is not strong enough."
+        ),
+        "updated_at": now.isoformat(),
+    }
+
+
+def _build_provider_truth_miss_evidence_accumulator(
+    miss_review: dict,
+    miss_repair_workbench: dict,
+    learning_score: dict,
+    truth_memory: dict,
+    intelligence_rows: list[dict],
+    now: datetime,
+) -> dict:
+    matcher = _build_provider_truth_miss_similarity_matcher(miss_review, truth_memory, intelligence_rows, now)
+    queue = _build_provider_truth_miss_evidence_queue(matcher, now)
+    refresh = _run_provider_truth_due_evidence_refresh(queue, intelligence_rows, now)
+    queue_after_refresh = dict(refresh.get("queue") or queue)
+    score = _build_provider_truth_miss_accumulator_score(
+        miss_repair_workbench,
+        matcher,
+        queue_after_refresh,
+        refresh,
+        learning_score,
+        now,
+    )
+    return {
+        "status": score.get("status"),
+        "readiness_state": score.get("readiness_state"),
+        "similarity_matcher": matcher,
+        "evidence_queue": queue_after_refresh,
+        "due_evidence_refresh": refresh,
+        "accumulator_score": score,
+        "next_action": score.get("next_action"),
+    }
+
+
 def _provider_truth_retry_delay_minutes(retry_count: int, high_impact: bool) -> int:
     if retry_count <= 0:
         return 0
@@ -18957,6 +19375,7 @@ def _build_dashboard_provider_truth_panel(
     learning_score: dict | None = None,
     miss_review: dict | None = None,
     miss_repair_workbench: dict | None = None,
+    miss_evidence_accumulator: dict | None = None,
 ) -> dict:
     top_agreement = (list((agreement_layer or {}).get("items") or []) or [{}])[0]
     top_arbitration = dict((arbitration or {}).get("top") or {})
@@ -18968,6 +19387,9 @@ def _build_dashboard_provider_truth_panel(
     learning_score = dict(learning_score or {})
     miss_review = dict(miss_review or {})
     miss_repair_workbench = dict(miss_repair_workbench or {})
+    miss_evidence_accumulator = dict(miss_evidence_accumulator or {})
+    miss_evidence_queue = dict(miss_evidence_accumulator.get("evidence_queue") or {})
+    miss_evidence_score = dict(miss_evidence_accumulator.get("accumulator_score") or {})
     status = (
         "BLOCKED"
         if str((agreement_layer or {}).get("status") or "").upper() == "BLOCKED"
@@ -19019,11 +19441,20 @@ def _build_dashboard_provider_truth_panel(
         "miss_workbench_benefit_count": int(((miss_repair_workbench.get("benefit_risk") or {}).get("benefit_count")) or 0),
         "miss_workbench_risk_count": int(((miss_repair_workbench.get("benefit_risk") or {}).get("risk_count")) or 0),
         "miss_workbench_sample_n": int(((miss_repair_workbench.get("candidate_replay") or {}).get("sample_n")) or 0),
+        "miss_evidence_status": miss_evidence_accumulator.get("status"),
+        "miss_evidence_readiness": miss_evidence_accumulator.get("readiness_state") or miss_evidence_score.get("readiness_state"),
+        "miss_evidence_sample_n": int(miss_evidence_score.get("sample_n") or 0),
+        "miss_evidence_needed_n": int(miss_evidence_score.get("needed_sample_n") or 0),
+        "miss_evidence_benefit_count": int(miss_evidence_score.get("benefit_count") or 0),
+        "miss_evidence_risk_count": int(miss_evidence_score.get("risk_count") or 0),
+        "miss_evidence_queued_count": int(miss_evidence_score.get("queued_count") or miss_evidence_queue.get("queued_count") or 0),
+        "miss_evidence_due_count": int(miss_evidence_score.get("due_count") or miss_evidence_queue.get("due_count") or 0),
+        "miss_evidence_next_refresh_at": miss_evidence_queue.get("next_refresh_at"),
         "top_symbol": top_agreement.get("symbol"),
         "top_status": top_agreement.get("status"),
         "top_best_source": top_arbitration.get("best_source"),
         "top_best_score": top_arbitration.get("best_source_score"),
-        "next_action": miss_repair_workbench.get("next_action") or miss_review.get("next_action") or queue_health.get("next_action") or (fallback_router or {}).get("next_action") or (agreement_layer or {}).get("next_action"),
+        "next_action": miss_evidence_accumulator.get("next_action") or miss_repair_workbench.get("next_action") or miss_review.get("next_action") or queue_health.get("next_action") or (fallback_router or {}).get("next_action") or (agreement_layer or {}).get("next_action"),
     }
 
 
@@ -19074,6 +19505,14 @@ def _build_provider_truth_layer(
     source_map = _apply_provider_truth_learning_to_source_map(source_map_base, learning_score)
     miss_review = _build_provider_truth_miss_review(learning_score, truth_memory, queue_health, intelligence_rows, now)
     miss_repair_workbench = _build_provider_truth_miss_repair_workbench(miss_review, learning_score, truth_memory, intelligence_rows, now)
+    miss_evidence_accumulator = _build_provider_truth_miss_evidence_accumulator(
+        miss_review,
+        miss_repair_workbench,
+        learning_score,
+        truth_memory,
+        intelligence_rows,
+        now,
+    )
     truth_panel = _build_dashboard_provider_truth_panel(
         source_map,
         agreement_layer,
@@ -19087,6 +19526,7 @@ def _build_provider_truth_layer(
         learning_score,
         miss_review,
         miss_repair_workbench,
+        miss_evidence_accumulator,
     )
     return {
         "status": truth_panel.get("status"),
@@ -19102,6 +19542,7 @@ def _build_provider_truth_layer(
         "provider_truth_learning_score": learning_score,
         "provider_truth_miss_review": miss_review,
         "provider_truth_miss_repair_workbench": miss_repair_workbench,
+        "provider_truth_miss_evidence_accumulator": miss_evidence_accumulator,
         "dashboard_provider_truth_panel": truth_panel,
         "next_action": truth_panel.get("next_action"),
     }

@@ -1075,6 +1075,42 @@ interface DailyCryptoBriefData {
       would_change_policy?: boolean
       next_action?: string | null
     }
+    provider_truth_miss_evidence_accumulator?: {
+      status?: string
+      readiness_state?: string
+      similarity_matcher?: {
+        status?: string
+        matched_count?: number
+      }
+      evidence_queue?: {
+        status?: string
+        queued_count?: number
+        due_count?: number
+        next_refresh_at?: string | null
+      }
+      due_evidence_refresh?: {
+        status?: string
+        read_only?: boolean
+        refreshed_count?: number
+        benefit_count?: number
+        risk_count?: number
+        neutral_count?: number
+      }
+      accumulator_score?: {
+        status?: string
+        readiness_state?: string
+        sample_n?: number
+        needed_sample_n?: number
+        benefit_count?: number
+        risk_count?: number
+        neutral_count?: number
+        progress_pct?: number
+        queued_count?: number
+        due_count?: number
+        refreshed_count?: number
+      }
+      next_action?: string | null
+    }
     dashboard_provider_truth_panel?: {
       status?: string
       headline?: string
@@ -1115,6 +1151,15 @@ interface DailyCryptoBriefData {
       miss_workbench_benefit_count?: number
       miss_workbench_risk_count?: number
       miss_workbench_sample_n?: number
+      miss_evidence_status?: string | null
+      miss_evidence_readiness?: string | null
+      miss_evidence_sample_n?: number
+      miss_evidence_needed_n?: number
+      miss_evidence_benefit_count?: number
+      miss_evidence_risk_count?: number
+      miss_evidence_queued_count?: number
+      miss_evidence_due_count?: number
+      miss_evidence_next_refresh_at?: string | null
       top_symbol?: string | null
       top_status?: string
       top_best_source?: string | null
@@ -5774,6 +5819,9 @@ function DailyCryptoBriefPanel({
     const providerTruthLearning = providerTruth.provider_truth_learning_score ?? {}
     const providerTruthMissReview = providerTruth.provider_truth_miss_review ?? {}
     const providerTruthMissWorkbench = providerTruth.provider_truth_miss_repair_workbench ?? {}
+    const providerTruthMissEvidence = providerTruth.provider_truth_miss_evidence_accumulator ?? {}
+    const providerTruthMissEvidenceScore = providerTruthMissEvidence.accumulator_score ?? {}
+    const providerTruthMissEvidenceQueue = providerTruthMissEvidence.evidence_queue ?? {}
     const topProviderTruthItem = providerTruthAgreement.items?.[0]
     const topProviderTruthSource = providerTruthSourceMap.providers?.[0]
     const topFallbackRoute = providerTruthFallback.routes?.[0]
@@ -6337,6 +6385,9 @@ function DailyCryptoBriefPanel({
             </div>
             <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
               workbench {String(providerTruthPanel.miss_workbench_readiness || providerTruthMissWorkbench.readiness_state || 'not ready').replace(/_/g, ' ').toLowerCase()} · replay {providerTruthPanel.miss_workbench_sample_n ?? providerTruthMissWorkbench.candidate_replay?.sample_n ?? 0} · benefit/risk {providerTruthPanel.miss_workbench_benefit_count ?? providerTruthMissWorkbench.benefit_risk?.benefit_count ?? 0}/{providerTruthPanel.miss_workbench_risk_count ?? providerTruthMissWorkbench.benefit_risk?.risk_count ?? 0}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              evidence {providerTruthPanel.miss_evidence_sample_n ?? providerTruthMissEvidenceScore.sample_n ?? 0}/{providerTruthPanel.miss_evidence_needed_n ?? providerTruthMissEvidenceScore.needed_sample_n ?? 3} · queued {providerTruthPanel.miss_evidence_queued_count ?? providerTruthMissEvidenceQueue.queued_count ?? 0} · due {providerTruthPanel.miss_evidence_due_count ?? providerTruthMissEvidenceQueue.due_count ?? 0} · {String(providerTruthPanel.miss_evidence_readiness || providerTruthMissEvidence.readiness_state || providerTruthMissEvidenceScore.readiness_state || 'watch more').replace(/_/g, ' ').toLowerCase()}
             </div>
             <div style={{ ...MONO, fontSize: 8, color: '#9db7ce', marginTop: 5, lineHeight: 1.45 }}>
               {topFallbackRoute?.symbol
