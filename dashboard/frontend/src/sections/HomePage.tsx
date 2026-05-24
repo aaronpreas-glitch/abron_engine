@@ -128,6 +128,7 @@ type ProviderEscalationAction = 'DISMISS' | 'KEEP_WATCHING' | 'FORCE_REFRESH'
 type ProviderEscalationReviewState = 'ACKNOWLEDGED' | 'RULE_PATCH_NEEDED' | 'DATA_PATCH_NEEDED' | 'FALSE_ALARM' | 'RESOLVED'
 type ProviderEscalationPatchState = 'WATCH' | 'NEEDS_MORE_DATA' | 'READY_FOR_IMPLEMENTATION'
 type ProviderEscalationWorkOrderState = 'READY' | 'STARTED' | 'BLOCKED' | 'COMPLETE'
+type ProviderTruthMissReviewState = 'PENDING_REVIEW' | 'APPROVED_FOR_IMPLEMENTATION' | 'NEEDS_MORE_EVIDENCE' | 'REJECTED' | 'AUTO_FROZEN'
 type LiveContextMissionState = 'NEW' | 'INVESTIGATING' | 'RESOLVED_COVERED' | 'RESOLVED_IGNORED' | 'NEEDS_SOURCE'
 
 interface ProviderEscalationItem {
@@ -1129,6 +1130,35 @@ interface DailyCryptoBriefData {
         confidence_delta?: number | null
         point_count?: number
       }
+      manual_review_packet?: {
+        status?: string
+        review_key?: string | null
+        candidate_symbol?: string | null
+        patch_type?: string | null
+        exact_rule_change?: string | null
+        policy_change_allowed?: boolean
+      }
+      approval_gate?: {
+        status?: string
+        review_key?: string | null
+        approval_state?: string
+        policy_change_allowed?: boolean
+        auto_apply_enabled?: boolean
+      }
+      dry_run_policy_preview?: {
+        status?: string
+        preview_count?: number
+        would_help_count?: number
+        would_risk_count?: number
+        would_neutral_count?: number
+        would_buy_count?: number
+      }
+      post_approval_watchdog?: {
+        status?: string
+        freeze_triggered?: boolean
+        risk_count?: number
+        worsened_count?: number
+      }
       next_action?: string | null
     }
     dashboard_provider_truth_panel?: {
@@ -1188,6 +1218,17 @@ interface DailyCryptoBriefData {
       miss_confidence_score?: number | null
       miss_confidence_trend?: string | null
       miss_confidence_point_count?: number
+      miss_review_packet_status?: string | null
+      miss_review_key?: string | null
+      miss_approval_state?: string | null
+      miss_approval_status?: string | null
+      miss_policy_change_allowed?: boolean
+      miss_dry_run_status?: string | null
+      miss_dry_run_preview_count?: number
+      miss_dry_run_help_count?: number
+      miss_dry_run_risk_count?: number
+      miss_watchdog_status?: string | null
+      miss_watchdog_freeze_triggered?: boolean
       top_symbol?: string | null
       top_status?: string
       top_best_source?: string | null
@@ -5712,11 +5753,13 @@ function DailyCryptoBriefPanel({
   onEscalationPatchAction,
   onEscalationWorkOrderAction,
   onLiveContextMissionAction,
+  onProviderTruthMissReviewAction,
   pendingEscalationId,
   pendingEscalationReviewKey,
   pendingEscalationPatchKey,
   pendingEscalationWorkOrderKey,
   pendingLiveContextMissionKey,
+  pendingProviderTruthMissReviewKey,
 }: {
   data?: DailyCryptoBriefData
   loading: boolean
@@ -5725,11 +5768,13 @@ function DailyCryptoBriefPanel({
   onEscalationPatchAction?: (item: ProviderEscalationPatchPlan, state: ProviderEscalationPatchState) => void
   onEscalationWorkOrderAction?: (item: ProviderEscalationWorkOrder, state: ProviderEscalationWorkOrderState) => void
   onLiveContextMissionAction?: (item: DailyTopMission | LiveOpportunityGap | LiveContextMissionOutcomeItem, state: LiveContextMissionState) => void
+  onProviderTruthMissReviewAction?: (item: { review_key?: string | null; status?: string | null }, state: ProviderTruthMissReviewState) => void
   pendingEscalationId?: number | null
   pendingEscalationReviewKey?: string | null
   pendingEscalationPatchKey?: string | null
   pendingEscalationWorkOrderKey?: string | null
   pendingLiveContextMissionKey?: string | null
+  pendingProviderTruthMissReviewKey?: string | null
 }) {
   if (loading && !data) {
     return (
@@ -5853,6 +5898,10 @@ function DailyCryptoBriefPanel({
     const providerTruthMissEvidenceTimeline = providerTruthMissEvidence.evidence_timeline ?? {}
     const providerTruthMissBeforeAfter = providerTruthMissEvidence.before_after_score ?? {}
     const providerTruthMissCurve = providerTruthMissEvidence.patch_confidence_curve ?? {}
+    const providerTruthMissReviewPacket = providerTruthMissEvidence.manual_review_packet ?? {}
+    const providerTruthMissApprovalGate = providerTruthMissEvidence.approval_gate ?? {}
+    const providerTruthMissDryRun = providerTruthMissEvidence.dry_run_policy_preview ?? {}
+    const providerTruthMissWatchdog = providerTruthMissEvidence.post_approval_watchdog ?? {}
     const topProviderTruthItem = providerTruthAgreement.items?.[0]
     const topProviderTruthSource = providerTruthSourceMap.providers?.[0]
     const topFallbackRoute = providerTruthFallback.routes?.[0]
@@ -6423,6 +6472,36 @@ function DailyCryptoBriefPanel({
             <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
               timeline {providerTruthPanel.miss_timeline_event_count ?? providerTruthMissEvidenceTimeline.event_count ?? 0} · refresh {providerTruthPanel.miss_timeline_refresh_count ?? providerTruthMissEvidenceTimeline.refresh_event_count ?? 0} · before/after +{providerTruthPanel.miss_before_after_improved_count ?? providerTruthMissBeforeAfter.improved_count ?? 0}/-{providerTruthPanel.miss_before_after_worsened_count ?? providerTruthMissBeforeAfter.worsened_count ?? 0} · curve {fmtFixed(providerTruthPanel.miss_confidence_score ?? providerTruthMissCurve.confidence_score, 0)} {String(providerTruthPanel.miss_confidence_trend || providerTruthMissCurve.trend || 'waiting').replace(/_/g, ' ').toLowerCase()}
             </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              review {String(providerTruthPanel.miss_review_packet_status || providerTruthMissReviewPacket.status || 'waiting').replace(/_/g, ' ').toLowerCase()} · gate {String(providerTruthPanel.miss_approval_state || providerTruthMissApprovalGate.approval_state || 'pending').replace(/_/g, ' ').toLowerCase()} · dry {providerTruthPanel.miss_dry_run_help_count ?? providerTruthMissDryRun.would_help_count ?? 0}/{providerTruthPanel.miss_dry_run_risk_count ?? providerTruthMissDryRun.would_risk_count ?? 0} · watchdog {String(providerTruthPanel.miss_watchdog_status || providerTruthMissWatchdog.status || 'standby').replace(/_/g, ' ').toLowerCase()}
+            </div>
+            {(providerTruthPanel.miss_review_key || providerTruthMissReviewPacket.review_key) && onProviderTruthMissReviewAction && (
+              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 8 }}>
+                {([
+                  ['APPROVED_FOR_IMPLEMENTATION', 'APPROVE'],
+                  ['NEEDS_MORE_EVIDENCE', 'HOLD'],
+                  ['REJECTED', 'REJECT'],
+                ] as Array<[ProviderTruthMissReviewState, string]>).map(([state, label]) => {
+                  const reviewKey = providerTruthPanel.miss_review_key || providerTruthMissReviewPacket.review_key || null
+                  const packetStatus = providerTruthPanel.miss_review_packet_status || providerTruthMissReviewPacket.status || null
+                  return (
+                    <button
+                      key={`provider-truth-miss-review-${state}`}
+                      type="button"
+                      className="mini-btn"
+                      disabled={
+                        pendingProviderTruthMissReviewKey === reviewKey
+                        || (state === 'APPROVED_FOR_IMPLEMENTATION' && packetStatus !== 'READY_FOR_OPERATOR_REVIEW')
+                      }
+                      onClick={() => onProviderTruthMissReviewAction({ review_key: reviewKey, status: packetStatus }, state)}
+                      style={{ fontSize: 7, padding: '4px 7px' }}
+                    >
+                      {label}
+                    </button>
+                  )
+                })}
+              </div>
+            )}
             <div style={{ ...MONO, fontSize: 8, color: '#9db7ce', marginTop: 5, lineHeight: 1.45 }}>
               {topFallbackRoute?.symbol
                 ? `${topFallbackRoute.symbol} routes to ${String(topFallbackRoute.route || 'confirmation').replace(/_/g, ' ').toLowerCase()} · ${topFallbackRoute.current_source || 'source'}`
@@ -9713,6 +9792,7 @@ export function HomePage() {
   const [pendingEscalationPatchKey, setPendingEscalationPatchKey] = React.useState<string | null>(null)
   const [pendingEscalationWorkOrderKey, setPendingEscalationWorkOrderKey] = React.useState<string | null>(null)
   const [pendingLiveContextMissionKey, setPendingLiveContextMissionKey] = React.useState<string | null>(null)
+  const [pendingProviderTruthMissReviewKey, setPendingProviderTruthMissReviewKey] = React.useState<string | null>(null)
   const [homeQueryStage, setHomeQueryStage] = React.useState(0)
 
   React.useEffect(() => {
@@ -9974,6 +10054,41 @@ export function HomePage() {
     })
   }
 
+  const providerTruthMissReviewMutation = useMutation({
+    mutationFn: (payload: {
+      review_key?: string | null
+      state: ProviderTruthMissReviewState
+      packet_status?: string | null
+      operator_note?: string
+    }) => api.post('/home/provider-truth-miss-review/decision', payload).then(r => r.data),
+    onMutate: (payload) => {
+      setPendingProviderTruthMissReviewKey(payload.review_key ?? null)
+    },
+    onSettled: async () => {
+      setPendingProviderTruthMissReviewKey(null)
+      await queryClient.invalidateQueries({ queryKey: ['home-daily-crypto-brief'] })
+      await queryClient.invalidateQueries({ queryKey: ['home-action-board'] })
+      await queryClient.invalidateQueries({ queryKey: ['home-system-audit-confidence'] })
+    },
+  })
+
+  const recordProviderTruthMissReviewDecision = (
+    item: { review_key?: string | null; status?: string | null },
+    state: ProviderTruthMissReviewState,
+  ) => {
+    providerTruthMissReviewMutation.mutate({
+      review_key: item.review_key,
+      state,
+      packet_status: item.status,
+      operator_note:
+        state === 'APPROVED_FOR_IMPLEMENTATION'
+          ? 'Operator approved provider-truth miss packet for manual implementation review only.'
+          : state === 'REJECTED'
+            ? 'Operator rejected this provider-truth miss patch packet.'
+            : 'Operator held this provider-truth miss packet for more evidence.',
+    })
+  }
+
   const liveContextMissionMutation = useMutation({
     mutationFn: (payload: {
       mission_key?: string
@@ -10155,11 +10270,13 @@ export function HomePage() {
           onEscalationPatchAction={recordProviderEscalationPatchDecision}
           onEscalationWorkOrderAction={recordProviderEscalationWorkOrderDecision}
           onLiveContextMissionAction={recordLiveContextMissionDecision}
+          onProviderTruthMissReviewAction={recordProviderTruthMissReviewDecision}
           pendingEscalationId={pendingEscalationId}
           pendingEscalationReviewKey={pendingEscalationReviewKey}
           pendingEscalationPatchKey={pendingEscalationPatchKey}
           pendingEscalationWorkOrderKey={pendingEscalationWorkOrderKey}
           pendingLiveContextMissionKey={pendingLiveContextMissionKey}
+          pendingProviderTruthMissReviewKey={pendingProviderTruthMissReviewKey}
         />
       </div>
 

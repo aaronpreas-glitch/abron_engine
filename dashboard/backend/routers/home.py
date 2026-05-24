@@ -39,6 +39,7 @@ _DAILY_BRIEF_OUTCOME_AUTORUN_MIN_SECONDS = max(
 _PROVIDER_ESCALATION_REVIEW_STATES_KEY = "provider_escalation_review_states"
 _PROVIDER_ESCALATION_PATCH_STATES_KEY = "provider_escalation_patch_states"
 _PROVIDER_ESCALATION_WORK_ORDER_STATES_KEY = "provider_escalation_work_order_states"
+_PROVIDER_TRUTH_MISS_REVIEW_STATES_KEY = "provider_truth_miss_review_states"
 _LIVE_CONTEXT_MISSION_STATES_KEY = "live_context_mission_states"
 _LIVE_CONTEXT_MISSION_OUTCOME_JOURNAL_KEY = "live_context_mission_outcome_journal"
 _REPLAY_EVIDENCE_SNAPSHOT_KEY = "replay_evidence_snapshot"
@@ -51,6 +52,7 @@ _PROVIDER_ESCALATION_REVIEW_OPEN_STATES = {
 _PROVIDER_ESCALATION_REVIEW_CLOSED_STATES = {"FALSE_ALARM", "RESOLVED"}
 _PROVIDER_ESCALATION_PATCH_STATES = {"WATCH", "NEEDS_MORE_DATA", "READY_FOR_IMPLEMENTATION"}
 _PROVIDER_ESCALATION_WORK_ORDER_STATES = {"READY", "STARTED", "BLOCKED", "COMPLETE"}
+_PROVIDER_TRUTH_MISS_REVIEW_STATES = {"PENDING_REVIEW", "APPROVED_FOR_IMPLEMENTATION", "NEEDS_MORE_EVIDENCE", "REJECTED", "AUTO_FROZEN"}
 _LIVE_CONTEXT_MISSION_STATES = {
     "NEW",
     "INVESTIGATING",
@@ -19266,6 +19268,287 @@ def _build_provider_truth_patch_confidence_curve(
     }
 
 
+def _provider_truth_review_key(packet: dict) -> str:
+    parts = [
+        str(packet.get("patch_type") or "UNKNOWN").upper(),
+        _provider_truth_learning_source(packet.get("source")),
+        _provider_source_key(packet.get("preferred_source")),
+        str(packet.get("route") or "").upper(),
+        str(packet.get("failure_class") or "").lower(),
+    ]
+    return "provider_truth_miss:" + ":".join(parts)
+
+
+def _build_provider_truth_manual_review_packet(
+    miss_review: dict,
+    miss_repair_workbench: dict,
+    accumulator_score: dict,
+    timeline: dict,
+    before_after: dict,
+    confidence_curve: dict,
+    now: datetime,
+) -> dict:
+    top = dict((miss_review or {}).get("top_case") or {})
+    if not top:
+        return {
+            "status": "NO_CANDIDATE",
+            "review_key": None,
+            "manual_only": True,
+            "policy_change_allowed": False,
+            "next_action": "No provider-truth patch candidate is ready for review.",
+        }
+
+    patch = dict(top.get("patch_candidate") or {})
+    patch_type = str((miss_repair_workbench or {}).get("patch_type") or patch.get("patch_type") or top.get("repair_kind") or "UNKNOWN").upper()
+    source = _provider_truth_learning_source(top.get("source"))
+    preferred_source = _provider_source_key(top.get("current_source"))
+    route = str(top.get("route") or "").upper()
+    sample_n = int((accumulator_score or {}).get("sample_n") or 0)
+    needed_n = int((accumulator_score or {}).get("needed_sample_n") or 3)
+    benefit = int((accumulator_score or {}).get("benefit_count") or 0)
+    risk = int((accumulator_score or {}).get("risk_count") or 0)
+    false_confirms = int((accumulator_score or {}).get("false_confirm_count") or 0)
+    confidence = _nullable_float((confidence_curve or {}).get("confidence_score"))
+    readiness = str((accumulator_score or {}).get("readiness_state") or "NOT_READY").upper()
+
+    if patch_type == "SOURCE_PRECEDENCE_UPDATE":
+        exact_change = (
+            f"For unresolved provider-truth misses from {source}, prefer {preferred_source} only for "
+            "manual review/routing when current data is LIVE or RECENT, confidence is not LOW, "
+            "and accumulated evidence remains benefit-positive."
+        )
+    elif patch_type == "FALLBACK_ROUTE_EXPANSION":
+        exact_change = (
+            f"Expand fallback route {route or 'UNKNOWN'} only for manual review when current data is "
+            "LIVE or RECENT and confidence is not LOW."
+        )
+    elif patch_type == "RETRY_CADENCE_TIGHTEN":
+        exact_change = (
+            f"Tighten retry cadence for unresolved route {route or 'UNKNOWN'} when quality and pressure "
+            "stay above the evidence threshold."
+        )
+    else:
+        exact_change = "No automatic policy edit is defined; implementation must be written and reviewed manually."
+
+    packet = {
+        "status": "READY_FOR_OPERATOR_REVIEW" if readiness == "READY_FOR_REVIEW" else "WAITING_FOR_EVIDENCE",
+        "review_key": None,
+        "created_at": now.isoformat(),
+        "candidate_symbol": top.get("symbol"),
+        "candidate_mint": top.get("mint"),
+        "patch_type": patch_type,
+        "source": source,
+        "preferred_source": preferred_source,
+        "route": route or None,
+        "failure_class": top.get("failure_class"),
+        "recommendation": top.get("recommendation"),
+        "exact_rule_change": exact_change,
+        "candidate_rule": patch.get("candidate_rule"),
+        "evidence_summary": {
+            "sample_n": sample_n,
+            "needed_sample_n": needed_n,
+            "benefit_count": benefit,
+            "risk_count": risk,
+            "neutral_count": int((accumulator_score or {}).get("neutral_count") or 0),
+            "false_confirm_count": false_confirms,
+            "readiness_state": readiness,
+        },
+        "timeline_summary": {
+            "event_count": int((timeline or {}).get("event_count") or 0),
+            "refresh_event_count": int((timeline or {}).get("refresh_event_count") or 0),
+            "latest_event_at": (timeline or {}).get("latest_event_at"),
+            "before_after_status": (before_after or {}).get("status"),
+            "improved_count": int((before_after or {}).get("improved_count") or 0),
+            "worsened_count": int((before_after or {}).get("worsened_count") or 0),
+            "confidence_score": confidence,
+            "confidence_trend": (confidence_curve or {}).get("trend"),
+            "confidence_points": int((confidence_curve or {}).get("point_count") or 0),
+        },
+        "guardrails": [
+            "Manual approval is required before any implementation work.",
+            "Approval does not re-arm live buying.",
+            "Approval does not automatically edit provider precedence.",
+            "Dry-run preview must remain benefit-positive and risk-zero.",
+            "Post-approval watchdog can freeze the review state on regression.",
+        ],
+        "manual_only": True,
+        "would_change_policy": False,
+        "policy_change_allowed": False,
+        "next_action": (
+            "Review the packet, dry-run preview, and watchdog before marking implementation approved."
+            if readiness == "READY_FOR_REVIEW"
+            else "Keep collecting evidence before operator review."
+        ),
+    }
+    packet["review_key"] = _provider_truth_review_key(packet)
+    return packet
+
+
+def _build_provider_truth_approval_gate(review_packet: dict, now: datetime) -> dict:
+    review_key = str((review_packet or {}).get("review_key") or "").strip()
+    if not review_key:
+        return {
+            "status": "NO_REVIEW_PACKET",
+            "review_key": None,
+            "approval_state": "WAITING_FOR_CANDIDATE",
+            "manual_required": True,
+            "policy_change_allowed": False,
+            "next_action": "No provider-truth review packet is available.",
+        }
+
+    states = _review_state_map(json.dumps(_freshness_kv_read(_PROVIDER_TRUTH_MISS_REVIEW_STATES_KEY)))
+    state_record = dict(states.get(review_key) or {})
+    packet_ready = str((review_packet or {}).get("status") or "").upper() == "READY_FOR_OPERATOR_REVIEW"
+    state = str(state_record.get("state") or ("PENDING_REVIEW" if packet_ready else "NEEDS_MORE_EVIDENCE")).upper()
+    if state not in _PROVIDER_TRUTH_MISS_REVIEW_STATES:
+        state = "PENDING_REVIEW" if packet_ready else "NEEDS_MORE_EVIDENCE"
+    if state == "APPROVED_FOR_IMPLEMENTATION" and not packet_ready:
+        state = "NEEDS_MORE_EVIDENCE"
+
+    policy_change_allowed = bool(state == "APPROVED_FOR_IMPLEMENTATION" and packet_ready)
+    return {
+        "status": "APPROVED" if policy_change_allowed else "FROZEN" if state == "AUTO_FROZEN" else "PENDING",
+        "review_key": review_key,
+        "approval_state": state,
+        "state_updated_at": state_record.get("updated_at"),
+        "operator_note": state_record.get("note"),
+        "manual_required": True,
+        "packet_ready": packet_ready,
+        "policy_change_allowed": policy_change_allowed,
+        "auto_apply_enabled": False,
+        "live_buying_armed": False,
+        "requires_code_review": True,
+        "next_action": (
+            "Approved for manual implementation review only; do not auto-apply provider policy."
+            if policy_change_allowed
+            else "Review packet is frozen after regression; collect fresh evidence before implementation."
+            if state == "AUTO_FROZEN"
+            else "Operator approval is required before implementation can begin."
+            if packet_ready
+            else "Approval gate is waiting for stronger evidence."
+        ),
+    }
+
+
+def _build_provider_truth_dry_run_policy_preview(
+    review_packet: dict,
+    approval_gate: dict,
+    accumulator_score: dict,
+    matcher: dict,
+    now: datetime,
+) -> dict:
+    patch_type = str((review_packet or {}).get("patch_type") or "UNKNOWN").upper()
+    items = []
+    benefit = 0
+    risk = 0
+    neutral = 0
+    evidence_items = list((accumulator_score or {}).get("items") or []) or list((matcher or {}).get("items") or [])
+    for raw in evidence_items[:30]:
+        item = dict(raw)
+        outcome = str(item.get("evidence_outcome") or item.get("evidence_label") or "").upper()
+        if outcome == "EVIDENCE_BENEFIT":
+            benefit += 1
+            simulated_change = "WOULD_SEND_TO_MANUAL_SECOND_SOURCE_REVIEW"
+        elif outcome == "EVIDENCE_RISK":
+            risk += 1
+            simulated_change = "WOULD_KEEP_BLOCKED"
+        else:
+            neutral += 1
+            simulated_change = "WOULD_KEEP_WATCHING"
+        items.append({
+            "symbol": item.get("symbol"),
+            "mint": item.get("mint"),
+            "current_source": item.get("current_source"),
+            "source": item.get("source"),
+            "quality": item.get("current_quality") if item.get("current_quality") is not None else item.get("quality"),
+            "pressure": item.get("current_pressure") if item.get("current_pressure") is not None else item.get("pressure"),
+            "evidence_outcome": outcome or None,
+            "simulated_change": simulated_change,
+            "would_buy": False,
+        })
+
+    approved = bool((approval_gate or {}).get("policy_change_allowed"))
+    status = "APPROVED_DRY_RUN_READY" if approved and benefit > risk and risk == 0 else "DRY_RUN_READY" if items else "NO_PREVIEW"
+    return {
+        "status": status,
+        "read_only": True,
+        "manual_only": True,
+        "patch_type": patch_type,
+        "candidate_rule": (review_packet or {}).get("exact_rule_change"),
+        "preview_count": len(items),
+        "would_help_count": benefit,
+        "would_risk_count": risk,
+        "would_neutral_count": neutral,
+        "would_buy_count": 0,
+        "policy_change_allowed": approved,
+        "items": items[:12],
+        "next_action": (
+            "Dry-run is clean; implementation still requires code review and watchdog monitoring."
+            if approved and risk == 0 and benefit > 0
+            else "Dry-run has risk or lacks benefit; keep the patch blocked."
+            if items
+            else "No dry-run candidates are available yet."
+        ),
+        "updated_at": now.isoformat(),
+    }
+
+
+def _build_provider_truth_post_approval_watchdog(
+    review_packet: dict,
+    approval_gate: dict,
+    dry_run_preview: dict,
+    accumulator_score: dict,
+    before_after: dict,
+    confidence_curve: dict,
+    now: datetime,
+) -> dict:
+    approved = bool((approval_gate or {}).get("policy_change_allowed"))
+    review_key = str((review_packet or {}).get("review_key") or "")
+    risk_count = int((accumulator_score or {}).get("risk_count") or 0) + int((dry_run_preview or {}).get("would_risk_count") or 0)
+    worsened = int((before_after or {}).get("worsened_count") or 0)
+    trend = str((confidence_curve or {}).get("trend") or "").upper()
+    confidence = _gb_float((confidence_curve or {}).get("confidence_score"))
+    freeze = bool(approved and (risk_count > 0 or worsened > 0 or trend == "WEAKENING" or confidence < 55))
+
+    if freeze and review_key:
+        states = _freshness_kv_read(_PROVIDER_TRUTH_MISS_REVIEW_STATES_KEY)
+        state_record = dict(states.get(review_key) or {})
+        if str(state_record.get("state") or "").upper() != "AUTO_FROZEN":
+            states[review_key] = {
+                **state_record,
+                "state": "AUTO_FROZEN",
+                "updated_at": now.isoformat(),
+                "note": "Auto-frozen by provider-truth post-approval watchdog after regression/risk signal.",
+            }
+            _freshness_kv_write(_PROVIDER_TRUTH_MISS_REVIEW_STATES_KEY, states)
+
+    status = "AUTO_FROZEN" if freeze else "ARMED" if approved else "STANDBY"
+    return {
+        "status": status,
+        "review_key": review_key or None,
+        "approved": approved,
+        "freeze_triggered": freeze,
+        "risk_count": risk_count,
+        "worsened_count": worsened,
+        "confidence_score": confidence,
+        "confidence_trend": trend or None,
+        "checks": [
+            {"name": "risk_zero", "passed": risk_count == 0, "value": risk_count},
+            {"name": "no_worsening_before_after", "passed": worsened == 0, "value": worsened},
+            {"name": "confidence_not_weakening", "passed": trend != "WEAKENING", "value": trend or "WAITING"},
+            {"name": "confidence_floor", "passed": confidence >= 55 or not approved, "value": confidence},
+        ],
+        "next_action": (
+            "Patch review was auto-frozen; do not implement until fresh evidence clears the regression."
+            if freeze
+            else "Watchdog armed; continue monitoring after manual implementation review."
+            if approved
+            else "Watchdog is standing by until explicit approval."
+        ),
+        "updated_at": now.isoformat(),
+    }
+
+
 def _build_provider_truth_miss_evidence_accumulator(
     miss_review: dict,
     miss_repair_workbench: dict,
@@ -19289,6 +19572,26 @@ def _build_provider_truth_miss_evidence_accumulator(
     timeline = _build_provider_truth_miss_evidence_timeline(matcher, queue_after_refresh, refresh, now)
     before_after = _build_provider_truth_before_after_score(timeline, now)
     confidence_curve = _build_provider_truth_patch_confidence_curve(score, timeline, before_after, now)
+    review_packet = _build_provider_truth_manual_review_packet(
+        miss_review,
+        miss_repair_workbench,
+        score,
+        timeline,
+        before_after,
+        confidence_curve,
+        now,
+    )
+    approval_gate = _build_provider_truth_approval_gate(review_packet, now)
+    dry_run_preview = _build_provider_truth_dry_run_policy_preview(review_packet, approval_gate, score, matcher, now)
+    post_approval_watchdog = _build_provider_truth_post_approval_watchdog(
+        review_packet,
+        approval_gate,
+        dry_run_preview,
+        score,
+        before_after,
+        confidence_curve,
+        now,
+    )
     return {
         "status": score.get("status"),
         "readiness_state": score.get("readiness_state"),
@@ -19299,7 +19602,11 @@ def _build_provider_truth_miss_evidence_accumulator(
         "evidence_timeline": timeline,
         "before_after_score": before_after,
         "patch_confidence_curve": confidence_curve,
-        "next_action": score.get("next_action"),
+        "manual_review_packet": review_packet,
+        "approval_gate": approval_gate,
+        "dry_run_policy_preview": dry_run_preview,
+        "post_approval_watchdog": post_approval_watchdog,
+        "next_action": approval_gate.get("next_action") or score.get("next_action"),
     }
 
 
@@ -19672,6 +19979,10 @@ def _build_dashboard_provider_truth_panel(
     miss_evidence_timeline = dict(miss_evidence_accumulator.get("evidence_timeline") or {})
     miss_evidence_before_after = dict(miss_evidence_accumulator.get("before_after_score") or {})
     miss_evidence_curve = dict(miss_evidence_accumulator.get("patch_confidence_curve") or {})
+    miss_review_packet = dict(miss_evidence_accumulator.get("manual_review_packet") or {})
+    miss_approval_gate = dict(miss_evidence_accumulator.get("approval_gate") or {})
+    miss_dry_run = dict(miss_evidence_accumulator.get("dry_run_policy_preview") or {})
+    miss_watchdog = dict(miss_evidence_accumulator.get("post_approval_watchdog") or {})
     status = (
         "BLOCKED"
         if str((agreement_layer or {}).get("status") or "").upper() == "BLOCKED"
@@ -19740,6 +20051,17 @@ def _build_dashboard_provider_truth_panel(
         "miss_confidence_score": miss_evidence_curve.get("confidence_score"),
         "miss_confidence_trend": miss_evidence_curve.get("trend"),
         "miss_confidence_point_count": int(miss_evidence_curve.get("point_count") or 0),
+        "miss_review_packet_status": miss_review_packet.get("status"),
+        "miss_review_key": miss_review_packet.get("review_key"),
+        "miss_approval_state": miss_approval_gate.get("approval_state"),
+        "miss_approval_status": miss_approval_gate.get("status"),
+        "miss_policy_change_allowed": bool(miss_approval_gate.get("policy_change_allowed")),
+        "miss_dry_run_status": miss_dry_run.get("status"),
+        "miss_dry_run_preview_count": int(miss_dry_run.get("preview_count") or 0),
+        "miss_dry_run_help_count": int(miss_dry_run.get("would_help_count") or 0),
+        "miss_dry_run_risk_count": int(miss_dry_run.get("would_risk_count") or 0),
+        "miss_watchdog_status": miss_watchdog.get("status"),
+        "miss_watchdog_freeze_triggered": bool(miss_watchdog.get("freeze_triggered")),
         "top_symbol": top_agreement.get("symbol"),
         "top_status": top_agreement.get("status"),
         "top_best_source": top_arbitration.get("best_source"),
@@ -25618,6 +25940,59 @@ async def home_provider_escalation_patch_decision(
             "updated_at": now,
             "operator_note": note,
             "manual_only": True,
+        }
+
+    try:
+        return await _aio.to_thread(_run)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post("/provider-truth-miss-review/decision")
+async def home_provider_truth_miss_review_decision(
+    body: dict,
+    _: str = Depends(get_current_user),
+):
+    import asyncio as _aio
+
+    state = str(body.get("state") or body.get("review_state") or body.get("action") or "").strip().upper()
+    aliases = {
+        "APPROVE": "APPROVED_FOR_IMPLEMENTATION",
+        "APPROVED": "APPROVED_FOR_IMPLEMENTATION",
+        "HOLD": "NEEDS_MORE_EVIDENCE",
+        "MORE_EVIDENCE": "NEEDS_MORE_EVIDENCE",
+        "REJECT": "REJECTED",
+        "FREEZE": "AUTO_FROZEN",
+    }
+    state = aliases.get(state, state)
+    if state not in _PROVIDER_TRUTH_MISS_REVIEW_STATES:
+        raise HTTPException(status_code=422, detail=f"state must be one of {sorted(_PROVIDER_TRUTH_MISS_REVIEW_STATES)}")
+    review_key = str(body.get("review_key") or "").strip()
+    if not review_key:
+        raise HTTPException(status_code=422, detail="review_key is required")
+    packet_status = str(body.get("packet_status") or "").strip().upper()
+    if state == "APPROVED_FOR_IMPLEMENTATION" and packet_status and packet_status != "READY_FOR_OPERATOR_REVIEW":
+        raise HTTPException(status_code=422, detail="provider-truth review packet must be READY_FOR_OPERATOR_REVIEW before approval")
+    note = str(body.get("operator_note") or body.get("note") or "").strip()[:500] or None
+
+    def _run() -> dict:
+        now = datetime.now(timezone.utc).isoformat()
+        states = _freshness_kv_read(_PROVIDER_TRUTH_MISS_REVIEW_STATES_KEY)
+        states[review_key] = {
+            "state": state,
+            "updated_at": now,
+            "note": note,
+            "packet_status": packet_status or None,
+        }
+        _freshness_kv_write(_PROVIDER_TRUTH_MISS_REVIEW_STATES_KEY, states)
+        return {
+            "ok": True,
+            "review_key": review_key,
+            "state": state,
+            "updated_at": now,
+            "operator_note": note,
+            "manual_only": True,
+            "policy_auto_apply": False,
         }
 
     try:
