@@ -18131,10 +18131,19 @@ def _build_provider_truth_learning_score(
                 "mint": row.get("mint"),
                 "source": source,
                 "label": label,
+                "route": row.get("route"),
+                "reason": row.get("reason"),
+                "failure_class": row.get("failure_class"),
+                "provider_path": row.get("provider_path"),
+                "checked_at": row.get("ts_utc"),
+                "current_source": current.get("market_source"),
                 "current_freshness": current.get("data_freshness"),
                 "current_confidence": current.get("data_confidence"),
                 "current_quality": _nullable_float(current.get("quality_score")),
                 "current_pressure": _nullable_float(current.get("pressure_score")),
+                "current_marketcap": _nullable_float(current.get("marketcap")),
+                "current_liquidity": _nullable_float(current.get("liquidity")),
+                "current_volume_24h_usd": _nullable_float(current.get("volume_24h_usd")),
             })
 
     for queue_item in list((queue_health or {}).get("items") or []):
@@ -18232,6 +18241,7 @@ def _build_provider_truth_learning_score(
             "sample_n": len(unresolved_items),
             "correct_count": len([x for x in unresolved_items if x.get("label") == "CORRECT_UNRESOLVED"]),
             "missed_count": len([x for x in unresolved_items if x.get("label") == "MISSED_UNRESOLVED"]),
+            "missed_items": [x for x in unresolved_items if x.get("label") == "MISSED_UNRESOLVED"][:8],
             "items": unresolved_items[:10],
         },
         "queue_decision_score": {
@@ -18280,6 +18290,157 @@ def _apply_provider_truth_learning_to_source_map(source_map: dict, learning: dic
     out["provider_truth_learning_status"] = (learning or {}).get("status")
     out["provider_truth_accuracy_pct"] = (learning or {}).get("accuracy_pct")
     return out
+
+
+def _build_provider_truth_miss_review(
+    learning_score: dict,
+    truth_memory: dict,
+    queue_health: dict | None,
+    intelligence_rows: list[dict],
+    now: datetime,
+) -> dict:
+    missed = [
+        dict(item) for item in (
+            list(((learning_score or {}).get("unresolved_score") or {}).get("missed_items") or [])
+            or list(((learning_score or {}).get("unresolved_score") or {}).get("items") or [])
+        )
+        if str(item.get("label") or "").upper() == "MISSED_UNRESOLVED"
+    ]
+    if not missed:
+        return {
+            "status": "CLEAR",
+            "miss_count": 0,
+            "items": [],
+            "top_case": None,
+            "next_action": "No missed unresolved provider-truth cases are active.",
+        }
+
+    current_by_key = _provider_truth_current_by_key(intelligence_rows)
+    history_by_key = _provider_truth_memory_history_by_key(truth_memory)
+    queue_by_key = {
+        _provider_truth_queue_key(item): dict(item)
+        for item in list((queue_health or {}).get("items") or [])
+        if _provider_truth_queue_key(item)
+    }
+    items = []
+    for miss in missed:
+        key = _provider_truth_queue_key(miss)
+        current = _provider_truth_current_for_row(miss, current_by_key)
+        history = history_by_key.get(key) or []
+        unresolved_history = [row for row in history if str(row.get("confirmation_status") or "").upper() == "UNRESOLVED"]
+        last_unresolved = unresolved_history[0] if unresolved_history else {}
+        queue_item = queue_by_key.get(key, {})
+        checked = _gb_parse_ts(miss.get("checked_at") or last_unresolved.get("ts_utc"))
+        age_minutes = round(max(0.0, (now - checked).total_seconds() / 60.0), 1) if checked else None
+        quality = _gb_float(miss.get("current_quality"), _gb_float(current.get("quality_score")))
+        pressure = _gb_float(miss.get("current_pressure"), _gb_float(current.get("pressure_score")))
+        marketcap = _gb_float(miss.get("current_marketcap"), _gb_float(current.get("marketcap")))
+        liquidity = _gb_float(miss.get("current_liquidity"), _gb_float(current.get("liquidity")))
+        freshness = str(miss.get("current_freshness") or current.get("data_freshness") or "").upper()
+        confidence = str(miss.get("current_confidence") or current.get("data_confidence") or "").upper()
+        source = _provider_truth_learning_source(miss.get("source") or last_unresolved.get("current_source"))
+        current_source = _provider_source_key(miss.get("current_source") or current.get("market_source"))
+
+        severity_score = 0.0
+        severity_score += min(35.0, quality * 0.35)
+        severity_score += min(25.0, pressure * 0.25)
+        if freshness == "LIVE":
+            severity_score += 14.0
+        elif freshness == "RECENT":
+            severity_score += 8.0
+        if confidence == "HIGH":
+            severity_score += 10.0
+        elif confidence == "LOW":
+            severity_score -= 8.0
+        if liquidity >= 100_000:
+            severity_score += 8.0
+        elif liquidity >= 25_000:
+            severity_score += 4.0
+        if marketcap >= 1_000_000:
+            severity_score += 8.0
+        elif marketcap >= 250_000:
+            severity_score += 4.0
+        retry_count = int(_gb_float(queue_item.get("retry_count"), len(unresolved_history)))
+        if retry_count >= 2:
+            severity_score += 4.0
+        severity_score = round(max(0.0, min(100.0, severity_score)), 1)
+        severity = "HIGH" if severity_score >= 75 else "MEDIUM" if severity_score >= 55 else "LOW"
+
+        route = str(miss.get("route") or last_unresolved.get("route") or queue_item.get("route") or "").upper()
+        failure_class = str(miss.get("failure_class") or last_unresolved.get("failure_class") or "unknown").lower()
+        reason = str(miss.get("reason") or last_unresolved.get("reason") or queue_item.get("reason") or "").strip()
+        if current_source and current_source != source and current_source not in {"unknown", "cache"}:
+            repair_kind = "SOURCE_PRECEDENCE_UPDATE"
+            recommendation = f"Prefer {current_source} when {source} leaves a live/high-quality token unresolved."
+        elif "provider_miss" in failure_class or "missing" in reason.lower():
+            repair_kind = "FALLBACK_ROUTE_EXPANSION"
+            recommendation = "Expand alternate live-market routing for this unresolved pattern before blocking similar names."
+        elif retry_count <= 1:
+            repair_kind = "RETRY_CADENCE_TIGHTEN"
+            recommendation = "Shorten the second retry window for medium/high-severity unresolved names."
+        else:
+            repair_kind = "MANUAL_REVIEW_ESCALATION"
+            recommendation = "Escalate repeated high-quality unresolved names to provider-truth review."
+
+        patch_candidate = {
+            "status": "REVIEW_ONLY",
+            "would_change_policy": False,
+            "patch_type": repair_kind,
+            "guardrails": [
+                "Do not re-arm live buying.",
+                "Apply only after at least 3 similar missed unresolved cases or manual approval.",
+                "Require LIVE/RECENT current data and non-low confidence before loosening a block.",
+            ],
+            "candidate_rule": (
+                f"If provider truth route {route or 'UNKNOWN'} is unresolved but a trusted current source is LIVE/RECENT, "
+                "send to second-source retry or manual review instead of leaving it as a silent block."
+            ),
+        }
+        explanation = (
+            f"{miss.get('symbol') or 'UNKNOWN'} was marked unresolved from {source}, "
+            f"but current intelligence is {freshness or 'UNKNOWN'}/{confidence or 'UNKNOWN'} "
+            f"with quality {round(quality, 1)} and pressure {round(pressure, 1)}."
+        )
+        items.append({
+            "symbol": miss.get("symbol"),
+            "mint": miss.get("mint"),
+            "source": source,
+            "current_source": current_source,
+            "route": route or None,
+            "failure_class": failure_class,
+            "reason": reason,
+            "checked_at": miss.get("checked_at") or last_unresolved.get("ts_utc"),
+            "age_minutes": age_minutes,
+            "retry_count": retry_count,
+            "severity": severity,
+            "severity_score": severity_score,
+            "current_freshness": freshness or None,
+            "current_confidence": confidence or None,
+            "current_quality": round(quality, 1),
+            "current_pressure": round(pressure, 1),
+            "current_marketcap": _nullable_float(marketcap),
+            "current_liquidity": _nullable_float(liquidity),
+            "explanation": explanation,
+            "repair_kind": repair_kind,
+            "recommendation": recommendation,
+            "patch_candidate": patch_candidate,
+        })
+
+    items.sort(key=lambda x: (_gb_float(x.get("severity_score")), _gb_float(x.get("current_marketcap"))), reverse=True)
+    top = items[0] if items else None
+    return {
+        "status": "REVIEW" if items else "CLEAR",
+        "miss_count": len(items),
+        "high_severity_count": len([item for item in items if str(item.get("severity")) == "HIGH"]),
+        "medium_severity_count": len([item for item in items if str(item.get("severity")) == "MEDIUM"]),
+        "items": items[:8],
+        "top_case": top,
+        "next_action": (
+            f"Review {top.get('symbol') or 'top miss'} before changing provider-truth thresholds."
+            if top
+            else "No missed unresolved provider-truth cases are active."
+        ),
+    }
 
 
 def _provider_truth_retry_delay_minutes(retry_count: int, high_impact: bool) -> int:
@@ -18631,6 +18792,7 @@ def _build_dashboard_provider_truth_panel(
     queue_health: dict | None = None,
     escalation_writer: dict | None = None,
     learning_score: dict | None = None,
+    miss_review: dict | None = None,
 ) -> dict:
     top_agreement = (list((agreement_layer or {}).get("items") or []) or [{}])[0]
     top_arbitration = dict((arbitration or {}).get("top") or {})
@@ -18640,6 +18802,7 @@ def _build_dashboard_provider_truth_panel(
     queue_health = dict(queue_health or {})
     escalation_writer = dict(escalation_writer or {})
     learning_score = dict(learning_score or {})
+    miss_review = dict(miss_review or {})
     status = (
         "BLOCKED"
         if str((agreement_layer or {}).get("status") or "").upper() == "BLOCKED"
@@ -18680,11 +18843,17 @@ def _build_dashboard_provider_truth_panel(
         "learning_judged_count": int(learning_score.get("judged_count") or 0),
         "learning_positive_count": int(learning_score.get("positive_count") or 0),
         "learning_negative_count": int(learning_score.get("negative_count") or 0),
+        "miss_review_status": miss_review.get("status"),
+        "miss_review_count": int(miss_review.get("miss_count") or 0),
+        "miss_review_high_severity_count": int(miss_review.get("high_severity_count") or 0),
+        "miss_review_top_symbol": (dict(miss_review.get("top_case") or {})).get("symbol"),
+        "miss_review_top_severity": (dict(miss_review.get("top_case") or {})).get("severity"),
+        "miss_review_repair_kind": (dict(miss_review.get("top_case") or {})).get("repair_kind"),
         "top_symbol": top_agreement.get("symbol"),
         "top_status": top_agreement.get("status"),
         "top_best_source": top_arbitration.get("best_source"),
         "top_best_score": top_arbitration.get("best_source_score"),
-        "next_action": queue_health.get("next_action") or (fallback_router or {}).get("next_action") or (agreement_layer or {}).get("next_action"),
+        "next_action": miss_review.get("next_action") or queue_health.get("next_action") or (fallback_router or {}).get("next_action") or (agreement_layer or {}).get("next_action"),
     }
 
 
@@ -18733,6 +18902,7 @@ def _build_provider_truth_layer(
     outcome_tracking = _build_provider_truth_outcome_tracking(truth_memory, intelligence_rows, now)
     learning_score = _build_provider_truth_learning_score(truth_memory, intelligence_rows, queue_health, outcome_tracking, now)
     source_map = _apply_provider_truth_learning_to_source_map(source_map_base, learning_score)
+    miss_review = _build_provider_truth_miss_review(learning_score, truth_memory, queue_health, intelligence_rows, now)
     truth_panel = _build_dashboard_provider_truth_panel(
         source_map,
         agreement_layer,
@@ -18744,6 +18914,7 @@ def _build_provider_truth_layer(
         queue_health,
         escalation_writer,
         learning_score,
+        miss_review,
     )
     return {
         "status": truth_panel.get("status"),
@@ -18757,6 +18928,7 @@ def _build_provider_truth_layer(
         "provider_truth_queue_health": queue_health,
         "provider_truth_escalation_writer": escalation_writer,
         "provider_truth_learning_score": learning_score,
+        "provider_truth_miss_review": miss_review,
         "dashboard_provider_truth_panel": truth_panel,
         "next_action": truth_panel.get("next_action"),
     }
