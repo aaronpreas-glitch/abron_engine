@@ -1159,6 +1159,30 @@ interface DailyCryptoBriefData {
         risk_count?: number
         worsened_count?: number
       }
+      patch_target_map?: {
+        status?: string
+        target_count?: number
+      }
+      implementation_checklist?: {
+        status?: string
+        passed_required?: number
+        total_required?: number
+      }
+      simulation_test_recipe?: {
+        status?: string
+        recipe_count?: number
+        target_count?: number
+      }
+      policy_patch_work_order?: {
+        status?: string
+        work_order_key?: string | null
+        target_count?: number
+        checklist_passed?: number
+        checklist_total?: number
+        recipe_count?: number
+        manual_only?: boolean
+        auto_apply_enabled?: boolean
+      }
       next_action?: string | null
     }
     dashboard_provider_truth_panel?: {
@@ -1229,6 +1253,12 @@ interface DailyCryptoBriefData {
       miss_dry_run_risk_count?: number
       miss_watchdog_status?: string | null
       miss_watchdog_freeze_triggered?: boolean
+      miss_work_order_status?: string | null
+      miss_work_order_key?: string | null
+      miss_work_order_target_count?: number
+      miss_work_order_checklist_passed?: number
+      miss_work_order_checklist_total?: number
+      miss_work_order_recipe_count?: number
       top_symbol?: string | null
       top_status?: string
       top_best_source?: string | null
@@ -5902,6 +5932,10 @@ function DailyCryptoBriefPanel({
     const providerTruthMissApprovalGate = providerTruthMissEvidence.approval_gate ?? {}
     const providerTruthMissDryRun = providerTruthMissEvidence.dry_run_policy_preview ?? {}
     const providerTruthMissWatchdog = providerTruthMissEvidence.post_approval_watchdog ?? {}
+    const providerTruthMissWorkOrder = providerTruthMissEvidence.policy_patch_work_order ?? {}
+    const providerTruthMissTargetMap = providerTruthMissEvidence.patch_target_map ?? {}
+    const providerTruthMissChecklist = providerTruthMissEvidence.implementation_checklist ?? {}
+    const providerTruthMissSimulation = providerTruthMissEvidence.simulation_test_recipe ?? {}
     const topProviderTruthItem = providerTruthAgreement.items?.[0]
     const topProviderTruthSource = providerTruthSourceMap.providers?.[0]
     const topFallbackRoute = providerTruthFallback.routes?.[0]
@@ -6474,6 +6508,9 @@ function DailyCryptoBriefPanel({
             </div>
             <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
               review {String(providerTruthPanel.miss_review_packet_status || providerTruthMissReviewPacket.status || 'waiting').replace(/_/g, ' ').toLowerCase()} · gate {String(providerTruthPanel.miss_approval_state || providerTruthMissApprovalGate.approval_state || 'pending').replace(/_/g, ' ').toLowerCase()} · dry {providerTruthPanel.miss_dry_run_help_count ?? providerTruthMissDryRun.would_help_count ?? 0}/{providerTruthPanel.miss_dry_run_risk_count ?? providerTruthMissDryRun.would_risk_count ?? 0} · watchdog {String(providerTruthPanel.miss_watchdog_status || providerTruthMissWatchdog.status || 'standby').replace(/_/g, ' ').toLowerCase()}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              work order {String(providerTruthPanel.miss_work_order_status || providerTruthMissWorkOrder.status || 'blocked by approval').replace(/_/g, ' ').toLowerCase()} · targets {providerTruthPanel.miss_work_order_target_count ?? providerTruthMissWorkOrder.target_count ?? providerTruthMissTargetMap.target_count ?? 0} · checklist {providerTruthPanel.miss_work_order_checklist_passed ?? providerTruthMissWorkOrder.checklist_passed ?? providerTruthMissChecklist.passed_required ?? 0}/{providerTruthPanel.miss_work_order_checklist_total ?? providerTruthMissWorkOrder.checklist_total ?? providerTruthMissChecklist.total_required ?? 0} · tests {providerTruthPanel.miss_work_order_recipe_count ?? providerTruthMissWorkOrder.recipe_count ?? providerTruthMissSimulation.recipe_count ?? 0}
             </div>
             {(providerTruthPanel.miss_review_key || providerTruthMissReviewPacket.review_key) && onProviderTruthMissReviewAction && (
               <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 8 }}>

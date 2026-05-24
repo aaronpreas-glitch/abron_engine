@@ -19549,6 +19549,264 @@ def _build_provider_truth_post_approval_watchdog(
     }
 
 
+def _build_provider_truth_patch_target_map(review_packet: dict, approval_gate: dict, now: datetime) -> dict:
+    patch_type = str((review_packet or {}).get("patch_type") or "UNKNOWN").upper()
+    source = str((review_packet or {}).get("source") or "").strip()
+    preferred = str((review_packet or {}).get("preferred_source") or "").strip()
+    if patch_type == "SOURCE_PRECEDENCE_UPDATE":
+        targets = [
+            {
+                "file": "dashboard/backend/routers/home.py",
+                "function": "_build_provider_truth_miss_repair_workbench",
+                "reason": "Replay applies the proposed source-precedence condition.",
+                "touch_type": "simulation_guard",
+            },
+            {
+                "file": "dashboard/backend/routers/home.py",
+                "function": "_build_provider_truth_dry_run_policy_preview",
+                "reason": "Dry-run must stay aligned with any manual implementation rule.",
+                "touch_type": "preview_guard",
+            },
+            {
+                "file": "utils/token_intelligence.py",
+                "function": "token_intelligence_fallback_confirmation_step",
+                "reason": f"Implementation review may route {source} misses toward {preferred} confirmation.",
+                "touch_type": "provider_routing_candidate",
+            },
+        ]
+    elif patch_type == "FALLBACK_ROUTE_EXPANSION":
+        targets = [
+            {
+                "file": "dashboard/backend/routers/home.py",
+                "function": "_build_fallback_provider_router",
+                "reason": "Fallback route expansion belongs in the provider-truth routing layer.",
+                "touch_type": "routing_candidate",
+            },
+            {
+                "file": "utils/token_intelligence.py",
+                "function": "token_intelligence_fallback_confirmation_step",
+                "reason": "Confirmation runner would need the expanded route included in read-only retries.",
+                "touch_type": "provider_routing_candidate",
+            },
+        ]
+    elif patch_type == "RETRY_CADENCE_TIGHTEN":
+        targets = [
+            {
+                "file": "dashboard/backend/routers/home.py",
+                "function": "_provider_truth_retry_delay_minutes",
+                "reason": "Retry cadence changes are isolated to the queue delay schedule.",
+                "touch_type": "cadence_candidate",
+            },
+            {
+                "file": "dashboard/backend/routers/home.py",
+                "function": "_build_provider_truth_queue_health",
+                "reason": "Queue health must show the revised retry windows and escalation state.",
+                "touch_type": "queue_candidate",
+            },
+        ]
+    else:
+        targets = [
+            {
+                "file": "dashboard/backend/routers/home.py",
+                "function": "_build_provider_truth_layer",
+                "reason": "Unknown patch type requires manual inspection before choosing a target.",
+                "touch_type": "manual_inspection",
+            }
+        ]
+    return {
+        "status": "MAPPED" if targets else "NO_TARGETS",
+        "review_key": (review_packet or {}).get("review_key"),
+        "patch_type": patch_type,
+        "target_count": len(targets),
+        "targets": targets,
+        "approval_required": True,
+        "approval_state": (approval_gate or {}).get("approval_state"),
+        "next_action": (
+            "Targets are mapped; build the implementation checklist before editing code."
+            if targets
+            else "No patch targets mapped yet."
+        ),
+        "updated_at": now.isoformat(),
+    }
+
+
+def _build_provider_truth_implementation_checklist(
+    review_packet: dict,
+    approval_gate: dict,
+    target_map: dict,
+    dry_run_preview: dict,
+    post_approval_watchdog: dict,
+    now: datetime,
+) -> dict:
+    approved = bool((approval_gate or {}).get("policy_change_allowed"))
+    dry_run_clean = int((dry_run_preview or {}).get("would_help_count") or 0) > 0 and int((dry_run_preview or {}).get("would_risk_count") or 0) == 0
+    watchdog_clear = not bool((post_approval_watchdog or {}).get("freeze_triggered"))
+    items = [
+        {
+            "key": "manual_approval_recorded",
+            "label": "Manual approval recorded",
+            "required": True,
+            "passed": approved,
+        },
+        {
+            "key": "target_map_complete",
+            "label": "Patch target map complete",
+            "required": True,
+            "passed": int((target_map or {}).get("target_count") or 0) > 0,
+        },
+        {
+            "key": "dry_run_clean",
+            "label": "Dry-run preview remains benefit-positive and risk-zero",
+            "required": True,
+            "passed": dry_run_clean,
+        },
+        {
+            "key": "watchdog_clear",
+            "label": "Post-approval watchdog has no freeze trigger",
+            "required": True,
+            "passed": watchdog_clear,
+        },
+        {
+            "key": "live_buy_lock",
+            "label": "Live buying remains locked",
+            "required": True,
+            "passed": True,
+        },
+        {
+            "key": "code_review_required",
+            "label": "Implementation must be a separate reviewed code change",
+            "required": True,
+            "passed": False,
+        },
+    ]
+    required = [item for item in items if item.get("required")]
+    passed = len([item for item in required if item.get("passed")])
+    status = "READY_AFTER_APPROVAL" if approved and dry_run_clean and watchdog_clear else "BLOCKED_BY_APPROVAL" if not approved else "BLOCKED_BY_GUARDRAIL"
+    return {
+        "status": status,
+        "review_key": (review_packet or {}).get("review_key"),
+        "passed_required": passed,
+        "total_required": len(required),
+        "items": items,
+        "rollback_conditions": [
+            "Any EVIDENCE_RISK item appears in accumulated refresh evidence.",
+            "Before/after score reports a worsened case.",
+            "Confidence curve turns WEAKENING or falls below 55.",
+            "Dry-run preview shows any would-risk candidate.",
+            "Any runtime traceback, DB lock, or provider-truth regression appears after implementation.",
+        ],
+        "manual_requirements": [
+            "Explicit operator approval in the provider-truth review gate.",
+            "Separate code patch and review.",
+            "Production smoke with live execution flag unset.",
+            "No open or executed live memecoin trades from the patch path.",
+        ],
+        "next_action": (
+            "Approval is recorded; run the simulation recipe before implementation."
+            if status == "READY_AFTER_APPROVAL"
+            else "Keep work order blocked until the provider-truth review is explicitly approved."
+            if status == "BLOCKED_BY_APPROVAL"
+            else "Resolve failed guardrails before implementation."
+        ),
+        "updated_at": now.isoformat(),
+    }
+
+
+def _build_provider_truth_simulation_test_recipe(
+    review_packet: dict,
+    target_map: dict,
+    implementation_checklist: dict,
+    now: datetime,
+) -> dict:
+    review_key = str((review_packet or {}).get("review_key") or "")
+    recipe = [
+        {
+            "name": "backend_compile",
+            "command": "python3 -m py_compile dashboard/backend/routers/home.py dashboard/backend/main.py dashboard/backend/snapshot_cache.py utils/token_intelligence.py",
+            "expected": "All files compile without syntax errors.",
+        },
+        {
+            "name": "provider_truth_brief_replay",
+            "command": "PYTHONPATH=/root/memecoin_engine:/root/memecoin_engine/dashboard/backend python3 - <<'PY'\nfrom dashboard.backend.routers.home import _build_daily_crypto_brief\nbrief=_build_daily_crypto_brief(24)\nacc=brief['provider_truth_layer']['provider_truth_miss_evidence_accumulator']\nprint(acc['manual_review_packet']['status'], acc['approval_gate']['approval_state'], acc['dry_run_policy_preview']['would_risk_count'])\nPY",
+            "expected": "Packet is visible, approval state is explicit, dry-run risk count is zero.",
+        },
+        {
+            "name": "dry_run_no_buy_check",
+            "command": "Inspect provider_truth_miss_evidence_accumulator.dry_run_policy_preview.would_buy_count",
+            "expected": "would_buy_count remains 0.",
+        },
+        {
+            "name": "watchdog_regression_check",
+            "command": "Inspect provider_truth_miss_evidence_accumulator.post_approval_watchdog",
+            "expected": "freeze_triggered is false before implementation; auto-freeze is active after approval if risk appears.",
+        },
+        {
+            "name": "production_safety_smoke",
+            "command": "systemctl is-active memecoin-engine memecoin-dashboard nginx && curl /api/health && verify MEMECOIN_LIVE_EXECUTION_CONFIRMED is unset",
+            "expected": "Services active, health 200, live execution remains locked.",
+        },
+    ]
+    status = "READY_AFTER_APPROVAL" if str((implementation_checklist or {}).get("status") or "") == "READY_AFTER_APPROVAL" else "BLOCKED_BY_APPROVAL"
+    return {
+        "status": status,
+        "review_key": review_key or None,
+        "recipe_count": len(recipe),
+        "target_count": int((target_map or {}).get("target_count") or 0),
+        "recipes": recipe,
+        "next_action": (
+            "Run these simulation checks before any manual implementation patch."
+            if status == "READY_AFTER_APPROVAL"
+            else "Simulation recipe is prepared but blocked until approval."
+        ),
+        "updated_at": now.isoformat(),
+    }
+
+
+def _build_provider_truth_policy_work_order(
+    review_packet: dict,
+    approval_gate: dict,
+    target_map: dict,
+    implementation_checklist: dict,
+    simulation_recipe: dict,
+    post_approval_watchdog: dict,
+    now: datetime,
+) -> dict:
+    review_key = str((review_packet or {}).get("review_key") or "")
+    approved = bool((approval_gate or {}).get("policy_change_allowed"))
+    frozen = bool((post_approval_watchdog or {}).get("freeze_triggered")) or str((approval_gate or {}).get("approval_state") or "").upper() == "AUTO_FROZEN"
+    checklist_ready = str((implementation_checklist or {}).get("status") or "") == "READY_AFTER_APPROVAL"
+    if frozen:
+        status = "AUTO_FROZEN"
+    elif approved and checklist_ready:
+        status = "READY_AFTER_APPROVAL"
+    else:
+        status = "BLOCKED_BY_APPROVAL"
+    return {
+        "status": status,
+        "work_order_key": f"work_order:{review_key}" if review_key else None,
+        "review_key": review_key or None,
+        "patch_type": (review_packet or {}).get("patch_type"),
+        "target_count": int((target_map or {}).get("target_count") or 0),
+        "checklist_passed": int((implementation_checklist or {}).get("passed_required") or 0),
+        "checklist_total": int((implementation_checklist or {}).get("total_required") or 0),
+        "recipe_count": int((simulation_recipe or {}).get("recipe_count") or 0),
+        "manual_only": True,
+        "auto_apply_enabled": False,
+        "implementation_started": False,
+        "target_map": target_map,
+        "implementation_checklist": implementation_checklist,
+        "simulation_test_recipe": simulation_recipe,
+        "next_action": (
+            "Ready for a separate manual implementation patch and code review."
+            if status == "READY_AFTER_APPROVAL"
+            else "Work order is frozen by the watchdog; collect fresh evidence before implementation."
+            if status == "AUTO_FROZEN"
+            else "Work order is prepared but blocked until explicit approval."
+        ),
+        "updated_at": now.isoformat(),
+    }
+
+
 def _build_provider_truth_miss_evidence_accumulator(
     miss_review: dict,
     miss_repair_workbench: dict,
@@ -19592,6 +19850,30 @@ def _build_provider_truth_miss_evidence_accumulator(
         confidence_curve,
         now,
     )
+    patch_target_map = _build_provider_truth_patch_target_map(review_packet, approval_gate, now)
+    implementation_checklist = _build_provider_truth_implementation_checklist(
+        review_packet,
+        approval_gate,
+        patch_target_map,
+        dry_run_preview,
+        post_approval_watchdog,
+        now,
+    )
+    simulation_recipe = _build_provider_truth_simulation_test_recipe(
+        review_packet,
+        patch_target_map,
+        implementation_checklist,
+        now,
+    )
+    policy_work_order = _build_provider_truth_policy_work_order(
+        review_packet,
+        approval_gate,
+        patch_target_map,
+        implementation_checklist,
+        simulation_recipe,
+        post_approval_watchdog,
+        now,
+    )
     return {
         "status": score.get("status"),
         "readiness_state": score.get("readiness_state"),
@@ -19606,7 +19888,11 @@ def _build_provider_truth_miss_evidence_accumulator(
         "approval_gate": approval_gate,
         "dry_run_policy_preview": dry_run_preview,
         "post_approval_watchdog": post_approval_watchdog,
-        "next_action": approval_gate.get("next_action") or score.get("next_action"),
+        "patch_target_map": patch_target_map,
+        "implementation_checklist": implementation_checklist,
+        "simulation_test_recipe": simulation_recipe,
+        "policy_patch_work_order": policy_work_order,
+        "next_action": policy_work_order.get("next_action") or approval_gate.get("next_action") or score.get("next_action"),
     }
 
 
@@ -19983,6 +20269,10 @@ def _build_dashboard_provider_truth_panel(
     miss_approval_gate = dict(miss_evidence_accumulator.get("approval_gate") or {})
     miss_dry_run = dict(miss_evidence_accumulator.get("dry_run_policy_preview") or {})
     miss_watchdog = dict(miss_evidence_accumulator.get("post_approval_watchdog") or {})
+    miss_work_order = dict(miss_evidence_accumulator.get("policy_patch_work_order") or {})
+    miss_target_map = dict(miss_evidence_accumulator.get("patch_target_map") or {})
+    miss_checklist = dict(miss_evidence_accumulator.get("implementation_checklist") or {})
+    miss_simulation = dict(miss_evidence_accumulator.get("simulation_test_recipe") or {})
     status = (
         "BLOCKED"
         if str((agreement_layer or {}).get("status") or "").upper() == "BLOCKED"
@@ -20062,6 +20352,12 @@ def _build_dashboard_provider_truth_panel(
         "miss_dry_run_risk_count": int(miss_dry_run.get("would_risk_count") or 0),
         "miss_watchdog_status": miss_watchdog.get("status"),
         "miss_watchdog_freeze_triggered": bool(miss_watchdog.get("freeze_triggered")),
+        "miss_work_order_status": miss_work_order.get("status"),
+        "miss_work_order_key": miss_work_order.get("work_order_key"),
+        "miss_work_order_target_count": int(miss_work_order.get("target_count") or miss_target_map.get("target_count") or 0),
+        "miss_work_order_checklist_passed": int(miss_work_order.get("checklist_passed") or miss_checklist.get("passed_required") or 0),
+        "miss_work_order_checklist_total": int(miss_work_order.get("checklist_total") or miss_checklist.get("total_required") or 0),
+        "miss_work_order_recipe_count": int(miss_work_order.get("recipe_count") or miss_simulation.get("recipe_count") or 0),
         "top_symbol": top_agreement.get("symbol"),
         "top_status": top_agreement.get("status"),
         "top_best_source": top_arbitration.get("best_source"),
