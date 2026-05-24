@@ -1320,6 +1320,24 @@ interface DailyCryptoBriefData {
         top_decision?: string | null
         top_safe_action?: string | null
       }
+      third_source_queue_consumer?: {
+        status?: string
+        checked_count?: number
+      }
+      resolution_outcome_classifier?: {
+        status?: string
+        top_outcome?: string | null
+      }
+      arbitration_state_update?: {
+        status?: string
+        resolved_count?: number
+        unresolved_count?: number
+        top_state?: string | null
+      }
+      operator_resolution_packet?: {
+        status?: string
+        safe_action?: string | null
+      }
       next_action?: string | null
     }
     dashboard_provider_truth_panel?: {
@@ -1469,6 +1487,15 @@ interface DailyCryptoBriefData {
       miss_manual_arbitration_status?: string | null
       miss_manual_arbitration_top_decision?: string | null
       miss_manual_arbitration_top_action?: string | null
+      miss_third_consumer_status?: string | null
+      miss_third_consumer_checked_count?: number
+      miss_resolution_classifier_status?: string | null
+      miss_resolution_classifier_top_outcome?: string | null
+      miss_arbitration_update_status?: string | null
+      miss_arbitration_update_resolved_count?: number
+      miss_arbitration_update_unresolved_count?: number
+      miss_operator_resolution_status?: string | null
+      miss_operator_resolution_safe_action?: string | null
       top_symbol?: string | null
       top_status?: string
       top_best_source?: string | null
@@ -6170,6 +6197,10 @@ function DailyCryptoBriefPanel({
     const providerTruthMissArbitration = providerTruthMissEvidence.arbitration_decision_matrix ?? {}
     const providerTruthMissThirdSource = providerTruthMissEvidence.third_source_confirmation_queue ?? {}
     const providerTruthMissManualArbitration = providerTruthMissEvidence.manual_arbitration_packet ?? {}
+    const providerTruthMissThirdConsumer = providerTruthMissEvidence.third_source_queue_consumer ?? {}
+    const providerTruthMissResolutionClassifier = providerTruthMissEvidence.resolution_outcome_classifier ?? {}
+    const providerTruthMissArbitrationUpdate = providerTruthMissEvidence.arbitration_state_update ?? {}
+    const providerTruthMissOperatorResolution = providerTruthMissEvidence.operator_resolution_packet ?? {}
     const topProviderTruthItem = providerTruthAgreement.items?.[0]
     const topProviderTruthSource = providerTruthSourceMap.providers?.[0]
     const topFallbackRoute = providerTruthFallback.routes?.[0]
@@ -6763,6 +6794,9 @@ function DailyCryptoBriefPanel({
             </div>
             <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
               disagreements {providerTruthPanel.miss_disagreement_cluster_count ?? providerTruthMissDisagreements.cluster_count ?? 0} · high {providerTruthPanel.miss_disagreement_high_count ?? providerTruthMissDisagreements.high_severity_count ?? 0} · arbitration {String(providerTruthPanel.miss_arbitration_status || providerTruthMissArbitration.status || 'none').replace(/_/g, ' ').toLowerCase()} · third source {providerTruthPanel.miss_third_source_due_count ?? providerTruthMissThirdSource.due_count ?? 0}/{providerTruthPanel.miss_third_source_queued_count ?? providerTruthMissThirdSource.queued_count ?? 0} · packet {String(providerTruthPanel.miss_manual_arbitration_status || providerTruthMissManualArbitration.status || 'none').replace(/_/g, ' ').toLowerCase()}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              third read {String(providerTruthPanel.miss_third_consumer_status || providerTruthMissThirdConsumer.status || 'waiting').replace(/_/g, ' ').toLowerCase()} · checked {providerTruthPanel.miss_third_consumer_checked_count ?? providerTruthMissThirdConsumer.checked_count ?? 0} · resolution {String(providerTruthPanel.miss_resolution_classifier_top_outcome || providerTruthMissResolutionClassifier.top_outcome || providerTruthMissResolutionClassifier.status || 'pending').replace(/_/g, ' ').toLowerCase()} · state {providerTruthPanel.miss_arbitration_update_resolved_count ?? providerTruthMissArbitrationUpdate.resolved_count ?? 0}/{providerTruthPanel.miss_arbitration_update_unresolved_count ?? providerTruthMissArbitrationUpdate.unresolved_count ?? 0} · operator {String(providerTruthPanel.miss_operator_resolution_safe_action || providerTruthMissOperatorResolution.safe_action || providerTruthMissOperatorResolution.status || 'waiting').replace(/_/g, ' ').toLowerCase()}
             </div>
             {(providerTruthPanel.miss_review_key || providerTruthMissReviewPacket.review_key) && onProviderTruthMissReviewAction && (
               <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 8 }}>
