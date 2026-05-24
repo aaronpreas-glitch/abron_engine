@@ -1338,6 +1338,29 @@ interface DailyCryptoBriefData {
         status?: string
         safe_action?: string | null
       }
+      third_source_sla_watchdog?: {
+        status?: string
+        queued_count?: number
+        due_count?: number
+        overdue_count?: number
+        oldest_age_minutes?: number | null
+      }
+      resolution_escalation_rules?: {
+        status?: string
+        rule_count?: number
+        top_rule?: string | null
+        top_action?: string | null
+      }
+      operator_action_inbox?: {
+        status?: string
+        action_count?: number
+        top_action?: string | null
+      }
+      decision_closeout_journal?: {
+        status?: string
+        entry_count?: number
+        latest_closeout?: string | null
+      }
       next_action?: string | null
     }
     dashboard_provider_truth_panel?: {
@@ -1496,6 +1519,20 @@ interface DailyCryptoBriefData {
       miss_arbitration_update_unresolved_count?: number
       miss_operator_resolution_status?: string | null
       miss_operator_resolution_safe_action?: string | null
+      miss_third_sla_status?: string | null
+      miss_third_sla_due_count?: number
+      miss_third_sla_overdue_count?: number
+      miss_third_sla_oldest_age_minutes?: number | null
+      miss_resolution_escalation_status?: string | null
+      miss_resolution_escalation_rule_count?: number
+      miss_resolution_escalation_top_rule?: string | null
+      miss_resolution_escalation_top_action?: string | null
+      miss_operator_inbox_status?: string | null
+      miss_operator_inbox_action_count?: number
+      miss_operator_inbox_top_action?: string | null
+      miss_closeout_status?: string | null
+      miss_closeout_entry_count?: number
+      miss_closeout_latest?: string | null
       top_symbol?: string | null
       top_status?: string
       top_best_source?: string | null
@@ -6201,6 +6238,10 @@ function DailyCryptoBriefPanel({
     const providerTruthMissResolutionClassifier = providerTruthMissEvidence.resolution_outcome_classifier ?? {}
     const providerTruthMissArbitrationUpdate = providerTruthMissEvidence.arbitration_state_update ?? {}
     const providerTruthMissOperatorResolution = providerTruthMissEvidence.operator_resolution_packet ?? {}
+    const providerTruthMissThirdSla = providerTruthMissEvidence.third_source_sla_watchdog ?? {}
+    const providerTruthMissEscalationRules = providerTruthMissEvidence.resolution_escalation_rules ?? {}
+    const providerTruthMissOperatorInbox = providerTruthMissEvidence.operator_action_inbox ?? {}
+    const providerTruthMissCloseout = providerTruthMissEvidence.decision_closeout_journal ?? {}
     const topProviderTruthItem = providerTruthAgreement.items?.[0]
     const topProviderTruthSource = providerTruthSourceMap.providers?.[0]
     const topFallbackRoute = providerTruthFallback.routes?.[0]
@@ -6797,6 +6838,9 @@ function DailyCryptoBriefPanel({
             </div>
             <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
               third read {String(providerTruthPanel.miss_third_consumer_status || providerTruthMissThirdConsumer.status || 'waiting').replace(/_/g, ' ').toLowerCase()} · checked {providerTruthPanel.miss_third_consumer_checked_count ?? providerTruthMissThirdConsumer.checked_count ?? 0} · resolution {String(providerTruthPanel.miss_resolution_classifier_top_outcome || providerTruthMissResolutionClassifier.top_outcome || providerTruthMissResolutionClassifier.status || 'pending').replace(/_/g, ' ').toLowerCase()} · state {providerTruthPanel.miss_arbitration_update_resolved_count ?? providerTruthMissArbitrationUpdate.resolved_count ?? 0}/{providerTruthPanel.miss_arbitration_update_unresolved_count ?? providerTruthMissArbitrationUpdate.unresolved_count ?? 0} · operator {String(providerTruthPanel.miss_operator_resolution_safe_action || providerTruthMissOperatorResolution.safe_action || providerTruthMissOperatorResolution.status || 'waiting').replace(/_/g, ' ').toLowerCase()}
+            </div>
+            <div style={{ ...MONO, fontSize: 8, color: '#8ca0b3', marginTop: 5, lineHeight: 1.45 }}>
+              sla {String(providerTruthPanel.miss_third_sla_status || providerTruthMissThirdSla.status || 'clear').replace(/_/g, ' ').toLowerCase()} · due {providerTruthPanel.miss_third_sla_due_count ?? providerTruthMissThirdSla.due_count ?? 0}/{providerTruthPanel.miss_third_sla_overdue_count ?? providerTruthMissThirdSla.overdue_count ?? 0} · escalate {String(providerTruthPanel.miss_resolution_escalation_top_rule || providerTruthMissEscalationRules.top_rule || providerTruthPanel.miss_resolution_escalation_status || providerTruthMissEscalationRules.status || 'clear').replace(/_/g, ' ').toLowerCase()} · inbox {providerTruthPanel.miss_operator_inbox_action_count ?? providerTruthMissOperatorInbox.action_count ?? 0} {String(providerTruthPanel.miss_operator_inbox_top_action || providerTruthMissOperatorInbox.top_action || providerTruthPanel.miss_operator_inbox_status || providerTruthMissOperatorInbox.status || 'empty').replace(/_/g, ' ').toLowerCase()} · closeout {providerTruthPanel.miss_closeout_entry_count ?? providerTruthMissCloseout.entry_count ?? 0} {String(providerTruthPanel.miss_closeout_latest || providerTruthMissCloseout.latest_closeout || 'waiting').replace(/_/g, ' ').toLowerCase()}
             </div>
             {(providerTruthPanel.miss_review_key || providerTruthMissReviewPacket.review_key) && onProviderTruthMissReviewAction && (
               <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 8 }}>

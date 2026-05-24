@@ -45,6 +45,7 @@ _PROVIDER_TRUTH_RISK_RECHECK_QUEUE_KEY = "provider_truth_risk_recheck_queue"
 _PROVIDER_TRUTH_HOLD_OUTCOME_JOURNAL_KEY = "provider_truth_hold_outcome_journal"
 _PROVIDER_TRUTH_THIRD_SOURCE_QUEUE_KEY = "provider_truth_third_source_queue"
 _PROVIDER_TRUTH_THIRD_SOURCE_RESULTS_KEY = "provider_truth_third_source_results"
+_PROVIDER_TRUTH_DECISION_CLOSEOUT_JOURNAL_KEY = "provider_truth_decision_closeout_journal"
 _LIVE_CONTEXT_MISSION_STATES_KEY = "live_context_mission_states"
 _LIVE_CONTEXT_MISSION_OUTCOME_JOURNAL_KEY = "live_context_mission_outcome_journal"
 _REPLAY_EVIDENCE_SNAPSHOT_KEY = "replay_evidence_snapshot"
@@ -21894,6 +21895,316 @@ def _build_provider_truth_operator_resolution_packet(
     }
 
 
+def _build_provider_truth_third_source_sla_watchdog(
+    third_source_queue: dict,
+    third_source_consumer: dict,
+    arbitration_state_update: dict,
+    now: datetime,
+) -> dict:
+    items = [dict(item) for item in list((third_source_queue or {}).get("items") or [])]
+    due_items = []
+    overdue_items = []
+    oldest_age_minutes = None
+    for item in items:
+        next_check_at = _gb_parse_ts(item.get("next_check_at"))
+        last_seen_at = _gb_parse_ts(item.get("last_seen_at"))
+        age_minutes = None
+        if last_seen_at:
+            age_minutes = max(0.0, (now - last_seen_at).total_seconds() / 60.0)
+            oldest_age_minutes = age_minutes if oldest_age_minutes is None else max(oldest_age_minutes, age_minutes)
+        is_due = bool(item.get("due")) or bool(next_check_at and next_check_at <= now)
+        is_overdue = bool(next_check_at and next_check_at <= now - timedelta(minutes=60))
+        row = {
+            **item,
+            "age_minutes": round(age_minutes, 1) if age_minutes is not None else None,
+            "due": is_due,
+            "overdue": is_overdue,
+        }
+        if is_due:
+            due_items.append(row)
+        if is_overdue:
+            overdue_items.append(row)
+    unresolved_count = int((arbitration_state_update or {}).get("unresolved_count") or 0)
+    checked_count = int((third_source_consumer or {}).get("checked_count") or 0)
+    if not items:
+        status = "CLEAR"
+    elif overdue_items:
+        status = "OVERDUE"
+    elif due_items:
+        status = "DUE"
+    else:
+        status = "WAITING"
+    return {
+        "status": status,
+        "queued_count": len(items),
+        "due_count": len(due_items),
+        "overdue_count": len(overdue_items),
+        "checked_count": checked_count,
+        "unresolved_count": unresolved_count,
+        "oldest_age_minutes": round(oldest_age_minutes, 1) if oldest_age_minutes is not None else None,
+        "next_check_at": min([str(item.get("next_check_at") or "") for item in items if item.get("next_check_at")], default=None),
+        "manual_only": True,
+        "auto_apply": False,
+        "items": (overdue_items or due_items or items)[:12],
+        "next_action": (
+            "Escalate stale third-source checks before clearing any provider truth hold."
+            if overdue_items
+            else "Run the due third-source confirmation check."
+            if due_items
+            else "Third-source confirmation is queued and still inside the SLA window."
+            if items
+            else "No third-source SLA is active."
+        ),
+        "updated_at": now.isoformat(),
+    }
+
+
+def _build_provider_truth_resolution_escalation_rules(
+    sla_watchdog: dict,
+    resolution_classifier: dict,
+    arbitration_state_update: dict,
+    now: datetime,
+) -> dict:
+    sla_status = str((sla_watchdog or {}).get("status") or "").upper()
+    overdue = int((sla_watchdog or {}).get("overdue_count") or 0)
+    rules = []
+    for item in list((resolution_classifier or {}).get("items") or []):
+        row = dict(item)
+        outcome = str(row.get("resolution_outcome") or "").upper()
+        if outcome == "CONFIRMED_RISK":
+            rule = "KEEP_BLOCKED_CONFIRMED_RISK"
+            action = "REJECT_PACKET"
+            severity = "HIGH"
+            reason = "Third-source evidence confirmed the risk side of the disagreement."
+        elif outcome == "CONFIRMED_BENEFIT":
+            rule = "RETURN_TO_MANUAL_REVIEW"
+            action = "RETURN_TO_MANUAL_REVIEW"
+            severity = "MEDIUM"
+            reason = "Third-source evidence supports benefit, but approval remains manual."
+        elif outcome == "STILL_CONFLICTED":
+            rule = "MANUAL_CA_REVIEW"
+            action = "REQUEST_CA_CHECK"
+            severity = "MEDIUM"
+            reason = "Third-source evidence did not resolve the provider disagreement."
+        elif outcome == "NO_DATA" and overdue:
+            rule = "NO_DATA_ESCALATE_CA_REVIEW"
+            action = "REQUEST_CA_CHECK"
+            severity = "HIGH"
+            reason = "Third-source data is missing and the SLA is overdue."
+        elif outcome == "NO_DATA":
+            rule = "NO_DATA_KEEP_HOLD"
+            action = "KEEP_HOLD"
+            severity = "MEDIUM"
+            reason = "Third-source data is missing; keep the hold until manually reviewed."
+        elif outcome == "PENDING_THIRD_SOURCE" and overdue:
+            rule = "STALE_UNRESOLVED"
+            action = "REQUEST_CA_CHECK"
+            severity = "HIGH"
+            reason = "Third-source confirmation is stale and unresolved."
+        elif outcome == "PENDING_THIRD_SOURCE":
+            rule = "AWAIT_THIRD_SOURCE"
+            action = "KEEP_WATCHING"
+            severity = "LOW"
+            reason = "Third-source confirmation is still within the wait window."
+        else:
+            continue
+        rules.append({
+            "cluster_key": row.get("cluster_key"),
+            "symbol": row.get("symbol"),
+            "mint": row.get("mint"),
+            "resolution_outcome": outcome,
+            "rule": rule,
+            "recommended_action": action,
+            "severity": severity,
+            "reason": reason,
+            "manual_only": True,
+            "auto_apply": False,
+        })
+    if not rules and int((arbitration_state_update or {}).get("unresolved_count") or 0) and sla_status == "OVERDUE":
+        rules.append({
+            "cluster_key": None,
+            "symbol": None,
+            "mint": None,
+            "resolution_outcome": "UNRESOLVED",
+            "rule": "STALE_UNRESOLVED",
+            "recommended_action": "REQUEST_CA_CHECK",
+            "severity": "HIGH",
+            "reason": "Arbitration is unresolved and third-source SLA is overdue.",
+            "manual_only": True,
+            "auto_apply": False,
+        })
+    top = rules[0] if rules else {}
+    status = (
+        "ESCALATE"
+        if any(str(rule.get("severity") or "").upper() == "HIGH" for rule in rules)
+        else "WAITING"
+        if rules
+        else "CLEAR"
+    )
+    return {
+        "status": status,
+        "rule_count": len(rules),
+        "top_rule": top.get("rule"),
+        "top_action": top.get("recommended_action"),
+        "manual_only": True,
+        "auto_apply": False,
+        "items": rules[:12],
+        "next_action": (
+            "Operator review is required before changing any provider truth hold."
+            if status == "ESCALATE"
+            else "Keep watching the third-source queue."
+            if status == "WAITING"
+            else "No resolution escalation is active."
+        ),
+        "updated_at": now.isoformat(),
+    }
+
+
+def _build_provider_truth_operator_action_inbox(
+    review_packet: dict,
+    operator_resolution_packet: dict,
+    sla_watchdog: dict,
+    escalation_rules: dict,
+    now: datetime,
+) -> dict:
+    review_key = str((review_packet or {}).get("review_key") or "").strip() or None
+    actions = []
+    for rule in list((escalation_rules or {}).get("items") or []):
+        top_action = str(rule.get("recommended_action") or "KEEP_WATCHING").upper()
+        allowed = ["KEEP_HOLD", "KEEP_WATCHING"]
+        if top_action == "REQUEST_CA_CHECK":
+            allowed = ["REQUEST_CA_CHECK", "KEEP_HOLD"]
+        elif top_action == "REJECT_PACKET":
+            allowed = ["REJECT_PACKET", "KEEP_HOLD"]
+        elif top_action == "RETURN_TO_MANUAL_REVIEW":
+            allowed = ["RETURN_TO_MANUAL_REVIEW", "KEEP_HOLD"]
+        actions.append({
+            "action_key": f"{review_key or 'no-review'}:{rule.get('cluster_key') or rule.get('symbol') or len(actions)}:{top_action}",
+            "review_key": review_key,
+            "symbol": rule.get("symbol"),
+            "mint": rule.get("mint"),
+            "recommended_action": top_action,
+            "allowed_actions": allowed,
+            "severity": rule.get("severity"),
+            "reason": rule.get("reason"),
+            "source": "RESOLUTION_ESCALATION_RULES",
+            "manual_only": True,
+            "auto_apply": False,
+        })
+    if not actions and str((operator_resolution_packet or {}).get("status") or "").upper() == "READY_FOR_OPERATOR_REVIEW":
+        safe_action = str((operator_resolution_packet or {}).get("safe_action") or "KEEP_WATCHING").upper()
+        actions.append({
+            "action_key": f"{review_key or 'no-review'}:operator-resolution:{safe_action}",
+            "review_key": review_key,
+            "symbol": None,
+            "mint": None,
+            "recommended_action": safe_action if safe_action else "KEEP_WATCHING",
+            "allowed_actions": ["KEEP_WATCHING", "KEEP_HOLD"],
+            "severity": "LOW",
+            "reason": (operator_resolution_packet or {}).get("summary") or "Operator packet is ready for review.",
+            "source": "OPERATOR_RESOLUTION_PACKET",
+            "manual_only": True,
+            "auto_apply": False,
+        })
+    top = actions[0] if actions else {}
+    status = "OPEN" if actions else "EMPTY"
+    return {
+        "status": status,
+        "review_key": review_key,
+        "action_count": len(actions),
+        "top_action": top.get("recommended_action"),
+        "sla_status": (sla_watchdog or {}).get("status"),
+        "manual_only": True,
+        "auto_apply": False,
+        "items": actions[:12],
+        "next_action": (
+            "Operator inbox has manual actions to review; live execution stays locked."
+            if actions
+            else "No operator action is required."
+        ),
+        "updated_at": now.isoformat(),
+    }
+
+
+def _build_provider_truth_decision_closeout_journal(
+    review_packet: dict,
+    operator_action_inbox: dict,
+    decision_audit_trail: dict,
+    resolution_classifier: dict,
+    now: datetime,
+) -> dict:
+    review_key = str((review_packet or {}).get("review_key") or "").strip() or None
+    payload = _freshness_kv_read(_PROVIDER_TRUTH_DECISION_CLOSEOUT_JOURNAL_KEY)
+    entries = [dict(entry) for entry in list((payload or {}).get("entries") or [])]
+    inbox_status = str((operator_action_inbox or {}).get("status") or "EMPTY").upper()
+    action_count = int((operator_action_inbox or {}).get("action_count") or 0)
+    latest_audit_state = (decision_audit_trail or {}).get("latest_state")
+    top_outcome = (resolution_classifier or {}).get("top_outcome") or (resolution_classifier or {}).get("status")
+    top_action = (operator_action_inbox or {}).get("top_action")
+    closeout_label = (
+        "OPEN_ACTION_REQUIRED"
+        if action_count
+        else "AUDIT_DECISION_RECORDED"
+        if latest_audit_state
+        else "OBSERVING"
+    )
+    signature = "|".join([
+        str(review_key or "no-review"),
+        str(latest_audit_state or "no-audit"),
+        str(top_outcome or "no-resolution"),
+        str(top_action or "no-action"),
+        inbox_status,
+        str(action_count),
+    ])
+    if (action_count or latest_audit_state) and signature not in {str(entry.get("signature") or "") for entry in entries[-300:]}:
+        entries.append({
+            "entry_id": f"{review_key or 'no-review'}:{now.isoformat()}",
+            "signature": signature,
+            "review_key": review_key,
+            "closeout": closeout_label,
+            "inbox_status": inbox_status,
+            "action_count": action_count,
+            "top_action": top_action,
+            "latest_audit_state": latest_audit_state,
+            "resolution_outcome": top_outcome,
+            "manual_only": True,
+            "auto_apply": False,
+            "created_at": now.isoformat(),
+        })
+        entries = entries[-500:]
+        _freshness_kv_write(
+            _PROVIDER_TRUTH_DECISION_CLOSEOUT_JOURNAL_KEY,
+            {
+                "status": "TRACKING",
+                "updated_at": now.isoformat(),
+                "entries": entries,
+            },
+        )
+    review_entries = [
+        dict(entry) for entry in entries
+        if not review_key or str(entry.get("review_key") or "") == review_key
+    ]
+    review_entries.sort(key=lambda x: _gb_parse_ts(x.get("created_at")) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    latest = review_entries[0] if review_entries else {}
+    return {
+        "status": "TRACKING" if review_entries else "EMPTY",
+        "review_key": review_key,
+        "entry_count": len(entries),
+        "review_entry_count": len(review_entries),
+        "latest_closeout": latest.get("closeout"),
+        "latest_action": latest.get("top_action"),
+        "manual_only": True,
+        "auto_apply": False,
+        "items": review_entries[:20],
+        "next_action": (
+            "Use closeout history to judge whether operator waits, blocks, and clears were correct."
+            if review_entries
+            else "No closeout entry is recorded for this review yet."
+        ),
+        "updated_at": now.isoformat(),
+    }
+
+
 def _build_provider_truth_miss_evidence_accumulator(
     miss_review: dict,
     miss_repair_workbench: dict,
@@ -22150,6 +22461,32 @@ def _build_provider_truth_miss_evidence_accumulator(
         arbitration_state_update,
         now,
     )
+    third_source_sla_watchdog = _build_provider_truth_third_source_sla_watchdog(
+        third_source_queue,
+        third_source_consumer,
+        arbitration_state_update,
+        now,
+    )
+    resolution_escalation_rules = _build_provider_truth_resolution_escalation_rules(
+        third_source_sla_watchdog,
+        resolution_classifier,
+        arbitration_state_update,
+        now,
+    )
+    operator_action_inbox = _build_provider_truth_operator_action_inbox(
+        review_packet,
+        operator_resolution_packet,
+        third_source_sla_watchdog,
+        resolution_escalation_rules,
+        now,
+    )
+    decision_closeout_journal = _build_provider_truth_decision_closeout_journal(
+        review_packet,
+        operator_action_inbox,
+        decision_audit_trail,
+        resolution_classifier,
+        now,
+    )
     return {
         "status": score.get("status"),
         "readiness_state": score.get("readiness_state"),
@@ -22194,6 +22531,10 @@ def _build_provider_truth_miss_evidence_accumulator(
         "resolution_outcome_classifier": resolution_classifier,
         "arbitration_state_update": arbitration_state_update,
         "operator_resolution_packet": operator_resolution_packet,
+        "third_source_sla_watchdog": third_source_sla_watchdog,
+        "resolution_escalation_rules": resolution_escalation_rules,
+        "operator_action_inbox": operator_action_inbox,
+        "decision_closeout_journal": decision_closeout_journal,
         "next_action": policy_work_order.get("next_action") or approval_gate.get("next_action") or score.get("next_action"),
     }
 
@@ -22601,6 +22942,10 @@ def _build_dashboard_provider_truth_panel(
     miss_resolution_classifier = dict(miss_evidence_accumulator.get("resolution_outcome_classifier") or {})
     miss_arbitration_update = dict(miss_evidence_accumulator.get("arbitration_state_update") or {})
     miss_operator_resolution = dict(miss_evidence_accumulator.get("operator_resolution_packet") or {})
+    miss_third_sla = dict(miss_evidence_accumulator.get("third_source_sla_watchdog") or {})
+    miss_resolution_escalation = dict(miss_evidence_accumulator.get("resolution_escalation_rules") or {})
+    miss_operator_inbox = dict(miss_evidence_accumulator.get("operator_action_inbox") or {})
+    miss_closeout = dict(miss_evidence_accumulator.get("decision_closeout_journal") or {})
     miss_top_evidence = (list(miss_approval_evidence.get("top_items") or []) or [{}])[0]
     miss_top_risk_case = dict(miss_risk_cases.get("top_case") or {})
     status = (
@@ -22770,6 +23115,20 @@ def _build_dashboard_provider_truth_panel(
         "miss_arbitration_update_unresolved_count": int(miss_arbitration_update.get("unresolved_count") or 0),
         "miss_operator_resolution_status": miss_operator_resolution.get("status"),
         "miss_operator_resolution_safe_action": miss_operator_resolution.get("safe_action"),
+        "miss_third_sla_status": miss_third_sla.get("status"),
+        "miss_third_sla_due_count": int(miss_third_sla.get("due_count") or 0),
+        "miss_third_sla_overdue_count": int(miss_third_sla.get("overdue_count") or 0),
+        "miss_third_sla_oldest_age_minutes": miss_third_sla.get("oldest_age_minutes"),
+        "miss_resolution_escalation_status": miss_resolution_escalation.get("status"),
+        "miss_resolution_escalation_rule_count": int(miss_resolution_escalation.get("rule_count") or 0),
+        "miss_resolution_escalation_top_rule": miss_resolution_escalation.get("top_rule"),
+        "miss_resolution_escalation_top_action": miss_resolution_escalation.get("top_action"),
+        "miss_operator_inbox_status": miss_operator_inbox.get("status"),
+        "miss_operator_inbox_action_count": int(miss_operator_inbox.get("action_count") or 0),
+        "miss_operator_inbox_top_action": miss_operator_inbox.get("top_action"),
+        "miss_closeout_status": miss_closeout.get("status"),
+        "miss_closeout_entry_count": int(miss_closeout.get("entry_count") or 0),
+        "miss_closeout_latest": miss_closeout.get("latest_closeout"),
         "top_symbol": top_agreement.get("symbol"),
         "top_status": top_agreement.get("status"),
         "top_best_source": top_arbitration.get("best_source"),
